@@ -1,0 +1,14 @@
+[Unit]
+Description=srv guest first-boot bootstrap
+After=local-fs.target tailscaled.service
+Wants=tailscaled.service
+ConditionPathExists=!/var/lib/srv/bootstrap.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/srv/bootstrap.sh
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

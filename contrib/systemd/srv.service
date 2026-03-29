@@ -1,0 +1,19 @@
+[Unit]
+Description=srv Firecracker control plane
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/dev/kvm
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/srv/srv.env
+ExecStart=/usr/local/bin/srv
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

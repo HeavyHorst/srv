@@ -1,0 +1,276 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"path/filepath"
+	"reflect"
+	"testing"
+	"time"
+
+	"srv/internal/model"
+)
+
+func TestStoreInstanceRoundTripAndListFiltering(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	createdAt := time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC)
+	updatedAt := createdAt.Add(2 * time.Minute)
+	deletedAt := createdAt.Add(10 * time.Minute)
+
+	ready := testInstance("alpha", model.StateReady, createdAt)
+	deleted := testInstance("beta", model.StateDeleted, createdAt.Add(time.Minute))
+	deleted.UpdatedAt = updatedAt
+	deleted.DeletedAt = &deletedAt
+
+	if err := s.CreateInstance(ctx, ready); err != nil {
+		t.Fatalf("CreateInstance(ready): %v", err)
+	}
+	if err := s.CreateInstance(ctx, deleted); err != nil {
+		t.Fatalf("CreateInstance(deleted): %v", err)
+	}
+
+	gotReady, err := s.GetInstance(ctx, ready.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(%q): %v", ready.Name, err)
+	}
+	if !reflect.DeepEqual(gotReady, ready) {
+		t.Fatalf("GetInstance(%q) mismatch\nwant: %#v\n got: %#v", ready.Name, ready, gotReady)
+	}
+
+	visible, err := s.ListInstances(ctx, false)
+	if err != nil {
+		t.Fatalf("ListInstances(false): %v", err)
+	}
+	if len(visible) != 1 || visible[0].Name != ready.Name {
+		t.Fatalf("ListInstances(false) = %#v, want only %q", visible, ready.Name)
+	}
+
+	all, err := s.ListInstances(ctx, true)
+	if err != nil {
+		t.Fatalf("ListInstances(true): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("ListInstances(true) returned %d rows, want 2", len(all))
+	}
+	if all[0].Name != ready.Name || all[1].Name != deleted.Name {
+		t.Fatalf("ListInstances(true) order = [%s %s], want [%s %s]", all[0].Name, all[1].Name, ready.Name, deleted.Name)
+	}
+
+	ready.State = model.StateFailed
+	ready.UpdatedAt = createdAt.Add(5 * time.Minute)
+	ready.LastError = "boot failed"
+	ready.FirecrackerPID = 1234
+	ready.TailscaleName = "alpha.tailnet"
+	ready.TailscaleIP = "100.64.0.10"
+	if err := s.UpdateInstance(ctx, ready); err != nil {
+		t.Fatalf("UpdateInstance(%q): %v", ready.Name, err)
+	}
+
+	updated, err := s.GetInstance(ctx, ready.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(%q) after update: %v", ready.Name, err)
+	}
+	if !reflect.DeepEqual(updated, ready) {
+		t.Fatalf("updated instance mismatch\nwant: %#v\n got: %#v", ready, updated)
+	}
+}
+
+func TestStoreFindInstanceMissingReturnsFalse(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	inst, found, err := s.FindInstance(ctx, "missing")
+	if err != nil {
+		t.Fatalf("FindInstance: %v", err)
+	}
+	if found {
+		t.Fatalf("FindInstance reported found for missing instance: %#v", inst)
+	}
+	if !reflect.DeepEqual(inst, model.Instance{}) {
+		t.Fatalf("FindInstance returned unexpected instance for missing row: %#v", inst)
+	}
+}
+
+func TestStoreListEventsDefaultsToTwentyNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	inst := testInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := s.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	base := time.Date(2026, time.March, 29, 13, 0, 0, 0, time.UTC)
+	for i := 0; i < 25; i++ {
+		event := model.InstanceEvent{
+			InstanceID: inst.ID,
+			CreatedAt:  base.Add(time.Duration(i) * time.Second),
+			Type:       "status",
+			Message:    "event",
+			Payload:    "payload",
+		}
+		if err := s.RecordEvent(ctx, event); err != nil {
+			t.Fatalf("RecordEvent(%d): %v", i, err)
+		}
+	}
+
+	events, err := s.ListEvents(ctx, inst.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 20 {
+		t.Fatalf("ListEvents returned %d rows, want 20", len(events))
+	}
+	if !events[0].CreatedAt.Equal(base.Add(24 * time.Second)) {
+		t.Fatalf("newest event time = %s, want %s", events[0].CreatedAt, base.Add(24*time.Second))
+	}
+	if !events[len(events)-1].CreatedAt.Equal(base.Add(5 * time.Second)) {
+		t.Fatalf("oldest returned event time = %s, want %s", events[len(events)-1].CreatedAt, base.Add(5*time.Second))
+	}
+}
+
+func TestStoreDeleteInstanceRemovesEvents(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	inst := testInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := s.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if err := s.RecordEvent(ctx, model.InstanceEvent{
+		InstanceID: inst.ID,
+		CreatedAt:  inst.CreatedAt.Add(time.Second),
+		Type:       "create",
+		Message:    "created",
+	}); err != nil {
+		t.Fatalf("RecordEvent: %v", err)
+	}
+
+	if err := s.DeleteInstance(ctx, inst.Name); err != nil {
+		t.Fatalf("DeleteInstance: %v", err)
+	}
+
+	if _, err := s.GetInstance(ctx, inst.Name); err == nil || !reflect.DeepEqual(err, sql.ErrNoRows) && err != sql.ErrNoRows {
+		if err == nil {
+			t.Fatalf("GetInstance after delete returned nil error")
+		}
+		if err != sql.ErrNoRows {
+			t.Fatalf("GetInstance after delete error = %v, want %v", err, sql.ErrNoRows)
+		}
+	}
+
+	events, err := s.ListEvents(ctx, inst.ID, 10)
+	if err != nil {
+		t.Fatalf("ListEvents after delete: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("ListEvents after delete returned %d rows, want 0", len(events))
+	}
+
+	if err := s.DeleteInstance(ctx, inst.Name); err != nil {
+		t.Fatalf("DeleteInstance on missing row should be a no-op, got %v", err)
+	}
+}
+
+func TestStoreRecordAuditRows(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	commandTime := time.Date(2026, time.March, 29, 14, 0, 0, 0, time.UTC)
+	if err := s.RecordCommand(ctx, model.CommandAudit{
+		CreatedAt:        commandTime,
+		ActorUser:        "alice@example.com",
+		ActorDisplayName: "Alice",
+		ActorNode:        "laptop",
+		RemoteAddr:       "100.64.0.1:1234",
+		SSHUser:          "root",
+		Command:          "list",
+		ArgsJSON:         `["list"]`,
+		Allowed:          true,
+		Reason:           "allowlisted",
+		DurationMS:       42,
+		ErrorText:        "",
+	}); err != nil {
+		t.Fatalf("RecordCommand: %v", err)
+	}
+
+	if err := s.RecordAuthz(ctx, model.AuthzDecision{
+		CreatedAt:  commandTime,
+		ActorUser:  "alice@example.com",
+		ActorNode:  "laptop",
+		RemoteAddr: "100.64.0.1:1234",
+		Action:     "list",
+		Allowed:    false,
+		Reason:     "denylisted",
+	}); err != nil {
+		t.Fatalf("RecordAuthz: %v", err)
+	}
+
+	var actorUser, displayName, actorNode, remoteAddr, sshUser, command, argsJSON, reason, errorText string
+	var allowed int
+	var durationMS int64
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT actor_user, actor_display_name, actor_node, remote_addr, ssh_user, command, args_json, allowed, reason, duration_ms, error_text
+		FROM commands
+	`).Scan(&actorUser, &displayName, &actorNode, &remoteAddr, &sshUser, &command, &argsJSON, &allowed, &reason, &durationMS, &errorText); err != nil {
+		t.Fatalf("query commands row: %v", err)
+	}
+	if actorUser != "alice@example.com" || displayName != "Alice" || actorNode != "laptop" || remoteAddr != "100.64.0.1:1234" || sshUser != "root" || command != "list" || argsJSON != `["list"]` || allowed != 1 || reason != "allowlisted" || durationMS != 42 || errorText != "" {
+		t.Fatalf("unexpected commands row: user=%q display=%q node=%q remote=%q ssh=%q command=%q args=%q allowed=%d reason=%q duration=%d error=%q", actorUser, displayName, actorNode, remoteAddr, sshUser, command, argsJSON, allowed, reason, durationMS, errorText)
+	}
+
+	var authActorUser, authActorNode, authRemoteAddr, action, authReason string
+	var authAllowed int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT actor_user, actor_node, remote_addr, action, allowed, reason
+		FROM authz_decisions
+	`).Scan(&authActorUser, &authActorNode, &authRemoteAddr, &action, &authAllowed, &authReason); err != nil {
+		t.Fatalf("query authz row: %v", err)
+	}
+	if authActorUser != "alice@example.com" || authActorNode != "laptop" || authRemoteAddr != "100.64.0.1:1234" || action != "list" || authAllowed != 0 || authReason != "denylisted" {
+		t.Fatalf("unexpected authz row: user=%q node=%q remote=%q action=%q allowed=%d reason=%q", authActorUser, authActorNode, authRemoteAddr, action, authAllowed, authReason)
+	}
+}
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "state", "app.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close(): %v", err)
+		}
+	})
+	return s
+}
+
+func testInstance(name, state string, createdAt time.Time) model.Instance {
+	updatedAt := createdAt.Add(30 * time.Second)
+	baseDir := filepath.Join("/tmp", name)
+	return model.Instance{
+		ID:            name + "-id",
+		Name:          name,
+		State:         state,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+		CreatedByUser: "alice@example.com",
+		CreatedByNode: "laptop",
+		RootFSPath:    filepath.Join(baseDir, "rootfs.img"),
+		KernelPath:    filepath.Join(baseDir, "vmlinux"),
+		InitrdPath:    filepath.Join(baseDir, "initrd.img"),
+		SocketPath:    filepath.Join(baseDir, "firecracker.sock"),
+		LogPath:       filepath.Join(baseDir, "firecracker.log"),
+		SerialLogPath: filepath.Join(baseDir, "serial.log"),
+		TapDevice:     "tap-1234567890",
+		GuestMAC:      "02:fc:aa:bb:cc:dd",
+		NetworkCIDR:   "172.28.0.0/30",
+		HostAddr:      "172.28.0.1/30",
+		GuestAddr:     "172.28.0.2/30",
+		GatewayAddr:   "172.28.0.1",
+	}
+}

@@ -1,3 +1,5 @@
 images/arch-base/out/
 /.config
 /srv
+/srv-net-helper
+/srv-vm-runner

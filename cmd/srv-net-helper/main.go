@@ -19,7 +19,7 @@ func main() {
 	)
 
 	flag.StringVar(&socketPath, "socket", getenv("SRV_NET_HELPER_SOCKET", nethelper.DefaultSocketPath), "unix socket path for the privileged network helper")
-	flag.StringVar(&tapUser, "tap-user", getenv("SRV_NET_HELPER_TAP_USER", "srv"), "user that should own newly created TAP devices")
+	flag.StringVar(&tapUser, "tap-user", getenv("SRV_NET_HELPER_TAP_USER", "srv-vm"), "user that should own newly created TAP devices")
 	flag.StringVar(&clientGroup, "client-group", getenv("SRV_NET_HELPER_CLIENT_GROUP", "srv"), "group allowed to connect to the helper socket")
 	flag.Parse()
 

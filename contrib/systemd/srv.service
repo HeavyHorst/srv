@@ -2,15 +2,13 @@
 Description=srv Firecracker control plane
 Wants=network-online.target
 After=network-online.target
-Requires=srv-net-helper.service
-After=srv-net-helper.service
-ConditionPathExists=/dev/kvm
+Requires=srv-net-helper.service srv-vm-runner.service
+After=srv-net-helper.service srv-vm-runner.service
 
 [Service]
 Type=simple
 User=srv
 Group=srv
-SupplementaryGroups=kvm
 EnvironmentFile=/etc/srv/srv.env
 ExecStart=/usr/local/bin/srv
 NoNewPrivileges=yes
@@ -23,7 +21,6 @@ SystemCallArchitectures=native
 RestrictRealtime=yes
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-Delegate=yes
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

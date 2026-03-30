@@ -14,13 +14,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
-	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 	"github.com/google/uuid"
 	"golang.org/x/oauth2/clientcredentials"
 	"tailscale.com/client/tailscale"
@@ -29,19 +26,13 @@ import (
 	"srv/internal/model"
 	"srv/internal/nethelper"
 	"srv/internal/store"
+	"srv/internal/vmrunner"
 )
 
 var (
-	errGuestNotReady    = errors.New("guest never joined the tailnet before timeout")
-	errGuestExited      = errors.New("guest exited before joining the tailnet")
-	validName           = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
-	vmContextForRequest = func(context.Context) context.Context {
-		return context.Background()
-	}
-	currentCgroupPath = func() (string, error) {
-		return readUnifiedCgroupPath("/proc/self/cgroup")
-	}
-	cgroupFSRoot       = "/sys/fs/cgroup"
+	errGuestNotReady   = errors.New("guest never joined the tailnet before timeout")
+	errGuestExited     = errors.New("guest exited before joining the tailnet")
+	validName          = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	loopDevicesForPath = func(path string) (string, error) {
 		output, err := exec.Command("losetup", "-j", path, "--output", "NAME", "--noheadings").CombinedOutput()
 		if err != nil {
@@ -57,6 +48,7 @@ type Provisioner struct {
 	store         *store.Store
 	tsClient      *tailscale.Client
 	networkHelper networkHelper
+	vmRunner      vmRunner
 }
 
 type networkHelper interface {
@@ -64,17 +56,13 @@ type networkHelper interface {
 	CleanupInstanceNetwork(ctx context.Context, req nethelper.CleanupRequest) error
 }
 
-type guestBootstrap struct {
-	Version             int      `json:"version"`
-	Hostname            string   `json:"hostname"`
-	TailscaleAuthKey    string   `json:"tailscale_auth_key,omitempty"`
-	TailscaleControlURL string   `json:"tailscale_control_url,omitempty"`
-	TailscaleTags       []string `json:"tailscale_tags,omitempty"`
+type vmRunner interface {
+	StartInstanceVM(ctx context.Context, req vmrunner.StartRequest) (vmrunner.StartResponse, error)
+	StopInstanceVM(ctx context.Context, req vmrunner.StopRequest) error
 }
 
-type guestMetadata struct {
-	SRV guestBootstrap `json:"srv"`
-}
+type guestBootstrap = vmrunner.Bootstrap
+type guestMetadata = vmrunner.Metadata
 
 type tailnetDeviceSnapshot struct {
 	DeviceID string
@@ -88,7 +76,13 @@ type CreateOptions struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner, error) {
-	p := &Provisioner{cfg: cfg, log: logger, store: st, networkHelper: nethelper.NewClient(cfg.NetHelperSocketPath)}
+	p := &Provisioner{
+		cfg:           cfg,
+		log:           logger,
+		store:         st,
+		networkHelper: nethelper.NewClient(cfg.NetHelperSocketPath),
+		vmRunner:      vmrunner.NewClient(cfg.VMRunnerSocketPath),
+	}
 	if cfg.Tailnet != "" && cfg.TailscaleClientSecret != "" {
 		credentials := clientcredentials.Config{
 			ClientID:     firstNonEmpty(cfg.TailscaleClientID, "srv-control-plane"),
@@ -169,8 +163,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	defer func() {
 		if cleanup {
 			if startedMachine {
-				_ = p.stopFirecracker(inst.FirecrackerPID)
-				_ = p.cleanupFirecrackerCgroup(inst.Name)
+				_ = p.stopFirecracker(inst.Name, inst.FirecrackerPID)
 			}
 			_ = p.cleanupNetworking(inst)
 			_ = p.removeInstanceDir(inst.Name)
@@ -195,6 +188,10 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 			return inst, err
 		}
 		p.recordEvent(inst.ID, "storage", "rootfs expanded for instance", map[string]any{"size_bytes": inst.RootFSSizeBytes})
+	}
+	if err := p.ensureInstanceRuntimePermissions(inst); err != nil {
+		inst.LastError = err.Error()
+		return inst, err
 	}
 
 	if err := p.setupNetworking(ctx, inst); err != nil {
@@ -285,11 +282,8 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 	}
 	p.recordEvent(inst.ID, "delete", "delete requested", nil)
 
-	if err := p.stopFirecracker(inst.FirecrackerPID); err != nil {
+	if err := p.stopFirecracker(inst.Name, inst.FirecrackerPID); err != nil {
 		p.log.Warn("stop firecracker", "name", inst.Name, "pid", inst.FirecrackerPID, "err", err)
-	}
-	if err := p.cleanupFirecrackerCgroup(inst.Name); err != nil {
-		p.log.Warn("cleanup firecracker cgroup", "name", inst.Name, "err", err)
 	}
 	if err := p.cleanupNetworking(inst); err != nil {
 		p.log.Warn("cleanup networking", "name", inst.Name, "err", err)
@@ -343,8 +337,8 @@ func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) 
 	if inst.FirecrackerPID != 0 {
 		inst.FirecrackerPID = 0
 		inst.UpdatedAt = time.Now().UTC()
-		if err := p.cleanupFirecrackerCgroup(inst.Name); err != nil {
-			p.log.Warn("cleanup stale firecracker cgroup", "name", inst.Name, "err", err)
+		if err := p.stopFirecracker(inst.Name, 0); err != nil {
+			p.log.Warn("cleanup stale firecracker state", "name", inst.Name, "err", err)
 		}
 		if err := p.store.UpdateInstance(ctx, inst); err != nil {
 			return err
@@ -378,11 +372,8 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 	}
 
 	p.recordEvent(inst.ID, "stop", "stop requested", nil)
-	if err := p.stopFirecracker(inst.FirecrackerPID); err != nil {
+	if err := p.stopFirecracker(inst.Name, inst.FirecrackerPID); err != nil {
 		return inst, err
-	}
-	if err := p.cleanupFirecrackerCgroup(inst.Name); err != nil {
-		p.log.Warn("cleanup firecracker cgroup", "name", inst.Name, "err", err)
 	}
 	if err := p.cleanupNetworking(inst); err != nil {
 		return inst, err
@@ -479,6 +470,9 @@ func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, e
 	if err := p.cleanupNetworking(inst); err != nil {
 		p.log.Warn("cleanup stale networking before start", "name", inst.Name, "err", err)
 	}
+	if err := p.ensureInstanceRuntimePermissions(inst); err != nil {
+		return inst, err
+	}
 	p.recordEvent(inst.ID, "start", "start requested", nil)
 
 	cleanup := true
@@ -486,8 +480,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, e
 	defer func() {
 		if cleanup {
 			if startedMachine {
-				_ = p.stopFirecracker(inst.FirecrackerPID)
-				_ = p.cleanupFirecrackerCgroup(inst.Name)
+				_ = p.stopFirecracker(inst.Name, inst.FirecrackerPID)
 			}
 			_ = p.cleanupNetworking(inst)
 			inst.State = model.StateStopped
@@ -575,11 +568,14 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 			return "", fmt.Errorf("instance %q already exists with state %s", name, existing.State)
 		}
 	}
-	if err := os.Mkdir(instanceDir, 0o755); err != nil {
+	if err := os.Mkdir(instanceDir, 0o770); err != nil {
 		if os.IsExist(err) {
 			return "", fmt.Errorf("instance %q already exists on disk", name)
 		}
 		return "", fmt.Errorf("create instance directory: %w", err)
+	}
+	if err := os.Chmod(instanceDir, 0o770); err != nil {
+		return "", fmt.Errorf("set instance directory permissions: %w", err)
 	}
 	return instanceDir, nil
 }
@@ -689,6 +685,9 @@ func (p *Provisioner) cloneRootFS(ctx context.Context, dest string) error {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("reflink rootfs clone: %w: %s", err, strings.TrimSpace(string(output)))
 	}
+	if err := os.Chmod(dest, 0o660); err != nil {
+		return fmt.Errorf("set rootfs permissions: %w", err)
+	}
 	return nil
 }
 
@@ -699,6 +698,22 @@ func (p *Provisioner) growRootFS(path string, sizeBytes int64) error {
 	cmd := exec.Command("resize2fs", path)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("resize rootfs filesystem: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (p *Provisioner) ensureInstanceRuntimePermissions(inst model.Instance) error {
+	instanceDir := filepath.Dir(inst.RootFSPath)
+	if err := os.Chmod(instanceDir, 0o770); err != nil {
+		return fmt.Errorf("set instance directory permissions: %w", err)
+	}
+	if err := os.Chmod(inst.RootFSPath, 0o660); err != nil {
+		return fmt.Errorf("set rootfs permissions: %w", err)
+	}
+	for _, path := range []string{inst.LogPath, inst.SerialLogPath} {
+		if err := os.Chmod(path, 0o660); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("set runtime file permissions for %s: %w", path, err)
+		}
 	}
 	return nil
 }
@@ -805,93 +820,38 @@ func (p *Provisioner) writeMetadataFile(inst model.Instance, bootstrap guestBoot
 		return fmt.Errorf("marshal bootstrap metadata: %w", err)
 	}
 	path := filepath.Join(filepath.Dir(inst.RootFSPath), "meta.json")
-	if err := os.WriteFile(path, payload, 0o600); err != nil {
+	if err := os.WriteFile(path, payload, 0o640); err != nil {
 		return fmt.Errorf("write metadata file: %w", err)
 	}
 	return nil
 }
 
 func (p *Provisioner) startFirecracker(ctx context.Context, inst model.Instance, bootstrap guestBootstrap) (int, error) {
-	if err := os.Remove(inst.SocketPath); err != nil && !os.IsNotExist(err) {
-		return 0, fmt.Errorf("remove stale firecracker socket: %w", err)
+	if p.vmRunner == nil {
+		return 0, errors.New("vm runner client is unavailable")
 	}
-	serialLog, err := os.OpenFile(inst.SerialLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	resp, err := p.vmRunner.StartInstanceVM(ctx, vmrunner.StartRequest{
+		Name:        inst.Name,
+		SocketPath:  inst.SocketPath,
+		LogPath:     inst.LogPath,
+		SerialLog:   inst.SerialLogPath,
+		KernelPath:  inst.KernelPath,
+		InitrdPath:  inst.InitrdPath,
+		RootFSPath:  inst.RootFSPath,
+		TapDevice:   inst.TapDevice,
+		GuestMAC:    inst.GuestMAC,
+		GuestAddr:   inst.GuestAddr,
+		GatewayAddr: inst.GatewayAddr,
+		Nameservers: p.cfg.VMDNSServers,
+		VCPUCount:   p.effectiveVCPUCount(inst),
+		MemoryMiB:   p.effectiveMemoryMiB(inst),
+		KernelArgs:  kernelArgs(p.cfg.ExtraKernelArgs),
+		Bootstrap:   bootstrap,
+	})
 	if err != nil {
-		return 0, fmt.Errorf("open serial log: %w", err)
-	}
-	defer serialLog.Close()
-
-	guestIP, guestNet, err := net.ParseCIDR(inst.GuestAddr)
-	if err != nil {
-		return 0, fmt.Errorf("parse guest addr: %w", err)
-	}
-
-	rootDriveID := "rootfs"
-	isReadOnly := false
-	isRootDevice := true
-	vcpus := p.effectiveVCPUCount(inst)
-	mem := p.effectiveMemoryMiB(inst)
-
-	fcCfg := firecracker.Config{
-		SocketPath:      inst.SocketPath,
-		LogPath:         inst.LogPath,
-		KernelImagePath: inst.KernelPath,
-		InitrdPath:      inst.InitrdPath,
-		KernelArgs:      kernelArgs(p.cfg.ExtraKernelArgs),
-		Drives: []models.Drive{{
-			DriveID:      &rootDriveID,
-			PathOnHost:   &inst.RootFSPath,
-			IsReadOnly:   &isReadOnly,
-			IsRootDevice: &isRootDevice,
-		}},
-		NetworkInterfaces: firecracker.NetworkInterfaces{{
-			StaticConfiguration: &firecracker.StaticNetworkConfiguration{
-				MacAddress:  inst.GuestMAC,
-				HostDevName: inst.TapDevice,
-				IPConfiguration: &firecracker.IPConfiguration{
-					IPAddr:      net.IPNet{IP: guestIP, Mask: guestNet.Mask},
-					Gateway:     net.ParseIP(inst.GatewayAddr),
-					Nameservers: p.cfg.VMDNSServers,
-				},
-			},
-			AllowMMDS: true,
-		}},
-		MachineCfg: models.MachineConfiguration{
-			VcpuCount:  &vcpus,
-			MemSizeMib: &mem,
-		},
-		MmdsAddress: net.ParseIP("169.254.169.254"),
-	}
-	// The microVM should outlive the provisioning request; deletes are handled
-	// later by PID instead of request-context cancellation.
-	vmCtx := vmContextForRequest(ctx)
-
-	cmd := firecracker.VMCommandBuilder{}.
-		WithBin(p.cfg.FirecrackerBinary).
-		WithSocketPath(inst.SocketPath).
-		WithStdout(serialLog).
-		WithStderr(serialLog).
-		Build(vmCtx)
-
-	machine, err := firecracker.NewMachine(vmCtx, fcCfg, firecracker.WithProcessRunner(cmd))
-	if err != nil {
-		return 0, fmt.Errorf("create firecracker machine: %w", err)
-	}
-	machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.NewSetMetadataHandler(guestMetadata{SRV: bootstrap}))
-
-	if err := machine.Start(vmCtx); err != nil {
-		return 0, fmt.Errorf("start firecracker machine: %w", err)
-	}
-	pid, err := machine.PID()
-	if err != nil {
-		return 0, fmt.Errorf("read firecracker pid: %w", err)
-	}
-	if err := p.assignFirecrackerToCgroup(inst.Name, pid); err != nil {
-		_ = p.stopFirecracker(pid)
-		_ = p.cleanupFirecrackerCgroup(inst.Name)
 		return 0, err
 	}
-	return pid, nil
+	return resp.PID, nil
 }
 
 func (p *Provisioner) instanceDir(name string) (string, error) {
@@ -909,60 +869,6 @@ func (p *Provisioner) removeInstanceDir(name string) error {
 	}
 	if err := os.RemoveAll(instanceDir); err != nil {
 		return fmt.Errorf("remove instance directory %s: %w", instanceDir, err)
-	}
-	return nil
-}
-
-func (p *Provisioner) firecrackerCgroupPath(name string) (string, error) {
-	cgroupPath, err := currentCgroupPath()
-	if err != nil {
-		return "", err
-	}
-	if !filepath.IsAbs(cgroupPath) {
-		return "", fmt.Errorf("current cgroup path %q is not absolute", cgroupPath)
-	}
-	vmRoot := filepath.Join(cgroupFSRoot, strings.TrimPrefix(cgroupPath, "/"), "firecracker-vms")
-	child, err := directChildPath(vmRoot, name)
-	if err != nil {
-		return "", fmt.Errorf("resolve firecracker cgroup for %q: %w", name, err)
-	}
-	return child, nil
-}
-
-func (p *Provisioner) assignFirecrackerToCgroup(name string, pid int) error {
-	if pid <= 0 {
-		return fmt.Errorf("assign firecracker cgroup for %q: invalid pid %d", name, pid)
-	}
-	cgroupPath, err := p.firecrackerCgroupPath(name)
-	if err != nil {
-		return fmt.Errorf("assign firecracker cgroup for %q: %w", name, err)
-	}
-	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
-		return fmt.Errorf("assign firecracker cgroup for %q: create %s: %w", name, cgroupPath, err)
-	}
-	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
-		return fmt.Errorf("assign firecracker cgroup for %q: move pid %d: %w", name, pid, err)
-	}
-	return nil
-}
-
-func (p *Provisioner) cleanupFirecrackerCgroup(name string) error {
-	cgroupPath, err := p.firecrackerCgroupPath(name)
-	if err != nil {
-		return fmt.Errorf("cleanup firecracker cgroup for %q: %w", name, err)
-	}
-	if err := os.Remove(cgroupPath); err != nil && !os.IsNotExist(err) {
-		if errors.Is(err, syscall.ENOTEMPTY) {
-			_ = os.Remove(filepath.Join(cgroupPath, "cgroup.procs"))
-			err = os.Remove(cgroupPath)
-		}
-		if err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("cleanup firecracker cgroup for %q: remove %s: %w", name, cgroupPath, err)
-		}
-	}
-	vmRoot := filepath.Dir(cgroupPath)
-	if err := os.Remove(vmRoot); err != nil && !os.IsNotExist(err) && !errors.Is(err, syscall.ENOTEMPTY) {
-		return fmt.Errorf("cleanup firecracker cgroup root %s: %w", vmRoot, err)
 	}
 	return nil
 }
@@ -1043,22 +949,14 @@ func (p *Provisioner) currentDeviceSnapshot(ctx context.Context, name string) (t
 	return tailnetDeviceSnapshot{DeviceID: device.DeviceID, LastSeen: device.LastSeen}, true, nil
 }
 
-func (p *Provisioner) stopFirecracker(pid int) error {
-	if pid <= 0 {
-		return nil
+func (p *Provisioner) stopFirecracker(name string, pid int) error {
+	if p.vmRunner == nil {
+		return errors.New("vm runner client is unavailable")
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("signal firecracker pid %d: %w", pid, err)
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if !processExists(pid) {
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("kill firecracker pid %d: %w", pid, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := p.vmRunner.StopInstanceVM(ctx, vmrunner.StopRequest{Name: name, PID: pid}); err != nil {
+		return fmt.Errorf("stop firecracker for %q: %w", name, err)
 	}
 	return nil
 }

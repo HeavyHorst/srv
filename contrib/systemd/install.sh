@@ -6,12 +6,15 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 BINARY_PATH="${BINARY_PATH:-/usr/local/bin/srv}"
 HELPER_BINARY_PATH="${HELPER_BINARY_PATH:-/usr/local/bin/srv-net-helper}"
+VM_RUNNER_BINARY_PATH="${VM_RUNNER_BINARY_PATH:-/usr/local/bin/srv-vm-runner}"
 UNIT_PATH="${UNIT_PATH:-/etc/systemd/system/srv.service}"
 HELPER_UNIT_PATH="${HELPER_UNIT_PATH:-/etc/systemd/system/srv-net-helper.service}"
+VM_RUNNER_UNIT_PATH="${VM_RUNNER_UNIT_PATH:-/etc/systemd/system/srv-vm-runner.service}"
 ENV_DIR="${ENV_DIR:-/etc/srv}"
 ENV_PATH="${ENV_PATH:-${ENV_DIR}/srv.env}"
 SERVICE_USER="${SERVICE_USER:-srv}"
 SERVICE_GROUP="${SERVICE_GROUP:-srv}"
+VM_RUNNER_USER="${VM_RUNNER_USER:-srv-vm}"
 
 OVERWRITE_ENV=0
 ENABLE_SERVICE=0
@@ -33,12 +36,15 @@ Options:
 Environment overrides:
   BINARY_PATH         default: ${BINARY_PATH}
   HELPER_BINARY_PATH  default: ${HELPER_BINARY_PATH}
+  VM_RUNNER_BINARY_PATH default: ${VM_RUNNER_BINARY_PATH}
   UNIT_PATH           default: ${UNIT_PATH}
   HELPER_UNIT_PATH    default: ${HELPER_UNIT_PATH}
+  VM_RUNNER_UNIT_PATH default: ${VM_RUNNER_UNIT_PATH}
   ENV_DIR             default: ${ENV_DIR}
   ENV_PATH            default: ${ENV_PATH}
   SERVICE_USER        default: ${SERVICE_USER}
   SERVICE_GROUP       default: ${SERVICE_GROUP}
+  VM_RUNNER_USER      default: ${VM_RUNNER_USER}
 EOF
 }
 
@@ -99,6 +105,12 @@ ensure_service_user() {
 	fi
 }
 
+ensure_vm_runner_user() {
+	if ! id -u "${VM_RUNNER_USER}" >/dev/null 2>&1; then
+		useradd --system --gid "${SERVICE_GROUP}" --home-dir /var/lib/srv --no-create-home "${VM_RUNNER_USER}"
+	fi
+}
+
 build_binary() {
 	local target="$1"
 	local output_path="$2"
@@ -133,16 +145,35 @@ install_helper_unit() {
 	rendered_unit="$(mktemp)"
 	awk \
 		-v binary_path="${HELPER_BINARY_PATH}" \
-		-v service_user="${SERVICE_USER}" \
+		-v vm_runner_user="${VM_RUNNER_USER}" \
 		-v service_group="${SERVICE_GROUP}" \
 		'
 			/^ExecStart=/ {
-				print "ExecStart=" binary_path " -socket /run/srv/net-helper.sock -tap-user " service_user " -client-group " service_group
+				print "ExecStart=" binary_path " -socket /run/srv/net-helper.sock -tap-user " vm_runner_user " -client-group " service_group
 				next
 			}
 			{ print }
 		' "${SCRIPT_DIR}/srv-net-helper.service" >"${rendered_unit}"
 	install -D -m 0644 "${rendered_unit}" "${HELPER_UNIT_PATH}"
+	rm -f "${rendered_unit}"
+}
+
+install_vm_runner_unit() {
+	local rendered_unit
+	rendered_unit="$(mktemp)"
+	awk \
+		-v binary_path="${VM_RUNNER_BINARY_PATH}" \
+		-v env_path="${ENV_PATH}" \
+		-v vm_runner_user="${VM_RUNNER_USER}" \
+		-v service_group="${SERVICE_GROUP}" \
+		'
+			/^EnvironmentFile=/ { print "EnvironmentFile=" env_path; next }
+			/^ExecStart=/ { print "ExecStart=" binary_path " -socket /run/srv-vm-runner/vm-runner.sock -client-group " service_group; next }
+			/^User=/ { print "User=" vm_runner_user; next }
+			/^Group=/ { print "Group=" service_group; next }
+			{ print }
+		' "${SCRIPT_DIR}/srv-vm-runner.service" >"${rendered_unit}"
+	install -D -m 0644 "${rendered_unit}" "${VM_RUNNER_UNIT_PATH}"
 	rm -f "${rendered_unit}"
 }
 
@@ -173,7 +204,7 @@ install_data_dirs() {
 	install -d -m 0755 "${data_dir}"
 	install -d -m 0755 "${data_dir}/images"
 	install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/state"
-	install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/instances"
+	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/instances"
 }
 
 reload_systemd() {
@@ -198,8 +229,10 @@ print_next_steps() {
 installed:
   binary:        ${BINARY_PATH}
   helper-binary: ${HELPER_BINARY_PATH}
+  vm-runner-binary: ${VM_RUNNER_BINARY_PATH}
   unit:          ${UNIT_PATH}
   helper-unit:   ${HELPER_UNIT_PATH}
+  vm-runner-unit: ${VM_RUNNER_UNIT_PATH}
   env:           ${ENV_PATH}
 
 next:
@@ -215,10 +248,13 @@ main() {
 	require_commands
 	cd "${REPO_ROOT}"
 	ensure_service_user
+	ensure_vm_runner_user
 	build_binary ./cmd/srv "${BINARY_PATH}"
 	build_binary ./cmd/srv-net-helper "${HELPER_BINARY_PATH}"
+	build_binary ./cmd/srv-vm-runner "${VM_RUNNER_BINARY_PATH}"
 	install_main_unit
 	install_helper_unit
+	install_vm_runner_unit
 	install_env
 	install_data_dirs
 	reload_systemd

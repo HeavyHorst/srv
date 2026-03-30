@@ -355,87 +355,43 @@ func TestEffectiveMachineConfigUsesInstanceOverrides(t *testing.T) {
 	}
 }
 
-func TestVMContextForRequestIsDetached(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	vmCtx := vmContextForRequest(ctx)
-	cancel()
-
-	select {
-	case <-vmCtx.Done():
-		t.Fatalf("vm context should not be canceled with the request context")
-	default:
-	}
-}
-
-func TestReadUnifiedCgroupPath(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "cgroup")
-	if err := os.WriteFile(path, []byte("12:memory:/system.slice/srv.service\n0::/system.slice/srv.service\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile(cgroup): %v", err)
-	}
-
-	got, err := readUnifiedCgroupPath(path)
-	if err != nil {
-		t.Fatalf("readUnifiedCgroupPath(): %v", err)
-	}
-	if got != "/system.slice/srv.service" {
-		t.Fatalf("readUnifiedCgroupPath() = %q, want %q", got, "/system.slice/srv.service")
-	}
-
-	missing := filepath.Join(t.TempDir(), "missing-cgroup")
-	if err := os.WriteFile(missing, []byte("12:memory:/system.slice/srv.service\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile(missing): %v", err)
-	}
-	if _, err := readUnifiedCgroupPath(missing); err == nil {
-		t.Fatalf("readUnifiedCgroupPath() unexpectedly accepted a file without a unified entry")
-	}
-}
-
-func TestAssignAndCleanupFirecrackerCgroup(t *testing.T) {
+func TestEnsureInstanceRuntimePermissions(t *testing.T) {
 	cfg := loadProvisionTestConfig(t, nil)
 	p := &Provisioner{cfg: cfg}
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Now().UTC())
 
-	oldRoot := cgroupFSRoot
-	oldCurrent := currentCgroupPath
-	t.Cleanup(func() {
-		cgroupFSRoot = oldRoot
-		currentCgroupPath = oldCurrent
-	})
-
-	cgroupFSRoot = t.TempDir()
-	currentCgroupPath = func() (string, error) {
-		return "/system.slice/srv.service", nil
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(instance dir): %v", err)
 	}
-
-	serviceCgroup := filepath.Join(cgroupFSRoot, "system.slice", "srv.service")
-	if err := os.MkdirAll(serviceCgroup, 0o755); err != nil {
-		t.Fatalf("MkdirAll(serviceCgroup): %v", err)
+	if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.WriteFile(inst.LogPath, []byte("log"), 0o644); err != nil {
+		t.Fatalf("WriteFile(log): %v", err)
+	}
+	if err := os.WriteFile(inst.SerialLogPath, []byte("serial"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
 	}
 
-	if err := p.assignFirecrackerToCgroup("demo", 4321); err != nil {
-		t.Fatalf("assignFirecrackerToCgroup(): %v", err)
+	if err := p.ensureInstanceRuntimePermissions(inst); err != nil {
+		t.Fatalf("ensureInstanceRuntimePermissions(): %v", err)
 	}
 
-	cgroupPath := filepath.Join(serviceCgroup, "firecracker-vms", "demo")
-	payload, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.procs"))
-	if err != nil {
-		t.Fatalf("ReadFile(cgroup.procs): %v", err)
-	}
-	if strings.TrimSpace(string(payload)) != "4321" {
-		t.Fatalf("cgroup.procs = %q, want %q", strings.TrimSpace(string(payload)), "4321")
+	assertMode := func(path string, want os.FileMode) {
+		t.Helper()
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat(%s): %v", path, err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Fatalf("mode for %s = %o, want %o", path, got, want)
+		}
 	}
 
-	if err := p.cleanupFirecrackerCgroup("demo"); err != nil {
-		t.Fatalf("cleanupFirecrackerCgroup(): %v", err)
-	}
-	if _, err := os.Stat(cgroupPath); !os.IsNotExist(err) {
-		t.Fatalf("cgroup path should be removed, stat err = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(serviceCgroup, "firecracker-vms")); !os.IsNotExist(err) {
-		t.Fatalf("firecracker cgroup root should be removed when empty, stat err = %v", err)
-	}
-	if err := p.assignFirecrackerToCgroup("nested/demo", 1); err == nil {
-		t.Fatalf("assignFirecrackerToCgroup() accepted an unsafe name")
-	}
+	assertMode(filepath.Dir(inst.RootFSPath), 0o770)
+	assertMode(inst.RootFSPath, 0o660)
+	assertMode(inst.LogPath, 0o660)
+	assertMode(inst.SerialLogPath, 0o660)
 }
 
 func TestEnsureStartPrereqsRequiresCompletedBootstrap(t *testing.T) {

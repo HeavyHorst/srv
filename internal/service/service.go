@@ -56,6 +56,9 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			return nil, fmt.Errorf("create %s: %w", dir, err)
 		}
 	}
+	if err := os.Chmod(cfg.InstancesDir(), 0o770); err != nil {
+		return nil, fmt.Errorf("set instances dir permissions: %w", err)
+	}
 
 	st, err := store.Open(cfg.DatabasePath())
 	if err != nil {

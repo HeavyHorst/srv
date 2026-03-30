@@ -30,6 +30,7 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_GUEST_AUTH_EXPIRY", "20m")
 	t.Setenv("SRV_GUEST_READY_TIMEOUT", "3m")
 	t.Setenv("SRV_NET_HELPER_SOCKET", "/run/srv/custom-net-helper.sock")
+	t.Setenv("SRV_VM_RUNNER_SOCKET", "/run/srv-vm-runner/custom-vm-runner.sock")
 	t.Setenv("SRV_VM_VCPUS", "2")
 	t.Setenv("SRV_VM_MEMORY_MIB", "2048")
 	t.Setenv("SRV_LOG_LEVEL", "debug")
@@ -53,6 +54,9 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	}
 	if cfg.NetHelperSocketPath != "/run/srv/custom-net-helper.sock" {
 		t.Fatalf("NetHelperSocketPath = %q, want %q", cfg.NetHelperSocketPath, "/run/srv/custom-net-helper.sock")
+	}
+	if cfg.VMRunnerSocketPath != "/run/srv-vm-runner/custom-vm-runner.sock" {
+		t.Fatalf("VMRunnerSocketPath = %q, want %q", cfg.VMRunnerSocketPath, "/run/srv-vm-runner/custom-vm-runner.sock")
 	}
 	if !reflect.DeepEqual(cfg.AllowedUsers, []string{"alice@example.com", "bob@example.com"}) {
 		t.Fatalf("AllowedUsers = %#v", cfg.AllowedUsers)
@@ -111,6 +115,11 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 			name:    "missing helper socket",
 			mutate:  func(cfg *Config) { cfg.NetHelperSocketPath = "" },
 			wantErr: "network helper socket path is required",
+		},
+		{
+			name:    "missing vm runner socket",
+			mutate:  func(cfg *Config) { cfg.VMRunnerSocketPath = "" },
+			wantErr: "vm runner socket path is required",
 		},
 		{
 			name:    "zero vcpus",
@@ -194,6 +203,7 @@ func validConfig() Config {
 		Hostname:            "srv",
 		ListenAddr:          ":22",
 		NetHelperSocketPath: "/run/srv/net-helper.sock",
+		VMRunnerSocketPath:  "/run/srv-vm-runner/vm-runner.sock",
 		VCPUCount:           2,
 		MemoryMiB:           1024,
 		GuestAuthExpiry:     15 * time.Minute,

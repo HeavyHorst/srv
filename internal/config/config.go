@@ -16,6 +16,7 @@ const (
 	defaultHostname         = "srv"
 	defaultListenAddr       = ":22"
 	defaultNetHelperSocket  = "/run/srv/net-helper.sock"
+	defaultVMRunnerSocket   = "/run/srv-vm-runner/vm-runner.sock"
 	defaultFirecrackerBin   = "/usr/bin/firecracker"
 	defaultVMNetworkCIDR    = "172.28.0.0/16"
 	defaultGuestAuthExpiry  = 15 * time.Minute
@@ -41,6 +42,7 @@ type Config struct {
 	BaseInitrdPath           string
 	BaseRootFSPath           string
 	NetHelperSocketPath      string
+	VMRunnerSocketPath       string
 	FirecrackerBinary        string
 	OutboundInterface        string
 	VMNetworkCIDR            string
@@ -78,6 +80,7 @@ func Load() (Config, error) {
 	flag.StringVar(&cfg.BaseInitrdPath, "base-initrd", getenv("SRV_BASE_INITRD", ""), "path to the optional initrd image")
 	flag.StringVar(&cfg.BaseRootFSPath, "base-rootfs", getenv("SRV_BASE_ROOTFS", ""), "path to the base rootfs image stored on btrfs")
 	flag.StringVar(&cfg.NetHelperSocketPath, "net-helper-socket", getenv("SRV_NET_HELPER_SOCKET", defaultNetHelperSocket), "unix socket used to reach the privileged network helper")
+	flag.StringVar(&cfg.VMRunnerSocketPath, "vm-runner-socket", getenv("SRV_VM_RUNNER_SOCKET", defaultVMRunnerSocket), "unix socket used to reach the Firecracker runner helper")
 	flag.StringVar(&cfg.FirecrackerBinary, "firecracker-bin", getenv("SRV_FIRECRACKER_BIN", defaultFirecrackerBin), "firecracker binary path")
 	flag.StringVar(&cfg.OutboundInterface, "outbound-interface", getenv("SRV_OUTBOUND_IFACE", ""), "host network interface used for VM NAT")
 	flag.StringVar(&cfg.VMNetworkCIDR, "vm-network-cidr", getenv("SRV_VM_NETWORK_CIDR", defaultVMNetworkCIDR), "IPv4 network reserved for VM /30 allocations")
@@ -131,6 +134,9 @@ func (c Config) Validate() error {
 	}
 	if c.NetHelperSocketPath == "" {
 		return errors.New("network helper socket path is required")
+	}
+	if c.VMRunnerSocketPath == "" {
+		return errors.New("vm runner socket path is required")
 	}
 	if err := ValidateMachineShape(c.VCPUCount, c.MemoryMiB); err != nil {
 		return err

@@ -1,15 +1,19 @@
 [Unit]
-Description=srv privileged network helper
+Description=srv Firecracker VM runner
 Wants=network-online.target
 After=network-online.target
+ConditionPathExists=/dev/kvm
 
 [Service]
 Type=simple
-User=root
-Group=root
-RuntimeDirectory=srv
-RuntimeDirectoryMode=0755
-ExecStart=/usr/local/bin/srv-net-helper -socket /run/srv/net-helper.sock -tap-user srv-vm -client-group srv
+User=srv-vm
+Group=srv
+SupplementaryGroups=kvm
+EnvironmentFile=/etc/srv/srv.env
+RuntimeDirectory=srv-vm-runner
+RuntimeDirectoryMode=0770
+UMask=0007
+ExecStart=/usr/local/bin/srv-vm-runner -socket /run/srv-vm-runner/vm-runner.sock -client-group srv
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
@@ -18,8 +22,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictRealtime=yes
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
+Delegate=yes
 Restart=on-failure
 RestartSec=5s
 

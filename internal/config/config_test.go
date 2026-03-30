@@ -114,6 +114,11 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 			wantErr: "vm vcpu count must be 1 or an even number",
 		},
 		{
+			name:    "too many vcpus",
+			mutate:  func(cfg *Config) { cfg.VCPUCount = MaxVCPUCount + 1 },
+			wantErr: "vm vcpu count must be <= 32",
+		},
+		{
 			name:    "low memory",
 			mutate:  func(cfg *Config) { cfg.MemoryMiB = 64 },
 			wantErr: "vm memory must be at least 128 MiB",

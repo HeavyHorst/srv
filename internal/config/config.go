@@ -19,6 +19,8 @@ const (
 	defaultVMNetworkCIDR    = "172.28.0.0/16"
 	defaultGuestAuthExpiry  = 15 * time.Minute
 	defaultGuestReadyTimout = 2 * time.Minute
+	MaxVCPUCount            = 32
+	MinMemoryMiB            = 128
 )
 
 type Config struct {
@@ -124,20 +126,30 @@ func (c Config) Validate() error {
 	if c.DataDir == "" {
 		return errors.New("data dir is required")
 	}
-	if c.VCPUCount < 1 {
-		return errors.New("vm vcpu count must be >= 1")
-	}
-	if c.VCPUCount != 1 && c.VCPUCount%2 != 0 {
-		return errors.New("vm vcpu count must be 1 or an even number")
-	}
-	if c.MemoryMiB < 128 {
-		return errors.New("vm memory must be at least 128 MiB")
+	if err := ValidateMachineShape(c.VCPUCount, c.MemoryMiB); err != nil {
+		return err
 	}
 	if c.GuestAuthExpiry <= 0 {
 		return errors.New("guest auth expiry must be positive")
 	}
 	if c.GuestReadyTimeout <= 0 {
 		return errors.New("guest ready timeout must be positive")
+	}
+	return nil
+}
+
+func ValidateMachineShape(vcpus, memoryMiB int64) error {
+	if vcpus < 1 {
+		return errors.New("vm vcpu count must be >= 1")
+	}
+	if vcpus > MaxVCPUCount {
+		return fmt.Errorf("vm vcpu count must be <= %d", MaxVCPUCount)
+	}
+	if vcpus != 1 && vcpus%2 != 0 {
+		return errors.New("vm vcpu count must be 1 or an even number")
+	}
+	if memoryMiB < MinMemoryMiB {
+		return fmt.Errorf("vm memory must be at least %d MiB", MinMemoryMiB)
 	}
 	return nil
 }

@@ -836,16 +836,7 @@ func (p *Provisioner) effectiveMemoryMiB(inst model.Instance) int64 {
 }
 
 func validateMachineShape(vcpus, memoryMiB int64) error {
-	if vcpus < 1 {
-		return errors.New("vm vcpu count must be >= 1")
-	}
-	if vcpus != 1 && vcpus%2 != 0 {
-		return errors.New("vm vcpu count must be 1 or an even number")
-	}
-	if memoryMiB < 128 {
-		return errors.New("vm memory must be at least 128 MiB")
-	}
-	return nil
+	return config.ValidateMachineShape(vcpus, memoryMiB)
 }
 
 func (p *Provisioner) waitForTailnetJoin(ctx context.Context, name string, firecrackerPID int) (string, string, error) {

@@ -274,6 +274,9 @@ func TestResolveCreateOptions(t *testing.T) {
 	if _, _, err := p.resolveCreateOptions(CreateOptions{VCPUCount: 3}, 4<<30); err == nil || !strings.Contains(err.Error(), "vm vcpu count must be 1 or an even number") {
 		t.Fatalf("resolveCreateOptions(odd vcpus) error = %v", err)
 	}
+	if _, _, err := p.resolveCreateOptions(CreateOptions{VCPUCount: config.MaxVCPUCount + 1}, 4<<30); err == nil || !strings.Contains(err.Error(), "vm vcpu count must be <= 32") {
+		t.Fatalf("resolveCreateOptions(too many vcpus) error = %v", err)
+	}
 }
 
 func TestEffectiveMachineConfigUsesInstanceOverrides(t *testing.T) {

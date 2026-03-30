@@ -21,30 +21,33 @@ type Actor struct {
 }
 
 type Instance struct {
-	ID             string
-	Name           string
-	State          string
-	CreatedAt      time.Time
-	CreatedByUser  string
-	CreatedByNode  string
-	RootFSPath     string
-	KernelPath     string
-	InitrdPath     string
-	SocketPath     string
-	LogPath        string
-	SerialLogPath  string
-	TapDevice      string
-	GuestMAC       string
-	NetworkCIDR    string
-	HostAddr       string
-	GuestAddr      string
-	GatewayAddr    string
-	FirecrackerPID int
-	TailscaleName  string
-	TailscaleIP    string
-	LastError      string
-	DeletedAt      *time.Time
-	UpdatedAt      time.Time
+	ID              string
+	Name            string
+	State           string
+	CreatedAt       time.Time
+	CreatedByUser   string
+	CreatedByNode   string
+	VCPUCount       int64
+	MemoryMiB       int64
+	RootFSSizeBytes int64
+	RootFSPath      string
+	KernelPath      string
+	InitrdPath      string
+	SocketPath      string
+	LogPath         string
+	SerialLogPath   string
+	TapDevice       string
+	GuestMAC        string
+	NetworkCIDR     string
+	HostAddr        string
+	GuestAddr       string
+	GatewayAddr     string
+	FirecrackerPID  int
+	TailscaleName   string
+	TailscaleIP     string
+	LastError       string
+	DeletedAt       *time.Time
+	UpdatedAt       time.Time
 }
 
 type InstanceEvent struct {

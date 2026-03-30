@@ -242,6 +242,64 @@ func TestBaseRootFSInUse(t *testing.T) {
 	}
 }
 
+func TestResolveCreateOptions(t *testing.T) {
+	cfg := loadProvisionTestConfig(t, nil)
+	p := &Provisioner{cfg: cfg}
+
+	resolved, needsResize, err := p.resolveCreateOptions(CreateOptions{VCPUCount: 4, MemoryMiB: 2048, RootFSSizeBytes: 8 << 30}, 4<<30)
+	if err != nil {
+		t.Fatalf("resolveCreateOptions() error = %v", err)
+	}
+	if resolved.VCPUCount != 4 || resolved.MemoryMiB != 2048 || resolved.RootFSSizeBytes != 8<<30 {
+		t.Fatalf("resolveCreateOptions() = %#v", resolved)
+	}
+	if !needsResize {
+		t.Fatalf("resolveCreateOptions() needsResize = false, want true")
+	}
+
+	resolved, needsResize, err = p.resolveCreateOptions(CreateOptions{}, 4<<30)
+	if err != nil {
+		t.Fatalf("resolveCreateOptions(defaults) error = %v", err)
+	}
+	if resolved.VCPUCount != cfg.VCPUCount || resolved.MemoryMiB != cfg.MemoryMiB || resolved.RootFSSizeBytes != 4<<30 {
+		t.Fatalf("resolveCreateOptions(defaults) = %#v", resolved)
+	}
+	if needsResize {
+		t.Fatalf("resolveCreateOptions(defaults) needsResize = true, want false")
+	}
+
+	if _, _, err := p.resolveCreateOptions(CreateOptions{RootFSSizeBytes: (4 << 30) - 1}, 4<<30); err == nil || !strings.Contains(err.Error(), "smaller than the base image size") {
+		t.Fatalf("resolveCreateOptions(smaller rootfs) error = %v", err)
+	}
+	if _, _, err := p.resolveCreateOptions(CreateOptions{VCPUCount: 3}, 4<<30); err == nil || !strings.Contains(err.Error(), "vm vcpu count must be 1 or an even number") {
+		t.Fatalf("resolveCreateOptions(odd vcpus) error = %v", err)
+	}
+}
+
+func TestEffectiveMachineConfigUsesInstanceOverrides(t *testing.T) {
+	cfg := loadProvisionTestConfig(t, nil)
+	p := &Provisioner{cfg: cfg}
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Now().UTC())
+	inst.VCPUCount = 4
+	inst.MemoryMiB = 4096
+
+	if got := p.effectiveVCPUCount(inst); got != 4 {
+		t.Fatalf("effectiveVCPUCount() = %d, want 4", got)
+	}
+	if got := p.effectiveMemoryMiB(inst); got != 4096 {
+		t.Fatalf("effectiveMemoryMiB() = %d, want 4096", got)
+	}
+
+	inst.VCPUCount = 0
+	inst.MemoryMiB = 0
+	if got := p.effectiveVCPUCount(inst); got != cfg.VCPUCount {
+		t.Fatalf("effectiveVCPUCount() fallback = %d, want %d", got, cfg.VCPUCount)
+	}
+	if got := p.effectiveMemoryMiB(inst); got != cfg.MemoryMiB {
+		t.Fatalf("effectiveMemoryMiB() fallback = %d, want %d", got, cfg.MemoryMiB)
+	}
+}
+
 func TestVMContextForRequestIsDetached(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	vmCtx := vmContextForRequest(ctx)
@@ -404,24 +462,27 @@ func newProvisionTestStore(t *testing.T, cfg config.Config) *store.Store {
 func provisionTestInstance(cfg config.Config, name, state string, createdAt time.Time) model.Instance {
 	instanceDir := filepath.Join(cfg.InstancesDir(), name)
 	return model.Instance{
-		ID:            name + "-id",
-		Name:          name,
-		State:         state,
-		CreatedAt:     createdAt,
-		UpdatedAt:     createdAt.Add(30 * time.Second),
-		CreatedByUser: "alice@example.com",
-		CreatedByNode: "laptop",
-		RootFSPath:    filepath.Join(instanceDir, "rootfs.img"),
-		KernelPath:    filepath.Join(cfg.ImagesDir(), "vmlinux"),
-		InitrdPath:    filepath.Join(cfg.ImagesDir(), "initrd.img"),
-		SocketPath:    filepath.Join(instanceDir, "firecracker.sock"),
-		LogPath:       filepath.Join(instanceDir, "firecracker.log"),
-		SerialLogPath: filepath.Join(instanceDir, "serial.log"),
-		TapDevice:     "tap-1234567890",
-		GuestMAC:      "02:fc:aa:bb:cc:dd",
-		NetworkCIDR:   "10.0.0.0/30",
-		HostAddr:      "10.0.0.1/30",
-		GuestAddr:     "10.0.0.2/30",
-		GatewayAddr:   "10.0.0.1",
+		ID:              name + "-id",
+		Name:            name,
+		State:           state,
+		CreatedAt:       createdAt,
+		UpdatedAt:       createdAt.Add(30 * time.Second),
+		CreatedByUser:   "alice@example.com",
+		CreatedByNode:   "laptop",
+		VCPUCount:       cfg.VCPUCount,
+		MemoryMiB:       cfg.MemoryMiB,
+		RootFSSizeBytes: 4 << 30,
+		RootFSPath:      filepath.Join(instanceDir, "rootfs.img"),
+		KernelPath:      filepath.Join(cfg.ImagesDir(), "vmlinux"),
+		InitrdPath:      filepath.Join(cfg.ImagesDir(), "initrd.img"),
+		SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
+		LogPath:         filepath.Join(instanceDir, "firecracker.log"),
+		SerialLogPath:   filepath.Join(instanceDir, "serial.log"),
+		TapDevice:       "tap-1234567890",
+		GuestMAC:        "02:fc:aa:bb:cc:dd",
+		NetworkCIDR:     "10.0.0.0/30",
+		HostAddr:        "10.0.0.1/30",
+		GuestAddr:       "10.0.0.2/30",
+		GatewayAddr:     "10.0.0.1",
 	}
 }

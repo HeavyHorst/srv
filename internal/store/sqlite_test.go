@@ -3,10 +3,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"srv/internal/model"
 )
@@ -234,6 +237,120 @@ func TestStoreRecordAuditRows(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesExistingInstancesTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state", "app.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open(): %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE instances (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			state TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			created_by_user TEXT NOT NULL,
+			created_by_node TEXT NOT NULL,
+			rootfs_path TEXT NOT NULL,
+			kernel_path TEXT NOT NULL,
+			initrd_path TEXT NOT NULL,
+			socket_path TEXT NOT NULL,
+			log_path TEXT NOT NULL,
+			serial_log_path TEXT NOT NULL,
+			tap_device TEXT NOT NULL,
+			guest_mac TEXT NOT NULL,
+			network_cidr TEXT NOT NULL,
+			host_addr TEXT NOT NULL,
+			guest_addr TEXT NOT NULL,
+			gateway_addr TEXT NOT NULL,
+			firecracker_pid INTEGER NOT NULL DEFAULT 0,
+			tailscale_name TEXT NOT NULL DEFAULT '',
+			tailscale_ip TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT '',
+			deleted_at TEXT
+		);
+		CREATE TABLE instance_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			instance_id TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			type TEXT NOT NULL,
+			message TEXT NOT NULL,
+			payload TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE commands (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			actor_user TEXT NOT NULL,
+			actor_display_name TEXT NOT NULL,
+			actor_node TEXT NOT NULL,
+			remote_addr TEXT NOT NULL,
+			ssh_user TEXT NOT NULL,
+			command TEXT NOT NULL,
+			args_json TEXT NOT NULL,
+			allowed INTEGER NOT NULL,
+			reason TEXT NOT NULL,
+			duration_ms INTEGER NOT NULL,
+			error_text TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE authz_decisions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			actor_user TEXT NOT NULL,
+			actor_node TEXT NOT NULL,
+			remote_addr TEXT NOT NULL,
+			action TEXT NOT NULL,
+			allowed INTEGER NOT NULL,
+			reason TEXT NOT NULL
+		);
+	`); err != nil {
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close(): %v", err)
+		}
+	})
+
+	rows, err := s.db.Query(`PRAGMA table_info(instances)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(instances): %v", err)
+	}
+	defer rows.Close()
+
+	columns := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid      int
+			name     string
+			declType string
+			notNull  int
+			defaultV sql.NullString
+			pk       int
+		)
+		if err := rows.Scan(&cid, &name, &declType, &notNull, &defaultV, &pk); err != nil {
+			t.Fatalf("scan table_info row: %v", err)
+		}
+		columns[name] = true
+	}
+	for _, want := range []string{"vcpu_count", "memory_mib", "rootfs_size_bytes"} {
+		if !columns[want] {
+			t.Fatalf("missing migrated column %q in %#v", want, columns)
+		}
+	}
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "state", "app.db")
@@ -253,24 +370,27 @@ func testInstance(name, state string, createdAt time.Time) model.Instance {
 	updatedAt := createdAt.Add(30 * time.Second)
 	baseDir := filepath.Join("/tmp", name)
 	return model.Instance{
-		ID:            name + "-id",
-		Name:          name,
-		State:         state,
-		CreatedAt:     createdAt,
-		UpdatedAt:     updatedAt,
-		CreatedByUser: "alice@example.com",
-		CreatedByNode: "laptop",
-		RootFSPath:    filepath.Join(baseDir, "rootfs.img"),
-		KernelPath:    filepath.Join(baseDir, "vmlinux"),
-		InitrdPath:    filepath.Join(baseDir, "initrd.img"),
-		SocketPath:    filepath.Join(baseDir, "firecracker.sock"),
-		LogPath:       filepath.Join(baseDir, "firecracker.log"),
-		SerialLogPath: filepath.Join(baseDir, "serial.log"),
-		TapDevice:     "tap-1234567890",
-		GuestMAC:      "02:fc:aa:bb:cc:dd",
-		NetworkCIDR:   "172.28.0.0/30",
-		HostAddr:      "172.28.0.1/30",
-		GuestAddr:     "172.28.0.2/30",
-		GatewayAddr:   "172.28.0.1",
+		ID:              name + "-id",
+		Name:            name,
+		State:           state,
+		CreatedAt:       createdAt,
+		UpdatedAt:       updatedAt,
+		CreatedByUser:   "alice@example.com",
+		CreatedByNode:   "laptop",
+		VCPUCount:       2,
+		MemoryMiB:       2048,
+		RootFSSizeBytes: 4 << 30,
+		RootFSPath:      filepath.Join(baseDir, "rootfs.img"),
+		KernelPath:      filepath.Join(baseDir, "vmlinux"),
+		InitrdPath:      filepath.Join(baseDir, "initrd.img"),
+		SocketPath:      filepath.Join(baseDir, "firecracker.sock"),
+		LogPath:         filepath.Join(baseDir, "firecracker.log"),
+		SerialLogPath:   filepath.Join(baseDir, "serial.log"),
+		TapDevice:       "tap-1234567890",
+		GuestMAC:        "02:fc:aa:bb:cc:dd",
+		NetworkCIDR:     "172.28.0.0/30",
+		HostAddr:        "172.28.0.1/30",
+		GuestAddr:       "172.28.0.2/30",
+		GatewayAddr:     "172.28.0.1",
 	}
 }

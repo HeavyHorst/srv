@@ -12,9 +12,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -268,17 +270,17 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, args []string) (c
 }
 
 func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
-	if len(args) != 2 {
-		err := errors.New("usage: new <name>")
+	name, opts, err := parseNewArgs(args)
+	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	inst, err := a.provisioner.Create(ctx, args[1], actor)
+	inst, err := a.provisioner.Create(ctx, name, actor, opts)
 	if err != nil {
-		stderr := fmt.Sprintf("create %s: %v\n", args[1], err)
+		stderr := fmt.Sprintf("create %s: %v\n", name, err)
 		if inst.Name != "" {
 			stderr += fmt.Sprintf("inspect: ssh root@%s inspect %s\n", a.cfg.Hostname, inst.Name)
 		}
@@ -335,7 +337,16 @@ func (a *App) cmdInspect(ctx context.Context, args []string) (commandResult, err
 	b.WriteString(fmt.Sprintf("created-by: %s via %s\n", inst.CreatedByUser, inst.CreatedByNode))
 	b.WriteString(fmt.Sprintf("created-at: %s\n", inst.CreatedAt.Format(time.RFC3339)))
 	b.WriteString(fmt.Sprintf("updated-at: %s\n", inst.UpdatedAt.Format(time.RFC3339)))
+	if vcpus := effectiveInstanceVCPUCount(inst, a.cfg); vcpus > 0 {
+		b.WriteString(fmt.Sprintf("vcpus: %d\n", vcpus))
+	}
+	if mem := effectiveInstanceMemoryMiB(inst, a.cfg); mem > 0 {
+		b.WriteString(fmt.Sprintf("memory: %d MiB\n", mem))
+	}
 	b.WriteString(fmt.Sprintf("rootfs: %s\n", inst.RootFSPath))
+	if size := effectiveInstanceRootFSSizeBytes(inst); size > 0 {
+		b.WriteString(fmt.Sprintf("rootfs-size: %s\n", formatBinarySize(size)))
+	}
 	b.WriteString(fmt.Sprintf("firecracker-pid: %d\n", inst.FirecrackerPID))
 	b.WriteString(fmt.Sprintf("tap-device: %s\n", inst.TapDevice))
 	b.WriteString(fmt.Sprintf("network: %s\n", inst.NetworkCIDR))
@@ -445,7 +456,7 @@ func (a *App) cmdDelete(ctx context.Context, args []string) (commandResult, erro
 }
 
 func helpResult() commandResult {
-	return commandResult{stdout: "commands: new <name>, list, inspect <name>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
+	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], list, inspect <name>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
 }
 
 func lifecycleReadyResult(action string, inst model.Instance) commandResult {
@@ -488,6 +499,179 @@ func trimNodeName(primary, fallback string) string {
 		return strings.TrimSuffix(primary, ".")
 	}
 	return strings.TrimSuffix(fallback, ".")
+}
+
+const mib = int64(1024 * 1024)
+
+func parseNewArgs(args []string) (string, provision.CreateOptions, error) {
+	if len(args) < 2 {
+		return "", provision.CreateOptions{}, errors.New(newUsage())
+	}
+
+	var (
+		name           string
+		opts           provision.CreateOptions
+		seenCPUs       bool
+		seenRAM        bool
+		seenRootFSSize bool
+	)
+
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "--") {
+			if name != "" {
+				return "", provision.CreateOptions{}, fmt.Errorf("unexpected argument %q\n%s", arg, newUsage())
+			}
+			name = arg
+			continue
+		}
+
+		key, value, hasValue := strings.Cut(arg, "=")
+		if !hasValue {
+			i++
+			if i >= len(args) {
+				return "", provision.CreateOptions{}, fmt.Errorf("missing value for %s\n%s", key, newUsage())
+			}
+			value = args[i]
+		}
+
+		switch key {
+		case "--cpus":
+			if seenCPUs {
+				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, newUsage())
+			}
+			seenCPUs = true
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %w\n%s", key, err, newUsage())
+			}
+			opts.VCPUCount = parsed
+		case "--ram":
+			if seenRAM {
+				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, newUsage())
+			}
+			seenRAM = true
+			parsed, err := parseSize(value, mib)
+			if err != nil {
+				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %v\n%s", key, err, newUsage())
+			}
+			opts.MemoryMiB = bytesToMiBCeil(parsed)
+		case "--rootfs-size":
+			if seenRootFSSize {
+				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, newUsage())
+			}
+			seenRootFSSize = true
+			parsed, err := parseSize(value, mib)
+			if err != nil {
+				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %v\n%s", key, err, newUsage())
+			}
+			opts.RootFSSizeBytes = parsed
+		default:
+			return "", provision.CreateOptions{}, fmt.Errorf("unknown option %q\n%s", key, newUsage())
+		}
+	}
+
+	if name == "" {
+		return "", provision.CreateOptions{}, errors.New(newUsage())
+	}
+	return name, opts, nil
+}
+
+func newUsage() string {
+	return "usage: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]"
+}
+
+func parseSize(value string, defaultUnit int64) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, errors.New("size cannot be empty")
+	}
+
+	idx := 0
+	for idx < len(value) && value[idx] >= '0' && value[idx] <= '9' {
+		idx++
+	}
+	if idx == 0 {
+		return 0, fmt.Errorf("invalid size %q", value)
+	}
+
+	number, err := strconv.ParseInt(value[:idx], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if number <= 0 {
+		return 0, errors.New("size must be positive")
+	}
+
+	multiplier, ok := map[string]int64{
+		"":    defaultUnit,
+		"b":   1,
+		"k":   1 << 10,
+		"kb":  1 << 10,
+		"kib": 1 << 10,
+		"m":   1 << 20,
+		"mb":  1 << 20,
+		"mib": 1 << 20,
+		"g":   1 << 30,
+		"gb":  1 << 30,
+		"gib": 1 << 30,
+		"t":   1 << 40,
+		"tb":  1 << 40,
+		"tib": 1 << 40,
+	}[strings.ToLower(strings.TrimSpace(value[idx:]))]
+	if !ok {
+		return 0, fmt.Errorf("unknown size unit %q", strings.TrimSpace(value[idx:]))
+	}
+	if number > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("size %q is too large", value)
+	}
+	return number * multiplier, nil
+}
+
+func bytesToMiBCeil(sizeBytes int64) int64 {
+	return (sizeBytes + mib - 1) / mib
+}
+
+func effectiveInstanceVCPUCount(inst model.Instance, cfg config.Config) int64 {
+	if inst.VCPUCount > 0 {
+		return inst.VCPUCount
+	}
+	return cfg.VCPUCount
+}
+
+func effectiveInstanceMemoryMiB(inst model.Instance, cfg config.Config) int64 {
+	if inst.MemoryMiB > 0 {
+		return inst.MemoryMiB
+	}
+	return cfg.MemoryMiB
+}
+
+func effectiveInstanceRootFSSizeBytes(inst model.Instance) int64 {
+	if inst.RootFSSizeBytes > 0 {
+		return inst.RootFSSizeBytes
+	}
+	info, err := os.Stat(inst.RootFSPath)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func formatBinarySize(sizeBytes int64) string {
+	if sizeBytes < 1024 {
+		return fmt.Sprintf("%d B", sizeBytes)
+	}
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	size := float64(sizeBytes)
+	unit := "B"
+	for _, next := range units {
+		size /= 1024
+		unit = next
+		if size < 1024 {
+			break
+		}
+	}
+	return fmt.Sprintf("%.1f %s", size, unit)
 }
 
 func ensureHostSigner(path string) (ssh.Signer, error) {

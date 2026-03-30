@@ -8,6 +8,12 @@ Target UX:
 ssh root@srv new demo
 ```
 
+Per-instance sizing can be overridden at create time:
+
+```bash
+ssh root@srv new demo --cpus 4 --ram 8G --rootfs-size 20G
+```
+
 The service treats SSH as command transport only. Caller identity comes from Tailscale `WhoIs` data resolved from the incoming tailnet connection.
 
 ## Current MVP Shape
@@ -25,7 +31,7 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 
 - Linux host with `/dev/kvm`
 - Firecracker installed, default path `/usr/bin/firecracker`
-- `ip`, `iptables`, `cp`, `stat`, and `sysctl` available on the host
+- `ip`, `iptables`, `cp`, `resize2fs`, `stat`, and `sysctl` available on the host
 - `SRV_DATA_DIR` on Btrfs
 - Tailscale tailnet access for the control plane
 - Tailscale OAuth client credentials with permission to mint auth keys for the configured guest tags

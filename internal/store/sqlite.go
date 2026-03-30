@@ -49,10 +49,11 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO instances (
 			id, name, state, created_at, updated_at, created_by_user, created_by_node,
+			vcpu_count, memory_mib, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
 			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		inst.ID,
 		inst.Name,
@@ -61,6 +62,9 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 		timeString(inst.UpdatedAt),
 		inst.CreatedByUser,
 		inst.CreatedByNode,
+		inst.VCPUCount,
+		inst.MemoryMiB,
+		inst.RootFSSizeBytes,
 		inst.RootFSPath,
 		inst.KernelPath,
 		inst.InitrdPath,
@@ -88,14 +92,18 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE instances
-		SET state = ?, updated_at = ?, rootfs_path = ?, kernel_path = ?, initrd_path = ?, socket_path = ?,
-			log_path = ?, serial_log_path = ?, tap_device = ?, guest_mac = ?, network_cidr = ?,
-			host_addr = ?, guest_addr = ?, gateway_addr = ?, firecracker_pid = ?, tailscale_name = ?,
+		SET state = ?, updated_at = ?, vcpu_count = ?, memory_mib = ?, rootfs_size_bytes = ?,
+			rootfs_path = ?, kernel_path = ?, initrd_path = ?, socket_path = ?, log_path = ?,
+			serial_log_path = ?, tap_device = ?, guest_mac = ?, network_cidr = ?, host_addr = ?,
+			guest_addr = ?, gateway_addr = ?, firecracker_pid = ?, tailscale_name = ?,
 			tailscale_ip = ?, last_error = ?, deleted_at = ?
 		WHERE name = ?
 	`,
 		inst.State,
 		timeString(inst.UpdatedAt),
+		inst.VCPUCount,
+		inst.MemoryMiB,
+		inst.RootFSSizeBytes,
 		inst.RootFSPath,
 		inst.KernelPath,
 		inst.InitrdPath,
@@ -124,6 +132,7 @@ func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
 func (s *Store) GetInstance(ctx context.Context, name string) (model.Instance, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, state, created_at, updated_at, created_by_user, created_by_node,
+			vcpu_count, memory_mib, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
 			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at
@@ -168,6 +177,7 @@ func (s *Store) DeleteInstance(ctx context.Context, name string) error {
 func (s *Store) ListInstances(ctx context.Context, includeDeleted bool) ([]model.Instance, error) {
 	query := `
 		SELECT id, name, state, created_at, updated_at, created_by_user, created_by_node,
+			vcpu_count, memory_mib, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
 			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at
@@ -294,6 +304,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			updated_at TEXT NOT NULL,
 			created_by_user TEXT NOT NULL,
 			created_by_node TEXT NOT NULL,
+			vcpu_count INTEGER NOT NULL DEFAULT 0,
+			memory_mib INTEGER NOT NULL DEFAULT 0,
+			rootfs_size_bytes INTEGER NOT NULL DEFAULT 0,
 			rootfs_path TEXT NOT NULL,
 			kernel_path TEXT NOT NULL,
 			initrd_path TEXT NOT NULL,
@@ -353,7 +366,63 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("run migration %q: %w", stmt, err)
 		}
 	}
+	for _, column := range []struct {
+		name string
+		decl string
+	}{
+		{name: "vcpu_count", decl: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "memory_mib", decl: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "rootfs_size_bytes", decl: "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn(ctx, "instances", column.name, column.decl); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (s *Store) ensureColumn(ctx context.Context, table, column, decl string) error {
+	exists, err := s.hasColumn(ctx, table, column)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, decl)
+	if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid      int
+			name     string
+			declType string
+			notNull  int
+			defaultV sql.NullString
+			pk       int
+		)
+		if err := rows.Scan(&cid, &name, &declType, &notNull, &defaultV, &pk); err != nil {
+			return false, fmt.Errorf("scan %s columns: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate %s columns: %w", table, err)
+	}
+	return false, nil
 }
 
 func scanInstance(scan func(dest ...any) error) (model.Instance, error) {
@@ -369,6 +438,9 @@ func scanInstance(scan func(dest ...any) error) (model.Instance, error) {
 		&updatedAt,
 		&inst.CreatedByUser,
 		&inst.CreatedByNode,
+		&inst.VCPUCount,
+		&inst.MemoryMiB,
+		&inst.RootFSSizeBytes,
 		&inst.RootFSPath,
 		&inst.KernelPath,
 		&inst.InitrdPath,

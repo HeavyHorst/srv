@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"srv/internal/config"
 	"srv/internal/model"
+	"srv/internal/provision"
 	"srv/internal/store"
 )
 
@@ -105,12 +107,15 @@ func TestCmdInspectFormatsInstanceAndEvents(t *testing.T) {
 	ctx := context.Background()
 	st := newServiceTestStore(t)
 	app := &App{
-		cfg:   config.Config{Hostname: "srv"},
+		cfg:   config.Config{Hostname: "srv", VCPUCount: 1, MemoryMiB: 1024},
 		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store: st,
 	}
 
 	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.VCPUCount = 4
+	inst.MemoryMiB = 4096
+	inst.RootFSSizeBytes = 8 << 30
 	inst.TailscaleName = "alpha.tailnet"
 	inst.TailscaleIP = "100.64.0.10"
 	inst.LastError = "previous boot hiccup"
@@ -138,6 +143,9 @@ func TestCmdInspectFormatsInstanceAndEvents(t *testing.T) {
 		"name: alpha\n",
 		"state: ready\n",
 		"created-by: alice@example.com via laptop\n",
+		"vcpus: 4\n",
+		"memory: 4096 MiB\n",
+		"rootfs-size: 8.0 GiB\n",
 		"tailscale-name: alpha.tailnet\n",
 		"tailscale-ip: 100.64.0.10\n",
 		"last-error: previous boot hiccup\n",
@@ -211,10 +219,64 @@ func TestEnsureHostSignerPersistsKey(t *testing.T) {
 
 func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
-	for _, want := range []string{"start <name>", "stop <name>", "restart <name>"} {
+	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "start <name>", "stop <name>", "restart <name>"} {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("helpResult() missing %q in %q", want, result.stdout)
 		}
+	}
+}
+
+func TestParseNewArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantName string
+		wantOpts provision.CreateOptions
+		wantErr  string
+	}{
+		{
+			name:     "parses name before flags",
+			args:     []string{"new", "demo", "--cpus", "2", "--ram", "4G", "--rootfs-size", "12G"},
+			wantName: "demo",
+			wantOpts: provision.CreateOptions{VCPUCount: 2, MemoryMiB: 4096, RootFSSizeBytes: 12 << 30},
+		},
+		{
+			name:     "parses flags before name and plain mib values",
+			args:     []string{"new", "--ram=1536", "--cpus=4", "demo"},
+			wantName: "demo",
+			wantOpts: provision.CreateOptions{VCPUCount: 4, MemoryMiB: 1536},
+		},
+		{
+			name:    "rejects unknown options",
+			args:    []string{"new", "demo", "--wat", "1"},
+			wantErr: `unknown option "--wat"`,
+		},
+		{
+			name:    "requires a name",
+			args:    []string{"new", "--cpus", "2"},
+			wantErr: newUsage(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotOpts, err := parseNewArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseNewArgs() error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseNewArgs() error = %v", err)
+			}
+			if gotName != tt.wantName {
+				t.Fatalf("parseNewArgs() name = %q, want %q", gotName, tt.wantName)
+			}
+			if !reflect.DeepEqual(gotOpts, tt.wantOpts) {
+				t.Fatalf("parseNewArgs() opts = %#v, want %#v", gotOpts, tt.wantOpts)
+			}
+		})
 	}
 }
 
@@ -236,24 +298,27 @@ func newServiceTestStore(t *testing.T) *store.Store {
 func serviceTestInstance(name, state string, createdAt time.Time) model.Instance {
 	baseDir := filepath.Join("/tmp", name)
 	return model.Instance{
-		ID:            name + "-id",
-		Name:          name,
-		State:         state,
-		CreatedAt:     createdAt,
-		UpdatedAt:     createdAt.Add(30 * time.Second),
-		CreatedByUser: "alice@example.com",
-		CreatedByNode: "laptop",
-		RootFSPath:    filepath.Join(baseDir, "rootfs.img"),
-		KernelPath:    filepath.Join(baseDir, "vmlinux"),
-		InitrdPath:    filepath.Join(baseDir, "initrd.img"),
-		SocketPath:    filepath.Join(baseDir, "firecracker.sock"),
-		LogPath:       filepath.Join(baseDir, "firecracker.log"),
-		SerialLogPath: filepath.Join(baseDir, "serial.log"),
-		TapDevice:     "tap-1234567890",
-		GuestMAC:      "02:fc:aa:bb:cc:dd",
-		NetworkCIDR:   "172.28.0.0/30",
-		HostAddr:      "172.28.0.1/30",
-		GuestAddr:     "172.28.0.2/30",
-		GatewayAddr:   "172.28.0.1",
+		ID:              name + "-id",
+		Name:            name,
+		State:           state,
+		CreatedAt:       createdAt,
+		UpdatedAt:       createdAt.Add(30 * time.Second),
+		CreatedByUser:   "alice@example.com",
+		CreatedByNode:   "laptop",
+		VCPUCount:       2,
+		MemoryMiB:       2048,
+		RootFSSizeBytes: 4 << 30,
+		RootFSPath:      filepath.Join(baseDir, "rootfs.img"),
+		KernelPath:      filepath.Join(baseDir, "vmlinux"),
+		InitrdPath:      filepath.Join(baseDir, "initrd.img"),
+		SocketPath:      filepath.Join(baseDir, "firecracker.sock"),
+		LogPath:         filepath.Join(baseDir, "firecracker.log"),
+		SerialLogPath:   filepath.Join(baseDir, "serial.log"),
+		TapDevice:       "tap-1234567890",
+		GuestMAC:        "02:fc:aa:bb:cc:dd",
+		NetworkCIDR:     "172.28.0.0/30",
+		HostAddr:        "172.28.0.1/30",
+		GuestAddr:       "172.28.0.2/30",
+		GatewayAddr:     "172.28.0.1",
 	}
 }

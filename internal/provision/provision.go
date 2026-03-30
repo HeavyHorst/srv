@@ -69,6 +69,12 @@ type tailnetDeviceSnapshot struct {
 	LastSeen string
 }
 
+type CreateOptions struct {
+	VCPUCount       int64
+	MemoryMiB       int64
+	RootFSSizeBytes int64
+}
+
 func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner, error) {
 	p := &Provisioner{cfg: cfg, log: logger, store: st}
 	if cfg.Tailnet != "" && cfg.TailscaleClientSecret != "" {
@@ -86,11 +92,19 @@ func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner,
 	return p, nil
 }
 
-func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor) (model.Instance, error) {
+func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor, opts CreateOptions) (model.Instance, error) {
 	if !validName.MatchString(name) {
 		return model.Instance{}, fmt.Errorf("invalid instance name %q", name)
 	}
-	if err := p.ensureCreatePrereqs(); err != nil {
+	baseRootFSSize, err := p.baseRootFSSize()
+	if err != nil {
+		return model.Instance{}, err
+	}
+	resolved, needsResize, err := p.resolveCreateOptions(opts, baseRootFSSize)
+	if err != nil {
+		return model.Instance{}, err
+	}
+	if err := p.ensureCreatePrereqs(needsResize); err != nil {
 		return model.Instance{}, err
 	}
 
@@ -107,25 +121,28 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 
 	now := time.Now().UTC()
 	inst := model.Instance{
-		ID:            uuid.NewString(),
-		Name:          name,
-		State:         model.StateProvisioning,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-		CreatedByUser: actor.UserLogin,
-		CreatedByNode: actor.NodeName,
-		RootFSPath:    filepath.Join(instanceDir, "rootfs.img"),
-		KernelPath:    p.cfg.BaseKernelPath,
-		InitrdPath:    p.cfg.BaseInitrdPath,
-		SocketPath:    filepath.Join(instanceDir, "firecracker.sock"),
-		LogPath:       filepath.Join(instanceDir, "firecracker.log"),
-		SerialLogPath: filepath.Join(instanceDir, "serial.log"),
-		TapDevice:     tapName(name),
-		GuestMAC:      guestMAC(name),
-		NetworkCIDR:   networkCIDR,
-		HostAddr:      hostAddr,
-		GuestAddr:     guestAddr,
-		GatewayAddr:   gateway,
+		ID:              uuid.NewString(),
+		Name:            name,
+		State:           model.StateProvisioning,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		CreatedByUser:   actor.UserLogin,
+		CreatedByNode:   actor.NodeName,
+		VCPUCount:       resolved.VCPUCount,
+		MemoryMiB:       resolved.MemoryMiB,
+		RootFSSizeBytes: resolved.RootFSSizeBytes,
+		RootFSPath:      filepath.Join(instanceDir, "rootfs.img"),
+		KernelPath:      p.cfg.BaseKernelPath,
+		InitrdPath:      p.cfg.BaseInitrdPath,
+		SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
+		LogPath:         filepath.Join(instanceDir, "firecracker.log"),
+		SerialLogPath:   filepath.Join(instanceDir, "serial.log"),
+		TapDevice:       tapName(name),
+		GuestMAC:        guestMAC(name),
+		NetworkCIDR:     networkCIDR,
+		HostAddr:        hostAddr,
+		GuestAddr:       guestAddr,
+		GatewayAddr:     gateway,
 	}
 
 	if err := p.store.CreateInstance(ctx, inst); err != nil {
@@ -159,6 +176,13 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		return inst, err
 	}
 	p.recordEvent(inst.ID, "storage", "rootfs cloned from base image", map[string]any{"dest": inst.RootFSPath})
+	if needsResize {
+		if err := p.growRootFS(inst.RootFSPath, inst.RootFSSizeBytes); err != nil {
+			inst.LastError = err.Error()
+			return inst, err
+		}
+		p.recordEvent(inst.ID, "storage", "rootfs expanded for instance", map[string]any{"size_bytes": inst.RootFSSizeBytes})
+	}
 
 	if err := p.setupNetworking(ctx, inst); err != nil {
 		inst.LastError = err.Error()
@@ -471,7 +495,7 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 	return instanceDir, nil
 }
 
-func (p *Provisioner) ensureCreatePrereqs() error {
+func (p *Provisioner) ensureCreatePrereqs(needsResize bool) error {
 	for _, path := range []string{p.cfg.BaseKernelPath, p.cfg.BaseRootFSPath, p.cfg.FirecrackerBinary} {
 		if path == "" {
 			return errors.New("create requires SRV_BASE_KERNEL, SRV_BASE_ROOTFS, and SRV_FIRECRACKER_BIN")
@@ -486,6 +510,11 @@ func (p *Provisioner) ensureCreatePrereqs() error {
 	}
 	if inUse {
 		return fmt.Errorf("base rootfs image %s is still attached to a loop device; wait for the image build or mount to finish before creating instances", p.cfg.BaseRootFSPath)
+	}
+	if needsResize {
+		if _, err := exec.LookPath("resize2fs"); err != nil {
+			return errors.New("create with a custom rootfs size requires resize2fs on the host")
+		}
 	}
 	if p.tsClient == nil {
 		return errors.New("create requires TS_TAILNET and TS_CLIENT_SECRET so the control plane can mint one-off guest auth keys")
@@ -532,10 +561,47 @@ func (p *Provisioner) baseRootFSInUse() (bool, error) {
 	return loops != "", nil
 }
 
+func (p *Provisioner) baseRootFSSize() (int64, error) {
+	info, err := os.Stat(p.cfg.BaseRootFSPath)
+	if err != nil {
+		return 0, fmt.Errorf("stat base rootfs %s: %w", p.cfg.BaseRootFSPath, err)
+	}
+	return info.Size(), nil
+}
+
+func (p *Provisioner) resolveCreateOptions(opts CreateOptions, baseRootFSSize int64) (CreateOptions, bool, error) {
+	resolved := CreateOptions{
+		VCPUCount:       p.effectiveVCPUCount(model.Instance{VCPUCount: opts.VCPUCount}),
+		MemoryMiB:       p.effectiveMemoryMiB(model.Instance{MemoryMiB: opts.MemoryMiB}),
+		RootFSSizeBytes: opts.RootFSSizeBytes,
+	}
+	if resolved.RootFSSizeBytes == 0 {
+		resolved.RootFSSizeBytes = baseRootFSSize
+	}
+	if err := validateMachineShape(resolved.VCPUCount, resolved.MemoryMiB); err != nil {
+		return CreateOptions{}, false, err
+	}
+	if resolved.RootFSSizeBytes < baseRootFSSize {
+		return CreateOptions{}, false, fmt.Errorf("rootfs size %d bytes is smaller than the base image size %d bytes", resolved.RootFSSizeBytes, baseRootFSSize)
+	}
+	return resolved, resolved.RootFSSizeBytes > baseRootFSSize, nil
+}
+
 func (p *Provisioner) cloneRootFS(ctx context.Context, dest string) error {
 	cmd := exec.CommandContext(ctx, "cp", "--reflink=always", p.cfg.BaseRootFSPath, dest)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("reflink rootfs clone: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (p *Provisioner) growRootFS(path string, sizeBytes int64) error {
+	if err := os.Truncate(path, sizeBytes); err != nil {
+		return fmt.Errorf("expand rootfs image to %d bytes: %w", sizeBytes, err)
+	}
+	cmd := exec.Command("resize2fs", path)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("resize rootfs filesystem: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -695,8 +761,8 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst model.Instance,
 	rootDriveID := "rootfs"
 	isReadOnly := false
 	isRootDevice := true
-	vcpus := p.cfg.VCPUCount
-	mem := p.cfg.MemoryMiB
+	vcpus := p.effectiveVCPUCount(inst)
+	mem := p.effectiveMemoryMiB(inst)
 
 	fcCfg := firecracker.Config{
 		SocketPath:      inst.SocketPath,
@@ -753,6 +819,33 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst model.Instance,
 		return 0, fmt.Errorf("read firecracker pid: %w", err)
 	}
 	return pid, nil
+}
+
+func (p *Provisioner) effectiveVCPUCount(inst model.Instance) int64 {
+	if inst.VCPUCount > 0 {
+		return inst.VCPUCount
+	}
+	return p.cfg.VCPUCount
+}
+
+func (p *Provisioner) effectiveMemoryMiB(inst model.Instance) int64 {
+	if inst.MemoryMiB > 0 {
+		return inst.MemoryMiB
+	}
+	return p.cfg.MemoryMiB
+}
+
+func validateMachineShape(vcpus, memoryMiB int64) error {
+	if vcpus < 1 {
+		return errors.New("vm vcpu count must be >= 1")
+	}
+	if vcpus != 1 && vcpus%2 != 0 {
+		return errors.New("vm vcpu count must be 1 or an even number")
+	}
+	if memoryMiB < 128 {
+		return errors.New("vm memory must be at least 128 MiB")
+	}
+	return nil
 }
 
 func (p *Provisioner) waitForTailnetJoin(ctx context.Context, name string, firecrackerPID int) (string, string, error) {

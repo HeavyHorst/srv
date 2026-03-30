@@ -14,6 +14,14 @@ Per-instance sizing can be overridden at create time:
 ssh root@srv new demo --cpus 4 --ram 8G --rootfs-size 20G
 ```
 
+Existing stopped instances can be resized later:
+
+```bash
+ssh root@srv stop demo
+ssh root@srv resize demo --cpus 4 --ram 8G --rootfs-size 20G
+ssh root@srv start demo
+```
+
 The service treats SSH as command transport only. Caller identity comes from Tailscale `WhoIs` data resolved from the incoming tailnet connection.
 
 ## Current MVP Shape
@@ -24,8 +32,16 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - Btrfs reflinks clone the base rootfs for fast per-instance writable disks.
 - Firecracker launches each VM with a TAP device and host-side NAT.
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
-- `new`, `list`, `inspect`, `start`, `stop`, `restart`, and `delete` are implemented.
+- `new`, `resize`, `list`, `inspect`, `start`, `stop`, `restart`, and `delete` are implemented.
 - When `srv` starts under systemd after a host reboot, previously active instances are restarted automatically.
+
+## Instance Lifecycle Notes
+
+- `new` accepts `--cpus`, `--ram`, and `--rootfs-size` to set per-instance sizing at creation time.
+- `resize` accepts the same sizing flags, but only for instances in the `stopped` state.
+- CPU and memory changes are persisted on the instance record and take effect on the next `start` or `restart`.
+- Rootfs resizing is grow-only. Requests smaller than the current disk image are rejected.
+- Rootfs growth happens on the host by expanding the disk image and filesystem before the next boot; live resize is not supported.
 
 ## Host Requirements
 

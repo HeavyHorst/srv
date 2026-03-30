@@ -250,6 +250,8 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, args []string) (c
 	switch args[0] {
 	case "new":
 		return a.cmdNew(ctx, actor, args)
+	case "resize":
+		return a.cmdResize(ctx, args)
 	case "list":
 		return a.cmdList(ctx)
 	case "inspect":
@@ -288,6 +290,38 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string) (com
 	}
 
 	return lifecycleReadyResult("created", inst), nil
+}
+
+func (a *App) cmdResize(ctx context.Context, args []string) (commandResult, error) {
+	name, opts, err := parseResizeArgs(args)
+	if err != nil {
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	inst, err := a.provisioner.Resize(ctx, name, opts)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = fmt.Errorf("instance %q does not exist", name)
+		}
+		stderr := fmt.Sprintf("resize %s: %v\n", name, err)
+		if inst.Name != "" {
+			stderr += fmt.Sprintf("inspect: ssh root@%s inspect %s\n", a.cfg.Hostname, inst.Name)
+		}
+		return commandResult{stderr: stderr, exitCode: 1}, err
+	}
+
+	stdout := fmt.Sprintf(
+		"resized: %s\nstate: %s\nvcpus: %d\nmemory: %d MiB\nrootfs-size: %s\n",
+		inst.Name,
+		inst.State,
+		effectiveInstanceVCPUCount(inst, a.cfg),
+		effectiveInstanceMemoryMiB(inst, a.cfg),
+		formatBinarySize(effectiveInstanceRootFSSizeBytes(inst)),
+	)
+	return commandResult{stdout: stdout, exitCode: 0}, nil
 }
 
 func (a *App) cmdList(ctx context.Context) (commandResult, error) {
@@ -456,7 +490,7 @@ func (a *App) cmdDelete(ctx context.Context, args []string) (commandResult, erro
 }
 
 func helpResult() commandResult {
-	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], list, inspect <name>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
+	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], list, inspect <name>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
 }
 
 func lifecycleReadyResult(action string, inst model.Instance) commandResult {
@@ -504,8 +538,23 @@ func trimNodeName(primary, fallback string) string {
 const mib = int64(1024 * 1024)
 
 func parseNewArgs(args []string) (string, provision.CreateOptions, error) {
+	return parseSizedInstanceArgs(args, newUsage())
+}
+
+func parseResizeArgs(args []string) (string, provision.CreateOptions, error) {
+	name, opts, err := parseSizedInstanceArgs(args, resizeUsage())
+	if err != nil {
+		return "", provision.CreateOptions{}, err
+	}
+	if opts == (provision.CreateOptions{}) {
+		return "", provision.CreateOptions{}, fmt.Errorf("resize requires at least one of --cpus, --ram, or --rootfs-size\n%s", resizeUsage())
+	}
+	return name, opts, nil
+}
+
+func parseSizedInstanceArgs(args []string, usage string) (string, provision.CreateOptions, error) {
 	if len(args) < 2 {
-		return "", provision.CreateOptions{}, errors.New(newUsage())
+		return "", provision.CreateOptions{}, errors.New(usage)
 	}
 
 	var (
@@ -520,7 +569,7 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, error) {
 		arg := args[i]
 		if !strings.HasPrefix(arg, "--") {
 			if name != "" {
-				return "", provision.CreateOptions{}, fmt.Errorf("unexpected argument %q\n%s", arg, newUsage())
+				return "", provision.CreateOptions{}, fmt.Errorf("unexpected argument %q\n%s", arg, usage)
 			}
 			name = arg
 			continue
@@ -530,7 +579,7 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, error) {
 		if !hasValue {
 			i++
 			if i >= len(args) {
-				return "", provision.CreateOptions{}, fmt.Errorf("missing value for %s\n%s", key, newUsage())
+				return "", provision.CreateOptions{}, fmt.Errorf("missing value for %s\n%s", key, usage)
 			}
 			value = args[i]
 		}
@@ -538,47 +587,51 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, error) {
 		switch key {
 		case "--cpus":
 			if seenCPUs {
-				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, newUsage())
+				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, usage)
 			}
 			seenCPUs = true
 			parsed, err := strconv.ParseInt(value, 10, 64)
 			if err != nil {
-				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %w\n%s", key, err, newUsage())
+				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %w\n%s", key, err, usage)
 			}
 			opts.VCPUCount = parsed
 		case "--ram":
 			if seenRAM {
-				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, newUsage())
+				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, usage)
 			}
 			seenRAM = true
 			parsed, err := parseSize(value, mib)
 			if err != nil {
-				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %v\n%s", key, err, newUsage())
+				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %v\n%s", key, err, usage)
 			}
 			opts.MemoryMiB = bytesToMiBCeil(parsed)
 		case "--rootfs-size":
 			if seenRootFSSize {
-				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, newUsage())
+				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, usage)
 			}
 			seenRootFSSize = true
 			parsed, err := parseSize(value, mib)
 			if err != nil {
-				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %v\n%s", key, err, newUsage())
+				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %v\n%s", key, err, usage)
 			}
 			opts.RootFSSizeBytes = parsed
 		default:
-			return "", provision.CreateOptions{}, fmt.Errorf("unknown option %q\n%s", key, newUsage())
+			return "", provision.CreateOptions{}, fmt.Errorf("unknown option %q\n%s", key, usage)
 		}
 	}
 
 	if name == "" {
-		return "", provision.CreateOptions{}, errors.New(newUsage())
+		return "", provision.CreateOptions{}, errors.New(usage)
 	}
 	return name, opts, nil
 }
 
 func newUsage() string {
 	return "usage: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]"
+}
+
+func resizeUsage() string {
+	return "usage: resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]"
 }
 
 func parseSize(value string, defaultUnit int64) (int64, error) {

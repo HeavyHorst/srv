@@ -377,6 +377,67 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 	return inst, nil
 }
 
+func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOptions) (model.Instance, error) {
+	inst, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return model.Instance{}, err
+	}
+	if inst.State == model.StateDeleted {
+		return inst, fmt.Errorf("instance %q is deleted", name)
+	}
+	if inst.State != model.StateStopped {
+		return inst, fmt.Errorf("instance %q must be stopped before resize (current state: %s)", name, inst.State)
+	}
+	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
+		return inst, fmt.Errorf("instance %q must be stopped before resize", name)
+	}
+
+	resized := inst
+	if resized.FirecrackerPID > 0 {
+		resized.FirecrackerPID = 0
+	}
+	if opts.VCPUCount > 0 {
+		resized.VCPUCount = opts.VCPUCount
+	}
+	if opts.MemoryMiB > 0 {
+		resized.MemoryMiB = opts.MemoryMiB
+	}
+	if err := validateMachineShape(p.effectiveVCPUCount(resized), p.effectiveMemoryMiB(resized)); err != nil {
+		return inst, err
+	}
+	if opts.RootFSSizeBytes > 0 {
+		currentSize, err := p.rootFSSize(resized.RootFSPath)
+		if err != nil {
+			return inst, err
+		}
+		if opts.RootFSSizeBytes < currentSize {
+			return inst, fmt.Errorf("rootfs size %d bytes is smaller than the current image size %d bytes", opts.RootFSSizeBytes, currentSize)
+		}
+		if opts.RootFSSizeBytes > currentSize {
+			if _, err := exec.LookPath("resize2fs"); err != nil {
+				return inst, errors.New("resize with a larger rootfs requires resize2fs on the host")
+			}
+			if err := p.growRootFS(resized.RootFSPath, opts.RootFSSizeBytes); err != nil {
+				return inst, err
+			}
+			p.recordEvent(inst.ID, "storage", "rootfs expanded for instance", map[string]any{"size_bytes": opts.RootFSSizeBytes})
+		}
+		resized.RootFSSizeBytes = opts.RootFSSizeBytes
+	}
+
+	resized.LastError = ""
+	resized.UpdatedAt = time.Now().UTC()
+	if err := p.store.UpdateInstance(ctx, resized); err != nil {
+		return inst, err
+	}
+	p.recordEvent(resized.ID, "resize", "instance config updated", map[string]any{
+		"vcpus":             p.effectiveVCPUCount(resized),
+		"memory_mib":        p.effectiveMemoryMiB(resized),
+		"rootfs_size_bytes": resized.RootFSSizeBytes,
+	})
+	return resized, nil
+}
+
 func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, error) {
 	inst, err := p.store.GetInstance(ctx, name)
 	if err != nil {
@@ -565,6 +626,14 @@ func (p *Provisioner) baseRootFSSize() (int64, error) {
 	info, err := os.Stat(p.cfg.BaseRootFSPath)
 	if err != nil {
 		return 0, fmt.Errorf("stat base rootfs %s: %w", p.cfg.BaseRootFSPath, err)
+	}
+	return info.Size(), nil
+}
+
+func (p *Provisioner) rootFSSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, fmt.Errorf("stat rootfs %s: %w", path, err)
 	}
 	return info.Size(), nil
 }

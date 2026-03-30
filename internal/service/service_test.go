@@ -219,10 +219,51 @@ func TestEnsureHostSignerPersistsKey(t *testing.T) {
 
 func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
-	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "start <name>", "stop <name>", "restart <name>"} {
+	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "start <name>", "stop <name>", "restart <name>"} {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("helpResult() missing %q in %q", want, result.stdout)
 		}
+	}
+}
+
+func TestCmdResizeUpdatesStoppedInstance(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.Config{Hostname: "srv", VCPUCount: 1, MemoryMiB: 1024}
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatalf("provision.New(): %v", err)
+	}
+	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+
+	inst := serviceTestInstance("alpha", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	result, err := app.cmdResize(ctx, []string{"resize", inst.Name, "--cpus", "4", "--ram", "6G"})
+	if err != nil {
+		t.Fatalf("cmdResize(): %v", err)
+	}
+	if result.exitCode != 0 {
+		t.Fatalf("cmdResize() exitCode = %d, want 0", result.exitCode)
+	}
+	for _, want := range []string{"resized: alpha\n", "state: stopped\n", "vcpus: 4\n", "memory: 6144 MiB\n"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("cmdResize() stdout missing %q\nfull output:\n%s", want, result.stdout)
+		}
+	}
+
+	updated, err := st.GetInstance(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(): %v", err)
+	}
+	if updated.VCPUCount != 4 || updated.MemoryMiB != 6144 || updated.RootFSSizeBytes != inst.RootFSSizeBytes {
+		t.Fatalf("updated instance = %#v", updated)
+	}
+	if !updated.UpdatedAt.After(inst.UpdatedAt) {
+		t.Fatalf("updated timestamp did not advance: before=%s after=%s", inst.UpdatedAt, updated.UpdatedAt)
 	}
 }
 
@@ -275,6 +316,49 @@ func TestParseNewArgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotOpts, tt.wantOpts) {
 				t.Fatalf("parseNewArgs() opts = %#v, want %#v", gotOpts, tt.wantOpts)
+			}
+		})
+	}
+}
+
+func TestParseResizeArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantName string
+		wantOpts provision.CreateOptions
+		wantErr  string
+	}{
+		{
+			name:     "parses name and one flag",
+			args:     []string{"resize", "demo", "--rootfs-size", "12G"},
+			wantName: "demo",
+			wantOpts: provision.CreateOptions{RootFSSizeBytes: 12 << 30},
+		},
+		{
+			name:    "requires at least one option",
+			args:    []string{"resize", "demo"},
+			wantErr: "resize requires at least one of --cpus, --ram, or --rootfs-size",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotOpts, err := parseResizeArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseResizeArgs() error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseResizeArgs() error = %v", err)
+			}
+			if gotName != tt.wantName {
+				t.Fatalf("parseResizeArgs() name = %q, want %q", gotName, tt.wantName)
+			}
+			if !reflect.DeepEqual(gotOpts, tt.wantOpts) {
+				t.Fatalf("parseResizeArgs() opts = %#v, want %#v", gotOpts, tt.wantOpts)
 			}
 		})
 	}

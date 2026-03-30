@@ -347,6 +347,119 @@ func TestEnsureStartPrereqsRequiresCompletedBootstrap(t *testing.T) {
 	}
 }
 
+func TestResizeStoppedInstanceUpdatesStoredConfigAndGrowsRootFS(t *testing.T) {
+	const testMiB = int64(1024 * 1024)
+
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.RootFSSizeBytes = 8 * testMiB
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(rootfs dir): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.Truncate(inst.RootFSPath, inst.RootFSSizeBytes); err != nil {
+		t.Fatalf("Truncate(rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(bin): %v", err)
+	}
+	resize2fs := filepath.Join(binDir, "resize2fs")
+	if err := os.WriteFile(resize2fs, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(resize2fs): %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	resized, err := p.Resize(ctx, inst.Name, CreateOptions{VCPUCount: 4, MemoryMiB: 4096, RootFSSizeBytes: 12 * testMiB})
+	if err != nil {
+		t.Fatalf("Resize(): %v", err)
+	}
+	if resized.VCPUCount != 4 || resized.MemoryMiB != 4096 || resized.RootFSSizeBytes != 12*testMiB {
+		t.Fatalf("Resize() returned %#v", resized)
+	}
+
+	info, err := os.Stat(inst.RootFSPath)
+	if err != nil {
+		t.Fatalf("Stat(rootfs): %v", err)
+	}
+	if info.Size() != 12*testMiB {
+		t.Fatalf("rootfs size after resize = %d, want %d", info.Size(), 12*testMiB)
+	}
+
+	stored, err := st.GetInstance(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(): %v", err)
+	}
+	if stored.VCPUCount != 4 || stored.MemoryMiB != 4096 || stored.RootFSSizeBytes != 12*testMiB {
+		t.Fatalf("stored instance = %#v", stored)
+	}
+
+	events, err := st.ListEvents(ctx, inst.ID, 10)
+	if err != nil {
+		t.Fatalf("ListEvents(): %v", err)
+	}
+	var sawResize bool
+	var sawStorage bool
+	for _, evt := range events {
+		if evt.Type == "resize" && evt.Message == "instance config updated" {
+			sawResize = true
+		}
+		if evt.Type == "storage" && evt.Message == "rootfs expanded for instance" {
+			sawStorage = true
+		}
+	}
+	if !sawResize || !sawStorage {
+		t.Fatalf("expected resize and storage events, got %#v", events)
+	}
+}
+
+func TestResizeRejectsShrinkingRootFS(t *testing.T) {
+	const testMiB = int64(1024 * 1024)
+
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.RootFSSizeBytes = 8 * testMiB
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(rootfs dir): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.Truncate(inst.RootFSPath, inst.RootFSSizeBytes); err != nil {
+		t.Fatalf("Truncate(rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	_, err := p.Resize(ctx, inst.Name, CreateOptions{RootFSSizeBytes: 4 * testMiB})
+	if err == nil || !strings.Contains(err.Error(), "smaller than the current image size") {
+		t.Fatalf("Resize() shrink error = %v", err)
+	}
+
+	info, err := os.Stat(inst.RootFSPath)
+	if err != nil {
+		t.Fatalf("Stat(rootfs): %v", err)
+	}
+	if info.Size() != 8*testMiB {
+		t.Fatalf("rootfs size changed after failed shrink: %d", info.Size())
+	}
+}
+
 func TestDeviceUpdatedSince(t *testing.T) {
 	previous := tailnetDeviceSnapshot{DeviceID: "device-1", LastSeen: "2026-03-29T12:00:00Z"}
 	if deviceUpdatedSince(tailscale.Device{DeviceID: "device-1", LastSeen: previous.LastSeen}, previous, true) {

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,6 +27,7 @@ import (
 
 	"srv/internal/config"
 	"srv/internal/model"
+	"srv/internal/nethelper"
 	"srv/internal/store"
 )
 
@@ -36,6 +38,10 @@ var (
 	vmContextForRequest = func(context.Context) context.Context {
 		return context.Background()
 	}
+	currentCgroupPath = func() (string, error) {
+		return readUnifiedCgroupPath("/proc/self/cgroup")
+	}
+	cgroupFSRoot       = "/sys/fs/cgroup"
 	loopDevicesForPath = func(path string) (string, error) {
 		output, err := exec.Command("losetup", "-j", path, "--output", "NAME", "--noheadings").CombinedOutput()
 		if err != nil {
@@ -46,10 +52,16 @@ var (
 )
 
 type Provisioner struct {
-	cfg      config.Config
-	log      *slog.Logger
-	store    *store.Store
-	tsClient *tailscale.Client
+	cfg           config.Config
+	log           *slog.Logger
+	store         *store.Store
+	tsClient      *tailscale.Client
+	networkHelper networkHelper
+}
+
+type networkHelper interface {
+	SetupInstanceNetwork(ctx context.Context, req nethelper.SetupRequest) error
+	CleanupInstanceNetwork(ctx context.Context, req nethelper.CleanupRequest) error
 }
 
 type guestBootstrap struct {
@@ -76,7 +88,7 @@ type CreateOptions struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner, error) {
-	p := &Provisioner{cfg: cfg, log: logger, store: st}
+	p := &Provisioner{cfg: cfg, log: logger, store: st, networkHelper: nethelper.NewClient(cfg.NetHelperSocketPath)}
 	if cfg.Tailnet != "" && cfg.TailscaleClientSecret != "" {
 		credentials := clientcredentials.Config{
 			ClientID:     firstNonEmpty(cfg.TailscaleClientID, "srv-control-plane"),
@@ -158,9 +170,10 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		if cleanup {
 			if startedMachine {
 				_ = p.stopFirecracker(inst.FirecrackerPID)
+				_ = p.cleanupFirecrackerCgroup(inst.Name)
 			}
 			_ = p.cleanupNetworking(inst)
-			_ = os.RemoveAll(instanceDir)
+			_ = p.removeInstanceDir(inst.Name)
 			if mintedKeyID != "" {
 				_ = p.deleteAuthKey(context.Background(), mintedKeyID)
 			}
@@ -275,10 +288,13 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 	if err := p.stopFirecracker(inst.FirecrackerPID); err != nil {
 		p.log.Warn("stop firecracker", "name", inst.Name, "pid", inst.FirecrackerPID, "err", err)
 	}
+	if err := p.cleanupFirecrackerCgroup(inst.Name); err != nil {
+		p.log.Warn("cleanup firecracker cgroup", "name", inst.Name, "err", err)
+	}
 	if err := p.cleanupNetworking(inst); err != nil {
 		p.log.Warn("cleanup networking", "name", inst.Name, "err", err)
 	}
-	if err := os.RemoveAll(filepath.Dir(inst.RootFSPath)); err != nil {
+	if err := p.removeInstanceDir(inst.Name); err != nil {
 		p.log.Warn("remove instance directory", "name", inst.Name, "err", err)
 	}
 	if p.tsClient != nil {
@@ -327,6 +343,9 @@ func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) 
 	if inst.FirecrackerPID != 0 {
 		inst.FirecrackerPID = 0
 		inst.UpdatedAt = time.Now().UTC()
+		if err := p.cleanupFirecrackerCgroup(inst.Name); err != nil {
+			p.log.Warn("cleanup stale firecracker cgroup", "name", inst.Name, "err", err)
+		}
 		if err := p.store.UpdateInstance(ctx, inst); err != nil {
 			return err
 		}
@@ -361,6 +380,9 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 	p.recordEvent(inst.ID, "stop", "stop requested", nil)
 	if err := p.stopFirecracker(inst.FirecrackerPID); err != nil {
 		return inst, err
+	}
+	if err := p.cleanupFirecrackerCgroup(inst.Name); err != nil {
+		p.log.Warn("cleanup firecracker cgroup", "name", inst.Name, "err", err)
 	}
 	if err := p.cleanupNetworking(inst); err != nil {
 		return inst, err
@@ -465,6 +487,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, e
 		if cleanup {
 			if startedMachine {
 				_ = p.stopFirecracker(inst.FirecrackerPID)
+				_ = p.cleanupFirecrackerCgroup(inst.Name)
 			}
 			_ = p.cleanupNetworking(inst)
 			inst.State = model.StateStopped
@@ -533,7 +556,10 @@ func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, e
 }
 
 func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (string, error) {
-	instanceDir := filepath.Join(p.cfg.InstancesDir(), name)
+	instanceDir, err := p.instanceDir(name)
+	if err != nil {
+		return "", err
+	}
 	if existing, found, err := p.store.FindInstance(ctx, name); err != nil {
 		return "", err
 	} else if found {
@@ -542,7 +568,9 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 			if err := p.store.DeleteInstance(ctx, name); err != nil {
 				return "", err
 			}
-			_ = os.RemoveAll(instanceDir)
+			if err := p.removeInstanceDir(name); err != nil {
+				return "", err
+			}
 		default:
 			return "", fmt.Errorf("instance %q already exists with state %s", name, existing.State)
 		}
@@ -712,62 +740,33 @@ func (p *Provisioner) allocateNetwork(ctx context.Context) (networkCIDR, hostAdd
 }
 
 func (p *Provisioner) setupNetworking(ctx context.Context, inst model.Instance) error {
+	if p.networkHelper == nil {
+		return errors.New("network helper client is unavailable")
+	}
 	outbound, err := p.outboundInterface(ctx)
 	if err != nil {
 		return err
 	}
-	if err := p.run(ctx, "ip", "tuntap", "add", "dev", inst.TapDevice, "mode", "tap"); err != nil {
-		return err
-	}
-	if err := p.run(ctx, "ip", "addr", "add", inst.HostAddr, "dev", inst.TapDevice); err != nil {
-		return err
-	}
-	if err := p.run(ctx, "ip", "link", "set", "dev", inst.TapDevice, "up"); err != nil {
-		return err
-	}
-	if err := p.run(ctx, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
-		return err
-	}
-	if err := p.ensureIPTablesRule(ctx, "nat", "POSTROUTING", "-s", inst.NetworkCIDR, "-o", outbound, "-j", "MASQUERADE"); err != nil {
-		return err
-	}
-	if err := p.ensureIPTablesRule(ctx, "filter", "FORWARD", "-i", inst.TapDevice, "-j", "ACCEPT"); err != nil {
-		return err
-	}
-	if err := p.ensureIPTablesRule(ctx, "filter", "FORWARD", "-o", inst.TapDevice, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
-		return err
-	}
-	return nil
+	return p.networkHelper.SetupInstanceNetwork(ctx, nethelper.SetupRequest{
+		TapDevice:         inst.TapDevice,
+		HostAddr:          inst.HostAddr,
+		NetworkCIDR:       inst.NetworkCIDR,
+		OutboundInterface: outbound,
+	})
 }
 
 func (p *Provisioner) cleanupNetworking(inst model.Instance) error {
+	if p.networkHelper == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	outbound, _ := p.outboundInterface(ctx)
-	var errs []string
-	if outbound != "" {
-		if err := p.deleteIPTablesRule(ctx, "nat", "POSTROUTING", "-s", inst.NetworkCIDR, "-o", outbound, "-j", "MASQUERADE"); err != nil {
-			errs = append(errs, err.Error())
-		}
-	}
-	if err := p.deleteIPTablesRule(ctx, "filter", "FORWARD", "-i", inst.TapDevice, "-j", "ACCEPT"); err != nil {
-		errs = append(errs, err.Error())
-	}
-	if err := p.deleteIPTablesRule(ctx, "filter", "FORWARD", "-o", inst.TapDevice, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
-		errs = append(errs, err.Error())
-	}
-	if inst.TapDevice != "" {
-		if err := p.run(ctx, "ip", "link", "set", "dev", inst.TapDevice, "down"); err != nil && !isMissingNetworkDeviceError(err) {
-			errs = append(errs, err.Error())
-		}
-		if err := p.run(ctx, "ip", "tuntap", "del", "dev", inst.TapDevice, "mode", "tap"); err != nil && !isMissingNetworkDeviceError(err) {
-			errs = append(errs, err.Error())
-		}
-	}
-	if len(errs) > 0 {
-		return errors.New(strings.Join(errs, "; "))
-	}
-	return nil
+	return p.networkHelper.CleanupInstanceNetwork(ctx, nethelper.CleanupRequest{
+		TapDevice:         inst.TapDevice,
+		NetworkCIDR:       inst.NetworkCIDR,
+		OutboundInterface: outbound,
+	})
 }
 
 func (p *Provisioner) mintGuestAuthKey(ctx context.Context) (secret string, keyID string, err error) {
@@ -887,7 +886,85 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst model.Instance,
 	if err != nil {
 		return 0, fmt.Errorf("read firecracker pid: %w", err)
 	}
+	if err := p.assignFirecrackerToCgroup(inst.Name, pid); err != nil {
+		_ = p.stopFirecracker(pid)
+		_ = p.cleanupFirecrackerCgroup(inst.Name)
+		return 0, err
+	}
 	return pid, nil
+}
+
+func (p *Provisioner) instanceDir(name string) (string, error) {
+	instanceDir, err := directChildPath(p.cfg.InstancesDir(), name)
+	if err != nil {
+		return "", fmt.Errorf("resolve instance directory for %q: %w", name, err)
+	}
+	return instanceDir, nil
+}
+
+func (p *Provisioner) removeInstanceDir(name string) error {
+	instanceDir, err := p.instanceDir(name)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(instanceDir); err != nil {
+		return fmt.Errorf("remove instance directory %s: %w", instanceDir, err)
+	}
+	return nil
+}
+
+func (p *Provisioner) firecrackerCgroupPath(name string) (string, error) {
+	cgroupPath, err := currentCgroupPath()
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(cgroupPath) {
+		return "", fmt.Errorf("current cgroup path %q is not absolute", cgroupPath)
+	}
+	vmRoot := filepath.Join(cgroupFSRoot, strings.TrimPrefix(cgroupPath, "/"), "firecracker-vms")
+	child, err := directChildPath(vmRoot, name)
+	if err != nil {
+		return "", fmt.Errorf("resolve firecracker cgroup for %q: %w", name, err)
+	}
+	return child, nil
+}
+
+func (p *Provisioner) assignFirecrackerToCgroup(name string, pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("assign firecracker cgroup for %q: invalid pid %d", name, pid)
+	}
+	cgroupPath, err := p.firecrackerCgroupPath(name)
+	if err != nil {
+		return fmt.Errorf("assign firecracker cgroup for %q: %w", name, err)
+	}
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		return fmt.Errorf("assign firecracker cgroup for %q: create %s: %w", name, cgroupPath, err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		return fmt.Errorf("assign firecracker cgroup for %q: move pid %d: %w", name, pid, err)
+	}
+	return nil
+}
+
+func (p *Provisioner) cleanupFirecrackerCgroup(name string) error {
+	cgroupPath, err := p.firecrackerCgroupPath(name)
+	if err != nil {
+		return fmt.Errorf("cleanup firecracker cgroup for %q: %w", name, err)
+	}
+	if err := os.Remove(cgroupPath); err != nil && !os.IsNotExist(err) {
+		if errors.Is(err, syscall.ENOTEMPTY) {
+			_ = os.Remove(filepath.Join(cgroupPath, "cgroup.procs"))
+			err = os.Remove(cgroupPath)
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("cleanup firecracker cgroup for %q: remove %s: %w", name, cgroupPath, err)
+		}
+	}
+	vmRoot := filepath.Dir(cgroupPath)
+	if err := os.Remove(vmRoot); err != nil && !os.IsNotExist(err) && !errors.Is(err, syscall.ENOTEMPTY) {
+		return fmt.Errorf("cleanup firecracker cgroup root %s: %w", vmRoot, err)
+	}
+	return nil
 }
 
 func (p *Provisioner) effectiveVCPUCount(inst model.Instance) int64 {
@@ -1011,37 +1088,6 @@ func (p *Provisioner) outboundInterface(ctx context.Context) (string, error) {
 	return "", errors.New("could not determine outbound interface from default route")
 }
 
-func (p *Provisioner) ensureIPTablesRule(ctx context.Context, table, chain string, rule ...string) error {
-	checkArgs := append([]string{"-t", table, "-C", chain}, rule...)
-	if err := exec.CommandContext(ctx, "iptables", checkArgs...).Run(); err == nil {
-		return nil
-	}
-	addArgs := append([]string{"-t", table, "-A", chain}, rule...)
-	return p.run(ctx, "iptables", addArgs...)
-}
-
-func (p *Provisioner) deleteIPTablesRule(ctx context.Context, table, chain string, rule ...string) error {
-	deleteArgs := append([]string{"-t", table, "-D", chain}, rule...)
-	cmd := exec.CommandContext(ctx, "iptables", deleteArgs...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		text := strings.TrimSpace(string(output))
-		if strings.Contains(text, "No chain/target/match") || strings.Contains(text, "Bad rule") {
-			return nil
-		}
-		return fmt.Errorf("iptables delete rule: %w: %s", err, text)
-	}
-	return nil
-}
-
-func (p *Provisioner) run(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
-	}
-	return nil
-}
-
 func (p *Provisioner) recordEvent(instanceID, eventType, message string, payload any) {
 	text := ""
 	if payload != nil {
@@ -1083,12 +1129,36 @@ func deviceUpdatedSince(device tailscale.Device, previous tailnetDeviceSnapshot,
 	return strings.TrimSpace(device.LastSeen) != "" && device.LastSeen != previous.LastSeen
 }
 
-func isMissingNetworkDeviceError(err error) bool {
-	if err == nil {
-		return false
+func readUnifiedCgroupPath(path string) (string, error) {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", path, err)
 	}
-	text := err.Error()
-	return strings.Contains(text, "Cannot find device") || strings.Contains(text, "No such device") || strings.Contains(text, "does not exist")
+	for _, line := range strings.Split(string(payload), "\n") {
+		if !strings.HasPrefix(line, "0::") {
+			continue
+		}
+		cgroupPath := strings.TrimSpace(strings.TrimPrefix(line, "0::"))
+		if cgroupPath == "" {
+			return "/", nil
+		}
+		if !filepath.IsAbs(cgroupPath) {
+			return "", fmt.Errorf("unified cgroup path %q is not absolute", cgroupPath)
+		}
+		return cgroupPath, nil
+	}
+	return "", fmt.Errorf("could not find a unified cgroup entry in %s", path)
+}
+
+func directChildPath(base, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("name is empty")
+	}
+	if name == "." || name == ".." || filepath.Base(name) != name {
+		return "", fmt.Errorf("name %q must be a single path segment", name)
+	}
+	return filepath.Join(filepath.Clean(base), name), nil
 }
 
 func tapName(name string) string {

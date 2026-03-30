@@ -1,0 +1,27 @@
+[Unit]
+Description=srv privileged network helper
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=srv
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/bin/srv-net-helper -socket /run/srv/net-helper.sock -tap-user srv -client-group srv
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictRealtime=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

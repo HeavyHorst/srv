@@ -31,6 +31,7 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - SQLite stores instances, events, command audits, and authz decisions.
 - Btrfs reflinks clone the base rootfs for fast per-instance writable disks.
 - Firecracker launches each VM with a TAP device and host-side NAT.
+- A small root-only network helper owns TAP and iptables mutations while the main `srv` process runs as an unprivileged service user under systemd.
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
 - `new`, `resize`, `list`, `inspect`, `start`, `stop`, `restart`, and `delete` are implemented.
 - When `srv` starts under systemd after a host reboot, previously active instances are restarted automatically.
@@ -47,7 +48,7 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 
 - Linux host with `/dev/kvm`
 - Firecracker installed, default path `/usr/bin/firecracker`
-- `ip`, `iptables`, `cp`, `resize2fs`, `stat`, and `sysctl` available on the host
+- `ip`, `iptables`, `cp`, `resize2fs`, and `stat` available on the host
 - `SRV_DATA_DIR` on Btrfs
 - Tailscale tailnet access for the control plane
 - Tailscale OAuth client credentials with permission to mint auth keys for the configured guest tags
@@ -62,6 +63,7 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - `SRV_BASE_ROOTFS`: base guest rootfs image stored on Btrfs
 - `SRV_GUEST_AUTH_TAGS`: comma-separated tags applied to guest auth keys
 - `SRV_DATA_DIR`: host state directory, default `/var/lib/srv`
+- `SRV_NET_HELPER_SOCKET`: unix socket used to reach the privileged host-network helper, default `/run/srv/net-helper.sock`
 - `SRV_VM_NETWORK_CIDR`: host-side private network pool for guest TAP allocations, default `172.28.0.0/16`
 - `SRV_OUTBOUND_IFACE`: optional override for the host interface used for NAT
 
@@ -78,11 +80,13 @@ sudo ./srv \
   -guest-auth-tags tag:microvm
 ```
 
+When running outside systemd, start the privileged network helper separately so `srv` can reach `SRV_NET_HELPER_SOCKET`. The systemd path below is the recommended way to keep the non-root control plane and the root-only helper wired together.
+
 ## Run Under Systemd
 
-Example systemd assets live in [contrib/systemd/srv.service](file:///home/rene/Work/Code/srv/contrib/systemd/srv.service) and [contrib/systemd/srv.env.example](file:///home/rene/Work/Code/srv/contrib/systemd/srv.env.example).
+Example systemd assets live in [contrib/systemd/srv.service](file:///home/rene/Code/srv/contrib/systemd/srv.service), [contrib/systemd/srv-net-helper.service](file:///home/rene/Code/srv/contrib/systemd/srv-net-helper.service), and [contrib/systemd/srv.env.example](file:///home/rene/Code/srv/contrib/systemd/srv.env.example).
 
-For a one-shot install, use [contrib/systemd/install.sh](file:///home/rene/Work/Code/srv/contrib/systemd/install.sh):
+For a one-shot install, use [contrib/systemd/install.sh](file:///home/rene/Code/srv/contrib/systemd/install.sh):
 
 ```bash
 sudo ./contrib/systemd/install.sh
@@ -90,19 +94,21 @@ sudoedit /etc/srv/srv.env
 sudo ./contrib/systemd/install.sh --enable-now
 ```
 
-Install the binary, unit, and environment file like this:
+Install the binaries, units, and environment file like this:
 
 ```bash
 go build -o /usr/local/bin/srv ./cmd/srv
+go build -o /usr/local/bin/srv-net-helper ./cmd/srv-net-helper
 sudo install -d -m 0755 /etc/srv
 sudo install -m 0644 contrib/systemd/srv.service /etc/systemd/system/srv.service
+sudo install -m 0644 contrib/systemd/srv-net-helper.service /etc/systemd/system/srv-net-helper.service
 sudo install -m 0640 contrib/systemd/srv.env.example /etc/srv/srv.env
 sudoedit /etc/srv/srv.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now srv
 ```
 
-The unit runs `srv` as root because the service needs KVM, TAP device creation, and host NAT management. Keep `SRV_DATA_DIR` on Btrfs and point `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` at the artifacts built under [images/arch-base/](file:///home/rene/Work/Code/srv/images/arch-base/README.md).
+Under systemd, the main `srv` unit runs as the dedicated `srv` service user and delegates TAP plus firewall changes to the root-owned helper unit. Keep `SRV_DATA_DIR` on Btrfs and point `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` at the artifacts built under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
 
 ## Build The Arch Base Image
 

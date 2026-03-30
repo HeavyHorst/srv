@@ -29,6 +29,7 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_GUEST_AUTH_TAGS", "tag:microvm")
 	t.Setenv("SRV_GUEST_AUTH_EXPIRY", "20m")
 	t.Setenv("SRV_GUEST_READY_TIMEOUT", "3m")
+	t.Setenv("SRV_NET_HELPER_SOCKET", "/run/srv/custom-net-helper.sock")
 	t.Setenv("SRV_VM_VCPUS", "2")
 	t.Setenv("SRV_VM_MEMORY_MIB", "2048")
 	t.Setenv("SRV_LOG_LEVEL", "debug")
@@ -49,6 +50,9 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	}
 	if cfg.DataDirAbs() != expectedAbs {
 		t.Fatalf("DataDirAbs = %q, want %q", cfg.DataDirAbs(), expectedAbs)
+	}
+	if cfg.NetHelperSocketPath != "/run/srv/custom-net-helper.sock" {
+		t.Fatalf("NetHelperSocketPath = %q, want %q", cfg.NetHelperSocketPath, "/run/srv/custom-net-helper.sock")
 	}
 	if !reflect.DeepEqual(cfg.AllowedUsers, []string{"alice@example.com", "bob@example.com"}) {
 		t.Fatalf("AllowedUsers = %#v", cfg.AllowedUsers)
@@ -102,6 +106,11 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 			name:    "missing data dir",
 			mutate:  func(cfg *Config) { cfg.DataDir = "" },
 			wantErr: "data dir is required",
+		},
+		{
+			name:    "missing helper socket",
+			mutate:  func(cfg *Config) { cfg.NetHelperSocketPath = "" },
+			wantErr: "network helper socket path is required",
 		},
 		{
 			name:    "zero vcpus",
@@ -181,12 +190,13 @@ func resetFlagsForTest(t *testing.T, args []string) {
 
 func validConfig() Config {
 	return Config{
-		DataDir:           "/tmp/srv",
-		Hostname:          "srv",
-		ListenAddr:        ":22",
-		VCPUCount:         2,
-		MemoryMiB:         1024,
-		GuestAuthExpiry:   15 * time.Minute,
-		GuestReadyTimeout: 2 * time.Minute,
+		DataDir:             "/tmp/srv",
+		Hostname:            "srv",
+		ListenAddr:          ":22",
+		NetHelperSocketPath: "/run/srv/net-helper.sock",
+		VCPUCount:           2,
+		MemoryMiB:           1024,
+		GuestAuthExpiry:     15 * time.Minute,
+		GuestReadyTimeout:   2 * time.Minute,
 	}
 }

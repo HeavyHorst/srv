@@ -107,6 +107,58 @@ func TestPrepareInstanceDirRejectsActiveOrOrphanedNames(t *testing.T) {
 	}
 }
 
+func TestInstanceDirRejectsUnsafeNames(t *testing.T) {
+	cfg := loadProvisionTestConfig(t, nil)
+	p := &Provisioner{cfg: cfg}
+
+	if got, err := p.instanceDir("demo"); err != nil || got != filepath.Join(cfg.InstancesDir(), "demo") {
+		t.Fatalf("instanceDir(demo) = (%q, %v)", got, err)
+	}
+
+	for _, name := range []string{"", ".", "..", "nested/demo", "../escape"} {
+		if _, err := p.instanceDir(name); err == nil {
+			t.Fatalf("instanceDir(%q) unexpectedly succeeded", name)
+		}
+	}
+}
+
+func TestRemoveInstanceDirDeletesOnlyCanonicalPath(t *testing.T) {
+	cfg := loadProvisionTestConfig(t, nil)
+	p := &Provisioner{cfg: cfg}
+
+	instanceDir := filepath.Join(cfg.InstancesDir(), "demo")
+	outsideDir := filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(instanceDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(instanceDir): %v", err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(outsideDir): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(instanceDir, "rootfs.img"), []byte("vm"), 0o644); err != nil {
+		t.Fatalf("WriteFile(instance rootfs): %v", err)
+	}
+	outsideFile := filepath.Join(outsideDir, "keep.txt")
+	if err := os.WriteFile(outsideFile, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("WriteFile(outside): %v", err)
+	}
+
+	if err := p.removeInstanceDir("demo"); err != nil {
+		t.Fatalf("removeInstanceDir(): %v", err)
+	}
+	if _, err := os.Stat(instanceDir); !os.IsNotExist(err) {
+		t.Fatalf("instance dir should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(outsideFile); err != nil {
+		t.Fatalf("outside file should remain, stat err = %v", err)
+	}
+	if err := p.removeInstanceDir("../escape"); err == nil {
+		t.Fatalf("removeInstanceDir() accepted traversal name")
+	}
+	if _, err := os.Stat(outsideFile); err != nil {
+		t.Fatalf("outside file should still remain after rejected traversal, stat err = %v", err)
+	}
+}
+
 func TestAllocateNetworkSkipsDeletedSubnetsAndDetectsExhaustion(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, map[string]string{
@@ -315,6 +367,77 @@ func TestVMContextForRequestIsDetached(t *testing.T) {
 	}
 }
 
+func TestReadUnifiedCgroupPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.WriteFile(path, []byte("12:memory:/system.slice/srv.service\n0::/system.slice/srv.service\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(cgroup): %v", err)
+	}
+
+	got, err := readUnifiedCgroupPath(path)
+	if err != nil {
+		t.Fatalf("readUnifiedCgroupPath(): %v", err)
+	}
+	if got != "/system.slice/srv.service" {
+		t.Fatalf("readUnifiedCgroupPath() = %q, want %q", got, "/system.slice/srv.service")
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing-cgroup")
+	if err := os.WriteFile(missing, []byte("12:memory:/system.slice/srv.service\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(missing): %v", err)
+	}
+	if _, err := readUnifiedCgroupPath(missing); err == nil {
+		t.Fatalf("readUnifiedCgroupPath() unexpectedly accepted a file without a unified entry")
+	}
+}
+
+func TestAssignAndCleanupFirecrackerCgroup(t *testing.T) {
+	cfg := loadProvisionTestConfig(t, nil)
+	p := &Provisioner{cfg: cfg}
+
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+	})
+
+	cgroupFSRoot = t.TempDir()
+	currentCgroupPath = func() (string, error) {
+		return "/system.slice/srv.service", nil
+	}
+
+	serviceCgroup := filepath.Join(cgroupFSRoot, "system.slice", "srv.service")
+	if err := os.MkdirAll(serviceCgroup, 0o755); err != nil {
+		t.Fatalf("MkdirAll(serviceCgroup): %v", err)
+	}
+
+	if err := p.assignFirecrackerToCgroup("demo", 4321); err != nil {
+		t.Fatalf("assignFirecrackerToCgroup(): %v", err)
+	}
+
+	cgroupPath := filepath.Join(serviceCgroup, "firecracker-vms", "demo")
+	payload, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.procs"))
+	if err != nil {
+		t.Fatalf("ReadFile(cgroup.procs): %v", err)
+	}
+	if strings.TrimSpace(string(payload)) != "4321" {
+		t.Fatalf("cgroup.procs = %q, want %q", strings.TrimSpace(string(payload)), "4321")
+	}
+
+	if err := p.cleanupFirecrackerCgroup("demo"); err != nil {
+		t.Fatalf("cleanupFirecrackerCgroup(): %v", err)
+	}
+	if _, err := os.Stat(cgroupPath); !os.IsNotExist(err) {
+		t.Fatalf("cgroup path should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(serviceCgroup, "firecracker-vms")); !os.IsNotExist(err) {
+		t.Fatalf("firecracker cgroup root should be removed when empty, stat err = %v", err)
+	}
+	if err := p.assignFirecrackerToCgroup("nested/demo", 1); err == nil {
+		t.Fatalf("assignFirecrackerToCgroup() accepted an unsafe name")
+	}
+}
+
 func TestEnsureStartPrereqsRequiresCompletedBootstrap(t *testing.T) {
 	firecrackerBin := filepath.Join(t.TempDir(), "bin", "firecracker")
 	cfg := loadProvisionTestConfig(t, map[string]string{
@@ -518,6 +641,14 @@ func TestHelperFunctions(t *testing.T) {
 	}
 	if got := kernelArgs("quiet loglevel=3"); got != "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet loglevel=3" {
 		t.Fatalf("kernelArgs() = %q", got)
+	}
+	if got, err := directChildPath("/tmp/srv", "demo"); err != nil || got != "/tmp/srv/demo" {
+		t.Fatalf("directChildPath() = (%q, %v)", got, err)
+	}
+	for _, name := range []string{"", ".", "..", "nested/demo"} {
+		if _, err := directChildPath("/tmp/srv", name); err == nil {
+			t.Fatalf("directChildPath(%q) unexpectedly succeeded", name)
+		}
 	}
 	if got := firstNonEmpty("", "  ", "value", "other"); got != "value" {
 		t.Fatalf("firstNonEmpty() = %q, want value", got)

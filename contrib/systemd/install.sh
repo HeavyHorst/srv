@@ -5,9 +5,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 BINARY_PATH="${BINARY_PATH:-/usr/local/bin/srv}"
+HELPER_BINARY_PATH="${HELPER_BINARY_PATH:-/usr/local/bin/srv-net-helper}"
 UNIT_PATH="${UNIT_PATH:-/etc/systemd/system/srv.service}"
+HELPER_UNIT_PATH="${HELPER_UNIT_PATH:-/etc/systemd/system/srv-net-helper.service}"
 ENV_DIR="${ENV_DIR:-/etc/srv}"
 ENV_PATH="${ENV_PATH:-${ENV_DIR}/srv.env}"
+SERVICE_USER="${SERVICE_USER:-srv}"
+SERVICE_GROUP="${SERVICE_GROUP:-srv}"
 
 OVERWRITE_ENV=0
 ENABLE_SERVICE=0
@@ -27,10 +31,14 @@ Options:
   -h, --help       show this help text
 
 Environment overrides:
-  BINARY_PATH   default: ${BINARY_PATH}
-  UNIT_PATH     default: ${UNIT_PATH}
-  ENV_DIR       default: ${ENV_DIR}
-  ENV_PATH      default: ${ENV_PATH}
+  BINARY_PATH         default: ${BINARY_PATH}
+  HELPER_BINARY_PATH  default: ${HELPER_BINARY_PATH}
+  UNIT_PATH           default: ${UNIT_PATH}
+  HELPER_UNIT_PATH    default: ${HELPER_UNIT_PATH}
+  ENV_DIR             default: ${ENV_DIR}
+  ENV_PATH            default: ${ENV_PATH}
+  SERVICE_USER        default: ${SERVICE_USER}
+  SERVICE_GROUP       default: ${SERVICE_GROUP}
 EOF
 }
 
@@ -44,7 +52,7 @@ require_root() {
 require_commands() {
 	local missing=()
 	local cmd
-	for cmd in awk go install systemctl; do
+	for cmd in awk go install systemctl id useradd; do
 		if ! command -v "${cmd}" >/dev/null 2>&1; then
 			missing+=("${cmd}")
 		fi
@@ -85,26 +93,56 @@ parse_args() {
 	done
 }
 
+ensure_service_user() {
+	if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
+		useradd --system --user-group --home-dir /var/lib/srv --no-create-home "${SERVICE_USER}"
+	fi
+}
+
 build_binary() {
+	local target="$1"
+	local output_path="$2"
 	local tmp_bin
 	tmp_bin="$(mktemp)"
-	go build -o "${tmp_bin}" ./cmd/srv
-	install -D -m 0755 "${tmp_bin}" "${BINARY_PATH}"
+	go build -o "${tmp_bin}" "${target}"
+	install -D -m 0755 "${tmp_bin}" "${output_path}"
 	rm -f "${tmp_bin}"
 }
 
-install_unit() {
+install_main_unit() {
 	local rendered_unit
 	rendered_unit="$(mktemp)"
 	awk \
 		-v binary_path="${BINARY_PATH}" \
 		-v env_path="${ENV_PATH}" \
+		-v service_user="${SERVICE_USER}" \
+		-v service_group="${SERVICE_GROUP}" \
 		'
 			/^EnvironmentFile=/ { print "EnvironmentFile=" env_path; next }
 			/^ExecStart=/ { print "ExecStart=" binary_path; next }
+			/^User=/ { print "User=" service_user; next }
+			/^Group=/ { print "Group=" service_group; next }
 			{ print }
 		' "${SCRIPT_DIR}/srv.service" >"${rendered_unit}"
 	install -D -m 0644 "${rendered_unit}" "${UNIT_PATH}"
+	rm -f "${rendered_unit}"
+}
+
+install_helper_unit() {
+	local rendered_unit
+	rendered_unit="$(mktemp)"
+	awk \
+		-v binary_path="${HELPER_BINARY_PATH}" \
+		-v service_user="${SERVICE_USER}" \
+		-v service_group="${SERVICE_GROUP}" \
+		'
+			/^ExecStart=/ {
+				print "ExecStart=" binary_path " -socket /run/srv/net-helper.sock -tap-user " service_user " -client-group " service_group
+				next
+			}
+			{ print }
+		' "${SCRIPT_DIR}/srv-net-helper.service" >"${rendered_unit}"
+	install -D -m 0644 "${rendered_unit}" "${HELPER_UNIT_PATH}"
 	rm -f "${rendered_unit}"
 }
 
@@ -115,6 +153,27 @@ install_env() {
 		return
 	fi
 	echo "keeping existing ${ENV_PATH}" >&2
+}
+
+configured_data_dir() {
+	local data_dir="/var/lib/srv"
+	if [[ -f "${ENV_PATH}" ]]; then
+		local configured
+		configured="$(awk -F= '$1 == "SRV_DATA_DIR" { value = $2 } END { print value }' "${ENV_PATH}")"
+		if [[ -n "${configured}" ]]; then
+			data_dir="${configured}"
+		fi
+	fi
+	printf '%s\n' "${data_dir}"
+}
+
+install_data_dirs() {
+	local data_dir
+	data_dir="$(configured_data_dir)"
+	install -d -m 0755 "${data_dir}"
+	install -d -m 0755 "${data_dir}/images"
+	install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/state"
+	install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/instances"
 }
 
 reload_systemd() {
@@ -137,9 +196,11 @@ manage_service() {
 print_next_steps() {
 	cat <<EOF
 installed:
-  binary: ${BINARY_PATH}
-  unit:   ${UNIT_PATH}
-  env:    ${ENV_PATH}
+  binary:        ${BINARY_PATH}
+  helper-binary: ${HELPER_BINARY_PATH}
+  unit:          ${UNIT_PATH}
+  helper-unit:   ${HELPER_UNIT_PATH}
+  env:           ${ENV_PATH}
 
 next:
   1. edit ${ENV_PATH}
@@ -153,9 +214,13 @@ main() {
 	require_root
 	require_commands
 	cd "${REPO_ROOT}"
-	build_binary
-	install_unit
+	ensure_service_user
+	build_binary ./cmd/srv "${BINARY_PATH}"
+	build_binary ./cmd/srv-net-helper "${HELPER_BINARY_PATH}"
+	install_main_unit
+	install_helper_unit
 	install_env
+	install_data_dirs
 	reload_systemd
 	manage_service
 	print_next_steps

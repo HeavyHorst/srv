@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -390,8 +391,8 @@ func TestEnsureInstanceRuntimePermissions(t *testing.T) {
 
 	assertMode(filepath.Dir(inst.RootFSPath), 0o770)
 	assertMode(inst.RootFSPath, 0o660)
-	assertMode(inst.LogPath, 0o660)
-	assertMode(inst.SerialLogPath, 0o660)
+	assertMode(inst.LogPath, 0o644)
+	assertMode(inst.SerialLogPath, 0o644)
 }
 
 func TestEnsureStartPrereqsRequiresCompletedBootstrap(t *testing.T) {
@@ -552,6 +553,33 @@ func TestDeviceUpdatedSince(t *testing.T) {
 	}
 	if !deviceUpdatedSince(tailscale.Device{DeviceID: "device-1"}, tailnetDeviceSnapshot{}, false) {
 		t.Fatalf("deviceUpdatedSince() should accept the first matching device when no previous snapshot exists")
+	}
+}
+
+func TestProcessExistsTreatsPermissionDeniedAsRunning(t *testing.T) {
+	oldSignalProcess := signalProcess
+	t.Cleanup(func() {
+		signalProcess = oldSignalProcess
+	})
+
+	signalProcess = func(pid int, sig syscall.Signal) error {
+		if pid != 4321 {
+			t.Fatalf("signalProcess pid = %d, want 4321", pid)
+		}
+		if sig != 0 {
+			t.Fatalf("signalProcess signal = %d, want 0", sig)
+		}
+		return syscall.EPERM
+	}
+	if !processExists(4321) {
+		t.Fatal("processExists() = false, want true for EPERM")
+	}
+
+	signalProcess = func(pid int, sig syscall.Signal) error {
+		return syscall.ESRCH
+	}
+	if processExists(4321) {
+		t.Fatal("processExists() = true, want false for ESRCH")
 	}
 }
 

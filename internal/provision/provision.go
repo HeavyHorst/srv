@@ -33,6 +33,7 @@ var (
 	errGuestNotReady   = errors.New("guest never joined the tailnet before timeout")
 	errGuestExited     = errors.New("guest exited before joining the tailnet")
 	validName          = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	signalProcess      = syscall.Kill
 	loopDevicesForPath = func(path string) (string, error) {
 		output, err := exec.Command("losetup", "-j", path, "--output", "NAME", "--noheadings").CombinedOutput()
 		if err != nil {
@@ -710,11 +711,8 @@ func (p *Provisioner) ensureInstanceRuntimePermissions(inst model.Instance) erro
 	if err := os.Chmod(inst.RootFSPath, 0o660); err != nil {
 		return fmt.Errorf("set rootfs permissions: %w", err)
 	}
-	for _, path := range []string{inst.LogPath, inst.SerialLogPath} {
-		if err := os.Chmod(path, 0o660); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("set runtime file permissions for %s: %w", path, err)
-		}
-	}
+	// The vm runner owns runtime log creation and may hand existing files to the
+	// jailer identity on first boot, so leave log paths alone during restart.
 	return nil
 }
 
@@ -947,7 +945,7 @@ func (p *Provisioner) stopFirecracker(name string, pid int) error {
 	if p.vmRunner == nil {
 		return errors.New("vm runner client is unavailable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := p.vmRunner.StopInstanceVM(ctx, vmrunner.StopRequest{Name: name, PID: pid}); err != nil {
 		return fmt.Errorf("stop firecracker for %q: %w", name, err)
@@ -1072,8 +1070,8 @@ func processExists(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	err := syscall.Kill(pid, 0)
-	return err == nil
+	err := signalProcess(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func uint32ToIP(v uint32) net.IP {

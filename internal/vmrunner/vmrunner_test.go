@@ -1,18 +1,25 @@
 package vmrunner
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
 )
 
 func TestRequestsValidate(t *testing.T) {
@@ -176,6 +183,124 @@ func TestVMContextForRequestIsDetached(t *testing.T) {
 	}
 }
 
+func TestStopVMUsesGracefulGuestShutdown(t *testing.T) {
+	server := newStopVMTestServer(t)
+	pid := startStopVMTestProcess(t)
+
+	oldRequest := requestGuestShutdown
+	oldWait := waitForProcessExit
+	oldForce := forceStopProcess
+	oldKillNow := killProcessNow
+	t.Cleanup(func() {
+		requestGuestShutdown = oldRequest
+		waitForProcessExit = oldWait
+		forceStopProcess = oldForce
+		killProcessNow = oldKillNow
+	})
+
+	var gotSocket string
+	var gotPID int
+	requestGuestShutdown = func(_ context.Context, socketPath string) error {
+		gotSocket = socketPath
+		return nil
+	}
+	waitForProcessExit = func(waitPID int, timeout time.Duration) error {
+		gotPID = waitPID
+		if timeout != gracefulStopTimeout {
+			t.Fatalf("waitForProcessExit timeout = %s, want %s", timeout, gracefulStopTimeout)
+		}
+		return nil
+	}
+	forceStopProcess = func(pid int) error {
+		t.Fatalf("forceStopProcess(%d) should not be called after a graceful stop", pid)
+		return nil
+	}
+	killProcessNow = func(pid int) error {
+		t.Fatalf("killProcessNow(%d) should not be called after a graceful stop", pid)
+		return nil
+	}
+
+	if err := server.stopVM(context.Background(), StopRequest{Name: "demo", PID: pid}); err != nil {
+		t.Fatalf("stopVM(): %v", err)
+	}
+	if gotSocket != filepath.Join(server.config.InstancesDir, "demo", "firecracker.sock") {
+		t.Fatalf("requestGuestShutdown socket = %q", gotSocket)
+	}
+	if gotPID != pid {
+		t.Fatalf("waitForProcessExit pid = %d, want %d", gotPID, pid)
+	}
+}
+
+func TestStopVMKillsImmediatelyAfterGracefulTimeout(t *testing.T) {
+	server := newStopVMTestServer(t)
+	pid := startStopVMTestProcess(t)
+
+	oldRequest := requestGuestShutdown
+	oldWait := waitForProcessExit
+	oldForce := forceStopProcess
+	oldKillNow := killProcessNow
+	t.Cleanup(func() {
+		requestGuestShutdown = oldRequest
+		waitForProcessExit = oldWait
+		forceStopProcess = oldForce
+		killProcessNow = oldKillNow
+	})
+
+	requestGuestShutdown = func(_ context.Context, socketPath string) error {
+		return nil
+	}
+	waitForProcessExit = func(waitPID int, timeout time.Duration) error {
+		return errProcessExitTimeout
+	}
+	forceStopProcess = func(pid int) error {
+		t.Fatalf("forceStopProcess(%d) should not be used after a graceful shutdown timeout", pid)
+		return nil
+	}
+	var killedPID int
+	killProcessNow = func(pid int) error {
+		killedPID = pid
+		return nil
+	}
+
+	if err := server.stopVM(context.Background(), StopRequest{Name: "demo", PID: pid}); err != nil {
+		t.Fatalf("stopVM(): %v", err)
+	}
+	if killedPID != pid {
+		t.Fatalf("killProcessNow pid = %d, want %d", killedPID, pid)
+	}
+}
+
+func TestStopProcessWithGraceWaitsAfterSIGKILL(t *testing.T) {
+	pid := startStopVMTestProcess(t)
+
+	oldWait := waitForProcessExit
+	t.Cleanup(func() {
+		waitForProcessExit = oldWait
+	})
+
+	var calls []time.Duration
+	waitForProcessExit = func(waitPID int, timeout time.Duration) error {
+		if waitPID != pid {
+			t.Fatalf("waitForProcessExit pid = %d, want %d", waitPID, pid)
+		}
+		calls = append(calls, timeout)
+		if len(calls) == 1 {
+			return errProcessExitTimeout
+		}
+		if timeout != postKillWaitTimeout {
+			t.Fatalf("post-kill wait timeout = %s, want %s", timeout, postKillWaitTimeout)
+		}
+		return nil
+	}
+
+	if err := stopProcessWithGrace(pid, time.Second); err != nil {
+		t.Fatalf("stopProcessWithGrace(): %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("waitForProcessExit calls = %d, want 2", len(calls))
+	}
+}
+
 func TestReadUnifiedCgroupPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cgroup")
 	if err := os.WriteFile(path, []byte("12:memory:/system.slice/srv-vm-runner.service\n0::/system.slice/srv-vm-runner.service\n"), 0o644); err != nil {
@@ -199,12 +324,84 @@ func TestReadUnifiedCgroupPath(t *testing.T) {
 	}
 }
 
+func TestDetectJailerCgroupVersion(t *testing.T) {
+	oldCurrent := currentCgroupPath
+	t.Cleanup(func() {
+		currentCgroupPath = oldCurrent
+	})
+
+	currentCgroupPath = func() (string, error) {
+		return "/system.slice/srv-vm-runner.service", nil
+	}
+	if got := detectJailerCgroupVersion(); got != "2" {
+		t.Fatalf("detectJailerCgroupVersion() = %q, want %q", got, "2")
+	}
+
+	currentCgroupPath = func() (string, error) {
+		return "", errors.New("no unified hierarchy")
+	}
+	if got := detectJailerCgroupVersion(); got != "1" {
+		t.Fatalf("detectJailerCgroupVersion() = %q, want %q", got, "1")
+	}
+}
+
+func TestDisabledJailerNumaNodeOmitsCpusetCgroups(t *testing.T) {
+	args := firecracker.NewJailerCommandBuilder().
+		WithID("demo").
+		WithUID(123).
+		WithGID(456).
+		WithNumaNode(disabledJailerNumaNode).
+		WithExecFile("/usr/bin/firecracker").
+		WithCgroupVersion("2").
+		Args()
+
+	want := []string{
+		"--id", "demo",
+		"--uid", "123",
+		"--gid", "456",
+		"--exec-file", "/usr/bin/firecracker",
+		"--cgroup-version", "2",
+	}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("JailerCommandBuilder.Args() = %#v, want %#v", args, want)
+	}
+}
+
+func TestValidateJailedFirecrackerBinary(t *testing.T) {
+	t.Run("accepts static elf without interpreter", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "firecracker-static")
+		if err := writeTestELF(path, ""); err != nil {
+			t.Fatalf("writeTestELF(static): %v", err)
+		}
+		if err := validateJailedFirecrackerBinary(path); err != nil {
+			t.Fatalf("validateJailedFirecrackerBinary(static): %v", err)
+		}
+	})
+
+	t.Run("rejects dynamic elf with interpreter", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "firecracker-dynamic")
+		const interp = "/lib64/ld-linux-x86-64.so.2"
+		if err := writeTestELF(path, interp); err != nil {
+			t.Fatalf("writeTestELF(dynamic): %v", err)
+		}
+		err := validateJailedFirecrackerBinary(path)
+		if err == nil {
+			t.Fatal("validateJailedFirecrackerBinary(dynamic) unexpectedly succeeded")
+		}
+		if !strings.Contains(err.Error(), interp) {
+			t.Fatalf("validateJailedFirecrackerBinary(dynamic) error = %q, want interpreter %q", err, interp)
+		}
+	})
+}
+
 func TestAssignAndCleanupFirecrackerCgroup(t *testing.T) {
 	oldRoot := cgroupFSRoot
 	oldCurrent := currentCgroupPath
+	oldRemove := removePath
 	t.Cleanup(func() {
 		cgroupFSRoot = oldRoot
 		currentCgroupPath = oldCurrent
+		removePath = oldRemove
 	})
 
 	cgroupFSRoot = t.TempDir()
@@ -241,6 +438,48 @@ func TestAssignAndCleanupFirecrackerCgroup(t *testing.T) {
 	}
 	if err := assignFirecrackerToCgroup("nested/demo", 1); err == nil {
 		t.Fatalf("assignFirecrackerToCgroup() accepted an unsafe name")
+	}
+}
+
+func TestCleanupFirecrackerCgroupIgnoresBusySharedRoot(t *testing.T) {
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	oldRemove := removePath
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+		removePath = oldRemove
+	})
+
+	cgroupFSRoot = t.TempDir()
+	currentCgroupPath = func() (string, error) {
+		return "/system.slice/srv-vm-runner.service", nil
+	}
+
+	serviceCgroup := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service")
+	if err := os.MkdirAll(filepath.Join(serviceCgroup, "firecracker-vms", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(demo): %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(serviceCgroup, "firecracker-vms", "other"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(other): %v", err)
+	}
+
+	vmRoot := filepath.Join(serviceCgroup, "firecracker-vms")
+	removePath = func(path string) error {
+		if path == vmRoot {
+			return syscall.EBUSY
+		}
+		return os.Remove(path)
+	}
+
+	if err := cleanupFirecrackerCgroup("demo"); err != nil {
+		t.Fatalf("cleanupFirecrackerCgroup(): %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(vmRoot, "demo")); !os.IsNotExist(err) {
+		t.Fatalf("demo cgroup should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(vmRoot, "other")); err != nil {
+		t.Fatalf("other cgroup should remain, stat err = %v", err)
 	}
 }
 
@@ -310,4 +549,111 @@ func TestResolveJailerRuntimePaths(t *testing.T) {
 	if _, err := resolveJailerRuntimePaths("/var/lib/srv/jailer", "/usr/bin/firecracker", "nested/demo"); err == nil {
 		t.Fatalf("resolveJailerRuntimePaths() accepted an unsafe name")
 	}
+}
+
+func writeTestELF(path, interp string) error {
+	var (
+		phoff uint64
+		phnum uint16
+		data  []byte
+	)
+	if interp != "" {
+		phoff = 64
+		phnum = 1
+		data = append([]byte(interp), 0)
+	}
+
+	buf := bytes.NewBuffer(make([]byte, 0, 64+56+len(data)))
+	ident := [16]byte{0x7f, 'E', 'L', 'F', 2, 1, 1}
+	if _, err := buf.Write(ident[:]); err != nil {
+		return err
+	}
+	for _, value := range []any{
+		uint16(2),
+		uint16(62),
+		uint32(1),
+		uint64(0),
+		phoff,
+		uint64(0),
+		uint32(0),
+		uint16(64),
+		uint16(56),
+		phnum,
+		uint16(0),
+		uint16(0),
+		uint16(0),
+	} {
+		if err := binary.Write(buf, binary.LittleEndian, value); err != nil {
+			return err
+		}
+	}
+	if interp != "" {
+		for _, value := range []any{
+			uint32(3),
+			uint32(0),
+			uint64(64 + 56),
+			uint64(0),
+			uint64(0),
+			uint64(len(data)),
+			uint64(len(data)),
+			uint64(1),
+		} {
+			if err := binary.Write(buf, binary.LittleEndian, value); err != nil {
+				return err
+			}
+		}
+		if _, err := buf.Write(data); err != nil {
+			return err
+		}
+	}
+
+	return os.WriteFile(path, buf.Bytes(), 0o755)
+}
+
+func newStopVMTestServer(t *testing.T) *Server {
+	t.Helper()
+
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+	})
+
+	instancesDir := filepath.Join(t.TempDir(), "instances")
+	if err := os.MkdirAll(filepath.Join(instancesDir, "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(instance dir): %v", err)
+	}
+	cgroupFSRoot = t.TempDir()
+	currentCgroupPath = func() (string, error) {
+		return "/system.slice/srv-vm-runner.service", nil
+	}
+	if err := os.MkdirAll(filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service", "firecracker-vms", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(cgroup): %v", err)
+	}
+
+	return NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		JailerBinary:      "/usr/bin/jailer",
+		JailerBaseDir:     filepath.Join(t.TempDir(), "jailer"),
+		InstancesDir:      instancesDir,
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	})
+}
+
+func startStopVMTestProcess(t *testing.T) int {
+	t.Helper()
+
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start(sleep): %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process == nil {
+			return
+		}
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return cmd.Process.Pid
 }

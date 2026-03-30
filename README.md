@@ -33,8 +33,9 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - Firecracker launches each VM with a TAP device and host-side NAT.
 - A small root-only network helper owns TAP and iptables mutations, while a separate root-owned VM runner service invokes Firecracker through the official jailer, drops the microVM process to `srv-vm:srv`, manages per-VM cgroups, and derives host runtime paths from `SRV_DATA_DIR/instances`.
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
-- `new`, `resize`, `list`, `inspect`, `start`, `stop`, `restart`, and `delete` are implemented.
+- `new`, `resize`, `list`, `inspect`, `logs`, `start`, `stop`, `restart`, and `delete` are implemented.
 - When `srv` starts under systemd after a host reboot, previously active instances are restarted automatically.
+- Instance creators can see and manage their own instances by default, while optional admin users can see and manage every instance.
 
 ## Non-Goals For Now
 
@@ -50,11 +51,8 @@ Moving past MVP here means making the single-host service safer to share and eas
 
 Ordered by current impact for this single-host design, with effort called out so the next steps stay pragmatic:
 
-1. Ownership-aware authz and visibility. High impact, medium effort. Instance creators should not automatically be able to manage every instance just because they can reach the service; owner-by-default behavior with an explicit admin path is the clearest first step past MVP.
-2. Better operator debugging. High impact, low effort. Add remote access to serial and Firecracker logs, and make `inspect` point directly at the relevant failure surface when a guest is stuck in `awaiting-tailnet` or fails during boot.
-3. Backup, restore, and upgrade runbook. High impact, medium effort. Define and test how to back up `SRV_DATA_DIR`, recover a host, and roll forward guest image or schema changes without improvisation.
-4. Host-level smoke test. Medium-high impact, medium effort. Add one repeatable end-to-end validation path that exercises the systemd units, both helpers, the jailer, guest tailnet join, and teardown on a real host.
-5. Service hardening and resource controls. Medium impact, medium effort. Tighten the privileged helpers further, document the expected host security posture, and make per-VM resource limits part of normal operations.
+1. Backup, restore, and upgrade runbook. High impact, medium effort. Define and test how to back up `SRV_DATA_DIR`, recover a host, and roll forward guest image or schema changes without improvisation.
+2. Service hardening and resource controls. Medium impact, medium effort. Tighten the privileged helpers further, document the expected host security posture, and make per-VM resource limits part of normal operations.
 
 ## Instance Lifecycle Notes
 
@@ -63,11 +61,20 @@ Ordered by current impact for this single-host design, with effort called out so
 - CPU and memory changes are persisted on the instance record and take effect on the next `start` or `restart`.
 - Rootfs resizing is grow-only. Requests smaller than the current disk image are rejected.
 - Rootfs growth happens on the host by expanding the disk image and filesystem before the next boot; live resize is not supported.
+- `logs <name>` shows recent serial and Firecracker log output remotely, or a single surface with `logs <name> serial` / `logs <name> firecracker`.
+
+## Authz Model
+
+- `SRV_ALLOWED_USERS` controls who may invoke the service at all. If it is empty, any reachable tailnet user may issue commands.
+- Instance creators can list, inspect, resize, start, stop, restart, delete, and read logs for their own instances.
+- `SRV_ADMIN_USERS` grants cross-instance visibility and management for operators who need to act across the whole host.
 
 ## Host Requirements
 
 - Linux host with `/dev/kvm`
-- Firecracker and jailer installed, default paths `/usr/bin/firecracker` and `/usr/bin/jailer`
+- Firecracker and jailer installed, or let `contrib/systemd/install.sh` download the official static release pair into `/usr/local/bin`
+- The jailer path expects a statically linked Firecracker binary compatible with the official musl release builds; dynamically linked distro builds can fail after chroot before the API socket appears
+- If `/etc/srv/srv.env` already exists, confirm `SRV_FIRECRACKER_BIN` and `SRV_JAILER_BIN` point at the intended static binaries after running the installer; the installer keeps existing env files unless you opt into overwriting them
 - `ip`, `iptables`, `cp`, `resize2fs`, and `stat` available on the host
 - `SRV_DATA_DIR` on Btrfs
 - Tailscale tailnet access for the control plane
@@ -78,6 +85,7 @@ Ordered by current impact for this single-host design, with effort called out so
 - `TS_AUTHKEY` or `TS_CLIENT_SECRET` / `TS_CLIENT_ID`: control-plane Tailscale credentials
 - `TS_TAILNET`: tailnet name used for guest auth-key minting
 - `SRV_ALLOWED_USERS`: optional comma-separated Tailscale login allowlist
+- `SRV_ADMIN_USERS`: optional comma-separated Tailscale login list with cross-instance visibility and management rights
 - `SRV_BASE_KERNEL`: Firecracker guest kernel image
 - `SRV_BASE_INITRD`: optional initrd image
 - `SRV_BASE_ROOTFS`: base guest rootfs image stored on Btrfs
@@ -117,12 +125,19 @@ sudoedit /etc/srv/srv.env
 sudo ./contrib/systemd/install.sh --enable-now
 ```
 
+That installer now downloads the matching official Firecracker and jailer release tarball, verifies its published SHA256 sidecar, and installs the static binaries under `/usr/local/bin` by default.
+
+If `/etc/srv/srv.env` already exists, the installer keeps it by default. On upgraded hosts, verify that `SRV_FIRECRACKER_BIN` and `SRV_JAILER_BIN` were not left pointing at older distro binaries under `/usr/bin`.
+
 Install the binaries, units, and environment file like this:
 
 ```bash
 go build -o /usr/local/bin/srv ./cmd/srv
 go build -o /usr/local/bin/srv-net-helper ./cmd/srv-net-helper
 go build -o /usr/local/bin/srv-vm-runner ./cmd/srv-vm-runner
+curl -L https://github.com/firecracker-microvm/firecracker/releases/download/v1.15.0/firecracker-v1.15.0-$(uname -m).tgz | tar -xz
+sudo install -m 0755 release-v1.15.0-$(uname -m)/firecracker-v1.15.0-$(uname -m) /usr/local/bin/firecracker
+sudo install -m 0755 release-v1.15.0-$(uname -m)/jailer-v1.15.0-$(uname -m) /usr/local/bin/jailer
 sudo install -d -m 0755 /etc/srv
 sudo install -m 0644 contrib/systemd/srv.service /etc/systemd/system/srv.service
 sudo install -m 0644 contrib/systemd/srv-net-helper.service /etc/systemd/system/srv-net-helper.service
@@ -134,6 +149,20 @@ sudo systemctl enable --now srv
 ```
 
 Under systemd, the main `srv` unit runs as the dedicated `srv` service user, the root-owned network helper owns host-side TAP and firewall mutation, and the separate root-owned VM runner invokes Firecracker through the official jailer before dropping the microVM process to `srv-vm:srv`. The runner still derives each VM's `rootfs.img`, logs, and Firecracker socket from `SRV_DATA_DIR/instances/<name>/` instead of accepting caller-supplied host paths, while the jailer builds its chroot workspaces under `SRV_JAILER_BASE_DIR`. Keep `SRV_DATA_DIR` on Btrfs and point `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` at the artifacts built under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
+
+The `srv-vm-runner` unit is expected to run as `User=root` and `Group=srv` so the control plane can reach `/run/srv-vm-runner/vm-runner.sock` while the jailer still has the privileges it needs to set up the microVM sandbox. In particular, do not add `NoNewPrivileges=yes` to that unit: the jailer must drop to the configured `srv-vm:srv` identity and `exec` Firecracker on real hosts.
+
+## Host-Level Smoke Test
+
+For a repeatable end-to-end validation pass on a prepared host, run [contrib/smoke/host-smoke.sh](contrib/smoke/host-smoke.sh):
+
+```bash
+sudo ./contrib/smoke/host-smoke.sh
+```
+
+That harness validates the systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` units, creates a real guest over the SSH control path, waits for readiness, opens a real guest SSH session, exercises a stop/start cycle, and finally deletes the guest. On failure it collects `inspect`, `logs`, `systemctl status`, and `journalctl` artifacts automatically. See [contrib/smoke/README.md](contrib/smoke/README.md) for prerequisites, environment overrides, and artifact locations.
+
+When debugging a failed host run, start with `ssh root@srv inspect <name>`, then compare the newest lines from `ssh root@srv logs <name> serial`, `ssh root@srv logs <name> firecracker`, and `journalctl -u srv-vm-runner`. The serial and Firecracker log files are append-only, so the latest lines are the trustworthy ones for the current failure.
 
 ## Build The Arch Base Image
 
@@ -161,14 +190,14 @@ The service injects Firecracker MMDS JSON like this:
 }
 ```
 
-The Arch guest image is expected to include a first-boot service that:
+The Arch guest image is expected to include a boot-time service that:
 
 1. Discovers the primary virtio NIC from the kernel-provided default route
 2. Adds a `169.254.169.254/32` route over that NIC
 3. Reads the MMDS payload from `http://169.254.169.254/` while requesting JSON output
 4. Sets the hostname from `srv.hostname`
 5. Starts `tailscaled`
-6. Runs `tailscale up --auth-key=... --ssh`
+6. Runs `tailscale up --auth-key=... --ssh` on the first authenticated boot and relies on persisted `tailscaled` state on later boots
 7. Deletes any transient copy of the key it created locally
 
 The control plane does not mutate the guest disk directly in this version; it relies on the image consuming the MMDS contract.

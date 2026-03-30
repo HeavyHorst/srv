@@ -7,15 +7,15 @@ It produces two artifacts:
 - `vmlinux`: an x86_64 Firecracker-compatible kernel built from the upstream 6.12 LTS kernel using Firecracker's recommended 6.1 guest config as a seed plus a small fragment for Tailscale, Arch guest usability, and Firecracker's current x86 ACPI boot requirements.
 - `rootfs-base.img`: a sparse ext4 image populated with an Arch userspace via `pacstrap`.
 
-The guest rootfs includes a first-boot `srv-bootstrap.service` that:
+The guest rootfs includes a boot-time `srv-bootstrap.service` that:
 
 1. discovers the primary virtio interface from the kernel-provided default route
 2. adds a route to Firecracker MMDS at `169.254.169.254/32`
 3. reads the MMDS payload from `http://169.254.169.254/` with `Accept: application/json`
 4. sets the hostname from `srv.hostname`
 5. starts `tailscaled`
-6. runs `tailscale up --auth-key=... --hostname=... --ssh`
-7. writes `/var/lib/srv/bootstrap.done` so later boots do not reuse the one-off auth key
+6. runs `tailscale up --auth-key=... --hostname=... --ssh` on the first authenticated boot and relies on persisted `tailscaled` state on later boots
+7. writes `/var/lib/srv/bootstrap.done` with the latest successful bootstrap timestamp for debugging
 
 That `--ssh` flag is intentional: it makes the control plane's existing `connect: ssh root@<name>` output usable through Tailscale SSH without injecting per-user OpenSSH keys into the guest image.
 
@@ -53,6 +53,8 @@ To write directly into the service's expected runtime image directory:
 ```bash
 sudo OUTPUT_DIR=/var/lib/srv/images/arch-base ./images/arch-base/build.sh
 ```
+
+Changes under `overlay/` only reach new guests after you rebuild `rootfs-base.img` and refresh the host's configured base rootfs artifact.
 
 ## Outputs
 

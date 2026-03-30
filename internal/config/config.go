@@ -37,6 +37,7 @@ type Config struct {
 	TailscaleAdvertiseTags []string
 	Tailnet                string
 	AllowedUsers           []string
+	AdminUsers             []string
 
 	BaseKernelPath           string
 	BaseInitrdPath           string
@@ -74,6 +75,7 @@ func Load() (Config, error) {
 	flag.StringVar(&cfg.TailscaleAPIBaseURL, "tailscale-api-base-url", getenv("TS_API_BASE_URL", getenv("TS_BASE_URL", "https://api.tailscale.com")), "tailscale control API base URL")
 	flag.StringVar(&cfg.Tailnet, "tailnet", os.Getenv("TS_TAILNET"), "tailnet name used for API operations")
 	allowedUsers := flag.String("allowed-users", getenv("SRV_ALLOWED_USERS", ""), "comma separated tailscale user logins allowed to invoke commands")
+	adminUsers := flag.String("admin-users", getenv("SRV_ADMIN_USERS", ""), "comma separated tailscale user logins allowed to view and manage every instance")
 	advertiseTags := flag.String("advertise-tags", getenv("SRV_ADVERTISE_TAGS", ""), "comma separated tailscale tags to advertise for the control-plane node")
 
 	flag.StringVar(&cfg.BaseKernelPath, "base-kernel", getenv("SRV_BASE_KERNEL", ""), "path to the Firecracker kernel image")
@@ -97,6 +99,7 @@ func Load() (Config, error) {
 	flag.Parse()
 
 	cfg.AllowedUsers = splitCSV(*allowedUsers)
+	cfg.AdminUsers = splitCSV(*adminUsers)
 	cfg.TailscaleAdvertiseTags = splitCSV(*advertiseTags)
 	cfg.VMDNSServers = splitCSV(*vmDNS)
 	cfg.GuestAuthTags = splitCSV(*guestTags)

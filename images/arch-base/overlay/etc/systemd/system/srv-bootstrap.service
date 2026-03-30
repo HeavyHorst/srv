@@ -1,8 +1,7 @@
 [Unit]
-Description=srv guest first-boot bootstrap
+Description=srv guest tailscale bootstrap
 After=local-fs.target tailscaled.service
 Wants=tailscaled.service
-ConditionPathExists=!/var/lib/srv/bootstrap.done
 
 [Service]
 Type=oneshot

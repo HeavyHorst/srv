@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -49,6 +50,16 @@ type commandResult struct {
 	stderr   string
 	exitCode int
 }
+
+type logTarget string
+
+const (
+	logTargetAll         logTarget = "all"
+	logTargetSerial      logTarget = "serial"
+	logTargetFirecracker logTarget = "firecracker"
+	defaultLogTailLines            = 40
+	mib                            = int64(1024 * 1024)
+)
 
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	for _, dir := range []string{cfg.DataDirAbs(), cfg.StateDir(), cfg.ImagesDir(), cfg.InstancesDir(), cfg.TSNetDir()} {
@@ -254,19 +265,21 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, args []string) (c
 	case "new":
 		return a.cmdNew(ctx, actor, args)
 	case "resize":
-		return a.cmdResize(ctx, args)
+		return a.cmdResize(ctx, actor, args)
 	case "list":
-		return a.cmdList(ctx)
+		return a.cmdList(ctx, actor)
 	case "inspect":
-		return a.cmdInspect(ctx, args)
+		return a.cmdInspect(ctx, actor, args)
+	case "logs":
+		return a.cmdLogs(ctx, actor, args)
 	case "start":
-		return a.cmdStart(ctx, args)
+		return a.cmdStart(ctx, actor, args)
 	case "stop":
-		return a.cmdStop(ctx, args)
+		return a.cmdStop(ctx, actor, args)
 	case "restart":
-		return a.cmdRestart(ctx, args)
+		return a.cmdRestart(ctx, actor, args)
 	case "delete":
-		return a.cmdDelete(ctx, args)
+		return a.cmdDelete(ctx, actor, args)
 	case "help":
 		return helpResult(), nil
 	default:
@@ -287,7 +300,7 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string) (com
 	if err != nil {
 		stderr := fmt.Sprintf("create %s: %v\n", name, err)
 		if inst.Name != "" {
-			stderr += fmt.Sprintf("inspect: ssh root@%s inspect %s\n", a.cfg.Hostname, inst.Name)
+			stderr += instanceDebugHints(a.cfg.Hostname, inst)
 		}
 		return commandResult{stderr: stderr, exitCode: 1}, err
 	}
@@ -295,7 +308,7 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string) (com
 	return lifecycleReadyResult("created", inst), nil
 }
 
-func (a *App) cmdResize(ctx context.Context, args []string) (commandResult, error) {
+func (a *App) cmdResize(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
 	name, opts, err := parseResizeArgs(args)
 	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -304,6 +317,10 @@ func (a *App) cmdResize(ctx context.Context, args []string) (commandResult, erro
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
+		return missingInstanceResult("resize", name, err)
+	}
+
 	inst, err := a.provisioner.Resize(ctx, name, opts)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -311,7 +328,7 @@ func (a *App) cmdResize(ctx context.Context, args []string) (commandResult, erro
 		}
 		stderr := fmt.Sprintf("resize %s: %v\n", name, err)
 		if inst.Name != "" {
-			stderr += fmt.Sprintf("inspect: ssh root@%s inspect %s\n", a.cfg.Hostname, inst.Name)
+			stderr += instanceDebugHints(a.cfg.Hostname, inst)
 		}
 		return commandResult{stderr: stderr, exitCode: 1}, err
 	}
@@ -327,11 +344,12 @@ func (a *App) cmdResize(ctx context.Context, args []string) (commandResult, erro
 	return commandResult{stdout: stdout, exitCode: 0}, nil
 }
 
-func (a *App) cmdList(ctx context.Context) (commandResult, error) {
+func (a *App) cmdList(ctx context.Context, actor model.Actor) (commandResult, error) {
 	instances, err := a.store.ListInstances(ctx, false)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("list instances: %v\n", err), exitCode: 1}, err
 	}
+	instances = a.visibleInstances(actor, instances)
 	if len(instances) == 0 {
 		return commandResult{stdout: "no instances\n", exitCode: 0}, nil
 	}
@@ -350,18 +368,15 @@ func (a *App) cmdList(ctx context.Context) (commandResult, error) {
 	return commandResult{stdout: b.String(), exitCode: 0}, nil
 }
 
-func (a *App) cmdInspect(ctx context.Context, args []string) (commandResult, error) {
+func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: inspect <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
-	inst, err := a.store.GetInstance(ctx, args[1])
+	inst, err := a.lookupVisibleInstance(ctx, actor, args[1])
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			err = fmt.Errorf("instance %q does not exist", args[1])
-		}
-		return commandResult{stderr: fmt.Sprintf("inspect %s: %v\n", args[1], err), exitCode: 1}, err
+		return missingInstanceResult("inspect", args[1], err)
 	}
 	events, err := a.store.ListEvents(ctx, inst.ID, 10)
 	if err != nil {
@@ -401,6 +416,11 @@ func (a *App) cmdInspect(ctx context.Context, args []string) (commandResult, err
 	if inst.DeletedAt != nil {
 		b.WriteString(fmt.Sprintf("deleted-at: %s\n", inst.DeletedAt.Format(time.RFC3339)))
 	}
+	b.WriteString(fmt.Sprintf("logs-serial: ssh root@%s logs %s serial\n", a.cfg.Hostname, inst.Name))
+	b.WriteString(fmt.Sprintf("logs-firecracker: ssh root@%s logs %s firecracker\n", a.cfg.Hostname, inst.Name))
+	if hint := inspectDebugHint(inst); hint != "" {
+		b.WriteString(fmt.Sprintf("debug-hint: %s\n", hint))
+	}
 	b.WriteString("events:\n")
 	for _, evt := range events {
 		b.WriteString(fmt.Sprintf("- %s [%s] %s\n", evt.CreatedAt.Format(time.RFC3339), evt.Type, evt.Message))
@@ -408,7 +428,25 @@ func (a *App) cmdInspect(ctx context.Context, args []string) (commandResult, err
 	return commandResult{stdout: b.String(), exitCode: 0}, nil
 }
 
-func (a *App) cmdStart(ctx context.Context, args []string) (commandResult, error) {
+func (a *App) cmdLogs(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+	name, target, err := parseLogsArgs(args)
+	if err != nil {
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+
+	inst, err := a.lookupVisibleInstance(ctx, actor, name)
+	if err != nil {
+		return missingInstanceResult("logs", name, err)
+	}
+
+	stdout, err := formatLogOutput(inst, target)
+	if err != nil {
+		return commandResult{stderr: fmt.Sprintf("logs %s: %v\n", name, err), exitCode: 1}, err
+	}
+	return commandResult{stdout: stdout, exitCode: 0}, nil
+}
+
+func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: start <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -417,18 +455,22 @@ func (a *App) cmdStart(ctx context.Context, args []string) (commandResult, error
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
+		return missingInstanceResult("start", args[1], err)
+	}
+
 	inst, err := a.provisioner.Start(ctx, args[1])
 	if err != nil {
 		stderr := fmt.Sprintf("start %s: %v\n", args[1], err)
 		if inst.Name != "" {
-			stderr += fmt.Sprintf("inspect: ssh root@%s inspect %s\n", a.cfg.Hostname, inst.Name)
+			stderr += instanceDebugHints(a.cfg.Hostname, inst)
 		}
 		return commandResult{stderr: stderr, exitCode: 1}, err
 	}
 	return lifecycleReadyResult("started", inst), nil
 }
 
-func (a *App) cmdStop(ctx context.Context, args []string) (commandResult, error) {
+func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: stop <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -436,6 +478,10 @@ func (a *App) cmdStop(ctx context.Context, args []string) (commandResult, error)
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
+		return missingInstanceResult("stop", args[1], err)
+	}
 
 	inst, err := a.provisioner.Stop(ctx, args[1])
 	if err != nil {
@@ -447,7 +493,7 @@ func (a *App) cmdStop(ctx context.Context, args []string) (commandResult, error)
 	return commandResult{stdout: fmt.Sprintf("stopped: %s\nstate: %s\n", inst.Name, inst.State), exitCode: 0}, nil
 }
 
-func (a *App) cmdRestart(ctx context.Context, args []string) (commandResult, error) {
+func (a *App) cmdRestart(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: restart <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -455,6 +501,10 @@ func (a *App) cmdRestart(ctx context.Context, args []string) (commandResult, err
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
+		return missingInstanceResult("restart", args[1], err)
+	}
 
 	if _, err := a.provisioner.Stop(ctx, args[1]); err != nil && !strings.Contains(err.Error(), "already stopped") {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -466,14 +516,14 @@ func (a *App) cmdRestart(ctx context.Context, args []string) (commandResult, err
 	if err != nil {
 		stderr := fmt.Sprintf("restart %s: %v\n", args[1], err)
 		if inst.Name != "" {
-			stderr += fmt.Sprintf("inspect: ssh root@%s inspect %s\n", a.cfg.Hostname, inst.Name)
+			stderr += instanceDebugHints(a.cfg.Hostname, inst)
 		}
 		return commandResult{stderr: stderr, exitCode: 1}, err
 	}
 	return lifecycleReadyResult("restarted", inst), nil
 }
 
-func (a *App) cmdDelete(ctx context.Context, args []string) (commandResult, error) {
+func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: delete <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -481,6 +531,10 @@ func (a *App) cmdDelete(ctx context.Context, args []string) (commandResult, erro
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
+		return missingInstanceResult("delete", args[1], err)
+	}
 
 	inst, err := a.provisioner.Delete(ctx, args[1])
 	if err != nil {
@@ -493,7 +547,7 @@ func (a *App) cmdDelete(ctx context.Context, args []string) (commandResult, erro
 }
 
 func helpResult() commandResult {
-	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], list, inspect <name>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
+	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], list, inspect <name>, logs <name> [serial|firecracker], start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
 }
 
 func lifecycleReadyResult(action string, inst model.Instance) commandResult {
@@ -531,14 +585,52 @@ func (a *App) authorize(actor model.Actor, command string) (bool, string) {
 	return false, fmt.Sprintf("%s is not in SRV_ALLOWED_USERS", actor.UserLogin)
 }
 
+func (a *App) isAdmin(actor model.Actor) bool {
+	for _, user := range a.cfg.AdminUsers {
+		if strings.EqualFold(user, actor.UserLogin) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) canAccessInstance(actor model.Actor, inst model.Instance) bool {
+	if a.isAdmin(actor) {
+		return true
+	}
+	return strings.EqualFold(inst.CreatedByUser, actor.UserLogin)
+}
+
+func (a *App) visibleInstances(actor model.Actor, instances []model.Instance) []model.Instance {
+	if a.isAdmin(actor) {
+		return instances
+	}
+	visible := make([]model.Instance, 0, len(instances))
+	for _, inst := range instances {
+		if a.canAccessInstance(actor, inst) {
+			visible = append(visible, inst)
+		}
+	}
+	return visible
+}
+
+func (a *App) lookupVisibleInstance(ctx context.Context, actor model.Actor, name string) (model.Instance, error) {
+	inst, err := a.store.GetInstance(ctx, name)
+	if err != nil {
+		return model.Instance{}, err
+	}
+	if !a.canAccessInstance(actor, inst) {
+		return model.Instance{}, sql.ErrNoRows
+	}
+	return inst, nil
+}
+
 func trimNodeName(primary, fallback string) string {
 	if primary != "" {
 		return strings.TrimSuffix(primary, ".")
 	}
 	return strings.TrimSuffix(fallback, ".")
 }
-
-const mib = int64(1024 * 1024)
 
 func parseNewArgs(args []string) (string, provision.CreateOptions, error) {
 	return parseSizedInstanceArgs(args, newUsage())
@@ -553,6 +645,23 @@ func parseResizeArgs(args []string) (string, provision.CreateOptions, error) {
 		return "", provision.CreateOptions{}, fmt.Errorf("resize requires at least one of --cpus, --ram, or --rootfs-size\n%s", resizeUsage())
 	}
 	return name, opts, nil
+}
+
+func parseLogsArgs(args []string) (string, logTarget, error) {
+	if len(args) < 2 || len(args) > 3 {
+		return "", "", errors.New(logsUsage())
+	}
+	if len(args) == 2 {
+		return args[1], logTargetAll, nil
+	}
+	switch logTarget(args[2]) {
+	case logTargetSerial:
+		return args[1], logTargetSerial, nil
+	case logTargetFirecracker:
+		return args[1], logTargetFirecracker, nil
+	default:
+		return "", "", fmt.Errorf("unknown log target %q\n%s", args[2], logsUsage())
+	}
 }
 
 func parseSizedInstanceArgs(args []string, usage string) (string, provision.CreateOptions, error) {
@@ -635,6 +744,10 @@ func newUsage() string {
 
 func resizeUsage() string {
 	return "usage: resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]"
+}
+
+func logsUsage() string {
+	return "usage: logs <name> [serial|firecracker]"
 }
 
 func parseSize(value string, defaultUnit int64) (int64, error) {
@@ -728,6 +841,95 @@ func formatBinarySize(sizeBytes int64) string {
 		}
 	}
 	return fmt.Sprintf("%.1f %s", size, unit)
+}
+
+func missingInstanceResult(command, name string, err error) (commandResult, error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		err = fmt.Errorf("instance %q does not exist", name)
+	}
+	return commandResult{stderr: fmt.Sprintf("%s %s: %v\n", command, name, err), exitCode: 1}, err
+}
+
+func inspectDebugHint(inst model.Instance) string {
+	if inst.State == model.StateAwaitingTailnet {
+		return "guest has not finished initial tailnet bootstrap; start with the serial log"
+	}
+	if inst.State == model.StateFailed || inst.LastError != "" {
+		return "boot and runtime failures usually show up first in the serial log, then in the Firecracker log"
+	}
+	return ""
+}
+
+func instanceDebugHints(hostname string, inst model.Instance) string {
+	return fmt.Sprintf("inspect: ssh root@%s inspect %s\nlogs-serial: ssh root@%s logs %s serial\nlogs-firecracker: ssh root@%s logs %s firecracker\n", hostname, inst.Name, hostname, inst.Name, hostname, inst.Name)
+}
+
+func formatLogOutput(inst model.Instance, target logTarget) (string, error) {
+	sections := make([]string, 0, 2)
+	if target == logTargetAll || target == logTargetSerial {
+		section, err := formatLogSection("serial", inst.SerialLogPath)
+		if err != nil {
+			return "", err
+		}
+		sections = append(sections, section)
+	}
+	if target == logTargetAll || target == logTargetFirecracker {
+		section, err := formatLogSection("firecracker", inst.LogPath)
+		if err != nil {
+			return "", err
+		}
+		sections = append(sections, section)
+	}
+	return strings.Join(sections, "\n"), nil
+}
+
+func formatLogSection(label, path string) (string, error) {
+	lines, exists, err := readLastLines(path, defaultLogTailLines)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%s-log: %s\n", label, path))
+	switch {
+	case !exists:
+		b.WriteString("(log file has not been created yet)\n")
+	case len(lines) == 0:
+		b.WriteString("(log is empty)\n")
+	default:
+		for _, line := range lines {
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+	return b.String(), nil
+}
+
+func readLastLines(path string, limit int) ([]string, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lines := make([]string, 0, limit)
+	for scanner.Scan() {
+		if len(lines) == limit {
+			copy(lines, lines[1:])
+			lines[len(lines)-1] = scanner.Text()
+			continue
+		}
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, false, err
+	}
+	return lines, true, nil
 }
 
 func ensureHostSigner(path string) (ssh.Signer, error) {

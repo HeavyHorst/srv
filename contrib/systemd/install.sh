@@ -7,6 +7,11 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 BINARY_PATH="${BINARY_PATH:-/usr/local/bin/srv}"
 HELPER_BINARY_PATH="${HELPER_BINARY_PATH:-/usr/local/bin/srv-net-helper}"
 VM_RUNNER_BINARY_PATH="${VM_RUNNER_BINARY_PATH:-/usr/local/bin/srv-vm-runner}"
+FIRECRACKER_BINARY_PATH="${FIRECRACKER_BINARY_PATH:-/usr/local/bin/firecracker}"
+JAILER_BINARY_PATH="${JAILER_BINARY_PATH:-/usr/local/bin/jailer}"
+FIRECRACKER_RELEASE_VERSION="${FIRECRACKER_RELEASE_VERSION:-v1.15.0}"
+FIRECRACKER_RELEASE_BASE_URL="${FIRECRACKER_RELEASE_BASE_URL:-https://github.com/firecracker-microvm/firecracker/releases/download}"
+INSTALL_FIRECRACKER_RELEASE="${INSTALL_FIRECRACKER_RELEASE:-1}"
 UNIT_PATH="${UNIT_PATH:-/etc/systemd/system/srv.service}"
 HELPER_UNIT_PATH="${HELPER_UNIT_PATH:-/etc/systemd/system/srv-net-helper.service}"
 VM_RUNNER_UNIT_PATH="${VM_RUNNER_UNIT_PATH:-/etc/systemd/system/srv-vm-runner.service}"
@@ -24,7 +29,8 @@ usage() {
 	cat <<EOF
 usage: sudo ./contrib/systemd/install.sh [options]
 
-Installs the srv binary, systemd unit, and environment file.
+Installs the srv binaries, the systemd units, the environment file, and an
+official static Firecracker/jailer release pair by default.
 
 Options:
   --overwrite-env  replace ${ENV_PATH} with the repo example file
@@ -37,6 +43,11 @@ Environment overrides:
   BINARY_PATH         default: ${BINARY_PATH}
   HELPER_BINARY_PATH  default: ${HELPER_BINARY_PATH}
   VM_RUNNER_BINARY_PATH default: ${VM_RUNNER_BINARY_PATH}
+  FIRECRACKER_BINARY_PATH default: ${FIRECRACKER_BINARY_PATH}
+  JAILER_BINARY_PATH  default: ${JAILER_BINARY_PATH}
+  FIRECRACKER_RELEASE_VERSION default: ${FIRECRACKER_RELEASE_VERSION}
+  FIRECRACKER_RELEASE_BASE_URL default: ${FIRECRACKER_RELEASE_BASE_URL}
+  INSTALL_FIRECRACKER_RELEASE default: ${INSTALL_FIRECRACKER_RELEASE}
   UNIT_PATH           default: ${UNIT_PATH}
   HELPER_UNIT_PATH    default: ${HELPER_UNIT_PATH}
   VM_RUNNER_UNIT_PATH default: ${VM_RUNNER_UNIT_PATH}
@@ -58,7 +69,7 @@ require_root() {
 require_commands() {
 	local missing=()
 	local cmd
-	for cmd in awk go install systemctl id useradd; do
+	for cmd in awk chown curl go install sha256sum systemctl tar id useradd; do
 		if ! command -v "${cmd}" >/dev/null 2>&1; then
 			missing+=("${cmd}")
 		fi
@@ -121,6 +132,46 @@ build_binary() {
 	rm -f "${tmp_bin}"
 }
 
+firecracker_release_arch() {
+	case "$(uname -m)" in
+		x86_64|aarch64)
+			printf '%s\n' "$(uname -m)"
+			;;
+		*)
+			echo "unsupported architecture for Firecracker release download: $(uname -m)" >&2
+			exit 1
+			;;
+	esac
+}
+
+install_firecracker_release() {
+	if [[ "${INSTALL_FIRECRACKER_RELEASE}" != "1" ]]; then
+		return
+	fi
+
+	local arch version archive_name download_url checksum_url tmp_dir archive_path checksum_path release_dir
+	arch="$(firecracker_release_arch)"
+	version="${FIRECRACKER_RELEASE_VERSION}"
+	archive_name="firecracker-${version}-${arch}.tgz"
+	download_url="${FIRECRACKER_RELEASE_BASE_URL}/${version}/${archive_name}"
+	checksum_url="${download_url}.sha256.txt"
+	tmp_dir="$(mktemp -d)"
+	archive_path="${tmp_dir}/${archive_name}"
+	checksum_path="${archive_path}.sha256.txt"
+
+	curl -fsSL -o "${archive_path}" "${download_url}"
+	curl -fsSL -o "${checksum_path}" "${checksum_url}"
+	(
+		cd "${tmp_dir}"
+		sha256sum -c "$(basename "${checksum_path}")"
+	)
+	tar -xzf "${archive_path}" -C "${tmp_dir}"
+	release_dir="${tmp_dir}/release-${version}-${arch}"
+	install -D -m 0755 "${release_dir}/firecracker-${version}-${arch}" "${FIRECRACKER_BINARY_PATH}"
+	install -D -m 0755 "${release_dir}/jailer-${version}-${arch}" "${JAILER_BINARY_PATH}"
+	rm -rf "${tmp_dir}"
+}
+
 install_main_unit() {
 	local rendered_unit
 	rendered_unit="$(mktemp)"
@@ -169,20 +220,91 @@ install_vm_runner_unit() {
 			/^EnvironmentFile=/ { print "EnvironmentFile=" env_path; next }
 			/^ExecStart=/ { print "ExecStart=" binary_path " -socket /run/srv-vm-runner/vm-runner.sock -client-group " service_group; next }
 			/^User=/ { print "User=root"; next }
-			/^Group=/ { print "Group=root"; next }
+			/^Group=/ { print "Group=" service_group; next }
 			{ print }
 		' "${SCRIPT_DIR}/srv-vm-runner.service" >"${rendered_unit}"
 	install -D -m 0644 "${rendered_unit}" "${VM_RUNNER_UNIT_PATH}"
 	rm -f "${rendered_unit}"
 }
 
+render_env_file() {
+	local destination="$1"
+	local rendered_env
+	rendered_env="$(mktemp)"
+	awk \
+		-v firecracker_binary_path="${FIRECRACKER_BINARY_PATH}" \
+		-v jailer_binary_path="${JAILER_BINARY_PATH}" \
+		'
+			/^SRV_FIRECRACKER_BIN=/ { print "SRV_FIRECRACKER_BIN=" firecracker_binary_path; next }
+			/^SRV_JAILER_BIN=/ { print "SRV_JAILER_BIN=" jailer_binary_path; next }
+			{ print }
+		' "${SCRIPT_DIR}/srv.env.example" >"${rendered_env}"
+	install -m 0640 "${rendered_env}" "${destination}"
+	rm -f "${rendered_env}"
+}
+
+read_env_value() {
+	local key="$1"
+	awk -F= -v key="${key}" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "${ENV_PATH}"
+}
+
+upsert_env_value() {
+	local key="$1"
+	local value="$2"
+	local rendered_env
+	rendered_env="$(mktemp)"
+	awk \
+		-v key="${key}" \
+		-v value="${value}" \
+		'
+			BEGIN { updated = 0 }
+			$0 ~ ("^" key "=") { print key "=" value; updated = 1; next }
+			{ print }
+			END {
+				if (!updated) {
+					print key "=" value
+				}
+			}
+		' "${ENV_PATH}" >"${rendered_env}"
+	install -m 0640 "${rendered_env}" "${ENV_PATH}"
+	rm -f "${rendered_env}"
+}
+
+reconcile_env_binary_path() {
+	local key="$1"
+	local desired_value="$2"
+	shift 2
+	local current_value
+	current_value="$(read_env_value "${key}" || true)"
+	if [[ -z "${current_value}" ]]; then
+		upsert_env_value "${key}" "${desired_value}"
+		return
+	fi
+	local allowed_value
+	for allowed_value in "$@"; do
+		if [[ "${current_value}" == "${allowed_value}" ]]; then
+			upsert_env_value "${key}" "${desired_value}"
+			return
+		fi
+	done
+	echo "keeping existing ${key}=${current_value}" >&2
+}
+
+reconcile_env_binary_paths() {
+	reconcile_env_binary_path "SRV_FIRECRACKER_BIN" "${FIRECRACKER_BINARY_PATH}" "/usr/bin/firecracker" "/usr/local/bin/firecracker"
+	reconcile_env_binary_path "SRV_JAILER_BIN" "${JAILER_BINARY_PATH}" "/usr/bin/jailer" "/usr/local/bin/jailer"
+}
+
 install_env() {
 	install -d -m 0755 "${ENV_DIR}"
 	if [[ ! -f "${ENV_PATH}" || "${OVERWRITE_ENV}" -eq 1 ]]; then
-		install -m 0640 "${SCRIPT_DIR}/srv.env.example" "${ENV_PATH}"
+		render_env_file "${ENV_PATH}"
 		return
 	fi
 	echo "keeping existing ${ENV_PATH}" >&2
+	if [[ "${INSTALL_FIRECRACKER_RELEASE}" == "1" ]]; then
+		reconcile_env_binary_paths
+	fi
 }
 
 configured_data_dir() {
@@ -205,6 +327,7 @@ install_data_dirs() {
 	install -d -m 0755 "${data_dir}/jailer"
 	install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/state"
 	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/instances"
+	chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${data_dir}/state" "${data_dir}/instances"
 }
 
 reload_systemd() {
@@ -213,14 +336,15 @@ reload_systemd() {
 
 manage_service() {
 	if (( ENABLE_SERVICE )) && (( START_SERVICE )); then
-		systemctl enable --now srv
+		systemctl enable srv
+		systemctl restart srv-net-helper srv-vm-runner srv
 		return
 	fi
 	if (( ENABLE_SERVICE )); then
 		systemctl enable srv
 	fi
 	if (( START_SERVICE )); then
-		systemctl start srv
+		systemctl restart srv-net-helper srv-vm-runner srv
 	fi
 }
 
@@ -230,6 +354,8 @@ installed:
   binary:        ${BINARY_PATH}
   helper-binary: ${HELPER_BINARY_PATH}
   vm-runner-binary: ${VM_RUNNER_BINARY_PATH}
+  firecracker-binary: ${FIRECRACKER_BINARY_PATH}
+  jailer-binary: ${JAILER_BINARY_PATH}
   unit:          ${UNIT_PATH}
   helper-unit:   ${HELPER_UNIT_PATH}
   vm-runner-unit: ${VM_RUNNER_UNIT_PATH}
@@ -252,6 +378,7 @@ main() {
 	build_binary ./cmd/srv "${BINARY_PATH}"
 	build_binary ./cmd/srv-net-helper "${HELPER_BINARY_PATH}"
 	build_binary ./cmd/srv-vm-runner "${VM_RUNNER_BINARY_PATH}"
+	install_firecracker_release
 	install_main_unit
 	install_helper_unit
 	install_vm_runner_unit

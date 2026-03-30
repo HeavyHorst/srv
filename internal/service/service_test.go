@@ -82,16 +82,17 @@ func TestCmdListFormatsVisibleInstances(t *testing.T) {
 	ready := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 	ready.TailscaleIP = "100.64.0.10"
 	ready.TailscaleName = "alpha.tailnet"
-	deleted := serviceTestInstance("beta", model.StateDeleted, ready.CreatedAt.Add(time.Minute))
+	otherOwner := serviceTestInstance("beta", model.StateStopped, ready.CreatedAt.Add(time.Minute))
+	otherOwner.CreatedByUser = "bob@example.com"
+	deleted := serviceTestInstance("gamma", model.StateDeleted, ready.CreatedAt.Add(2*time.Minute))
 
-	if err := st.CreateInstance(ctx, ready); err != nil {
-		t.Fatalf("CreateInstance(ready): %v", err)
-	}
-	if err := st.CreateInstance(ctx, deleted); err != nil {
-		t.Fatalf("CreateInstance(deleted): %v", err)
+	for _, inst := range []model.Instance{ready, otherOwner, deleted} {
+		if err := st.CreateInstance(ctx, inst); err != nil {
+			t.Fatalf("CreateInstance(%s): %v", inst.Name, err)
+		}
 	}
 
-	result, err := app.cmdList(ctx)
+	result, err := app.cmdList(ctx, model.Actor{UserLogin: "alice@example.com"})
 	if err != nil {
 		t.Fatalf("cmdList(): %v", err)
 	}
@@ -100,6 +101,36 @@ func TestCmdListFormatsVisibleInstances(t *testing.T) {
 	}
 	if want := "alpha\tready\t100.64.0.10\talpha.tailnet\n"; result.stdout != want {
 		t.Fatalf("cmdList() stdout = %q, want %q", result.stdout, want)
+	}
+}
+
+func TestCmdListAdminSeesAllVisibleInstances(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:   config.Config{Hostname: "srv", AdminUsers: []string{"ops@example.com"}},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+	}
+
+	alpha := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	beta := serviceTestInstance("beta", model.StateStopped, alpha.CreatedAt.Add(time.Minute))
+	beta.CreatedByUser = "bob@example.com"
+
+	for _, inst := range []model.Instance{alpha, beta} {
+		if err := st.CreateInstance(ctx, inst); err != nil {
+			t.Fatalf("CreateInstance(%s): %v", inst.Name, err)
+		}
+	}
+
+	result, err := app.cmdList(ctx, model.Actor{UserLogin: "ops@example.com"})
+	if err != nil {
+		t.Fatalf("cmdList(): %v", err)
+	}
+	for _, want := range []string{"alpha\tready\n", "beta\tstopped\n"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("cmdList() stdout missing %q\nfull output:\n%s", want, result.stdout)
+		}
 	}
 }
 
@@ -131,7 +162,7 @@ func TestCmdInspectFormatsInstanceAndEvents(t *testing.T) {
 		t.Fatalf("RecordEvent: %v", err)
 	}
 
-	result, err := app.cmdInspect(ctx, []string{"inspect", inst.Name})
+	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name})
 	if err != nil {
 		t.Fatalf("cmdInspect(): %v", err)
 	}
@@ -149,6 +180,9 @@ func TestCmdInspectFormatsInstanceAndEvents(t *testing.T) {
 		"tailscale-name: alpha.tailnet\n",
 		"tailscale-ip: 100.64.0.10\n",
 		"last-error: previous boot hiccup\n",
+		"logs-serial: ssh root@srv logs alpha serial\n",
+		"logs-firecracker: ssh root@srv logs alpha firecracker\n",
+		"debug-hint: boot and runtime failures usually show up first in the serial log, then in the Firecracker log\n",
 		"events:\n",
 		"- 2026-03-29T12:00:10Z [create] instance record created\n",
 	}
@@ -166,7 +200,7 @@ func TestCmdInspectMissingInstanceReturnsFriendlyError(t *testing.T) {
 		store: newServiceTestStore(t),
 	}
 
-	result, err := app.cmdInspect(context.Background(), []string{"inspect", "missing"})
+	result, err := app.cmdInspect(context.Background(), model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", "missing"})
 	if err == nil {
 		t.Fatalf("cmdInspect() error = nil, want non-nil")
 	}
@@ -181,6 +215,55 @@ func TestCmdInspectMissingInstanceReturnsFriendlyError(t *testing.T) {
 	}
 	if !strings.Contains(result.stderr, `inspect missing: instance "missing" does not exist`) {
 		t.Fatalf("cmdInspect() stderr = %q", result.stderr)
+	}
+}
+
+func TestCmdInspectHidesInstancesFromOtherUsers(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:   config.Config{Hostname: "srv"},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+	}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "bob@example.com"}, []string{"inspect", inst.Name})
+	if err == nil {
+		t.Fatalf("cmdInspect() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), `instance "alpha" does not exist`) {
+		t.Fatalf("cmdInspect() error = %q", err.Error())
+	}
+	if !strings.Contains(result.stderr, `inspect alpha: instance "alpha" does not exist`) {
+		t.Fatalf("cmdInspect() stderr = %q", result.stderr)
+	}
+}
+
+func TestCmdInspectAwaitingTailnetPointsToSerialLog(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:   config.Config{Hostname: "srv"},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+	}
+
+	inst := serviceTestInstance("alpha", model.StateAwaitingTailnet, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name})
+	if err != nil {
+		t.Fatalf("cmdInspect(): %v", err)
+	}
+	if !strings.Contains(result.stdout, "debug-hint: guest has not finished initial tailnet bootstrap; start with the serial log\n") {
+		t.Fatalf("cmdInspect() stdout = %q", result.stdout)
 	}
 }
 
@@ -219,7 +302,7 @@ func TestEnsureHostSignerPersistsKey(t *testing.T) {
 
 func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
-	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "start <name>", "stop <name>", "restart <name>"} {
+	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "logs <name> [serial|firecracker]", "start <name>", "stop <name>", "restart <name>"} {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("helpResult() missing %q in %q", want, result.stdout)
 		}
@@ -242,7 +325,7 @@ func TestCmdResizeUpdatesStoppedInstance(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
-	result, err := app.cmdResize(ctx, []string{"resize", inst.Name, "--cpus", "4", "--ram", "6G"})
+	result, err := app.cmdResize(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"resize", inst.Name, "--cpus", "4", "--ram", "6G"})
 	if err != nil {
 		t.Fatalf("cmdResize(): %v", err)
 	}
@@ -264,6 +347,105 @@ func TestCmdResizeUpdatesStoppedInstance(t *testing.T) {
 	}
 	if !updated.UpdatedAt.After(inst.UpdatedAt) {
 		t.Fatalf("updated timestamp did not advance: before=%s after=%s", inst.UpdatedAt, updated.UpdatedAt)
+	}
+}
+
+func TestCmdResizeDeniesOtherUsers(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.Config{Hostname: "srv", VCPUCount: 1, MemoryMiB: 1024}
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatalf("provision.New(): %v", err)
+	}
+	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+
+	inst := serviceTestInstance("alpha", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	result, err := app.cmdResize(ctx, model.Actor{UserLogin: "bob@example.com"}, []string{"resize", inst.Name, "--cpus", "4"})
+	if err == nil {
+		t.Fatalf("cmdResize() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), `instance "alpha" does not exist`) {
+		t.Fatalf("cmdResize() error = %q", err.Error())
+	}
+	if !strings.Contains(result.stderr, `resize alpha: instance "alpha" does not exist`) {
+		t.Fatalf("cmdResize() stderr = %q", result.stderr)
+	}
+}
+
+func TestCmdLogsReturnsRecentOutput(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:   config.Config{Hostname: "srv"},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+	}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	baseDir := t.TempDir()
+	inst.SerialLogPath = filepath.Join(baseDir, "serial.log")
+	inst.LogPath = filepath.Join(baseDir, "firecracker.log")
+	if err := os.WriteFile(inst.SerialLogPath, []byte("serial-1\nserial-2\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+	if err := os.WriteFile(inst.LogPath, []byte("fc-1\nfc-2\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(firecracker): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	result, err := app.cmdLogs(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"logs", inst.Name})
+	if err != nil {
+		t.Fatalf("cmdLogs(): %v", err)
+	}
+	for _, want := range []string{"serial-log: " + inst.SerialLogPath + "\n", "serial-1\n", "serial-2\n", "firecracker-log: " + inst.LogPath + "\n", "fc-1\n", "fc-2\n"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("cmdLogs() stdout missing %q\nfull output:\n%s", want, result.stdout)
+		}
+	}
+	serialIndex := strings.Index(result.stdout, "serial-log: ")
+	firecrackerIndex := strings.Index(result.stdout, "firecracker-log: ")
+	if serialIndex < 0 || firecrackerIndex < 0 || serialIndex >= firecrackerIndex {
+		t.Fatalf("cmdLogs() stdout did not keep serial before firecracker:\n%s", result.stdout)
+	}
+}
+
+func TestCmdLogsCanSelectSingleSurface(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:   config.Config{Hostname: "srv"},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+	}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	baseDir := t.TempDir()
+	inst.SerialLogPath = filepath.Join(baseDir, "serial.log")
+	inst.LogPath = filepath.Join(baseDir, "firecracker.log")
+	if err := os.WriteFile(inst.LogPath, []byte("fc-only\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(firecracker): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	result, err := app.cmdLogs(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"logs", inst.Name, "firecracker"})
+	if err != nil {
+		t.Fatalf("cmdLogs(): %v", err)
+	}
+	if strings.Contains(result.stdout, "serial-log: ") {
+		t.Fatalf("cmdLogs() unexpectedly included serial output:\n%s", result.stdout)
+	}
+	if !strings.Contains(result.stdout, "firecracker-log: "+inst.LogPath+"\n") {
+		t.Fatalf("cmdLogs() stdout = %q", result.stdout)
 	}
 }
 
@@ -359,6 +541,38 @@ func TestParseResizeArgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotOpts, tt.wantOpts) {
 				t.Fatalf("parseResizeArgs() opts = %#v, want %#v", gotOpts, tt.wantOpts)
+			}
+		})
+	}
+}
+
+func TestParseLogsArgs(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantName   string
+		wantTarget logTarget
+		wantErr    string
+	}{
+		{name: "default to both logs", args: []string{"logs", "demo"}, wantName: "demo", wantTarget: logTargetAll},
+		{name: "select serial", args: []string{"logs", "demo", "serial"}, wantName: "demo", wantTarget: logTargetSerial},
+		{name: "reject unknown target", args: []string{"logs", "demo", "kernel"}, wantErr: `unknown log target "kernel"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotTarget, err := parseLogsArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseLogsArgs() error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseLogsArgs() error = %v", err)
+			}
+			if gotName != tt.wantName || gotTarget != tt.wantTarget {
+				t.Fatalf("parseLogsArgs() = (%q, %q), want (%q, %q)", gotName, gotTarget, tt.wantName, tt.wantTarget)
 			}
 		})
 	}

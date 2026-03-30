@@ -3,6 +3,7 @@ package vmrunner
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +24,16 @@ import (
 	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 )
 
-const DefaultSocketPath = "/run/srv-vm-runner/vm-runner.sock"
+const (
+	DefaultSocketPath = "/run/srv-vm-runner/vm-runner.sock"
+	// firecracker-go-sdk requires NumaNode to be set, but a negative value keeps
+	// the SDK from synthesizing cpuset cgroup arguments for every jailed launch.
+	disabledJailerNumaNode     = -1
+	gracefulStopRequestTimeout = 2 * time.Second
+	gracefulStopTimeout        = 10 * time.Second
+	forcedStopTimeout          = 10 * time.Second
+	postKillWaitTimeout        = 2 * time.Second
+)
 
 var (
 	validName           = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -34,8 +44,22 @@ var (
 	currentCgroupPath = func() (string, error) {
 		return readUnifiedCgroupPath("/proc/self/cgroup")
 	}
-	cgroupFSRoot = "/sys/fs/cgroup"
+	cgroupFSRoot         = "/sys/fs/cgroup"
+	removePath           = os.Remove
+	requestGuestShutdown = func(ctx context.Context, socketPath string) error {
+		action := models.InstanceActionInfoActionTypeSendCtrlAltDel
+		_, err := firecracker.NewClient(socketPath, nil, false).CreateSyncAction(ctx, &models.InstanceActionInfo{ActionType: &action})
+		if err != nil {
+			return fmt.Errorf("request guest shutdown via %s: %w", socketPath, err)
+		}
+		return nil
+	}
+	waitForProcessExit = waitForProcessExitByPolling
+	forceStopProcess   = func(pid int) error { return stopProcessWithGrace(pid, forcedStopTimeout) }
+	killProcessNow     = func(pid int) error { return stopProcessWithGrace(pid, 0) }
 )
+
+var errProcessExitTimeout = errors.New("process did not exit before timeout")
 
 type Bootstrap struct {
 	Version             int      `json:"version"`
@@ -343,7 +367,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	mem := req.MemoryMiB
 	uid := s.config.JailerUID
 	gid := s.config.JailerGID
-	numaNode := 0
+	numaNode := disabledJailerNumaNode
 
 	fcCfg := firecracker.Config{
 		SocketPath:      filepath.Base(paths.SocketPath),
@@ -382,6 +406,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 			JailerBinary:   s.config.JailerBinary,
 			ChrootBaseDir:  s.config.JailerBaseDir,
 			ChrootStrategy: firecracker.NewNaiveChrootStrategy(s.config.KernelPath),
+			CgroupVersion:  detectJailerCgroupVersion(),
 			Stdout:         serialLog,
 			Stderr:         serialLog,
 		},
@@ -412,11 +437,21 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	return StartResponse{PID: pid}, nil
 }
 
-func (s *Server) stopVM(_ context.Context, req StopRequest) error {
+func (s *Server) stopVM(ctx context.Context, req StopRequest) error {
 	var errs []error
 	if req.PID > 0 {
-		if err := stopProcess(req.PID); err != nil {
-			errs = append(errs, err)
+		stoppedGracefully, err := s.tryGracefulStop(ctx, req)
+		if err != nil {
+			s.log.Warn("graceful guest shutdown failed; falling back to forced stop", "name", req.Name, "pid", req.PID, "err", err)
+		}
+		if !stoppedGracefully {
+			stop := forceStopProcess
+			if errors.Is(err, errProcessExitTimeout) {
+				stop = killProcessNow
+			}
+			if err := stop(req.PID); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	if err := cleanupFirecrackerCgroup(req.Name); err != nil {
@@ -426,6 +461,25 @@ func (s *Server) stopVM(_ context.Context, req StopRequest) error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+func (s *Server) tryGracefulStop(ctx context.Context, req StopRequest) (bool, error) {
+	if req.PID <= 0 || !processExists(req.PID) {
+		return true, nil
+	}
+	paths, err := resolveInstanceRuntimePaths(s.config.InstancesDir, req.Name)
+	if err != nil {
+		return false, err
+	}
+	stopCtx, cancel := context.WithTimeout(vmContextForRequest(ctx), gracefulStopRequestTimeout)
+	defer cancel()
+	if err := requestGuestShutdown(stopCtx, paths.SocketPath); err != nil {
+		return false, err
+	}
+	if err := waitForProcessExit(req.PID, gracefulStopTimeout); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (r StartRequest) Validate() error {
@@ -545,12 +599,47 @@ func validateStartRuntimeFiles(cfg ServerConfig, paths instanceRuntimePaths) err
 			return fmt.Errorf("stat %s %s: %w", label, path, err)
 		}
 	}
+	if err := validateJailedFirecrackerBinary(cfg.FirecrackerBinary); err != nil {
+		return err
+	}
 	if cfg.InitrdPath != "" {
 		if _, err := os.Stat(cfg.InitrdPath); err != nil {
 			return fmt.Errorf("stat initrd %s: %w", cfg.InitrdPath, err)
 		}
 	}
 	return nil
+}
+
+func validateJailedFirecrackerBinary(path string) error {
+	interp, err := elfInterpreter(path)
+	if err != nil {
+		return fmt.Errorf("inspect firecracker binary %s: %w", path, err)
+	}
+	if interp == "" {
+		return nil
+	}
+	return fmt.Errorf("firecracker binary %s is dynamically linked via %s; Firecracker jailer requires a statically linked firecracker binary (default musl build)", path, interp)
+}
+
+func elfInterpreter(path string) (string, error) {
+	binary, err := elf.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer binary.Close()
+
+	for _, prog := range binary.Progs {
+		if prog.Type != elf.PT_INTERP {
+			continue
+		}
+		payload, err := io.ReadAll(prog.Open())
+		if err != nil {
+			return "", fmt.Errorf("read PT_INTERP: %w", err)
+		}
+		return strings.TrimRight(string(payload), "\x00\n"), nil
+	}
+
+	return "", nil
 }
 
 func prepareJailedRuntimeHandler(hostPaths instanceRuntimePaths, jailerPaths jailerRuntimePaths, jailerGID int) firecracker.Handler {
@@ -724,23 +813,48 @@ func respondError(w http.ResponseWriter, status int, err error) {
 }
 
 func stopProcess(pid int) error {
+	return stopProcessWithGrace(pid, forcedStopTimeout)
+}
+
+func stopProcessWithGrace(pid int, timeout time.Duration) error {
 	if pid <= 0 {
 		return nil
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("signal firecracker pid %d: %w", pid, err)
+	if timeout > 0 {
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("signal firecracker pid %d: %w", pid, err)
+		}
+		if err := waitForProcessExit(pid, timeout); err == nil {
+			return nil
+		}
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("kill firecracker pid %d: %w", pid, err)
+	}
+	if err := waitForProcessExit(pid, postKillWaitTimeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+func waitForProcessExitByPolling(pid int, timeout time.Duration) error {
+	if pid <= 0 || !processExists(pid) {
+		return nil
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("wait for firecracker pid %d to exit: %w", pid, errProcessExitTimeout)
+	}
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if !processExists(pid) {
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("kill firecracker pid %d: %w", pid, err)
+	if !processExists(pid) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("wait for firecracker pid %d to exit after %s: %w", pid, timeout, errProcessExitTimeout)
 }
 
 func processExists(pid int) bool {
@@ -749,6 +863,13 @@ func processExists(pid int) bool {
 	}
 	err := syscall.Kill(pid, 0)
 	return err == nil
+}
+
+func detectJailerCgroupVersion() string {
+	if _, err := currentCgroupPath(); err == nil {
+		return "2"
+	}
+	return "1"
 }
 
 func firecrackerCgroupPath(name string) (string, error) {
@@ -789,17 +910,17 @@ func cleanupFirecrackerCgroup(name string) error {
 	if err != nil {
 		return fmt.Errorf("cleanup firecracker cgroup for %q: %w", name, err)
 	}
-	if err := os.Remove(cgroupPath); err != nil && !os.IsNotExist(err) {
+	if err := removePath(cgroupPath); err != nil && !os.IsNotExist(err) {
 		if errors.Is(err, syscall.ENOTEMPTY) {
-			_ = os.Remove(filepath.Join(cgroupPath, "cgroup.procs"))
-			err = os.Remove(cgroupPath)
+			_ = removePath(filepath.Join(cgroupPath, "cgroup.procs"))
+			err = removePath(cgroupPath)
 		}
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("cleanup firecracker cgroup for %q: remove %s: %w", name, cgroupPath, err)
 		}
 	}
 	vmRoot := filepath.Dir(cgroupPath)
-	if err := os.Remove(vmRoot); err != nil && !os.IsNotExist(err) && !errors.Is(err, syscall.ENOTEMPTY) {
+	if err := removePath(vmRoot); err != nil && !os.IsNotExist(err) && !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EBUSY) {
 		return fmt.Errorf("cleanup firecracker cgroup root %s: %w", vmRoot, err)
 	}
 	return nil

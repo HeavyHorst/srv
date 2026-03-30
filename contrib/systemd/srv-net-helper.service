@@ -13,13 +13,12 @@ ExecStart=/usr/local/bin/srv-net-helper -socket /run/srv/net-helper.sock -tap-us
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
-ProtectKernelModules=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictRealtime=yes
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW
 Restart=on-failure
 RestartSec=5s
 

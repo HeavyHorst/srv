@@ -24,6 +24,7 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_HOSTNAME", "control")
 	t.Setenv("SRV_LISTEN_ADDR", ":2222")
 	t.Setenv("SRV_ALLOWED_USERS", " alice@example.com, bob@example.com ")
+	t.Setenv("SRV_ADMIN_USERS", " ops@example.com, root@example.com ")
 	t.Setenv("SRV_ADVERTISE_TAGS", "tag:control, tag:ssh")
 	t.Setenv("SRV_VM_DNS", "1.1.1.1, 8.8.8.8")
 	t.Setenv("SRV_GUEST_AUTH_TAGS", "tag:microvm")
@@ -60,6 +61,9 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cfg.AllowedUsers, []string{"alice@example.com", "bob@example.com"}) {
 		t.Fatalf("AllowedUsers = %#v", cfg.AllowedUsers)
+	}
+	if !reflect.DeepEqual(cfg.AdminUsers, []string{"ops@example.com", "root@example.com"}) {
+		t.Fatalf("AdminUsers = %#v", cfg.AdminUsers)
 	}
 	if !reflect.DeepEqual(cfg.TailscaleAdvertiseTags, []string{"tag:control", "tag:ssh"}) {
 		t.Fatalf("TailscaleAdvertiseTags = %#v", cfg.TailscaleAdvertiseTags)

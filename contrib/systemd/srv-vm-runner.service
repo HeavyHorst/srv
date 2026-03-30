@@ -7,14 +7,15 @@ ConditionPathExists=/dev/kvm
 [Service]
 Type=simple
 User=root
-Group=root
+Group=srv
 SupplementaryGroups=kvm
 EnvironmentFile=/etc/srv/srv.env
 RuntimeDirectory=srv-vm-runner
 RuntimeDirectoryMode=0770
 UMask=0007
 ExecStart=/usr/local/bin/srv-vm-runner -socket /run/srv-vm-runner/vm-runner.sock -client-group srv
-NoNewPrivileges=yes
+# The jailer drops to the configured uid/gid and execs Firecracker itself.
+# NoNewPrivileges blocks that handoff on real hosts.
 PrivateTmp=yes
 ProtectHome=yes
 ProtectKernelModules=yes

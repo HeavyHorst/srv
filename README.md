@@ -36,6 +36,26 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - `new`, `resize`, `list`, `inspect`, `start`, `stop`, `restart`, and `delete` are implemented.
 - When `srv` starts under systemd after a host reboot, previously active instances are restarted automatically.
 
+## Non-Goals For Now
+
+- `srv` is intentionally a single-host control plane for this phase of the project.
+- Clustering or multi-host scheduling is out of scope for now.
+- High availability or control-plane replication is out of scope for now.
+- A web UI is out of scope for now; SSH remains the control interface.
+- Live migration is out of scope for now.
+
+Moving past MVP here means making the single-host service safer to share and easier to operate, not turning it into a general-purpose cloud platform.
+
+## Post-MVP Checklist
+
+Ordered by current impact for this single-host design, with effort called out so the next steps stay pragmatic:
+
+1. Ownership-aware authz and visibility. High impact, medium effort. Instance creators should not automatically be able to manage every instance just because they can reach the service; owner-by-default behavior with an explicit admin path is the clearest first step past MVP.
+2. Better operator debugging. High impact, low effort. Add remote access to serial and Firecracker logs, and make `inspect` point directly at the relevant failure surface when a guest is stuck in `awaiting-tailnet` or fails during boot.
+3. Backup, restore, and upgrade runbook. High impact, medium effort. Define and test how to back up `SRV_DATA_DIR`, recover a host, and roll forward guest image or schema changes without improvisation.
+4. Host-level smoke test. Medium-high impact, medium effort. Add one repeatable end-to-end validation path that exercises the systemd units, both helpers, the jailer, guest tailnet join, and teardown on a real host.
+5. Service hardening and resource controls. Medium impact, medium effort. Tighten the privileged helpers further, document the expected host security posture, and make per-VM resource limits part of normal operations.
+
 ## Instance Lifecycle Notes
 
 - `new` accepts `--cpus`, `--ram`, and `--rootfs-size` to set per-instance sizing at creation time.
@@ -64,7 +84,7 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - `SRV_GUEST_AUTH_TAGS`: comma-separated tags applied to guest auth keys
 - `SRV_DATA_DIR`: host state directory, default `/var/lib/srv`
 - `SRV_NET_HELPER_SOCKET`: unix socket used to reach the privileged host-network helper, default `/run/srv/net-helper.sock`
-- `SRV_VM_RUNNER_SOCKET`: unix socket used to reach the Firecracker runner helper, default `/run/srv-vm-runner/vm-runner.sock`
+- `SRV_VM_RUNNER_SOCKET`: unix socket used to reach the separate root-owned Firecracker runner helper, default `/run/srv-vm-runner/vm-runner.sock`
 - `SRV_JAILER_BIN`: Firecracker jailer binary used by the VM runner, default `/usr/bin/jailer`
 - `SRV_JAILER_BASE_DIR`: base directory for jailer workspaces, default `SRV_DATA_DIR/jailer`
 - `SRV_VM_NETWORK_CIDR`: host-side private network pool for guest TAP allocations, default `172.28.0.0/16`
@@ -83,7 +103,7 @@ sudo ./srv \
   -guest-auth-tags tag:microvm
 ```
 
-When running outside systemd, start both helpers separately so `srv` can reach `SRV_NET_HELPER_SOCKET` and `SRV_VM_RUNNER_SOCKET`. The systemd path below is the recommended way to keep the non-root control plane, the root-only network helper, and the separate Firecracker runner wired together. Build those helpers with `go build ./cmd/srv-net-helper ./cmd/srv-vm-runner` before launching them manually.
+When running outside systemd, start both helpers separately so `srv` can reach `SRV_NET_HELPER_SOCKET` and `SRV_VM_RUNNER_SOCKET`. The systemd path below is the recommended way to keep the non-root control plane, the root-only network helper, and the separate root-owned Firecracker runner wired together. Build those helpers with `go build ./cmd/srv-net-helper ./cmd/srv-vm-runner` before launching them manually.
 
 ## Run Under Systemd
 

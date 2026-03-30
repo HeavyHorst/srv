@@ -164,13 +164,12 @@ install_vm_runner_unit() {
 	awk \
 		-v binary_path="${VM_RUNNER_BINARY_PATH}" \
 		-v env_path="${ENV_PATH}" \
-		-v vm_runner_user="${VM_RUNNER_USER}" \
 		-v service_group="${SERVICE_GROUP}" \
 		'
 			/^EnvironmentFile=/ { print "EnvironmentFile=" env_path; next }
 			/^ExecStart=/ { print "ExecStart=" binary_path " -socket /run/srv-vm-runner/vm-runner.sock -client-group " service_group; next }
-			/^User=/ { print "User=" vm_runner_user; next }
-			/^Group=/ { print "Group=" service_group; next }
+			/^User=/ { print "User=root"; next }
+			/^Group=/ { print "Group=root"; next }
 			{ print }
 		' "${SCRIPT_DIR}/srv-vm-runner.service" >"${rendered_unit}"
 	install -D -m 0644 "${rendered_unit}" "${VM_RUNNER_UNIT_PATH}"
@@ -203,6 +202,7 @@ install_data_dirs() {
 	data_dir="$(configured_data_dir)"
 	install -d -m 0755 "${data_dir}"
 	install -d -m 0755 "${data_dir}/images"
+	install -d -m 0755 "${data_dir}/jailer"
 	install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/state"
 	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/instances"
 }

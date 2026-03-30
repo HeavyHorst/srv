@@ -31,7 +31,7 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - SQLite stores instances, events, command audits, and authz decisions.
 - Btrfs reflinks clone the base rootfs for fast per-instance writable disks.
 - Firecracker launches each VM with a TAP device and host-side NAT.
-- A small root-only network helper owns TAP and iptables mutations, while a separate `srv-vm` runner service owns Firecracker processes, `kvm` access, per-VM cgroups, and host-side resolution of per-instance runtime paths under `SRV_DATA_DIR/instances`.
+- A small root-only network helper owns TAP and iptables mutations, while a separate root-owned VM runner service invokes Firecracker through the official jailer, drops the microVM process to `srv-vm:srv`, manages per-VM cgroups, and derives host runtime paths from `SRV_DATA_DIR/instances`.
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
 - `new`, `resize`, `list`, `inspect`, `start`, `stop`, `restart`, and `delete` are implemented.
 - When `srv` starts under systemd after a host reboot, previously active instances are restarted automatically.
@@ -47,7 +47,7 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 ## Host Requirements
 
 - Linux host with `/dev/kvm`
-- Firecracker installed, default path `/usr/bin/firecracker`
+- Firecracker and jailer installed, default paths `/usr/bin/firecracker` and `/usr/bin/jailer`
 - `ip`, `iptables`, `cp`, `resize2fs`, and `stat` available on the host
 - `SRV_DATA_DIR` on Btrfs
 - Tailscale tailnet access for the control plane
@@ -65,6 +65,8 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - `SRV_DATA_DIR`: host state directory, default `/var/lib/srv`
 - `SRV_NET_HELPER_SOCKET`: unix socket used to reach the privileged host-network helper, default `/run/srv/net-helper.sock`
 - `SRV_VM_RUNNER_SOCKET`: unix socket used to reach the Firecracker runner helper, default `/run/srv-vm-runner/vm-runner.sock`
+- `SRV_JAILER_BIN`: Firecracker jailer binary used by the VM runner, default `/usr/bin/jailer`
+- `SRV_JAILER_BASE_DIR`: base directory for jailer workspaces, default `SRV_DATA_DIR/jailer`
 - `SRV_VM_NETWORK_CIDR`: host-side private network pool for guest TAP allocations, default `172.28.0.0/16`
 - `SRV_OUTBOUND_IFACE`: optional override for the host interface used for NAT
 
@@ -111,7 +113,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now srv
 ```
 
-Under systemd, the main `srv` unit runs as the dedicated `srv` service user, the root-owned network helper owns host-side TAP and firewall mutation, and the separate `srv-vm` runner service owns Firecracker execution plus `kvm` access. The runner derives each VM's `rootfs.img`, logs, and Firecracker socket from `SRV_DATA_DIR/instances/<name>/` instead of accepting caller-supplied host paths. Keep `SRV_DATA_DIR` on Btrfs and point `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` at the artifacts built under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
+Under systemd, the main `srv` unit runs as the dedicated `srv` service user, the root-owned network helper owns host-side TAP and firewall mutation, and the separate root-owned VM runner invokes Firecracker through the official jailer before dropping the microVM process to `srv-vm:srv`. The runner still derives each VM's `rootfs.img`, logs, and Firecracker socket from `SRV_DATA_DIR/instances/<name>/` instead of accepting caller-supplied host paths, while the jailer builds its chroot workspaces under `SRV_JAILER_BASE_DIR`. Keep `SRV_DATA_DIR` on Btrfs and point `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` at the artifacts built under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
 
 ## Build The Arch Base Image
 

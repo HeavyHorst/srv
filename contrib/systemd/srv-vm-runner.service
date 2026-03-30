@@ -6,8 +6,8 @@ ConditionPathExists=/dev/kvm
 
 [Service]
 Type=simple
-User=srv-vm
-Group=srv
+User=root
+Group=root
 SupplementaryGroups=kvm
 EnvironmentFile=/etc/srv/srv.env
 RuntimeDirectory=srv-vm-runner

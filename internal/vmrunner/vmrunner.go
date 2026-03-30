@@ -161,6 +161,10 @@ type StopFunc func(context.Context, StopRequest) error
 
 type ServerConfig struct {
 	FirecrackerBinary string
+	JailerBinary      string
+	JailerBaseDir     string
+	JailerUID         int
+	JailerGID         int
 	InstancesDir      string
 	KernelPath        string
 	InitrdPath        string
@@ -171,6 +175,13 @@ type instanceRuntimePaths struct {
 	LogPath    string
 	SerialLog  string
 	RootFSPath string
+}
+
+type jailerRuntimePaths struct {
+	WorkspaceDir string
+	RootDir      string
+	SocketPath   string
+	LogPath      string
 }
 
 type Server struct {
@@ -294,14 +305,31 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	if err != nil {
 		return StartResponse{}, err
 	}
-	if err := os.Remove(paths.SocketPath); err != nil && !os.IsNotExist(err) {
-		return StartResponse{}, fmt.Errorf("remove stale firecracker socket: %w", err)
+	jailerPaths, err := resolveJailerRuntimePaths(s.config.JailerBaseDir, s.config.FirecrackerBinary, req.Name)
+	if err != nil {
+		return StartResponse{}, err
+	}
+	if err := validateStartRuntimeFiles(s.config, paths); err != nil {
+		return StartResponse{}, err
+	}
+	if err := os.MkdirAll(s.config.JailerBaseDir, 0o755); err != nil {
+		return StartResponse{}, fmt.Errorf("create jailer base dir: %w", err)
+	}
+	if err := cleanupJailedRuntimePaths(paths, jailerPaths); err != nil {
+		return StartResponse{}, err
 	}
 	serialLog, err := os.OpenFile(paths.SerialLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o660)
 	if err != nil {
 		return StartResponse{}, fmt.Errorf("open serial log: %w", err)
 	}
 	defer serialLog.Close()
+
+	cleanupRuntime := true
+	defer func() {
+		if cleanupRuntime {
+			_ = cleanupJailedRuntimePaths(paths, jailerPaths)
+		}
+	}()
 
 	guestIP, guestNet, err := net.ParseCIDR(req.GuestAddr)
 	if err != nil {
@@ -313,10 +341,13 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	isRootDevice := true
 	vcpus := req.VCPUCount
 	mem := req.MemoryMiB
+	uid := s.config.JailerUID
+	gid := s.config.JailerGID
+	numaNode := 0
 
 	fcCfg := firecracker.Config{
-		SocketPath:      paths.SocketPath,
-		LogPath:         paths.LogPath,
+		SocketPath:      filepath.Base(paths.SocketPath),
+		LogPath:         filepath.Base(paths.LogPath),
 		KernelImagePath: s.config.KernelPath,
 		InitrdPath:      s.config.InitrdPath,
 		KernelArgs:      req.KernelArgs,
@@ -342,21 +373,27 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 			VcpuCount:  &vcpus,
 			MemSizeMib: &mem,
 		},
+		JailerCfg: &firecracker.JailerConfig{
+			GID:            &gid,
+			UID:            &uid,
+			ID:             req.Name,
+			NumaNode:       &numaNode,
+			ExecFile:       s.config.FirecrackerBinary,
+			JailerBinary:   s.config.JailerBinary,
+			ChrootBaseDir:  s.config.JailerBaseDir,
+			ChrootStrategy: firecracker.NewNaiveChrootStrategy(s.config.KernelPath),
+			Stdout:         serialLog,
+			Stderr:         serialLog,
+		},
 		MmdsAddress: net.ParseIP("169.254.169.254"),
 	}
 
 	vmCtx := vmContextForRequest(ctx)
-	cmd := firecracker.VMCommandBuilder{}.
-		WithBin(s.config.FirecrackerBinary).
-		WithSocketPath(paths.SocketPath).
-		WithStdout(serialLog).
-		WithStderr(serialLog).
-		Build(vmCtx)
-
-	machine, err := firecracker.NewMachine(vmCtx, fcCfg, firecracker.WithProcessRunner(cmd))
+	machine, err := firecracker.NewMachine(vmCtx, fcCfg)
 	if err != nil {
 		return StartResponse{}, fmt.Errorf("create firecracker machine: %w", err)
 	}
+	machine.Handlers.FcInit = machine.Handlers.FcInit.Swap(prepareJailedRuntimeHandler(paths, jailerPaths, s.config.JailerGID))
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.NewSetMetadataHandler(Metadata{SRV: req.Bootstrap}))
 
 	if err := machine.Start(vmCtx); err != nil {
@@ -371,16 +408,24 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 		_ = cleanupFirecrackerCgroup(req.Name)
 		return StartResponse{}, err
 	}
+	cleanupRuntime = false
 	return StartResponse{PID: pid}, nil
 }
 
 func (s *Server) stopVM(_ context.Context, req StopRequest) error {
+	var errs []error
 	if req.PID > 0 {
 		if err := stopProcess(req.PID); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return cleanupFirecrackerCgroup(req.Name)
+	if err := cleanupFirecrackerCgroup(req.Name); err != nil {
+		errs = append(errs, err)
+	}
+	if err := s.cleanupVMRuntime(req.Name); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (r StartRequest) Validate() error {
@@ -419,6 +464,10 @@ func (r StartRequest) Validate() error {
 func (c ServerConfig) normalized() ServerConfig {
 	return ServerConfig{
 		FirecrackerBinary: strings.TrimSpace(c.FirecrackerBinary),
+		JailerBinary:      strings.TrimSpace(c.JailerBinary),
+		JailerBaseDir:     strings.TrimSpace(c.JailerBaseDir),
+		JailerUID:         c.JailerUID,
+		JailerGID:         c.JailerGID,
 		InstancesDir:      strings.TrimSpace(c.InstancesDir),
 		KernelPath:        strings.TrimSpace(c.KernelPath),
 		InitrdPath:        strings.TrimSpace(c.InitrdPath),
@@ -429,6 +478,8 @@ func (c ServerConfig) Validate() error {
 	c = c.normalized()
 	for label, path := range map[string]string{
 		"firecracker binary path": c.FirecrackerBinary,
+		"jailer binary path":      c.JailerBinary,
+		"jailer base dir":         c.JailerBaseDir,
 		"instances dir":           c.InstancesDir,
 		"kernel path":             c.KernelPath,
 	} {
@@ -438,6 +489,12 @@ func (c ServerConfig) Validate() error {
 	}
 	if err := validateAbsolutePath("initrd path", c.InitrdPath, true); err != nil {
 		return err
+	}
+	if c.JailerUID < 0 {
+		return fmt.Errorf("jailer uid %d is invalid", c.JailerUID)
+	}
+	if c.JailerGID < 0 {
+		return fmt.Errorf("jailer gid %d is invalid", c.JailerGID)
 	}
 	return nil
 }
@@ -453,6 +510,138 @@ func resolveInstanceRuntimePaths(instancesDir, name string) (instanceRuntimePath
 		SerialLog:  filepath.Join(instanceDir, "serial.log"),
 		RootFSPath: filepath.Join(instanceDir, "rootfs.img"),
 	}, nil
+}
+
+func resolveJailerRuntimePaths(jailerBaseDir, firecrackerBinary, name string) (jailerRuntimePaths, error) {
+	execName := strings.TrimSpace(filepath.Base(strings.TrimSpace(firecrackerBinary)))
+	if execName == "" || execName == "." || execName == string(filepath.Separator) {
+		return jailerRuntimePaths{}, fmt.Errorf("resolve jailer workspace for %q: firecracker binary path %q is invalid", name, firecrackerBinary)
+	}
+	baseDir, err := directChildPath(jailerBaseDir, execName)
+	if err != nil {
+		return jailerRuntimePaths{}, fmt.Errorf("resolve jailer workspace base for %q: %w", name, err)
+	}
+	workspaceDir, err := directChildPath(baseDir, name)
+	if err != nil {
+		return jailerRuntimePaths{}, fmt.Errorf("resolve jailer workspace for %q: %w", name, err)
+	}
+	rootDir := filepath.Join(workspaceDir, "root")
+	return jailerRuntimePaths{
+		WorkspaceDir: workspaceDir,
+		RootDir:      rootDir,
+		SocketPath:   filepath.Join(rootDir, "firecracker.sock"),
+		LogPath:      filepath.Join(rootDir, "firecracker.log"),
+	}, nil
+}
+
+func validateStartRuntimeFiles(cfg ServerConfig, paths instanceRuntimePaths) error {
+	for label, path := range map[string]string{
+		"firecracker binary": cfg.FirecrackerBinary,
+		"jailer binary":      cfg.JailerBinary,
+		"kernel":             cfg.KernelPath,
+		"rootfs":             paths.RootFSPath,
+	} {
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("stat %s %s: %w", label, path, err)
+		}
+	}
+	if cfg.InitrdPath != "" {
+		if _, err := os.Stat(cfg.InitrdPath); err != nil {
+			return fmt.Errorf("stat initrd %s: %w", cfg.InitrdPath, err)
+		}
+	}
+	return nil
+}
+
+func prepareJailedRuntimeHandler(hostPaths instanceRuntimePaths, jailerPaths jailerRuntimePaths, jailerGID int) firecracker.Handler {
+	return firecracker.Handler{
+		Name: firecracker.CreateLogFilesHandlerName,
+		Fn: func(_ context.Context, m *firecracker.Machine) error {
+			if err := prepareInstanceLogFile(hostPaths.LogPath, jailerGID); err != nil {
+				return err
+			}
+			if err := linkFileIntoJail(hostPaths.LogPath, jailerPaths.LogPath); err != nil {
+				return err
+			}
+			if err := exposeJailedSocket(hostPaths.SocketPath, m.Cfg.SocketPath); err != nil {
+				return err
+			}
+			m.Cfg.LogPath = filepath.Base(jailerPaths.LogPath)
+			return nil
+		},
+	}
+}
+
+func prepareInstanceLogFile(path string, gid int) error {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("remove stale log symlink %s: %w", path, err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat log file %s: %w", path, err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o660)
+	if err != nil {
+		return fmt.Errorf("open log file %s: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close log file %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		return fmt.Errorf("chmod log file %s: %w", path, err)
+	}
+	if err := os.Chown(path, -1, gid); err != nil {
+		return fmt.Errorf("chown log file %s: %w", path, err)
+	}
+	return nil
+}
+
+func linkFileIntoJail(srcPath, jailedPath string) error {
+	if err := os.Remove(jailedPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale jailed file %s: %w", jailedPath, err)
+	}
+	if err := os.Link(srcPath, jailedPath); err != nil {
+		if errors.Is(err, syscall.EXDEV) {
+			return fmt.Errorf("link %s into jail at %s: %w (keep SRV_JAILER_BASE_DIR on the same filesystem as SRV_DATA_DIR)", srcPath, jailedPath, err)
+		}
+		return fmt.Errorf("link %s into jail at %s: %w", srcPath, jailedPath, err)
+	}
+	return nil
+}
+
+func exposeJailedSocket(hostSocketPath, jailedSocketPath string) error {
+	if err := os.Remove(hostSocketPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale firecracker socket alias %s: %w", hostSocketPath, err)
+	}
+	if err := os.Symlink(jailedSocketPath, hostSocketPath); err != nil {
+		return fmt.Errorf("link firecracker socket %s -> %s: %w", hostSocketPath, jailedSocketPath, err)
+	}
+	return nil
+}
+
+func cleanupJailedRuntimePaths(hostPaths instanceRuntimePaths, jailerPaths jailerRuntimePaths) error {
+	var errs []error
+	if err := os.Remove(hostPaths.SocketPath); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("remove firecracker socket alias %s: %w", hostPaths.SocketPath, err))
+	}
+	if err := os.RemoveAll(jailerPaths.WorkspaceDir); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("remove jailer workspace %s: %w", jailerPaths.WorkspaceDir, err))
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Server) cleanupVMRuntime(name string) error {
+	hostPaths, err := resolveInstanceRuntimePaths(s.config.InstancesDir, name)
+	if err != nil {
+		return err
+	}
+	jailerPaths, err := resolveJailerRuntimePaths(s.config.JailerBaseDir, s.config.FirecrackerBinary, name)
+	if err != nil {
+		return err
+	}
+	return cleanupJailedRuntimePaths(hostPaths, jailerPaths)
 }
 
 func (r StopRequest) Validate() error {

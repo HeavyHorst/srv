@@ -247,6 +247,10 @@ func TestAssignAndCleanupFirecrackerCgroup(t *testing.T) {
 func TestServerConfigValidate(t *testing.T) {
 	valid := ServerConfig{
 		FirecrackerBinary: "/usr/bin/firecracker",
+		JailerBinary:      "/usr/bin/jailer",
+		JailerBaseDir:     "/var/lib/srv/jailer",
+		JailerUID:         1001,
+		JailerGID:         1002,
 		InstancesDir:      "/var/lib/srv/instances",
 		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
 	}
@@ -257,9 +261,12 @@ func TestServerConfigValidate(t *testing.T) {
 		name string
 		cfg  ServerConfig
 	}{
-		{name: "missing instances dir", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, KernelPath: valid.KernelPath}},
-		{name: "relative kernel path", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, InstancesDir: valid.InstancesDir, KernelPath: "images/vmlinux"}},
-		{name: "relative initrd path", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, InstancesDir: valid.InstancesDir, KernelPath: valid.KernelPath, InitrdPath: "images/initrd"}},
+		{name: "missing jailer base dir", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: valid.JailerBinary, InstancesDir: valid.InstancesDir, KernelPath: valid.KernelPath, JailerUID: valid.JailerUID, JailerGID: valid.JailerGID}},
+		{name: "missing instances dir", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: valid.JailerBinary, JailerBaseDir: valid.JailerBaseDir, KernelPath: valid.KernelPath, JailerUID: valid.JailerUID, JailerGID: valid.JailerGID}},
+		{name: "relative jailer path", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: "bin/jailer", JailerBaseDir: valid.JailerBaseDir, InstancesDir: valid.InstancesDir, KernelPath: valid.KernelPath, JailerUID: valid.JailerUID, JailerGID: valid.JailerGID}},
+		{name: "relative kernel path", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: valid.JailerBinary, JailerBaseDir: valid.JailerBaseDir, InstancesDir: valid.InstancesDir, KernelPath: "images/vmlinux", JailerUID: valid.JailerUID, JailerGID: valid.JailerGID}},
+		{name: "relative initrd path", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: valid.JailerBinary, JailerBaseDir: valid.JailerBaseDir, InstancesDir: valid.InstancesDir, KernelPath: valid.KernelPath, InitrdPath: "images/initrd", JailerUID: valid.JailerUID, JailerGID: valid.JailerGID}},
+		{name: "negative jailer uid", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: valid.JailerBinary, JailerBaseDir: valid.JailerBaseDir, InstancesDir: valid.InstancesDir, KernelPath: valid.KernelPath, JailerUID: -1, JailerGID: valid.JailerGID}},
 	} {
 		if err := tc.cfg.Validate(); err == nil {
 			t.Fatalf("%s unexpectedly passed validation", tc.name)
@@ -283,5 +290,24 @@ func TestResolveInstanceRuntimePaths(t *testing.T) {
 	}
 	if _, err := resolveInstanceRuntimePaths("/var/lib/srv/instances", "nested/demo"); err == nil {
 		t.Fatalf("resolveInstanceRuntimePaths() accepted an unsafe name")
+	}
+}
+
+func TestResolveJailerRuntimePaths(t *testing.T) {
+	got, err := resolveJailerRuntimePaths("/var/lib/srv/jailer", "/usr/bin/firecracker", "demo")
+	if err != nil {
+		t.Fatalf("resolveJailerRuntimePaths(): %v", err)
+	}
+	want := jailerRuntimePaths{
+		WorkspaceDir: "/var/lib/srv/jailer/firecracker/demo",
+		RootDir:      "/var/lib/srv/jailer/firecracker/demo/root",
+		SocketPath:   "/var/lib/srv/jailer/firecracker/demo/root/firecracker.sock",
+		LogPath:      "/var/lib/srv/jailer/firecracker/demo/root/firecracker.log",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveJailerRuntimePaths() = %#v, want %#v", got, want)
+	}
+	if _, err := resolveJailerRuntimePaths("/var/lib/srv/jailer", "/usr/bin/firecracker", "nested/demo"); err == nil {
+		t.Fatalf("resolveJailerRuntimePaths() accepted an unsafe name")
 	}
 }

@@ -31,7 +31,7 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - SQLite stores instances, events, command audits, and authz decisions.
 - Btrfs reflinks clone the base rootfs for fast per-instance writable disks.
 - Firecracker launches each VM with a TAP device and host-side NAT.
-- A small root-only network helper owns TAP and iptables mutations, while a separate `srv-vm` runner service owns Firecracker processes, `kvm` access, and per-VM cgroups.
+- A small root-only network helper owns TAP and iptables mutations, while a separate `srv-vm` runner service owns Firecracker processes, `kvm` access, per-VM cgroups, and host-side resolution of per-instance runtime paths under `SRV_DATA_DIR/instances`.
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
 - `new`, `resize`, `list`, `inspect`, `start`, `stop`, `restart`, and `delete` are implemented.
 - When `srv` starts under systemd after a host reboot, previously active instances are restarted automatically.
@@ -111,7 +111,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now srv
 ```
 
-Under systemd, the main `srv` unit runs as the dedicated `srv` service user, the root-owned network helper owns host-side TAP and firewall mutation, and the separate `srv-vm` runner service owns Firecracker execution plus `kvm` access. Keep `SRV_DATA_DIR` on Btrfs and point `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` at the artifacts built under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
+Under systemd, the main `srv` unit runs as the dedicated `srv` service user, the root-owned network helper owns host-side TAP and firewall mutation, and the separate `srv-vm` runner service owns Firecracker execution plus `kvm` access. The runner derives each VM's `rootfs.img`, logs, and Firecracker socket from `SRV_DATA_DIR/instances/<name>/` instead of accepting caller-supplied host paths. Keep `SRV_DATA_DIR` on Btrfs and point `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` at the artifacts built under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
 
 ## Build The Arch Base Image
 

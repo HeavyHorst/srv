@@ -51,12 +51,6 @@ type Metadata struct {
 
 type StartRequest struct {
 	Name        string    `json:"name"`
-	SocketPath  string    `json:"socket_path"`
-	LogPath     string    `json:"log_path"`
-	SerialLog   string    `json:"serial_log_path"`
-	KernelPath  string    `json:"kernel_path"`
-	InitrdPath  string    `json:"initrd_path,omitempty"`
-	RootFSPath  string    `json:"rootfs_path"`
 	TapDevice   string    `json:"tap_device"`
 	GuestMAC    string    `json:"guest_mac"`
 	GuestAddr   string    `json:"guest_addr"`
@@ -165,22 +159,36 @@ func (c *Client) post(ctx context.Context, path string, payload any, out any) er
 type StartFunc func(context.Context, StartRequest) (StartResponse, error)
 type StopFunc func(context.Context, StopRequest) error
 
+type ServerConfig struct {
+	FirecrackerBinary string
+	InstancesDir      string
+	KernelPath        string
+	InitrdPath        string
+}
+
+type instanceRuntimePaths struct {
+	SocketPath string
+	LogPath    string
+	SerialLog  string
+	RootFSPath string
+}
+
 type Server struct {
-	log               *slog.Logger
-	firecrackerBinary string
-	start             StartFunc
-	stop              StopFunc
+	log    *slog.Logger
+	config ServerConfig
+	start  StartFunc
+	stop   StopFunc
 }
 
-func NewServer(logger *slog.Logger, firecrackerBinary string) *Server {
-	return NewServerWithHandlers(logger, firecrackerBinary, nil, nil)
+func NewServer(logger *slog.Logger, cfg ServerConfig) *Server {
+	return NewServerWithHandlers(logger, cfg, nil, nil)
 }
 
-func NewServerWithHandlers(logger *slog.Logger, firecrackerBinary string, start StartFunc, stop StopFunc) *Server {
+func NewServerWithHandlers(logger *slog.Logger, cfg ServerConfig, start StartFunc, stop StopFunc) *Server {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	s := &Server{log: logger, firecrackerBinary: strings.TrimSpace(firecrackerBinary)}
+	s := &Server{log: logger, config: cfg.normalized()}
 	if start != nil {
 		s.start = start
 	} else {
@@ -279,13 +287,17 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, error) {
-	if s.firecrackerBinary == "" {
-		return StartResponse{}, errors.New("firecracker binary path is required")
+	if err := s.config.Validate(); err != nil {
+		return StartResponse{}, err
 	}
-	if err := os.Remove(req.SocketPath); err != nil && !os.IsNotExist(err) {
+	paths, err := resolveInstanceRuntimePaths(s.config.InstancesDir, req.Name)
+	if err != nil {
+		return StartResponse{}, err
+	}
+	if err := os.Remove(paths.SocketPath); err != nil && !os.IsNotExist(err) {
 		return StartResponse{}, fmt.Errorf("remove stale firecracker socket: %w", err)
 	}
-	serialLog, err := os.OpenFile(req.SerialLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o660)
+	serialLog, err := os.OpenFile(paths.SerialLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o660)
 	if err != nil {
 		return StartResponse{}, fmt.Errorf("open serial log: %w", err)
 	}
@@ -303,14 +315,14 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	mem := req.MemoryMiB
 
 	fcCfg := firecracker.Config{
-		SocketPath:      req.SocketPath,
-		LogPath:         req.LogPath,
-		KernelImagePath: req.KernelPath,
-		InitrdPath:      req.InitrdPath,
+		SocketPath:      paths.SocketPath,
+		LogPath:         paths.LogPath,
+		KernelImagePath: s.config.KernelPath,
+		InitrdPath:      s.config.InitrdPath,
 		KernelArgs:      req.KernelArgs,
 		Drives: []models.Drive{{
 			DriveID:      &rootDriveID,
-			PathOnHost:   &req.RootFSPath,
+			PathOnHost:   &paths.RootFSPath,
 			IsReadOnly:   &isReadOnly,
 			IsRootDevice: &isRootDevice,
 		}},
@@ -335,8 +347,8 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 
 	vmCtx := vmContextForRequest(ctx)
 	cmd := firecracker.VMCommandBuilder{}.
-		WithBin(s.firecrackerBinary).
-		WithSocketPath(req.SocketPath).
+		WithBin(s.config.FirecrackerBinary).
+		WithSocketPath(paths.SocketPath).
 		WithStdout(serialLog).
 		WithStderr(serialLog).
 		Build(vmCtx)
@@ -375,20 +387,6 @@ func (r StartRequest) Validate() error {
 	if !validName.MatchString(strings.TrimSpace(r.Name)) {
 		return fmt.Errorf("invalid instance name %q", r.Name)
 	}
-	for label, path := range map[string]string{
-		"socket path":     r.SocketPath,
-		"log path":        r.LogPath,
-		"serial log path": r.SerialLog,
-		"kernel path":     r.KernelPath,
-		"rootfs path":     r.RootFSPath,
-	} {
-		if err := validateAbsolutePath(label, path, false); err != nil {
-			return err
-		}
-	}
-	if err := validateAbsolutePath("initrd path", r.InitrdPath, true); err != nil {
-		return err
-	}
 	if !ifaceName.MatchString(strings.TrimSpace(r.TapDevice)) {
 		return fmt.Errorf("tap device %q is invalid", r.TapDevice)
 	}
@@ -416,6 +414,45 @@ func (r StartRequest) Validate() error {
 		return errors.New("bootstrap hostname is required")
 	}
 	return nil
+}
+
+func (c ServerConfig) normalized() ServerConfig {
+	return ServerConfig{
+		FirecrackerBinary: strings.TrimSpace(c.FirecrackerBinary),
+		InstancesDir:      strings.TrimSpace(c.InstancesDir),
+		KernelPath:        strings.TrimSpace(c.KernelPath),
+		InitrdPath:        strings.TrimSpace(c.InitrdPath),
+	}
+}
+
+func (c ServerConfig) Validate() error {
+	c = c.normalized()
+	for label, path := range map[string]string{
+		"firecracker binary path": c.FirecrackerBinary,
+		"instances dir":           c.InstancesDir,
+		"kernel path":             c.KernelPath,
+	} {
+		if err := validateAbsolutePath(label, path, false); err != nil {
+			return err
+		}
+	}
+	if err := validateAbsolutePath("initrd path", c.InitrdPath, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func resolveInstanceRuntimePaths(instancesDir, name string) (instanceRuntimePaths, error) {
+	instanceDir, err := directChildPath(instancesDir, name)
+	if err != nil {
+		return instanceRuntimePaths{}, fmt.Errorf("resolve instance directory for %q: %w", name, err)
+	}
+	return instanceRuntimePaths{
+		SocketPath: filepath.Join(instanceDir, "firecracker.sock"),
+		LogPath:    filepath.Join(instanceDir, "firecracker.log"),
+		SerialLog:  filepath.Join(instanceDir, "serial.log"),
+		RootFSPath: filepath.Join(instanceDir, "rootfs.img"),
+	}, nil
 }
 
 func (r StopRequest) Validate() error {

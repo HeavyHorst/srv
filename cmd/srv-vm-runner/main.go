@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"srv/internal/vmrunner"
@@ -15,16 +16,33 @@ func main() {
 	var (
 		socketPath        string
 		clientGroup       string
+		instancesDir      string
+		kernelPath        string
+		initrdPath        string
 		firecrackerBinary string
 	)
 
+	defaultDataDir := getenv("SRV_DATA_DIR", "/var/lib/srv")
 	flag.StringVar(&socketPath, "socket", getenv("SRV_VM_RUNNER_SOCKET", vmrunner.DefaultSocketPath), "unix socket path for the Firecracker runner helper")
 	flag.StringVar(&clientGroup, "client-group", getenv("SRV_VM_RUNNER_CLIENT_GROUP", "srv"), "group allowed to connect to the VM runner socket")
+	flag.StringVar(&instancesDir, "instances-dir", filepath.Join(defaultDataDir, "instances"), "base directory containing per-instance runtime artifacts")
+	flag.StringVar(&kernelPath, "base-kernel", getenv("SRV_BASE_KERNEL", ""), "path to the Firecracker kernel image")
+	flag.StringVar(&initrdPath, "base-initrd", getenv("SRV_BASE_INITRD", ""), "path to the optional initrd image")
 	flag.StringVar(&firecrackerBinary, "firecracker-bin", getenv("SRV_FIRECRACKER_BIN", "/usr/bin/firecracker"), "firecracker binary path")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	server := vmrunner.NewServer(logger, firecrackerBinary)
+	cfg := vmrunner.ServerConfig{
+		FirecrackerBinary: firecrackerBinary,
+		InstancesDir:      instancesDir,
+		KernelPath:        kernelPath,
+		InitrdPath:        initrdPath,
+	}
+	if err := cfg.Validate(); err != nil {
+		logger.Error("invalid vm runner config", "err", err)
+		os.Exit(2)
+	}
+	server := vmrunner.NewServer(logger, cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

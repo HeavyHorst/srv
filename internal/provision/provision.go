@@ -581,9 +581,9 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 }
 
 func (p *Provisioner) ensureCreatePrereqs(needsResize bool) error {
-	for _, path := range []string{p.cfg.BaseKernelPath, p.cfg.BaseRootFSPath, p.cfg.FirecrackerBinary} {
+	for _, path := range []string{p.cfg.BaseKernelPath, p.cfg.BaseRootFSPath} {
 		if path == "" {
-			return errors.New("create requires SRV_BASE_KERNEL, SRV_BASE_ROOTFS, and SRV_FIRECRACKER_BIN")
+			return errors.New("create requires SRV_BASE_KERNEL and SRV_BASE_ROOTFS")
 		}
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("required file %s: %w", path, err)
@@ -627,7 +627,7 @@ func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
 	if p.tsClient == nil {
 		return errors.New("start requires TS_TAILNET and TS_CLIENT_SECRET so the control plane can observe guest tailnet readiness")
 	}
-	for _, path := range []string{inst.KernelPath, inst.RootFSPath, p.cfg.FirecrackerBinary} {
+	for _, path := range []string{inst.KernelPath, inst.RootFSPath} {
 		if path == "" {
 			return fmt.Errorf("instance %q is missing required runtime paths", inst.Name)
 		}
@@ -832,12 +832,6 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst model.Instance,
 	}
 	resp, err := p.vmRunner.StartInstanceVM(ctx, vmrunner.StartRequest{
 		Name:        inst.Name,
-		SocketPath:  inst.SocketPath,
-		LogPath:     inst.LogPath,
-		SerialLog:   inst.SerialLogPath,
-		KernelPath:  inst.KernelPath,
-		InitrdPath:  inst.InitrdPath,
-		RootFSPath:  inst.RootFSPath,
 		TapDevice:   inst.TapDevice,
 		GuestMAC:    inst.GuestMAC,
 		GuestAddr:   inst.GuestAddr,

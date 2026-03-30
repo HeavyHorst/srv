@@ -16,14 +16,8 @@ import (
 )
 
 func TestRequestsValidate(t *testing.T) {
-	root := t.TempDir()
 	valid := StartRequest{
 		Name:        "demo",
-		SocketPath:  filepath.Join(root, "firecracker.sock"),
-		LogPath:     filepath.Join(root, "firecracker.log"),
-		SerialLog:   filepath.Join(root, "serial.log"),
-		KernelPath:  filepath.Join(root, "vmlinux"),
-		RootFSPath:  filepath.Join(root, "rootfs.img"),
 		TapDevice:   "tap-demo",
 		GuestMAC:    "02:fc:aa:bb:cc:dd",
 		GuestAddr:   "10.0.0.2/30",
@@ -55,14 +49,8 @@ func TestRequestsValidate(t *testing.T) {
 }
 
 func TestClientAndServerOverUnixSocket(t *testing.T) {
-	root := t.TempDir()
 	valid := StartRequest{
 		Name:        "demo",
-		SocketPath:  filepath.Join(root, "firecracker.sock"),
-		LogPath:     filepath.Join(root, "firecracker.log"),
-		SerialLog:   filepath.Join(root, "serial.log"),
-		KernelPath:  filepath.Join(root, "vmlinux"),
-		RootFSPath:  filepath.Join(root, "rootfs.img"),
 		TapDevice:   "tap-demo",
 		GuestMAC:    "02:fc:aa:bb:cc:dd",
 		GuestAddr:   "10.0.0.2/30",
@@ -79,7 +67,11 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 		started []StartRequest
 		stopped []StopRequest
 	)
-	server := NewServerWithHandlers(slog.New(slog.NewTextHandler(io.Discard, nil)), "/usr/bin/firecracker",
+	server := NewServerWithHandlers(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		InstancesDir:      filepath.Join(t.TempDir(), "instances"),
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	},
 		func(_ context.Context, req StartRequest) (StartResponse, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -137,7 +129,11 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 }
 
 func TestServeUnixSetsSocketPermissions(t *testing.T) {
-	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), "/usr/bin/firecracker")
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		InstancesDir:      filepath.Join(t.TempDir(), "instances"),
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	})
 	socketPath := filepath.Join(t.TempDir(), "vm-runner.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -245,5 +241,47 @@ func TestAssignAndCleanupFirecrackerCgroup(t *testing.T) {
 	}
 	if err := assignFirecrackerToCgroup("nested/demo", 1); err == nil {
 		t.Fatalf("assignFirecrackerToCgroup() accepted an unsafe name")
+	}
+}
+
+func TestServerConfigValidate(t *testing.T) {
+	valid := ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		InstancesDir:      "/var/lib/srv/instances",
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("ServerConfig.Validate(): %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  ServerConfig
+	}{
+		{name: "missing instances dir", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, KernelPath: valid.KernelPath}},
+		{name: "relative kernel path", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, InstancesDir: valid.InstancesDir, KernelPath: "images/vmlinux"}},
+		{name: "relative initrd path", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, InstancesDir: valid.InstancesDir, KernelPath: valid.KernelPath, InitrdPath: "images/initrd"}},
+	} {
+		if err := tc.cfg.Validate(); err == nil {
+			t.Fatalf("%s unexpectedly passed validation", tc.name)
+		}
+	}
+}
+
+func TestResolveInstanceRuntimePaths(t *testing.T) {
+	got, err := resolveInstanceRuntimePaths("/var/lib/srv/instances", "demo")
+	if err != nil {
+		t.Fatalf("resolveInstanceRuntimePaths(): %v", err)
+	}
+	want := instanceRuntimePaths{
+		SocketPath: "/var/lib/srv/instances/demo/firecracker.sock",
+		LogPath:    "/var/lib/srv/instances/demo/firecracker.log",
+		SerialLog:  "/var/lib/srv/instances/demo/serial.log",
+		RootFSPath: "/var/lib/srv/instances/demo/rootfs.img",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolveInstanceRuntimePaths() = %#v, want %#v", got, want)
+	}
+	if _, err := resolveInstanceRuntimePaths("/var/lib/srv/instances", "nested/demo"); err == nil {
+		t.Fatalf("resolveInstanceRuntimePaths() accepted an unsafe name")
 	}
 }

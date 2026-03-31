@@ -57,11 +57,7 @@ sudo journalctl -u srv-vm-runner -f
 ## Smoke Test
 
 ```bash
-# Basic
 sudo ./contrib/smoke/host-smoke.sh
-
-# Strict (for upgrades)
-STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh
 ```
 
 ## Build Artifacts
@@ -108,7 +104,7 @@ sudo ./contrib/systemd/install.sh
 # restore /etc/srv/srv.env and /var/lib/srv
 sudo systemctl daemon-reload
 sudo systemctl enable --now srv-vm-runner srv-net-helper srv
-STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh
+sudo ./contrib/smoke/host-smoke.sh
 ```
 
 ## Debug Commands

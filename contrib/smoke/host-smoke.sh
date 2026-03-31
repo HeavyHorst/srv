@@ -20,7 +20,6 @@ Environment overrides:
   READY_TIMEOUT_SECONDS         default: derived from SRV_GUEST_READY_TIMEOUT
   GUEST_SSH_READY_TIMEOUT       default: 30
   SSH_CONNECT_TIMEOUT           default: 10
-  STRICT_HOST_ASSERTIONS        default: 0
 EOF
 }
 
@@ -43,7 +42,6 @@ READY_TIMEOUT_SECONDS="${READY_TIMEOUT_SECONDS:-}"
 GUEST_SSH_READY_TIMEOUT="${GUEST_SSH_READY_TIMEOUT:-30}"
 SSH_USER="${SSH_USER:-root}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
-STRICT_HOST_ASSERTIONS="${STRICT_HOST_ASSERTIONS:-0}"
 
 RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUN_STARTED_EPOCH="$(date -u +%s)"
@@ -260,16 +258,13 @@ verify_guest_ssh() {
 	done
 }
 
-assert_strict_host_runtime() {
+assert_host_runtime() {
 	local stage="$1"
 	local vm_runner_cgroup
 	local cgroup_path
 	local expected_cpu_max
 	local expected_memory_max
 
-	if [[ "${STRICT_HOST_ASSERTIONS}" != "1" ]]; then
-		return 0
-	fi
 	vm_runner_cgroup="$(systemctl show -p ControlGroup --value srv-vm-runner.service)"
 	if [[ -z "${vm_runner_cgroup}" ]]; then
 		fail "srv-vm-runner.service did not report a control group during ${stage}"
@@ -294,14 +289,11 @@ assert_strict_host_runtime() {
 	fi
 }
 
-assert_strict_host_cleanup() {
+assert_host_cleanup() {
 	local stage="$1"
 	local vm_runner_cgroup
 	local cgroup_path
 
-	if [[ "${STRICT_HOST_ASSERTIONS}" != "1" ]]; then
-		return 0
-	fi
 	if [[ -n "${INSTANCE_TAP_DEVICE}" && -e "/sys/class/net/${INSTANCE_TAP_DEVICE}" ]]; then
 		fail "tap device ${INSTANCE_TAP_DEVICE} still exists after ${stage}"
 	fi
@@ -399,7 +391,6 @@ ready-timeout-seconds: ${READY_TIMEOUT_SECONDS}
 poll-interval-seconds: ${POLL_INTERVAL_SECONDS}
 guest-ssh-ready-timeout: ${GUEST_SSH_READY_TIMEOUT}
 keep-failed: ${KEEP_FAILED}
-strict-host-assertions: ${STRICT_HOST_ASSERTIONS}
 jailer-workspace-dir: ${JAILER_WORKSPACE_DIR}
 EOF
 
@@ -442,7 +433,7 @@ log "instance is ready as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
 capture_best_effort tailscale-status-after-ready tailscale status
 verify_guest_ssh guest-ssh-create-ready
 assert_instance_listed list-create-ready ready
-assert_strict_host_runtime create-ready
+assert_host_runtime create-ready
 
 log "stopping ${INSTANCE_NAME}"
 if ! srv_ssh_capture stop stop "${INSTANCE_NAME}"; then
@@ -461,7 +452,7 @@ if ! grep -q '^firecracker-pid: 0$' "${ARTIFACT_DIR}/inspect-stopped.stdout"; th
 	fail "inspect after stop did not report firecracker-pid: 0"
 fi
 INSTANCE_TAP_DEVICE="$(extract_field "${ARTIFACT_DIR}/inspect-stopped.stdout" tap-device || true)"
-assert_strict_host_cleanup stop
+assert_host_cleanup stop
 
 log "starting ${INSTANCE_NAME}"
 if ! srv_ssh_capture start start "${INSTANCE_NAME}"; then
@@ -474,7 +465,7 @@ log "instance is ready again as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
 capture_best_effort tailscale-status-after-restart tailscale status
 verify_guest_ssh guest-ssh-start-ready
 assert_instance_listed list-start-ready ready
-assert_strict_host_runtime start-ready
+assert_host_runtime start-ready
 
 log "deleting ${INSTANCE_NAME}"
 if ! srv_ssh_capture delete delete "${INSTANCE_NAME}"; then
@@ -494,6 +485,6 @@ fi
 if [[ -e "${INSTANCE_DIR}" ]]; then
 	fail "instance directory ${INSTANCE_DIR} still exists after delete"
 fi
-assert_strict_host_cleanup delete
+assert_host_cleanup delete
 
 CLEANUP_COMPLETE=1

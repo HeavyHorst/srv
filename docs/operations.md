@@ -65,10 +65,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now srv-vm-runner srv-net-helper srv
 ```
 
-6. Run the strict prepared-host validation gate before handing the host back to users.
+6. Run the prepared-host validation gate before handing the host back to users.
 
 ```bash
-STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh
+sudo ./contrib/smoke/host-smoke.sh
 ```
 
 That smoke pass is part of the supported restore workflow now, not an optional extra.
@@ -86,10 +86,10 @@ That smoke pass is part of the supported restore workflow now, not an optional e
 sudo systemctl restart srv-vm-runner srv-net-helper srv
 ```
 
-5. Run the strict smoke gate.
+5. Run the host smoke test.
 
 ```bash
-STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh
+sudo ./contrib/smoke/host-smoke.sh
 ```
 
 Rollback for control-plane or schema regressions is restore-based:
@@ -98,7 +98,7 @@ Rollback for control-plane or schema regressions is restore-based:
 2. Reinstall the previous binaries and previous static Firecracker/jailer pair if those changed.
 3. Restore the pre-upgrade backup of `/etc/srv` and `SRV_DATA_DIR`.
 4. Restart the services.
-5. Run the same strict smoke gate again.
+5. Run the same host smoke test again.
 
 ### Kernel Rollout For Existing Guests
 
@@ -132,4 +132,4 @@ Important caveat: existing guests keep their own writable `rootfs.img`. There is
 - Keep using the official static Firecracker and jailer release pairing. Distro-provided dynamically linked binaries can fail after chroot before the API socket appears.
 - Preserve `/etc/srv/srv.env` across reinstall or upgrade unless you are intentionally changing configuration and have accounted for the stored absolute paths.
 - Keep `SRV_DATA_DIR` on Btrfs. Fast per-instance provisioning still depends on reflink cloning the configured base rootfs.
-- Run `STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh` after install, restore, control-plane upgrade, and base-image changes.
+- Run `sudo ./contrib/smoke/host-smoke.sh` after install, restore, control-plane upgrade, and base-image changes.

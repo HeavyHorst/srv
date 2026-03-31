@@ -1,5 +1,7 @@
 # srv
 
+> **Note:** This project is under active development. APIs, configuration, and behavior may change without notice.
+
 Self-hosted control-plane service for creating Firecracker microVMs over SSH on a Tailscale tailnet.
 
 `srv` exposes an SSH command surface on one Linux host and manages Firecracker microVMs behind it.

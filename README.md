@@ -31,7 +31,7 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - SQLite stores instances, events, command audits, and authz decisions.
 - Btrfs reflinks clone the base rootfs for fast per-instance writable disks.
 - Firecracker launches each VM with a TAP device and host-side NAT.
-- A small root-only network helper owns TAP and iptables mutations, while a separate root-owned VM runner service invokes Firecracker through the official jailer, drops the microVM process to `srv-vm:srv`, manages per-VM cgroups, and derives host runtime paths from `SRV_DATA_DIR/instances`.
+- A small root-only network helper owns TAP and iptables mutations, while a separate root-owned VM runner service invokes Firecracker through the official jailer, drops the microVM process to `srv-vm:srv`, enforces per-VM cgroup v2 CPU, memory, swap, and pid limits, and derives host runtime paths from `SRV_DATA_DIR/instances`.
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
 - The prepared-host path is the supported path today: systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` on a Linux host with root privileges, Tailscale, cgroup v2, and `/dev/kvm`.
 - `new`, `resize`, `list`, `inspect`, `logs`, `start`, `stop`, `restart`, and `delete` work end to end on that real host path.
@@ -48,12 +48,11 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 - A web UI is out of scope for now; SSH remains the control interface.
 - Live migration is out of scope for now.
 
-What remains is mostly operational maturity: making the single-host service safer to share, easier to recover, and easier to upgrade without improvisation.
+Operational maturity for the prepared-host path now has a concrete runbook instead of scattered caveats.
 
-## What Remains
+## Operations Runbook
 
-- Backup, restore, and upgrade runbook. Define and test how to back up `SRV_DATA_DIR`, recover onto a fresh host, reattach the expected static Firecracker and jailer setup, and roll guest image or schema changes forward without guesswork.
-- Service hardening and resource controls. Tighten the privileged helper posture further, document the host hardening expectations for the prepared systemd path, and make per-VM resource limits part of normal operations instead of a future concern.
+- [docs/operations.md](file:///home/rene/Code/srv/docs/operations.md) consolidates backup, restore, rebuild, upgrade, rollback, smoke-gated validation, and host hardening expectations for the supported prepared-host path.
 
 ## Operational Bar
 
@@ -68,6 +67,7 @@ What remains is mostly operational maturity: making the single-host service safe
 - `new` accepts `--cpus`, `--ram`, and `--rootfs-size` to set per-instance sizing at creation time.
 - `resize` accepts the same sizing flags, but only for instances in the `stopped` state.
 - CPU and memory changes are persisted on the instance record and take effect on the next `start` or `restart`.
+- Existing stopped guests pick up the currently configured `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` on the next `start` or `restart`, so you can roll boot artifacts forward without recreating the writable guest disk.
 - Rootfs resizing is grow-only. Requests smaller than the current disk image are rejected.
 - Rootfs growth happens on the host by expanding the disk image and filesystem before the next boot; live resize is not supported.
 - Each instance's writable disk lives at `SRV_DATA_DIR/instances/<name>/rootfs.img`; the configured base kernel and base rootfs remain separate shared inputs.
@@ -106,6 +106,7 @@ What remains is mostly operational maturity: making the single-host service safe
 - `SRV_JAILER_BIN`: Firecracker jailer binary used by the VM runner, default `/usr/bin/jailer`
 - `SRV_JAILER_BASE_DIR`: base directory for jailer workspaces, default `SRV_DATA_DIR/jailer`
 - `SRV_VM_NETWORK_CIDR`: host-side private network pool for guest TAP allocations, default `172.28.0.0/16`
+- `SRV_VM_PIDS_MAX`: maximum tasks allowed in each VM cgroup, default `512`
 - `SRV_OUTBOUND_IFACE`: optional override for the host interface used for NAT
 
 ## Run
@@ -158,9 +159,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now srv
 ```
 
-Under systemd, the main `srv` unit runs as the dedicated `srv` service user, the root-owned network helper owns host-side TAP and firewall mutation, and the separate root-owned VM runner invokes Firecracker through the official jailer before dropping the microVM process to `srv-vm:srv`. The runner still derives each VM's `rootfs.img`, logs, and Firecracker socket from `SRV_DATA_DIR/instances/<name>/` instead of accepting caller-supplied host paths, while the jailer builds its chroot workspaces under `SRV_JAILER_BASE_DIR`. Keep `SRV_DATA_DIR` on Btrfs and point `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` at the artifacts built under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
+Under systemd, the main `srv` unit runs as the dedicated `srv` service user, the root-owned network helper owns host-side TAP and firewall mutation, and the separate root-owned VM runner invokes Firecracker through the official jailer before dropping the microVM process to `srv-vm:srv`. The runner keeps itself in a delegated `supervisor/` cgroup, launches each VM directly into a constrained `firecracker-vms/<name>/` leaf cgroup, and still derives each VM's `rootfs.img`, logs, and Firecracker socket from `SRV_DATA_DIR/instances/<name>/` instead of accepting caller-supplied host paths. The jailer builds its chroot workspaces under `SRV_JAILER_BASE_DIR`. Keep `SRV_DATA_DIR` on Btrfs and point `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` at the artifacts built under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
 
-The `srv-vm-runner` unit is expected to run as `User=root` and `Group=srv` so the control plane can reach `/run/srv-vm-runner/vm-runner.sock` while the jailer still has the privileges it needs to set up the microVM sandbox. In particular, do not add `NoNewPrivileges=yes` to that unit: the jailer must drop to the configured `srv-vm:srv` identity and `exec` Firecracker on real hosts.
+The `srv-vm-runner` unit is expected to run as `User=root`, `Group=srv`, and `Delegate=cpu memory pids` so the control plane can reach `/run/srv-vm-runner/vm-runner.sock` while the jailer still has the privileges it needs to set up the microVM sandbox and program per-VM cgroup limits. In particular, do not add `NoNewPrivileges=yes` to that unit: the jailer must drop to the configured `srv-vm:srv` identity and `exec` Firecracker on real hosts.
 
 ## Host-Level Smoke Test
 
@@ -170,7 +171,13 @@ For a repeatable end-to-end validation pass on a prepared host, run [contrib/smo
 sudo ./contrib/smoke/host-smoke.sh
 ```
 
-That harness is the current validation bar for prepared hosts. It validates the systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` units, confirms the SSH control surface is reachable, creates a real guest, waits for `inspect` readiness, polls for a real guest SSH session after each ready transition, verifies `list`, exercises a stop/start cycle, and finally deletes the guest. On failure it collects `inspect`, `logs`, `systemctl status`, and `journalctl` artifacts automatically. See [contrib/smoke/README.md](contrib/smoke/README.md) for prerequisites, environment overrides, and artifact locations.
+For install, restore, or upgrade validation, use the stricter gate from [docs/operations.md](file:///home/rene/Code/srv/docs/operations.md):
+
+```bash
+STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh
+```
+
+That harness is the current validation bar for prepared hosts. It validates the systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` units, confirms the SSH control surface is reachable, creates a real guest, waits for `inspect` readiness, polls for a real guest SSH session after each ready transition, verifies `list`, exercises a stop/start cycle, and finally deletes the guest. With `STRICT_HOST_ASSERTIONS=1`, it also checks the live per-VM cgroup limit files and the cleanup of TAP, jailer, and cgroup artifacts after stop/delete. On failure it collects `inspect`, `logs`, `systemctl status`, and `journalctl` artifacts automatically. See [contrib/smoke/README.md](contrib/smoke/README.md) for prerequisites, environment overrides, and artifact locations.
 
 When debugging a failed host run, start with `ssh root@srv inspect <name>`, then compare the newest lines from `ssh root@srv logs <name> serial`, `ssh root@srv logs <name> firecracker`, and `journalctl -u srv-vm-runner`. The serial and Firecracker log files are append-only, so the latest lines are the trustworthy ones for the current failure.
 
@@ -182,7 +189,7 @@ The repo now includes an Arch guest image builder under `images/arch-base/`.
 sudo OUTPUT_DIR=/var/lib/srv/images/arch-base ./images/arch-base/build.sh
 ```
 
-That builder compiles a Firecracker-compatible `vmlinux`, pacstraps an Arch rootfs image, and installs the guest boot-time bootstrap service described below. The bootstrap service runs on every boot, starts `tailscaled`, and only performs `tailscale up --auth-key=... --ssh` on the first authenticated boot. The kernel fragment is also tuned for Firecracker's current x86 ACPI boot path and includes the minimal x86 keyboard-controller/input stack needed for graceful `SendCtrlAltDel` shutdowns. Changes under `images/arch-base/overlay/` or `images/arch-base/kernel-fragment.config` only reach new guests after you rebuild the artifacts and refresh the host's configured `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS`. See `images/arch-base/README.md` for details.
+That builder compiles a Firecracker-compatible `vmlinux`, pacstraps an Arch rootfs image, and installs the guest boot-time bootstrap service described below. The bootstrap service runs on every boot, starts `tailscaled`, and only performs `tailscale up --auth-key=... --ssh` on the first authenticated boot. The kernel fragment is also tuned for Firecracker's current x86 ACPI boot path and includes the minimal x86 keyboard-controller/input stack needed for graceful `SendCtrlAltDel` shutdowns. Rebuilt kernels can be picked up by existing stopped guests on their next `start` or `restart` once the host's configured `SRV_BASE_KERNEL` is refreshed. Rootfs changes under `images/arch-base/overlay/` still only reach newly created guests after you rebuild the artifacts and refresh `SRV_BASE_ROOTFS`. See `images/arch-base/README.md` for details.
 
 ## Guest Bootstrap Contract
 

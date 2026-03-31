@@ -12,11 +12,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,11 +30,16 @@ const (
 	DefaultSocketPath = "/run/srv-vm-runner/vm-runner.sock"
 	// firecracker-go-sdk requires NumaNode to be set, but a negative value keeps
 	// the SDK from synthesizing cpuset cgroup arguments for every jailed launch.
-	disabledJailerNumaNode     = -1
-	gracefulStopRequestTimeout = 2 * time.Second
-	gracefulStopTimeout        = 10 * time.Second
-	forcedStopTimeout          = 10 * time.Second
-	postKillWaitTimeout        = 2 * time.Second
+	defaultCgroupCPUQuotaPeriodMicros = int64(100000)
+	defaultVMPIDsMax                  = int64(512)
+	firecrackerSupervisorCgroupName   = "supervisor"
+	firecrackerVMRootCgroupName       = "firecracker-vms"
+	miBBytes                          = int64(1024 * 1024)
+	disabledJailerNumaNode            = -1
+	gracefulStopRequestTimeout        = 2 * time.Second
+	gracefulStopTimeout               = 10 * time.Second
+	forcedStopTimeout                 = 10 * time.Second
+	postKillWaitTimeout               = 2 * time.Second
 )
 
 var (
@@ -45,7 +52,10 @@ var (
 		return readUnifiedCgroupPath("/proc/self/cgroup")
 	}
 	cgroupFSRoot         = "/sys/fs/cgroup"
+	createDirAll         = os.MkdirAll
+	readTextFile         = os.ReadFile
 	removePath           = os.Remove
+	writeTextFile        = os.WriteFile
 	requestGuestShutdown = func(ctx context.Context, socketPath string) error {
 		action := models.InstanceActionInfoActionTypeSendCtrlAltDel
 		_, err := firecracker.NewClient(socketPath, nil, false).CreateSyncAction(ctx, &models.InstanceActionInfo{ActionType: &action})
@@ -192,6 +202,7 @@ type ServerConfig struct {
 	InstancesDir      string
 	KernelPath        string
 	InitrdPath        string
+	VMPIDsMax         int64
 }
 
 type instanceRuntimePaths struct {
@@ -213,6 +224,9 @@ type Server struct {
 	config ServerConfig
 	start  StartFunc
 	stop   StopFunc
+
+	cgroupMu           sync.Mutex
+	delegatedCgroupRel string
 }
 
 func NewServer(logger *slog.Logger, cfg ServerConfig) *Server {
@@ -414,7 +428,11 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	}
 
 	vmCtx := vmContextForRequest(ctx)
-	machine, err := firecracker.NewMachine(vmCtx, fcCfg)
+	processRunner, err := s.processRunnerForStart(vmCtx, req, fcCfg.SocketPath, serialLog)
+	if err != nil {
+		return StartResponse{}, err
+	}
+	machine, err := firecracker.NewMachine(vmCtx, fcCfg, firecracker.WithProcessRunner(processRunner))
 	if err != nil {
 		return StartResponse{}, fmt.Errorf("create firecracker machine: %w", err)
 	}
@@ -427,11 +445,6 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	pid, err := machine.PID()
 	if err != nil {
 		return StartResponse{}, fmt.Errorf("read firecracker pid: %w", err)
-	}
-	if err := assignFirecrackerToCgroup(req.Name, pid); err != nil {
-		_ = stopProcess(pid)
-		_ = cleanupFirecrackerCgroup(req.Name)
-		return StartResponse{}, err
 	}
 	cleanupRuntime = false
 	return StartResponse{PID: pid}, nil
@@ -454,7 +467,7 @@ func (s *Server) stopVM(ctx context.Context, req StopRequest) error {
 			}
 		}
 	}
-	if err := cleanupFirecrackerCgroup(req.Name); err != nil {
+	if err := s.cleanupFirecrackerCgroup(req.Name); err != nil {
 		errs = append(errs, err)
 	}
 	if err := s.cleanupVMRuntime(req.Name); err != nil {
@@ -515,7 +528,73 @@ func (r StartRequest) Validate() error {
 	return nil
 }
 
+func (s *Server) processRunnerForStart(ctx context.Context, req StartRequest, apiSocketPath string, serialLog io.Writer) (*exec.Cmd, error) {
+	parentCgroup, err := s.prepareFirecrackerCgroupParent()
+	if err != nil {
+		return nil, err
+	}
+	return s.buildJailedVMCommand(ctx, req, apiSocketPath, parentCgroup, serialLog)
+}
+
+func (s *Server) buildJailedVMCommand(ctx context.Context, req StartRequest, apiSocketPath, parentCgroup string, serialLog io.Writer) (*exec.Cmd, error) {
+	if strings.TrimSpace(parentCgroup) == "" {
+		return nil, errors.New("parent cgroup is required")
+	}
+	fcArgs := []string{"--no-seccomp", "--api-sock", apiSocketPath}
+	builder := firecracker.NewJailerCommandBuilder().
+		WithID(req.Name).
+		WithUID(s.config.JailerUID).
+		WithGID(s.config.JailerGID).
+		WithNumaNode(disabledJailerNumaNode).
+		WithExecFile(s.config.FirecrackerBinary).
+		WithChrootBaseDir(s.config.JailerBaseDir).
+		WithCgroupVersion("2").
+		WithFirecrackerArgs(fcArgs...).
+		WithStdout(serialLog).
+		WithStderr(serialLog)
+	if s.config.JailerBinary != "" {
+		builder = builder.WithBin(s.config.JailerBinary)
+	}
+	args := builder.Args()
+	extra := []string{"--parent-cgroup", parentCgroup}
+	for _, setting := range jailerCgroupSettings(req, s.config.VMPIDsMax) {
+		extra = append(extra, "--cgroup", setting)
+	}
+	args = insertBeforeDoubleDash(args, extra...)
+	cmd := exec.CommandContext(ctx, builder.Bin(), args...)
+	cmd.Stdout = serialLog
+	cmd.Stderr = serialLog
+	return cmd, nil
+}
+
+func jailerCgroupSettings(req StartRequest, pidsMax int64) []string {
+	return []string{
+		fmt.Sprintf("cpu.max=%d %d", req.VCPUCount*defaultCgroupCPUQuotaPeriodMicros, defaultCgroupCPUQuotaPeriodMicros),
+		fmt.Sprintf("memory.max=%d", req.MemoryMiB*miBBytes),
+		"memory.swap.max=0",
+		fmt.Sprintf("pids.max=%d", pidsMax),
+	}
+}
+
+func insertBeforeDoubleDash(args []string, insert ...string) []string {
+	idx := len(args)
+	for i, arg := range args {
+		if arg == "--" {
+			idx = i
+			break
+		}
+	}
+	withInsert := append([]string{}, args[:idx]...)
+	withInsert = append(withInsert, insert...)
+	withInsert = append(withInsert, args[idx:]...)
+	return withInsert
+}
+
 func (c ServerConfig) normalized() ServerConfig {
+	pidsMax := c.VMPIDsMax
+	if pidsMax == 0 {
+		pidsMax = defaultVMPIDsMax
+	}
 	return ServerConfig{
 		FirecrackerBinary: strings.TrimSpace(c.FirecrackerBinary),
 		JailerBinary:      strings.TrimSpace(c.JailerBinary),
@@ -525,6 +604,7 @@ func (c ServerConfig) normalized() ServerConfig {
 		InstancesDir:      strings.TrimSpace(c.InstancesDir),
 		KernelPath:        strings.TrimSpace(c.KernelPath),
 		InitrdPath:        strings.TrimSpace(c.InitrdPath),
+		VMPIDsMax:         pidsMax,
 	}
 }
 
@@ -549,6 +629,9 @@ func (c ServerConfig) Validate() error {
 	}
 	if c.JailerGID < 0 {
 		return fmt.Errorf("jailer gid %d is invalid", c.JailerGID)
+	}
+	if c.VMPIDsMax < 1 {
+		return fmt.Errorf("vm pids max %d is invalid", c.VMPIDsMax)
 	}
 	return nil
 }
@@ -872,15 +955,118 @@ func detectJailerCgroupVersion() string {
 	return "1"
 }
 
-func firecrackerCgroupPath(name string) (string, error) {
-	cgroupPath, err := currentCgroupPath()
+func (s *Server) prepareFirecrackerCgroupParent() (string, error) {
+	rootRel, err := s.delegatedCgroupRoot()
 	if err != nil {
 		return "", err
 	}
-	if !filepath.IsAbs(cgroupPath) {
-		return "", fmt.Errorf("current cgroup path %q is not absolute", cgroupPath)
+	rootPath := cgroupPathOnHost(rootRel)
+	supervisorPath := filepath.Join(rootPath, firecrackerSupervisorCgroupName)
+	vmRootPath := filepath.Join(rootPath, firecrackerVMRootCgroupName)
+	if err := createDirAll(supervisorPath, 0o755); err != nil {
+		return "", fmt.Errorf("create cgroup supervisor %s: %w", supervisorPath, err)
 	}
-	vmRoot := filepath.Join(cgroupFSRoot, strings.TrimPrefix(cgroupPath, "/"), "firecracker-vms")
+	if err := createDirAll(vmRootPath, 0o755); err != nil {
+		return "", fmt.Errorf("create firecracker cgroup root %s: %w", vmRootPath, err)
+	}
+	currentRel, err := currentCgroupPath()
+	if err != nil {
+		return "", fmt.Errorf("read current cgroup path: %w", err)
+	}
+	supervisorRel := filepath.Join(rootRel, firecrackerSupervisorCgroupName)
+	if currentRel != supervisorRel {
+		if err := moveProcessToCgroup(os.Getpid(), supervisorPath); err != nil {
+			return "", err
+		}
+	}
+	if err := enableCgroupControllers(rootPath, "cpu", "memory", "pids"); err != nil {
+		return "", err
+	}
+	if err := enableCgroupControllers(vmRootPath, "cpu", "memory", "pids"); err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(filepath.Join(rootRel, firecrackerVMRootCgroupName), "/"), nil
+}
+
+func (s *Server) delegatedCgroupRoot() (string, error) {
+	s.cgroupMu.Lock()
+	defer s.cgroupMu.Unlock()
+	if s.delegatedCgroupRel != "" {
+		return s.delegatedCgroupRel, nil
+	}
+	currentRel, err := currentCgroupPath()
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(currentRel) {
+		return "", fmt.Errorf("current cgroup path %q is not absolute", currentRel)
+	}
+	if filepath.Base(currentRel) == firecrackerSupervisorCgroupName {
+		currentRel = filepath.Dir(currentRel)
+	}
+	s.delegatedCgroupRel = currentRel
+	return s.delegatedCgroupRel, nil
+}
+
+func moveProcessToCgroup(pid int, cgroupPath string) error {
+	if pid <= 0 {
+		return fmt.Errorf("move process to cgroup %s: invalid pid %d", cgroupPath, pid)
+	}
+	if err := writeTextFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		return fmt.Errorf("move pid %d into cgroup %s: %w", pid, cgroupPath, err)
+	}
+	return nil
+}
+
+func enableCgroupControllers(cgroupPath string, controllers ...string) error {
+	available, err := readCgroupControllerFile(filepath.Join(cgroupPath, "cgroup.controllers"))
+	if err != nil {
+		return fmt.Errorf("read cgroup controllers for %s: %w", cgroupPath, err)
+	}
+	enabled, err := readCgroupControllerFile(filepath.Join(cgroupPath, "cgroup.subtree_control"))
+	if err != nil {
+		return fmt.Errorf("read cgroup subtree control for %s: %w", cgroupPath, err)
+	}
+	var ops []string
+	for _, controller := range controllers {
+		if _, ok := available[controller]; !ok {
+			return fmt.Errorf("cgroup %s does not expose delegated %s controller", cgroupPath, controller)
+		}
+		if _, ok := enabled[controller]; ok {
+			continue
+		}
+		ops = append(ops, "+"+controller)
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	if err := writeTextFile(filepath.Join(cgroupPath, "cgroup.subtree_control"), []byte(strings.Join(ops, " ")), 0o644); err != nil {
+		return fmt.Errorf("enable cgroup controllers %v for %s: %w", controllers, cgroupPath, err)
+	}
+	return nil
+}
+
+func readCgroupControllerFile(path string) (map[string]struct{}, error) {
+	payload, err := readTextFile(path)
+	if err != nil {
+		return nil, err
+	}
+	values := make(map[string]struct{})
+	for _, controller := range strings.Fields(string(payload)) {
+		values[strings.TrimPrefix(controller, "+")] = struct{}{}
+	}
+	return values, nil
+}
+
+func cgroupPathOnHost(rel string) string {
+	return filepath.Join(cgroupFSRoot, strings.TrimPrefix(rel, "/"))
+}
+
+func firecrackerCgroupPathUnder(cgroupRel, name string) (string, error) {
+	if !filepath.IsAbs(cgroupRel) {
+		return "", fmt.Errorf("current cgroup path %q is not absolute", cgroupRel)
+	}
+	vmRoot := filepath.Join(cgroupPathOnHost(cgroupRel), firecrackerVMRootCgroupName)
 	child, err := directChildPath(vmRoot, name)
 	if err != nil {
 		return "", fmt.Errorf("resolve firecracker cgroup for %q: %w", name, err)
@@ -888,40 +1074,21 @@ func firecrackerCgroupPath(name string) (string, error) {
 	return child, nil
 }
 
-func assignFirecrackerToCgroup(name string, pid int) error {
-	if pid <= 0 {
-		return fmt.Errorf("assign firecracker cgroup for %q: invalid pid %d", name, pid)
-	}
-	cgroupPath, err := firecrackerCgroupPath(name)
+func (s *Server) cleanupFirecrackerCgroup(name string) error {
+	rootRel, err := s.delegatedCgroupRoot()
 	if err != nil {
-		return fmt.Errorf("assign firecracker cgroup for %q: %w", name, err)
+		return fmt.Errorf("cleanup firecracker cgroup for %q: %w", name, err)
 	}
-	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
-		return fmt.Errorf("assign firecracker cgroup for %q: create %s: %w", name, cgroupPath, err)
-	}
-	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
-		return fmt.Errorf("assign firecracker cgroup for %q: move pid %d: %w", name, pid, err)
-	}
-	return nil
+	return cleanupFirecrackerCgroupUnder(rootRel, name)
 }
 
-func cleanupFirecrackerCgroup(name string) error {
-	cgroupPath, err := firecrackerCgroupPath(name)
+func cleanupFirecrackerCgroupUnder(rootRel, name string) error {
+	cgroupPath, err := firecrackerCgroupPathUnder(rootRel, name)
 	if err != nil {
 		return fmt.Errorf("cleanup firecracker cgroup for %q: %w", name, err)
 	}
 	if err := removePath(cgroupPath); err != nil && !os.IsNotExist(err) {
-		if errors.Is(err, syscall.ENOTEMPTY) {
-			_ = removePath(filepath.Join(cgroupPath, "cgroup.procs"))
-			err = removePath(cgroupPath)
-		}
-		if err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("cleanup firecracker cgroup for %q: remove %s: %w", name, cgroupPath, err)
-		}
-	}
-	vmRoot := filepath.Dir(cgroupPath)
-	if err := removePath(vmRoot); err != nil && !os.IsNotExist(err) && !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EBUSY) {
-		return fmt.Errorf("cleanup firecracker cgroup root %s: %w", vmRoot, err)
+		return fmt.Errorf("cleanup firecracker cgroup for %q: remove %s: %w", name, cgroupPath, err)
 	}
 	return nil
 }

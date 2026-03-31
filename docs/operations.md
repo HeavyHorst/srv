@@ -1,0 +1,135 @@
+# Operations Runbook
+
+This runbook is for the supported prepared-host path: systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` on a Linux host with cgroup v2, `/dev/kvm`, Btrfs-backed `SRV_DATA_DIR`, and the official static Firecracker/jailer release pair.
+
+Same-host reboot recovery is already built into the control plane: when `srv` comes back under systemd, previously active instances are restarted automatically. The steps below cover the larger operator workflows that were previously only implied.
+
+## Supported Upgrade Lanes
+
+- Guest-local maintenance is still guest-local. Running `pacman -Syu` inside a guest is supported when you want that guest to drift independently, but it is not the control plane's golden-image rollout path.
+- Kernel roll-forward is a host-managed lane. Existing stopped guests pick up the current `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` on their next `start` or `restart`.
+- Rootfs golden-image rollout is a new-guest lane. Updating `SRV_BASE_ROOTFS` changes what future `new` clones from, but it does not rewrite existing guests' writable disks.
+- Schema rollout is tied to the control-plane binary. SQLite migrations run during `srv` startup and are currently additive; rollback means restoring the pre-upgrade backup together with the previous binary set.
+
+## Backup
+
+Take backups from a quiesced host so `SRV_DATA_DIR` and the SQLite WAL state are self-consistent.
+
+1. Stop the services.
+
+```bash
+sudo systemctl stop srv srv-net-helper srv-vm-runner
+```
+
+2. Capture the state directory, environment file, and any unit overrides.
+
+```bash
+sudo tar --xattrs --acls --numeric-owner \
+  --ignore-failed-read \
+  -C / \
+  -czf /var/tmp/srv-backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz \
+  etc/srv \
+  var/lib/srv \
+  etc/systemd/system/srv.service.d \
+  etc/systemd/system/srv-net-helper.service.d \
+  etc/systemd/system/srv-vm-runner.service.d \
+  etc/systemd/system.control
+```
+
+3. Start the services again if this was only a backup window.
+
+```bash
+sudo systemctl start srv-vm-runner srv-net-helper srv
+```
+
+Notes:
+
+- Preserve the configured paths in `/etc/srv/srv.env`. Instance rows store absolute runtime paths such as `SRV_DATA_DIR/instances/<name>/rootfs.img`, so changing `SRV_DATA_DIR`, `SRV_JAILER_BASE_DIR`, or the base artifact paths during restore is not a supported relocation workflow.
+- Keep `SRV_JAILER_BASE_DIR` on the same filesystem as `SRV_DATA_DIR`; the runner hard-links log files into the jail and cross-filesystem links fail.
+
+## Restore Or Rebuild A Host
+
+1. Prepare a fresh host with the normal prerequisites: Tailscale, cgroup v2, `/dev/kvm`, Btrfs for `SRV_DATA_DIR`, and the repo checkout.
+2. Reinstall the managed assets.
+
+```bash
+sudo ./contrib/systemd/install.sh
+```
+
+3. Restore `/etc/srv/srv.env` from backup and verify that `SRV_FIRECRACKER_BIN`, `SRV_JAILER_BIN`, `SRV_DATA_DIR`, `SRV_BASE_KERNEL`, `SRV_BASE_ROOTFS`, and any optional `SRV_BASE_INITRD` still point at the intended paths.
+4. Restore the saved `SRV_DATA_DIR` tree to the same path.
+5. Reload systemd and start the services.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now srv-vm-runner srv-net-helper srv
+```
+
+6. Run the strict prepared-host validation gate before handing the host back to users.
+
+```bash
+STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh
+```
+
+That smoke pass is part of the supported restore workflow now, not an optional extra.
+
+## Upgrade And Rollback
+
+### Control Plane And Schema
+
+1. Take the quiesced backup above before starting the upgraded `srv` binary for the first time.
+2. Build and install the new `srv`, `srv-net-helper`, and `srv-vm-runner` binaries.
+3. If you also refreshed Firecracker, use the matching official static `firecracker` and `jailer` pair and verify `/etc/srv/srv.env` still points at those paths.
+4. Restart the services.
+
+```bash
+sudo systemctl restart srv-vm-runner srv-net-helper srv
+```
+
+5. Run the strict smoke gate.
+
+```bash
+STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh
+```
+
+Rollback for control-plane or schema regressions is restore-based:
+
+1. Stop the services.
+2. Reinstall the previous binaries and previous static Firecracker/jailer pair if those changed.
+3. Restore the pre-upgrade backup of `/etc/srv` and `SRV_DATA_DIR`.
+4. Restart the services.
+5. Run the same strict smoke gate again.
+
+### Kernel Rollout For Existing Guests
+
+1. Rebuild the kernel artifact under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
+2. Update `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` in `/etc/srv/srv.env`.
+3. Restart the units if needed so the runner sees the new base paths.
+4. Stop and start guests one at a time, or let already stopped guests pick up the new boot artifacts on their next `start`.
+5. Use a canary guest first, then roll wider once it passes the workload check you care about.
+
+Rollback is just pointing `SRV_BASE_KERNEL` or `SRV_BASE_INITRD` back to the previous artifact and restarting the affected guests again.
+
+### Golden Rootfs Rollout
+
+1. Rebuild `rootfs-base.img` under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
+2. Point `SRV_BASE_ROOTFS` at the new image.
+3. Create a canary guest with `ssh root@srv new <name>` and validate it.
+4. After the canary passes, new guests will clone from the new base image.
+
+Rollback for the golden rootfs lane is also path-based: point `SRV_BASE_ROOTFS` back to the previous image before creating more guests.
+
+Important caveat: existing guests keep their own writable `rootfs.img`. There is no host-driven in-place existing-rootfs conversion workflow yet. For an existing guest that needs OS updates today, the supported choices are:
+
+- manage that guest locally with `pacman -Syu`, accepting guest-local drift
+- create a replacement guest from the refreshed golden image and migrate the workload or data to it
+
+## Host Hardening And Caveats
+
+- cgroup v2 is required. The runner now depends on a delegated cgroup v2 subtree to place each VM into its own `firecracker-vms/<name>` leaf with enforced `cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`.
+- `srv-vm-runner.service` must keep `User=root`, `Group=srv`, `Delegate=cpu memory pids`, and a group-accessible socket under `/run/srv-vm-runner/`.
+- Do not add `NoNewPrivileges=yes` to `srv-vm-runner.service`; the jailer must drop privileges and `exec` Firecracker on real hosts.
+- Keep using the official static Firecracker and jailer release pairing. Distro-provided dynamically linked binaries can fail after chroot before the API socket appears.
+- Preserve `/etc/srv/srv.env` across reinstall or upgrade unless you are intentionally changing configuration and have accounted for the stored absolute paths.
+- Keep `SRV_DATA_DIR` on Btrfs. Fast per-instance provisioning still depends on reflink cloning the configured base rootfs.
+- Run `STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh` after install, restore, control-plane upgrade, and base-image changes.

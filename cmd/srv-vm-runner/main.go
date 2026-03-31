@@ -27,6 +27,7 @@ func main() {
 		jailerBaseDir     string
 		jailerUser        string
 		jailerGroup       string
+		vmPIDsMax         int64
 	)
 
 	defaultDataDir := getenv("SRV_DATA_DIR", "/var/lib/srv")
@@ -40,6 +41,7 @@ func main() {
 	flag.StringVar(&jailerBaseDir, "jailer-base-dir", getenv("SRV_JAILER_BASE_DIR", filepath.Join(defaultDataDir, "jailer")), "base directory where Firecracker jailer workspaces are created")
 	flag.StringVar(&jailerUser, "jailer-user", getenv("SRV_JAILER_USER", "srv-vm"), "user that the jailer drops the Firecracker process to")
 	flag.StringVar(&jailerGroup, "jailer-group", getenv("SRV_JAILER_GROUP", "srv"), "group that the jailer drops the Firecracker process to")
+	flag.Int64Var(&vmPIDsMax, "vm-pids-max", getenvInt64("SRV_VM_PIDS_MAX", 512), "maximum tasks allowed in each VM cgroup")
 	flag.Parse()
 
 	uid, gid, err := resolveProcessIdentity(jailerUser, jailerGroup)
@@ -59,6 +61,7 @@ func main() {
 		InstancesDir:      instancesDir,
 		KernelPath:        kernelPath,
 		InitrdPath:        initrdPath,
+		VMPIDsMax:         vmPIDsMax,
 	}
 	if err := cfg.Validate(); err != nil {
 		logger.Error("invalid vm runner config", "err", err)
@@ -80,6 +83,18 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getenvInt64(key string, fallback int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func resolveProcessIdentity(username, groupName string) (int, int, error) {

@@ -225,6 +225,10 @@ wait_for_ready() {
 	done
 }
 
+trim_file() {
+	tr -d '\n' <"$1"
+}
+
 assert_instance_listed() {
 	local label="$1"
 	local expected_state="$2"
@@ -254,6 +258,40 @@ verify_guest_ssh() {
 
 		sleep "${POLL_INTERVAL_SECONDS}"
 	done
+}
+
+assert_strict_host_runtime() {
+	local stage="$1"
+	local vm_runner_cgroup
+	local cgroup_path
+	local expected_cpu_max
+	local expected_memory_max
+
+	if [[ "${STRICT_HOST_ASSERTIONS}" != "1" ]]; then
+		return 0
+	fi
+	vm_runner_cgroup="$(systemctl show -p ControlGroup --value srv-vm-runner.service)"
+	if [[ -z "${vm_runner_cgroup}" ]]; then
+		fail "srv-vm-runner.service did not report a control group during ${stage}"
+	fi
+	cgroup_path="/sys/fs/cgroup/${vm_runner_cgroup#/}/firecracker-vms/${INSTANCE_NAME}"
+	if [[ ! -d "${cgroup_path}" ]]; then
+		fail "firecracker cgroup ${cgroup_path} is missing during ${stage}"
+	fi
+	expected_cpu_max="$(( VM_VCPUS * 100000 )) 100000"
+	expected_memory_max="$(( VM_MEMORY_MIB * 1024 * 1024 ))"
+	if [[ "$(trim_file "${cgroup_path}/cpu.max")" != "${expected_cpu_max}" ]]; then
+		fail "cpu.max for ${cgroup_path} was $(trim_file "${cgroup_path}/cpu.max"), want ${expected_cpu_max} during ${stage}"
+	fi
+	if [[ "$(trim_file "${cgroup_path}/memory.max")" != "${expected_memory_max}" ]]; then
+		fail "memory.max for ${cgroup_path} was $(trim_file "${cgroup_path}/memory.max"), want ${expected_memory_max} during ${stage}"
+	fi
+	if [[ "$(trim_file "${cgroup_path}/memory.swap.max")" != "0" ]]; then
+		fail "memory.swap.max for ${cgroup_path} was $(trim_file "${cgroup_path}/memory.swap.max"), want 0 during ${stage}"
+	fi
+	if [[ "$(trim_file "${cgroup_path}/pids.max")" != "${VM_PIDS_MAX}" ]]; then
+		fail "pids.max for ${cgroup_path} was $(trim_file "${cgroup_path}/pids.max"), want ${VM_PIDS_MAX} during ${stage}"
+	fi
 }
 
 assert_strict_host_cleanup() {
@@ -319,6 +357,10 @@ on_exit() {
 require_root
 require_commands
 load_env
+
+VM_VCPUS="${SRV_VM_VCPUS:-1}"
+VM_MEMORY_MIB="${SRV_VM_MEMORY_MIB:-1024}"
+VM_PIDS_MAX="${SRV_VM_PIDS_MAX:-512}"
 
 CONTROL_HOST="${SMOKE_SSH_HOST:-${SRV_HOSTNAME:-srv}}"
 SRV_DATA_DIR="${SRV_DATA_DIR:-/var/lib/srv}"
@@ -400,6 +442,7 @@ log "instance is ready as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
 capture_best_effort tailscale-status-after-ready tailscale status
 verify_guest_ssh guest-ssh-create-ready
 assert_instance_listed list-create-ready ready
+assert_strict_host_runtime create-ready
 
 log "stopping ${INSTANCE_NAME}"
 if ! srv_ssh_capture stop stop "${INSTANCE_NAME}"; then
@@ -431,6 +474,7 @@ log "instance is ready again as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
 capture_best_effort tailscale-status-after-restart tailscale status
 verify_guest_ssh guest-ssh-start-ready
 assert_instance_listed list-start-ready ready
+assert_strict_host_runtime start-ready
 
 log "deleting ${INSTANCE_NAME}"
 if ! srv_ssh_capture delete delete "${INSTANCE_NAME}"; then

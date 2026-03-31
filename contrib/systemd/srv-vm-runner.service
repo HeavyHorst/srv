@@ -23,7 +23,8 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictRealtime=yes
-Delegate=yes
+# Delegate only the controllers the runner manages under its per-VM subtree.
+Delegate=cpu memory pids
 Restart=on-failure
 RestartSec=5s
 

@@ -56,6 +56,8 @@ sudo OUTPUT_DIR=/var/lib/srv/images/arch-base ./images/arch-base/build.sh
 
 Changes under `overlay/` only reach new guests after you rebuild `rootfs-base.img` and refresh the host's configured base rootfs artifact.
 
+Rebuilt `vmlinux` artifacts can be picked up by existing stopped guests on their next `start` or `restart` once the host's `SRV_BASE_KERNEL` points at the refreshed kernel path.
+
 ## Outputs
 
 After a successful build, the output directory contains:

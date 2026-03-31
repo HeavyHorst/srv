@@ -402,11 +402,12 @@ func TestEnsureStartPrereqsRequiresCompletedBootstrap(t *testing.T) {
 	})
 	p := &Provisioner{cfg: cfg}
 	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	p.applyConfiguredBootArtifacts(&inst)
 
 	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
 		t.Fatalf("MkdirAll(instance dir): %v", err)
 	}
-	for _, path := range []string{inst.RootFSPath, inst.KernelPath, cfg.FirecrackerBinary} {
+	for _, path := range []string{inst.RootFSPath, inst.KernelPath, inst.InitrdPath, cfg.FirecrackerBinary} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
 		}
@@ -424,6 +425,35 @@ func TestEnsureStartPrereqsRequiresCompletedBootstrap(t *testing.T) {
 	inst.TailscaleName = "demo.tailnet"
 	if err := p.ensureStartPrereqs(inst); err != nil {
 		t.Fatalf("ensureStartPrereqs() with prior tailnet identity: %v", err)
+	}
+}
+
+func TestEnsureStartPrereqsUsesCurrentBaseKernelPath(t *testing.T) {
+	currentKernel := filepath.Join(t.TempDir(), "images", "current-vmlinux")
+	cfg := loadProvisionTestConfig(t, map[string]string{
+		"SRV_BASE_KERNEL": currentKernel,
+	})
+	p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.KernelPath = filepath.Join(t.TempDir(), "images", "old-vmlinux")
+	inst.TailscaleName = "demo.tailnet"
+	p.applyConfiguredBootArtifacts(&inst)
+
+	for _, path := range []string{inst.RootFSPath, inst.KernelPath, inst.InitrdPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+
+	if err := p.ensureStartPrereqs(inst); err != nil {
+		t.Fatalf("ensureStartPrereqs() with refreshed base kernel: %v", err)
+	}
+
+	if inst.KernelPath != currentKernel {
+		t.Fatalf("applyConfiguredBootArtifacts() kernel path = %q, want %q", inst.KernelPath, currentKernel)
 	}
 }
 

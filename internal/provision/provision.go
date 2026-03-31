@@ -457,6 +457,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, e
 	if err != nil {
 		return model.Instance{}, err
 	}
+	p.applyConfiguredBootArtifacts(&inst)
 	if err := p.ensureStartPrereqs(inst); err != nil {
 		return inst, err
 	}
@@ -618,6 +619,28 @@ func (p *Provisioner) ensureCreatePrereqs(needsResize bool) error {
 	return nil
 }
 
+func (p *Provisioner) configuredKernelPath(inst model.Instance) string {
+	if path := strings.TrimSpace(p.cfg.BaseKernelPath); path != "" {
+		return path
+	}
+	return strings.TrimSpace(inst.KernelPath)
+}
+
+func (p *Provisioner) configuredInitrdPath(inst model.Instance) string {
+	if path := strings.TrimSpace(p.cfg.BaseInitrdPath); path != "" {
+		return path
+	}
+	return strings.TrimSpace(inst.InitrdPath)
+}
+
+func (p *Provisioner) applyConfiguredBootArtifacts(inst *model.Instance) {
+	if inst == nil {
+		return
+	}
+	inst.KernelPath = p.configuredKernelPath(*inst)
+	inst.InitrdPath = p.configuredInitrdPath(*inst)
+}
+
 func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
 	if inst.State == model.StateDeleted {
 		return fmt.Errorf("instance %q is deleted", inst.Name)
@@ -634,6 +657,11 @@ func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
 		}
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("required file %s: %w", path, err)
+		}
+	}
+	if initrdPath := inst.InitrdPath; initrdPath != "" {
+		if _, err := os.Stat(initrdPath); err != nil {
+			return fmt.Errorf("required file %s: %w", initrdPath, err)
 		}
 	}
 	return nil

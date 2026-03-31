@@ -2,6 +2,8 @@
 
 `contrib/smoke/host-smoke.sh` is the repo's repeatable end-to-end validation path for a real prepared host.
 
+Treat it as the post-install, post-restore, and post-upgrade gate for the prepared-host path. The supported rebuild and upgrade workflows in [docs/operations.md](file:///home/rene/Code/srv/docs/operations.md) assume a clean smoke pass before the host is considered ready again.
+
 It is intentionally not part of `go test ./...`. The harness assumes:
 
 - a Linux host with systemd and root access
@@ -23,14 +25,21 @@ The harness validates the host-managed deployment end to end by:
 4. Polling `inspect <name>` until the guest reports `state: ready` plus `tailscale-name` and `tailscale-ip`, or timing out.
 5. Polling for a real SSH session to the guest over the tailnet after each ready transition, so tailnet-ready and SSH-ready can converge separately on warm boots.
 6. Verifying the instance appears in `list` while ready.
-7. Stopping the guest, validating `inspect` reports `state: stopped` and `firecracker-pid: 0`, then starting it again and waiting for a second ready pass.
-8. Capturing `inspect`, `logs`, `systemctl status`, `journalctl`, and `tailscale status` artifacts automatically on failure.
-9. Deleting the guest, then confirming the instance disappears from `list` and its runtime directory is removed from `SRV_DATA_DIR/instances/<name>`.
+7. When `STRICT_HOST_ASSERTIONS=1` is set, verifying the live per-VM cgroup limit files (`cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`) under `srv-vm-runner.service` during each ready pass.
+8. Stopping the guest, validating `inspect` reports `state: stopped` and `firecracker-pid: 0`, then starting it again and waiting for a second ready pass.
+9. Capturing `inspect`, `logs`, `systemctl status`, `journalctl`, and `tailscale status` artifacts automatically on failure.
+10. Deleting the guest, then confirming the instance disappears from `list` and its runtime directory is removed from `SRV_DATA_DIR/instances/<name>`.
 
 ## Run
 
 ```bash
 sudo ./contrib/smoke/host-smoke.sh
+```
+
+For restore, rebuild, or upgrade validation, prefer the stricter mode:
+
+```bash
+STRICT_HOST_ASSERTIONS=1 sudo ./contrib/smoke/host-smoke.sh
 ```
 
 Artifacts are written under `/var/tmp/srv-smoke/<instance>/` by default.
@@ -44,7 +53,7 @@ Artifacts are written under `/var/tmp/srv-smoke/<instance>/` by default.
 - `KEEP_FAILED=1` to leave a failed instance intact for debugging
 - `READY_TIMEOUT_SECONDS=300` to override the derived guest-ready timeout
 - `GUEST_SSH_READY_TIMEOUT=45` to wait longer for guest SSH to become reachable after a ready transition
-- `STRICT_HOST_ASSERTIONS=1` to additionally require that the TAP device, jailer workspace, and instance-specific Firecracker cgroup path are gone after stop/delete
+- `STRICT_HOST_ASSERTIONS=1` to additionally require the live per-VM cgroup limit files during ready passes, plus TAP, jailer workspace, and cgroup cleanup after stop/delete
 
 ## Failure Artifacts
 

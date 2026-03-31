@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -367,6 +368,131 @@ func TestDisabledJailerNumaNodeOmitsCpusetCgroups(t *testing.T) {
 	}
 }
 
+func TestBuildJailedVMCommandIncludesResourceLimits(t *testing.T) {
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		JailerBinary:      "/usr/bin/jailer",
+		JailerBaseDir:     "/var/lib/srv/jailer",
+		JailerUID:         123,
+		JailerGID:         456,
+		InstancesDir:      "/var/lib/srv/instances",
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+		VMPIDsMax:         321,
+	})
+
+	cmd, err := server.buildJailedVMCommand(
+		context.Background(),
+		StartRequest{Name: "demo", VCPUCount: 2, MemoryMiB: 1024},
+		"firecracker.sock",
+		"system.slice/srv-vm-runner.service/firecracker-vms",
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatalf("buildJailedVMCommand(): %v", err)
+	}
+
+	want := []string{
+		"/usr/bin/jailer",
+		"--id", "demo",
+		"--uid", "123",
+		"--gid", "456",
+		"--exec-file", "/usr/bin/firecracker",
+		"--cgroup-version", "2",
+		"--chroot-base-dir", "/var/lib/srv/jailer",
+		"--parent-cgroup", "system.slice/srv-vm-runner.service/firecracker-vms",
+		"--cgroup", "cpu.max=200000 100000",
+		"--cgroup", "memory.max=1073741824",
+		"--cgroup", "memory.swap.max=0",
+		"--cgroup", "pids.max=321",
+		"--",
+		"--no-seccomp",
+		"--api-sock", "firecracker.sock",
+	}
+	if !reflect.DeepEqual(cmd.Args, want) {
+		t.Fatalf("buildJailedVMCommand() args = %#v, want %#v", cmd.Args, want)
+	}
+}
+
+func TestPrepareFirecrackerCgroupParentMovesRunnerAndEnablesControllers(t *testing.T) {
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	oldCreateDirAll := createDirAll
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+		createDirAll = oldCreateDirAll
+	})
+
+	cgroupFSRoot = t.TempDir()
+	serviceRel := "/system.slice/srv-vm-runner.service"
+	servicePath := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service")
+	seedCgroup := func(path string) error {
+		if err := os.WriteFile(filepath.Join(path, "cgroup.controllers"), []byte("cpu memory pids"), 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(path, "cgroup.subtree_control"), nil, 0o644); err != nil {
+			return err
+		}
+		return nil
+	}
+	createDirAll = func(path string, mode os.FileMode) error {
+		if err := os.MkdirAll(path, mode); err != nil {
+			return err
+		}
+		if strings.HasPrefix(path, cgroupFSRoot) {
+			if err := seedCgroup(path); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := createDirAll(servicePath, 0o755); err != nil {
+		t.Fatalf("createDirAll(servicePath): %v", err)
+	}
+	currentCgroupPath = func() (string, error) {
+		return serviceRel, nil
+	}
+
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		JailerBinary:      "/usr/bin/jailer",
+		JailerBaseDir:     "/var/lib/srv/jailer",
+		JailerUID:         123,
+		JailerGID:         456,
+		InstancesDir:      "/var/lib/srv/instances",
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	})
+
+	parent, err := server.prepareFirecrackerCgroupParent()
+	if err != nil {
+		t.Fatalf("prepareFirecrackerCgroupParent(): %v", err)
+	}
+	if parent != "system.slice/srv-vm-runner.service/firecracker-vms" {
+		t.Fatalf("prepareFirecrackerCgroupParent() = %q", parent)
+	}
+
+	supervisorProcs, err := os.ReadFile(filepath.Join(servicePath, firecrackerSupervisorCgroupName, "cgroup.procs"))
+	if err != nil {
+		t.Fatalf("ReadFile(supervisor cgroup.procs): %v", err)
+	}
+	if strings.TrimSpace(string(supervisorProcs)) != strconv.Itoa(os.Getpid()) {
+		t.Fatalf("supervisor cgroup.procs = %q, want %d", strings.TrimSpace(string(supervisorProcs)), os.Getpid())
+	}
+
+	for _, path := range []string{
+		filepath.Join(servicePath, "cgroup.subtree_control"),
+		filepath.Join(servicePath, firecrackerVMRootCgroupName, "cgroup.subtree_control"),
+	} {
+		payload, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", path, err)
+		}
+		if got := strings.Fields(string(payload)); !reflect.DeepEqual(got, []string{"+cpu", "+memory", "+pids"}) {
+			t.Fatalf("%s = %#v, want [+cpu +memory +pids]", path, got)
+		}
+	}
+}
+
 func TestValidateJailedFirecrackerBinary(t *testing.T) {
 	t.Run("accepts static elf without interpreter", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "firecracker-static")
@@ -394,7 +520,7 @@ func TestValidateJailedFirecrackerBinary(t *testing.T) {
 	})
 }
 
-func TestAssignAndCleanupFirecrackerCgroup(t *testing.T) {
+func TestServerCleanupFirecrackerCgroupPropagatesBusyLeaf(t *testing.T) {
 	oldRoot := cgroupFSRoot
 	oldCurrent := currentCgroupPath
 	oldRemove := removePath
@@ -405,81 +531,42 @@ func TestAssignAndCleanupFirecrackerCgroup(t *testing.T) {
 	})
 
 	cgroupFSRoot = t.TempDir()
+	serviceRel := "/system.slice/srv-vm-runner.service"
 	currentCgroupPath = func() (string, error) {
-		return "/system.slice/srv-vm-runner.service", nil
+		return serviceRel, nil
 	}
 
 	serviceCgroup := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service")
-	if err := os.MkdirAll(serviceCgroup, 0o755); err != nil {
-		t.Fatalf("MkdirAll(serviceCgroup): %v", err)
-	}
-
-	if err := assignFirecrackerToCgroup("demo", 4321); err != nil {
-		t.Fatalf("assignFirecrackerToCgroup(): %v", err)
-	}
-
-	cgroupPath := filepath.Join(serviceCgroup, "firecracker-vms", "demo")
-	payload, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.procs"))
-	if err != nil {
-		t.Fatalf("ReadFile(cgroup.procs): %v", err)
-	}
-	if strings.TrimSpace(string(payload)) != "4321" {
-		t.Fatalf("cgroup.procs = %q, want %q", strings.TrimSpace(string(payload)), "4321")
-	}
-
-	if err := cleanupFirecrackerCgroup("demo"); err != nil {
-		t.Fatalf("cleanupFirecrackerCgroup(): %v", err)
-	}
-	if _, err := os.Stat(cgroupPath); !os.IsNotExist(err) {
-		t.Fatalf("cgroup path should be removed, stat err = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(serviceCgroup, "firecracker-vms")); !os.IsNotExist(err) {
-		t.Fatalf("firecracker cgroup root should be removed when empty, stat err = %v", err)
-	}
-	if err := assignFirecrackerToCgroup("nested/demo", 1); err == nil {
-		t.Fatalf("assignFirecrackerToCgroup() accepted an unsafe name")
-	}
-}
-
-func TestCleanupFirecrackerCgroupIgnoresBusySharedRoot(t *testing.T) {
-	oldRoot := cgroupFSRoot
-	oldCurrent := currentCgroupPath
-	oldRemove := removePath
-	t.Cleanup(func() {
-		cgroupFSRoot = oldRoot
-		currentCgroupPath = oldCurrent
-		removePath = oldRemove
-	})
-
-	cgroupFSRoot = t.TempDir()
-	currentCgroupPath = func() (string, error) {
-		return "/system.slice/srv-vm-runner.service", nil
-	}
-
-	serviceCgroup := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service")
-	if err := os.MkdirAll(filepath.Join(serviceCgroup, "firecracker-vms", "demo"), 0o755); err != nil {
+	cgroupPath := filepath.Join(serviceCgroup, firecrackerVMRootCgroupName, "demo")
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
 		t.Fatalf("MkdirAll(demo): %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(serviceCgroup, "firecracker-vms", "other"), 0o755); err != nil {
-		t.Fatalf("MkdirAll(other): %v", err)
-	}
 
-	vmRoot := filepath.Join(serviceCgroup, "firecracker-vms")
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		JailerBinary:      "/usr/bin/jailer",
+		JailerBaseDir:     "/var/lib/srv/jailer",
+		JailerUID:         123,
+		JailerGID:         456,
+		InstancesDir:      "/var/lib/srv/instances",
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	})
+
+	var removed []string
 	removePath = func(path string) error {
-		if path == vmRoot {
-			return syscall.EBUSY
+		removed = append(removed, path)
+		if path == cgroupPath {
+			return syscall.ENOTEMPTY
 		}
 		return os.Remove(path)
 	}
 
-	if err := cleanupFirecrackerCgroup("demo"); err != nil {
-		t.Fatalf("cleanupFirecrackerCgroup(): %v", err)
+	err := server.cleanupFirecrackerCgroup("demo")
+	if err == nil || !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("cleanupFirecrackerCgroup() error = %v, want ENOTEMPTY", err)
 	}
-	if _, err := os.Stat(filepath.Join(vmRoot, "demo")); !os.IsNotExist(err) {
-		t.Fatalf("demo cgroup should be removed, stat err = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(vmRoot, "other")); err != nil {
-		t.Fatalf("other cgroup should remain, stat err = %v", err)
+	if len(removed) != 1 || removed[0] != cgroupPath {
+		t.Fatalf("cleanupFirecrackerCgroup() removed %#v, want only %q", removed, cgroupPath)
 	}
 }
 
@@ -506,6 +593,7 @@ func TestServerConfigValidate(t *testing.T) {
 		{name: "relative kernel path", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: valid.JailerBinary, JailerBaseDir: valid.JailerBaseDir, InstancesDir: valid.InstancesDir, KernelPath: "images/vmlinux", JailerUID: valid.JailerUID, JailerGID: valid.JailerGID}},
 		{name: "relative initrd path", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: valid.JailerBinary, JailerBaseDir: valid.JailerBaseDir, InstancesDir: valid.InstancesDir, KernelPath: valid.KernelPath, InitrdPath: "images/initrd", JailerUID: valid.JailerUID, JailerGID: valid.JailerGID}},
 		{name: "negative jailer uid", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: valid.JailerBinary, JailerBaseDir: valid.JailerBaseDir, InstancesDir: valid.InstancesDir, KernelPath: valid.KernelPath, JailerUID: -1, JailerGID: valid.JailerGID}},
+		{name: "negative vm pids max", cfg: ServerConfig{FirecrackerBinary: valid.FirecrackerBinary, JailerBinary: valid.JailerBinary, JailerBaseDir: valid.JailerBaseDir, InstancesDir: valid.InstancesDir, KernelPath: valid.KernelPath, JailerUID: valid.JailerUID, JailerGID: valid.JailerGID, VMPIDsMax: -1}},
 	} {
 		if err := tc.cfg.Validate(); err == nil {
 			t.Fatalf("%s unexpectedly passed validation", tc.name)

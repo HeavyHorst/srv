@@ -26,9 +26,11 @@ The harness validates the host-managed deployment end to end by:
 5. Polling for a real SSH session to the guest over the tailnet after each ready transition, so tailnet-ready and SSH-ready can converge separately on warm boots.
 6. Verifying the instance appears in `list` while ready.
 7. Verifying the live per-VM cgroup limit files (`cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`) under `srv-vm-runner.service` during each ready pass.
-8. Stopping the guest, validating `inspect` reports `state: stopped` and `firecracker-pid: 0`, then starting it again and waiting for a second ready pass.
-9. Capturing `inspect`, `logs`, `systemctl status`, `journalctl`, and `tailscale status` artifacts automatically on failure.
-10. Deleting the guest, then confirming the instance disappears from `list`, its runtime directory is removed from `SRV_DATA_DIR/instances/<name>`, and its TAP, jailer workspace, and cgroup artifacts are cleaned up.
+8. Stopping the guest, creating a stopped backup, verifying `backup list` reports it, and confirming the backup files exist under `SRV_DATA_DIR/backups/<name>/<backup-id>/`.
+9. Starting the guest again, mutating guest-persistent files over SSH, stopping it once more, restoring the backup, and starting it a third time.
+10. Proving the restore actually rolled the rootfs back by checking the pre-backup file contents return and post-backup-only files disappear.
+11. Capturing `inspect`, `logs`, `systemctl status`, `journalctl`, and `tailscale status` artifacts automatically on failure.
+12. Deleting the guest, then confirming the instance disappears from `list`, its runtime directory is removed from `SRV_DATA_DIR/instances/<name>`, and its TAP, jailer workspace, and cgroup artifacts are cleaned up.
 
 ## Run
 
@@ -53,6 +55,9 @@ Artifacts are written under `/var/tmp/srv-smoke/<instance>/` by default.
 On failure, the harness keeps a small artifact bundle that typically includes:
 
 - `create.*`
+- `backup-create.*`
+- `backup-list.*`
+- `restore.*`
 - `inspect-final.*`
 - `logs-serial.*`
 - `logs-firecracker.*`

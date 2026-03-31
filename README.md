@@ -72,11 +72,18 @@ ssh root@srv start demo
 ssh root@srv restart demo
 ssh root@srv delete demo
 
+# stopped-VM backups
+ssh root@srv backup create demo
+ssh root@srv backup list demo
+ssh root@srv restore demo <backup-id>
+
 # resize while stopped
 ssh root@srv stop demo
 ssh root@srv resize demo --cpus 4 --ram 8G --rootfs-size 20G
 ssh root@srv start demo
 ```
+
+Per-VM backup and restore is currently an in-place stopped-instance workflow: create a backup from a stopped VM, then restore that backup back onto the same VM later. Backups are tied to the original VM record and are not restored onto a newly recreated VM that happens to reuse the same name.
 
 ## Host Requirements
 
@@ -112,7 +119,7 @@ For a repeatable end-to-end validation pass on a prepared host, run:
 sudo ./contrib/smoke/host-smoke.sh
 ```
 
-That harness validates the systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` units, confirms the SSH control surface is reachable, creates a real guest, waits for `inspect` readiness, polls for a real guest SSH session after each ready transition, verifies `list`, exercises a full stop/start cycle, checks the live per-VM cgroup limit files, and finally deletes the guest while confirming TAP, jailer, and cgroup cleanup.
+That harness validates the systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` units, confirms the SSH control surface is reachable, creates a real guest, waits for `inspect` readiness, polls for a real guest SSH session after each ready transition, verifies `list`, exercises a full stop/backup/start/restore cycle, proves restore actually rolls the guest rootfs back, checks the live per-VM cgroup limit files, and finally deletes the guest while confirming TAP, jailer, and cgroup cleanup.
 
 When debugging a failed host run, start with `ssh root@srv inspect <name>`, then compare the newest lines from `ssh root@srv logs <name> serial`, `ssh root@srv logs <name> firecracker`, and `journalctl -u srv-vm-runner`.
 

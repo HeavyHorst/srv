@@ -19,6 +19,9 @@ ssh root@srv <command> [args]
 | `restart <name>` | Restart VM |
 | `delete <name>` | Remove VM |
 | `resize <name>` | Resize stopped VM (grow-only) |
+| `backup create <name>` | Create an in-place backup for a stopped VM |
+| `backup list <name>` | List stored backups for a VM |
+| `restore <name> <backup-id>` | Restore a stopped VM from one of its backups |
 
 ## Quick Examples
 
@@ -33,6 +36,12 @@ ssh root@srv new demo --cpus 4 --ram 8G --rootfs-size 20G
 ssh root@srv stop demo
 ssh root@srv resize demo --cpus 4 --ram 8G
 ssh root@srv start demo
+
+# Backup and restore (VM must be stopped)
+ssh root@srv stop demo
+ssh root@srv backup create demo
+ssh root@srv backup list demo
+ssh root@srv restore demo <backup-id>
 
 # View logs
 ssh root@srv logs demo
@@ -128,8 +137,10 @@ cat /sys/fs/cgroup/firecracker-vms/<name>/memory.max
 ## Notes
 
 - VM disks at: `SRV_DATA_DIR/instances/<name>/rootfs.img`
+- VM backups live at: `SRV_DATA_DIR/backups/<name>/<backup-id>/`
 - Resize is grow-only (shrink rejected)
 - Resize only works on stopped VMs
+- Backup and restore only work on stopped VMs and only restore onto the original VM record, not a newly recreated VM with the same name
 - Creators manage their own VMs; admins manage all VMs
 - Warm start/restart reuses tailscaled state
 - Host reboot auto-restarts active VMs

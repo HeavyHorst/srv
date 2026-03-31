@@ -47,6 +47,13 @@ type App struct {
 	localAPI    *local.Client
 	sshServer   *gssh.Server
 	mu          sync.Mutex
+	lockMu      sync.Mutex
+	locks       map[string]*instanceLockEntry
+}
+
+type instanceLockEntry struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type commandResult struct {
@@ -66,13 +73,16 @@ const (
 )
 
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
-	for _, dir := range []string{cfg.DataDirAbs(), cfg.StateDir(), cfg.ImagesDir(), cfg.InstancesDir(), cfg.TSNetDir()} {
+	for _, dir := range []string{cfg.DataDirAbs(), cfg.StateDir(), cfg.ImagesDir(), cfg.InstancesDir(), cfg.BackupsDir(), cfg.TSNetDir()} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create %s: %w", dir, err)
 		}
 	}
 	if err := os.Chmod(cfg.InstancesDir(), 0o770); err != nil {
 		return nil, fmt.Errorf("set instances dir permissions: %w", err)
+	}
+	if err := os.Chmod(cfg.BackupsDir(), 0o770); err != nil {
+		return nil, fmt.Errorf("set backups dir permissions: %w", err)
 	}
 
 	st, err := store.Open(cfg.DatabasePath())
@@ -87,6 +97,31 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 
 	return &App{cfg: cfg, log: logger, store: st, provisioner: prov}, nil
+}
+
+func (a *App) lockInstance(name string) func() {
+	a.lockMu.Lock()
+	if a.locks == nil {
+		a.locks = make(map[string]*instanceLockEntry)
+	}
+	entry := a.locks[name]
+	if entry == nil {
+		entry = &instanceLockEntry{}
+		a.locks[name] = entry
+	}
+	entry.refs++
+	a.lockMu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		a.lockMu.Lock()
+		defer a.lockMu.Unlock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(a.locks, name)
+		}
+	}
 }
 
 func (a *App) Run(ctx context.Context) error {
@@ -270,12 +305,16 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, args []string) (c
 		return a.cmdNew(ctx, actor, args)
 	case "resize":
 		return a.cmdResize(ctx, actor, args)
+	case "backup":
+		return a.cmdBackup(ctx, actor, args)
 	case "list":
 		return a.cmdList(ctx, actor)
 	case "inspect":
 		return a.cmdInspect(ctx, actor, args)
 	case "logs":
 		return a.cmdLogs(ctx, actor, args)
+	case "restore":
+		return a.cmdRestore(ctx, actor, args)
 	case "start":
 		return a.cmdStart(ctx, actor, args)
 	case "stop":
@@ -318,8 +357,8 @@ func (a *App) cmdResize(ctx context.Context, actor model.Actor, args []string) (
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	unlock := a.lockInstance(name)
+	defer unlock()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
 		return missingInstanceResult("resize", name, err)
@@ -348,6 +387,75 @@ func (a *App) cmdResize(ctx context.Context, actor model.Actor, args []string) (
 	return commandResult{stdout: stdout, exitCode: 0}, nil
 }
 
+func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+	action, name, err := parseBackupArgs(args)
+	if err != nil {
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+	if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
+		return missingInstanceResult("backup", name, err)
+	}
+
+	switch action {
+	case "create":
+		unlock := a.lockInstance(name)
+		defer unlock()
+
+		if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
+			return missingInstanceResult("backup", name, err)
+		}
+
+		info, err := a.provisioner.CreateBackup(ctx, name)
+		if err != nil {
+			return commandResult{stderr: fmt.Sprintf("backup %s: %v\n", name, err), exitCode: 1}, err
+		}
+		stdout := fmt.Sprintf(
+			"backup-created: %s\nbackup-id: %s\ncreated-at: %s\nrootfs-size: %s\npath: %s\n",
+			name,
+			info.ID,
+			info.CreatedAt.Format(time.RFC3339),
+			formatBinarySize(info.RootFSSizeBytes),
+			info.Path,
+		)
+		return commandResult{stdout: stdout, exitCode: 0}, nil
+	case "list":
+		backups, err := a.provisioner.ListBackups(ctx, name)
+		if err != nil {
+			return commandResult{stderr: fmt.Sprintf("backup list %s: %v\n", name, err), exitCode: 1}, err
+		}
+		if len(backups) == 0 {
+			return commandResult{stdout: fmt.Sprintf("no backups for %s\n", name), exitCode: 0}, nil
+		}
+
+		rows := make([][]string, 0, len(backups))
+		for _, backup := range backups {
+			logs := make([]string, 0, 2)
+			if backup.HasSerialLog {
+				logs = append(logs, "serial")
+			}
+			if backup.HasFirecrackerLog {
+				logs = append(logs, "firecracker")
+			}
+			rows = append(rows, []string{
+				backup.ID,
+				backup.CreatedAt.Format(time.RFC3339),
+				formatBinarySize(backup.RootFSSizeBytes),
+				strconv.FormatInt(backup.VCPUCount, 10),
+				fmt.Sprintf("%d MiB", backup.MemoryMiB),
+				strings.Join(logs, ","),
+			})
+		}
+
+		tableOutput, err := renderTextTable([]string{"ID", "Created At", "RootFS Size", "VCPUs", "Memory", "Logs"}, rows)
+		if err != nil {
+			return commandResult{stderr: fmt.Sprintf("render backup list: %v\n", err), exitCode: 1}, err
+		}
+		return commandResult{stdout: fmt.Sprintf("backups for %s:\n%s", name, tableOutput), exitCode: 0}, nil
+	default:
+		return commandResult{stderr: backupUsage() + "\n", exitCode: 2}, errors.New(backupUsage())
+	}
+}
+
 func (a *App) cmdList(ctx context.Context, actor model.Actor) (commandResult, error) {
 	instances, err := a.store.ListInstances(ctx, false)
 	if err != nil {
@@ -363,7 +471,19 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor) (commandResult, er
 		rows = append(rows, []string{inst.Name, string(inst.State), inst.TailscaleIP, inst.TailscaleName})
 	}
 
+	tableOutput, err := renderTextTable([]string{"Name", "State", "Tailscale IP", "Tailscale Name"}, rows)
+	if err != nil {
+		return commandResult{stderr: fmt.Sprintf("render instance list: %v\n", err), exitCode: 1}, err
+	}
+	return commandResult{stdout: tableOutput, exitCode: 0}, nil
+}
+
+func renderTextTable(headers []string, rows [][]string) (string, error) {
 	var b bytes.Buffer
+	headerCells := make([]any, 0, len(headers))
+	for _, header := range headers {
+		headerCells = append(headerCells, header)
+	}
 	table := tablewriter.NewTable(&b,
 		tablewriter.WithRenderer(renderer.NewBlueprint(tw.Rendition{
 			Borders: tw.BorderNone,
@@ -388,14 +508,14 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor) (commandResult, er
 			Row: tw.CellConfig{Alignment: tw.CellAlignment{Global: tw.AlignLeft}},
 		}),
 	)
-	table.Header("Name", "State", "Tailscale IP", "Tailscale Name")
+	table.Header(headerCells...)
 	if err := table.Bulk(rows); err != nil {
-		return commandResult{stderr: fmt.Sprintf("format instance list: %v\n", err), exitCode: 1}, err
+		return "", err
 	}
 	if err := table.Render(); err != nil {
-		return commandResult{stderr: fmt.Sprintf("render instance list: %v\n", err), exitCode: 1}, err
+		return "", err
 	}
-	return commandResult{stdout: b.String(), exitCode: 0}, nil
+	return b.String(), nil
 }
 
 func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
@@ -476,14 +596,47 @@ func (a *App) cmdLogs(ctx context.Context, actor model.Actor, args []string) (co
 	return commandResult{stdout: stdout, exitCode: 0}, nil
 }
 
+func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+	name, backupID, err := parseRestoreArgs(args)
+	if err != nil {
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+
+	unlock := a.lockInstance(name)
+	defer unlock()
+
+	if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
+		return missingInstanceResult("restore", name, err)
+	}
+
+	inst, info, err := a.provisioner.RestoreBackup(ctx, name, backupID)
+	if err != nil {
+		stderr := fmt.Sprintf("restore %s: %v\n", name, err)
+		if inst.Name != "" {
+			stderr += instanceDebugHints(a.cfg.Hostname, inst)
+		}
+		return commandResult{stderr: stderr, exitCode: 1}, err
+	}
+
+	stdout := fmt.Sprintf(
+		"restored: %s\nbackup-id: %s\nstate: %s\nrootfs-size: %s\nbackup-created-at: %s\n",
+		inst.Name,
+		info.ID,
+		inst.State,
+		formatBinarySize(effectiveInstanceRootFSSizeBytes(inst)),
+		info.CreatedAt.Format(time.RFC3339),
+	)
+	return commandResult{stdout: stdout, exitCode: 0}, nil
+}
+
 func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: start <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	unlock := a.lockInstance(args[1])
+	defer unlock()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
 		return missingInstanceResult("start", args[1], err)
@@ -506,8 +659,8 @@ func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string) (co
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	unlock := a.lockInstance(args[1])
+	defer unlock()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
 		return missingInstanceResult("stop", args[1], err)
@@ -529,8 +682,8 @@ func (a *App) cmdRestart(ctx context.Context, actor model.Actor, args []string) 
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	unlock := a.lockInstance(args[1])
+	defer unlock()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
 		return missingInstanceResult("restart", args[1], err)
@@ -559,8 +712,8 @@ func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string) (
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	unlock := a.lockInstance(args[1])
+	defer unlock()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
 		return missingInstanceResult("delete", args[1], err)
@@ -577,7 +730,7 @@ func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string) (
 }
 
 func helpResult() commandResult {
-	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], list, inspect <name>, logs <name> [serial|firecracker], start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
+	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], backup <create|list> <name>, list, inspect <name>, logs <name> [serial|firecracker], restore <name> <backup-id>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
 }
 
 func lifecycleReadyResult(action string, inst model.Instance) commandResult {
@@ -675,6 +828,28 @@ func parseResizeArgs(args []string) (string, provision.CreateOptions, error) {
 		return "", provision.CreateOptions{}, fmt.Errorf("resize requires at least one of --cpus, --ram, or --rootfs-size\n%s", resizeUsage())
 	}
 	return name, opts, nil
+}
+
+func parseBackupArgs(args []string) (string, string, error) {
+	if len(args) != 3 {
+		return "", "", errors.New(backupUsage())
+	}
+	switch args[1] {
+	case "create", "list":
+		return args[1], args[2], nil
+	default:
+		return "", "", fmt.Errorf("unknown backup action %q\n%s", args[1], backupUsage())
+	}
+}
+
+func parseRestoreArgs(args []string) (string, string, error) {
+	if len(args) != 3 {
+		return "", "", errors.New(restoreUsage())
+	}
+	if strings.TrimSpace(args[2]) == "" {
+		return "", "", errors.New(restoreUsage())
+	}
+	return args[1], args[2], nil
 }
 
 func parseLogsArgs(args []string) (string, logTarget, error) {
@@ -776,8 +951,16 @@ func resizeUsage() string {
 	return "usage: resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]"
 }
 
+func backupUsage() string {
+	return "usage: backup <create|list> <name>"
+}
+
 func logsUsage() string {
 	return "usage: logs <name> [serial|firecracker]"
+}
+
+func restoreUsage() string {
+	return "usage: restore <name> <backup-id>"
 }
 
 func parseSize(value string, defaultUnit int64) (int64, error) {

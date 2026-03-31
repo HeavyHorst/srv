@@ -51,6 +51,10 @@ CLEANUP_COMPLETE=0
 TAILSCALE_NAME=""
 TAILSCALE_IP=""
 INSTANCE_TAP_DEVICE=""
+BACKUP_ID=""
+BACKUP_PATH=""
+BACKUP_MARKER_PATH="/root/srv-smoke-backup-marker"
+POST_BACKUP_PATH="/root/srv-smoke-post-backup-only"
 
 log() {
 	printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -258,6 +262,69 @@ verify_guest_ssh() {
 	done
 }
 
+verify_guest_file_content() {
+	local label="$1"
+	local path="$2"
+	local expected="$3"
+
+	if ! guest_ssh_capture "${label}" "cat '${path}'"; then
+		fail "guest file ${path} could not be read during ${label}"
+	fi
+	if [[ "$(trim_file "${ARTIFACT_DIR}/${label}.stdout")" != "${expected}" ]]; then
+		fail "guest file ${path} during ${label} was $(trim_file "${ARTIFACT_DIR}/${label}.stdout"), want ${expected}"
+	fi
+}
+
+verify_guest_file_missing() {
+	local label="$1"
+	local path="$2"
+
+	if ! guest_ssh_capture "${label}" "if [ -e '${path}' ]; then echo present; else echo absent; fi"; then
+		fail "guest file presence check for ${path} failed during ${label}"
+	fi
+	if [[ "$(trim_file "${ARTIFACT_DIR}/${label}.stdout")" != "absent" ]]; then
+		fail "guest file ${path} should be absent during ${label}"
+	fi
+}
+
+assert_stopped_state() {
+	local label="$1"
+
+	if ! srv_ssh_capture "${label}" inspect "${INSTANCE_NAME}"; then
+		fail "inspect during ${label} failed"
+	fi
+	if ! grep -q '^state: stopped$' "${ARTIFACT_DIR}/${label}.stdout"; then
+		fail "inspect during ${label} did not report state: stopped"
+	fi
+	if ! grep -q '^firecracker-pid: 0$' "${ARTIFACT_DIR}/${label}.stdout"; then
+		fail "inspect during ${label} did not report firecracker-pid: 0"
+	fi
+	INSTANCE_TAP_DEVICE="$(extract_field "${ARTIFACT_DIR}/${label}.stdout" tap-device || true)"
+}
+
+assert_backup_artifacts() {
+	local label="$1"
+
+	if [[ -z "${BACKUP_ID}" || -z "${BACKUP_PATH}" ]]; then
+		fail "backup metadata missing during ${label}"
+	fi
+	if [[ "${BACKUP_PATH}" != "${SRV_DATA_DIR}/backups/${INSTANCE_NAME}/${BACKUP_ID}" ]]; then
+		fail "backup path ${BACKUP_PATH} did not match expected path ${SRV_DATA_DIR}/backups/${INSTANCE_NAME}/${BACKUP_ID} during ${label}"
+	fi
+	if [[ ! -d "${BACKUP_PATH}" ]]; then
+		fail "backup path ${BACKUP_PATH} is missing during ${label}"
+	fi
+	for path in \
+		"${BACKUP_PATH}/manifest.json" \
+		"${BACKUP_PATH}/rootfs.img" \
+		"${BACKUP_PATH}/serial.log" \
+		"${BACKUP_PATH}/firecracker.log"; do
+		if [[ ! -e "${path}" ]]; then
+			fail "expected backup artifact ${path} is missing during ${label}"
+		fi
+	done
+}
+
 assert_host_runtime() {
 	local stage="$1"
 	local vm_runner_cgroup
@@ -432,6 +499,10 @@ wait_for_ready inspect-create-ready
 log "instance is ready as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
 capture_best_effort tailscale-status-after-ready tailscale status
 verify_guest_ssh guest-ssh-create-ready
+if ! guest_ssh_capture guest-marker-before-backup "printf '%s\n' 'before-backup' > '${BACKUP_MARKER_PATH}' && sync"; then
+	fail "failed to create backup marker before stopped backup"
+fi
+verify_guest_file_content guest-marker-before-backup-verify "${BACKUP_MARKER_PATH}" "before-backup"
 assert_instance_listed list-create-ready ready
 assert_host_runtime create-ready
 
@@ -442,17 +513,30 @@ fi
 if ! grep -q '^state: stopped$' "${ARTIFACT_DIR}/stop.stdout"; then
 	fail "stop ${INSTANCE_NAME} did not report state: stopped"
 fi
-if ! srv_ssh_capture inspect-stopped inspect "${INSTANCE_NAME}"; then
-	fail "inspect after stop failed"
-fi
-if ! grep -q '^state: stopped$' "${ARTIFACT_DIR}/inspect-stopped.stdout"; then
-	fail "inspect after stop did not report state: stopped"
-fi
-if ! grep -q '^firecracker-pid: 0$' "${ARTIFACT_DIR}/inspect-stopped.stdout"; then
-	fail "inspect after stop did not report firecracker-pid: 0"
-fi
-INSTANCE_TAP_DEVICE="$(extract_field "${ARTIFACT_DIR}/inspect-stopped.stdout" tap-device || true)"
+assert_stopped_state inspect-stopped
 assert_host_cleanup stop
+
+log "creating stopped backup for ${INSTANCE_NAME}"
+if ! srv_ssh_capture backup-create backup create "${INSTANCE_NAME}"; then
+	fail "backup create ${INSTANCE_NAME} failed"
+fi
+BACKUP_ID="$(extract_field "${ARTIFACT_DIR}/backup-create.stdout" backup-id || true)"
+BACKUP_PATH="$(extract_field "${ARTIFACT_DIR}/backup-create.stdout" path || true)"
+if [[ -z "${BACKUP_ID}" ]]; then
+	fail "backup create did not report a backup-id"
+fi
+if ! grep -q "^backup-created: ${INSTANCE_NAME}$" "${ARTIFACT_DIR}/backup-create.stdout"; then
+	fail "backup create did not report backup-created: ${INSTANCE_NAME}"
+fi
+assert_backup_artifacts backup-create
+
+log "listing backups for ${INSTANCE_NAME}"
+if ! srv_ssh_capture backup-list backup list "${INSTANCE_NAME}"; then
+	fail "backup list ${INSTANCE_NAME} failed"
+fi
+if ! grep -q "${BACKUP_ID}" "${ARTIFACT_DIR}/backup-list.stdout"; then
+	fail "backup list did not include backup ${BACKUP_ID}"
+fi
 
 log "starting ${INSTANCE_NAME}"
 if ! srv_ssh_capture start start "${INSTANCE_NAME}"; then
@@ -464,8 +548,50 @@ wait_for_ready inspect-start-ready
 log "instance is ready again as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
 capture_best_effort tailscale-status-after-restart tailscale status
 verify_guest_ssh guest-ssh-start-ready
+if ! guest_ssh_capture guest-marker-after-backup "printf '%s\n' 'after-backup' > '${BACKUP_MARKER_PATH}' && printf '%s\n' 'post-backup-only' > '${POST_BACKUP_PATH}' && sync"; then
+	fail "failed to mutate guest after backup"
+fi
+verify_guest_file_content guest-marker-after-backup-verify "${BACKUP_MARKER_PATH}" "after-backup"
+verify_guest_file_content guest-post-backup-file-verify "${POST_BACKUP_PATH}" "post-backup-only"
 assert_instance_listed list-start-ready ready
 assert_host_runtime start-ready
+
+log "stopping ${INSTANCE_NAME} for restore"
+if ! srv_ssh_capture stop-before-restore stop "${INSTANCE_NAME}"; then
+	fail "stop ${INSTANCE_NAME} before restore failed"
+fi
+if ! grep -q '^state: stopped$' "${ARTIFACT_DIR}/stop-before-restore.stdout"; then
+	fail "stop before restore did not report state: stopped"
+fi
+assert_stopped_state inspect-before-restore
+assert_host_cleanup stop-before-restore
+
+log "restoring ${INSTANCE_NAME} from backup ${BACKUP_ID}"
+if ! srv_ssh_capture restore restore "${INSTANCE_NAME}" "${BACKUP_ID}"; then
+	fail "restore ${INSTANCE_NAME} from backup ${BACKUP_ID} failed"
+fi
+if ! grep -q "^backup-id: ${BACKUP_ID}$" "${ARTIFACT_DIR}/restore.stdout"; then
+	fail "restore did not report backup-id: ${BACKUP_ID}"
+fi
+if ! grep -q '^state: stopped$' "${ARTIFACT_DIR}/restore.stdout"; then
+	fail "restore did not report state: stopped"
+fi
+assert_stopped_state inspect-restored-stopped
+
+log "starting ${INSTANCE_NAME} after restore"
+if ! srv_ssh_capture start-after-restore start "${INSTANCE_NAME}"; then
+	fail "start ${INSTANCE_NAME} after restore failed"
+fi
+
+wait_for_ready inspect-restore-ready
+
+log "instance is ready after restore as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
+capture_best_effort tailscale-status-after-restore tailscale status
+verify_guest_ssh guest-ssh-restore-ready
+verify_guest_file_content guest-marker-restored "${BACKUP_MARKER_PATH}" "before-backup"
+verify_guest_file_missing guest-post-backup-file-restored "${POST_BACKUP_PATH}"
+assert_instance_listed list-restore-ready ready
+assert_host_runtime restore-ready
 
 log "deleting ${INSTANCE_NAME}"
 if ! srv_ssh_capture delete delete "${INSTANCE_NAME}"; then

@@ -326,8 +326,9 @@ install_data_dirs() {
 	install -d -m 0755 "${data_dir}/images"
 	install -d -m 0755 "${data_dir}/jailer"
 	install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/state"
+	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/backups"
 	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/instances"
-	chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${data_dir}/state" "${data_dir}/instances"
+	chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${data_dir}/state" "${data_dir}/backups" "${data_dir}/instances"
 }
 
 reload_systemd() {

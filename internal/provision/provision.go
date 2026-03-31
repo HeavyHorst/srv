@@ -623,9 +623,10 @@ func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool)
 }
 
 func (p *Provisioner) ensureRootFSReflinkSupport(ctx context.Context) error {
-	probeDir, err := os.MkdirTemp(p.cfg.DataDirAbs(), ".srv-reflink-check-")
+	probeParent := p.cfg.InstancesDir()
+	probeDir, err := os.MkdirTemp(probeParent, ".srv-reflink-check-")
 	if err != nil {
-		return fmt.Errorf("create reflink probe dir in %s: %w", p.cfg.DataDirAbs(), err)
+		return fmt.Errorf("create reflink probe dir in %s: %w", probeParent, err)
 	}
 	defer func() {
 		_ = os.RemoveAll(probeDir)

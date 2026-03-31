@@ -3,7 +3,9 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"log/slog"
 	"os"
@@ -137,6 +139,61 @@ func TestCmdListAdminSeesAllVisibleInstances(t *testing.T) {
 	}
 	if got := rows["beta"]; len(got) < 2 || got[1] != "stopped" {
 		t.Fatalf("cmdList() beta row = %v\nfull output:\n%s", got, result.stdout)
+	}
+}
+
+func TestCmdBackupListFormatsBackupsAsTable(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadServiceTestConfig(t, nil)
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatalf("provision.New(): %v", err)
+	}
+	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+
+	inst := serviceTestInstance("alpha", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.RootFSSizeBytes = 8 << 30
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	backupID := "20260331T120000.000000000Z"
+	backupDir := filepath.Join(cfg.BackupsDir(), inst.Name, backupID)
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(backup dir): %v", err)
+	}
+	manifest := map[string]any{
+		"version":    1,
+		"id":         backupID,
+		"created_at": inst.CreatedAt.Add(5 * time.Minute),
+		"instance":   inst,
+		"files": map[string]any{
+			"rootfs":          "rootfs.img",
+			"serial_log":      "serial.log",
+			"firecracker_log": "firecracker.log",
+		},
+	}
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("json.Marshal(manifest): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "manifest.json"), payload, 0o644); err != nil {
+		t.Fatalf("WriteFile(manifest): %v", err)
+	}
+
+	result, err := app.cmdBackup(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"backup", "list", inst.Name})
+	if err != nil {
+		t.Fatalf("cmdBackup(list): %v", err)
+	}
+	if result.exitCode != 0 {
+		t.Fatalf("cmdBackup(list) exitCode = %d, want 0", result.exitCode)
+	}
+	for _, want := range []string{"backups for alpha:", "ID", "Created At", "RootFS Size", "VCPUs", "Memory", "Logs", backupID, "8.0 GiB", "serial,firecracker"} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("cmdBackup(list) stdout missing %q\nfull output:\n%s", want, result.stdout)
+		}
 	}
 }
 
@@ -324,7 +381,7 @@ func TestEnsureHostSignerPersistsKey(t *testing.T) {
 
 func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
-	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "logs <name> [serial|firecracker]", "start <name>", "stop <name>", "restart <name>"} {
+	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "backup <create|list> <name>", "logs <name> [serial|firecracker]", "restore <name> <backup-id>", "start <name>", "stop <name>", "restart <name>"} {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("helpResult() missing %q in %q", want, result.stdout)
 		}
@@ -568,6 +625,70 @@ func TestParseResizeArgs(t *testing.T) {
 	}
 }
 
+func TestParseBackupArgs(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantAction string
+		wantName   string
+		wantErr    string
+	}{
+		{name: "create", args: []string{"backup", "create", "demo"}, wantAction: "create", wantName: "demo"},
+		{name: "list", args: []string{"backup", "list", "demo"}, wantAction: "list", wantName: "demo"},
+		{name: "rejects unknown action", args: []string{"backup", "prune", "demo"}, wantErr: `unknown backup action "prune"`},
+		{name: "requires name", args: []string{"backup", "create"}, wantErr: backupUsage()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotAction, gotName, err := parseBackupArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseBackupArgs() error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseBackupArgs() error = %v", err)
+			}
+			if gotAction != tt.wantAction || gotName != tt.wantName {
+				t.Fatalf("parseBackupArgs() = (%q, %q), want (%q, %q)", gotAction, gotName, tt.wantAction, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestParseRestoreArgs(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         []string
+		wantName     string
+		wantBackupID string
+		wantErr      string
+	}{
+		{name: "valid", args: []string{"restore", "demo", "20260331T120000Z"}, wantName: "demo", wantBackupID: "20260331T120000Z"},
+		{name: "requires backup id", args: []string{"restore", "demo"}, wantErr: restoreUsage()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotBackupID, err := parseRestoreArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseRestoreArgs() error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseRestoreArgs() error = %v", err)
+			}
+			if gotName != tt.wantName || gotBackupID != tt.wantBackupID {
+				t.Fatalf("parseRestoreArgs() = (%q, %q), want (%q, %q)", gotName, gotBackupID, tt.wantName, tt.wantBackupID)
+			}
+		})
+	}
+}
+
 func TestParseLogsArgs(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -613,6 +734,33 @@ func newServiceTestStore(t *testing.T) *store.Store {
 		}
 	})
 	return st
+}
+
+func loadServiceTestConfig(t *testing.T, env map[string]string) config.Config {
+	t.Helper()
+	oldArgs := os.Args
+	oldCommandLine := flag.CommandLine
+
+	fs := flag.NewFlagSet("srv.test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	flag.CommandLine = fs
+	os.Args = []string{"srv.test"}
+	t.Cleanup(func() {
+		flag.CommandLine = oldCommandLine
+		os.Args = oldArgs
+	})
+
+	dataDir := t.TempDir()
+	t.Setenv("SRV_DATA_DIR", dataDir)
+	for key, value := range env {
+		t.Setenv(key, value)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load(): %v", err)
+	}
+	return cfg
 }
 
 func serviceTestInstance(name, state string, createdAt time.Time) model.Instance {

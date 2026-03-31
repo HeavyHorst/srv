@@ -250,6 +250,399 @@ func TestWriteMetadataFileRedactsAuthKey(t *testing.T) {
 	}
 }
 
+func TestCreateListAndRestoreBackup(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+	oldReflinkCloneFile := reflinkCloneFile
+	t.Cleanup(func() {
+		reflinkCloneFile = oldReflinkCloneFile
+	})
+	reflinkCloneFile = func(_ context.Context, src, dest string) error {
+		payload, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dest, payload, 0o644)
+	}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.TailscaleName = "demo.tailnet"
+	inst.TailscaleIP = "100.64.0.10"
+	inst.RootFSSizeBytes = 12 << 20
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(instance dir): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("rootfs-v1"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.WriteFile(inst.SerialLogPath, []byte("serial-v1\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+	if err := os.WriteFile(inst.LogPath, []byte("firecracker-v1\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(firecracker): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	backup, err := p.CreateBackup(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("CreateBackup(): %v", err)
+	}
+	if backup.Name != inst.Name {
+		t.Fatalf("CreateBackup() name = %q, want %q", backup.Name, inst.Name)
+	}
+	if _, err := os.Stat(filepath.Join(backup.Path, backupManifestName)); err != nil {
+		t.Fatalf("Stat(manifest): %v", err)
+	}
+
+	backups, err := p.ListBackups(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("ListBackups(): %v", err)
+	}
+	if len(backups) != 1 || backups[0].ID != backup.ID {
+		t.Fatalf("ListBackups() = %#v", backups)
+	}
+
+	mutated := inst
+	mutated.VCPUCount = 4
+	mutated.MemoryMiB = 4096
+	mutated.RootFSSizeBytes = 20 << 20
+	mutated.UpdatedAt = inst.UpdatedAt.Add(time.Minute)
+	if err := st.UpdateInstance(ctx, mutated); err != nil {
+		t.Fatalf("UpdateInstance(): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("rootfs-v2"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs v2): %v", err)
+	}
+	if err := os.WriteFile(inst.SerialLogPath, []byte("serial-v2\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial v2): %v", err)
+	}
+	if err := os.WriteFile(inst.LogPath, []byte("firecracker-v2\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(firecracker v2): %v", err)
+	}
+
+	restored, restoredBackup, err := p.RestoreBackup(ctx, inst.Name, backup.ID)
+	if err != nil {
+		t.Fatalf("RestoreBackup(): %v", err)
+	}
+	if restoredBackup.ID != backup.ID {
+		t.Fatalf("RestoreBackup() backup ID = %q, want %q", restoredBackup.ID, backup.ID)
+	}
+	if restored.State != model.StateStopped {
+		t.Fatalf("RestoreBackup() state = %q, want %q", restored.State, model.StateStopped)
+	}
+	if restored.VCPUCount != inst.VCPUCount || restored.MemoryMiB != inst.MemoryMiB || restored.RootFSSizeBytes != inst.RootFSSizeBytes {
+		t.Fatalf("RestoreBackup() restored instance = %#v, want original sizing %#v", restored, inst)
+	}
+
+	payload, err := os.ReadFile(inst.RootFSPath)
+	if err != nil {
+		t.Fatalf("ReadFile(rootfs): %v", err)
+	}
+	if string(payload) != "rootfs-v1" {
+		t.Fatalf("rootfs contents = %q, want %q", string(payload), "rootfs-v1")
+	}
+	serialPayload, err := os.ReadFile(inst.SerialLogPath)
+	if err != nil {
+		t.Fatalf("ReadFile(serial): %v", err)
+	}
+	if string(serialPayload) != "serial-v1\n" {
+		t.Fatalf("serial log contents = %q, want %q", string(serialPayload), "serial-v1\n")
+	}
+	fcPayload, err := os.ReadFile(inst.LogPath)
+	if err != nil {
+		t.Fatalf("ReadFile(firecracker): %v", err)
+	}
+	if string(fcPayload) != "firecracker-v1\n" {
+		t.Fatalf("firecracker log contents = %q, want %q", string(fcPayload), "firecracker-v1\n")
+	}
+
+	stored, err := st.GetInstance(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(): %v", err)
+	}
+	if stored.VCPUCount != inst.VCPUCount || stored.MemoryMiB != inst.MemoryMiB || stored.RootFSSizeBytes != inst.RootFSSizeBytes {
+		t.Fatalf("stored instance after restore = %#v", stored)
+	}
+	if stored.FirecrackerPID != 0 {
+		t.Fatalf("stored firecracker pid = %d, want 0", stored.FirecrackerPID)
+	}
+	info, err := os.Stat(inst.RootFSPath)
+	if err != nil {
+		t.Fatalf("Stat(rootfs): %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o660 {
+		t.Fatalf("rootfs mode after restore = %o, want 660", got)
+	}
+	for _, path := range []string{inst.SerialLogPath, inst.LogPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat(%s): %v", path, err)
+		}
+		if got := info.Mode().Perm(); got != 0o660 {
+			t.Fatalf("mode for %s after restore = %o, want 660", path, got)
+		}
+	}
+
+	events, err := st.ListEvents(ctx, inst.ID, 10)
+	if err != nil {
+		t.Fatalf("ListEvents(): %v", err)
+	}
+	var sawBackupCreate bool
+	var sawBackupRestore bool
+	for _, evt := range events {
+		if evt.Type == "backup" && evt.Message == "instance backup created" {
+			sawBackupCreate = true
+		}
+		if evt.Type == "backup" && evt.Message == "instance restored from backup" {
+			sawBackupRestore = true
+		}
+	}
+	if !sawBackupCreate || !sawBackupRestore {
+		t.Fatalf("expected backup create and restore events, got %#v", events)
+	}
+}
+
+func TestBackupRequiresStoppedInstance(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(instance dir): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	_, err := p.CreateBackup(ctx, inst.Name)
+	if err == nil || !strings.Contains(err.Error(), "must be stopped before backup or restore") {
+		t.Fatalf("CreateBackup() error = %v", err)
+	}
+}
+
+func TestRestoreBackupRejectsRecreatedInstanceWithSameName(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+	oldReflinkCloneFile := reflinkCloneFile
+	t.Cleanup(func() {
+		reflinkCloneFile = oldReflinkCloneFile
+	})
+	reflinkCloneFile = func(_ context.Context, src, dest string) error {
+		payload, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dest, payload, 0o644)
+	}
+
+	original := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := os.MkdirAll(filepath.Dir(original.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(instance dir): %v", err)
+	}
+	if err := os.WriteFile(original.RootFSPath, []byte("old-rootfs"), 0o644); err != nil {
+		t.Fatalf("WriteFile(old rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, original); err != nil {
+		t.Fatalf("CreateInstance(original): %v", err)
+	}
+
+	backup, err := p.CreateBackup(ctx, original.Name)
+	if err != nil {
+		t.Fatalf("CreateBackup(): %v", err)
+	}
+	if err := st.DeleteInstance(ctx, original.Name); err != nil {
+		t.Fatalf("DeleteInstance(): %v", err)
+	}
+
+	recreated := provisionTestInstance(cfg, "demo", model.StateStopped, original.CreatedAt.Add(time.Hour))
+	recreated.ID = "demo-recreated-id"
+	recreated.NetworkCIDR = "10.0.0.4/30"
+	recreated.HostAddr = "10.0.0.5/30"
+	recreated.GuestAddr = "10.0.0.6/30"
+	recreated.GatewayAddr = "10.0.0.5"
+	if err := os.WriteFile(recreated.RootFSPath, []byte("new-rootfs"), 0o644); err != nil {
+		t.Fatalf("WriteFile(new rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, recreated); err != nil {
+		t.Fatalf("CreateInstance(recreated): %v", err)
+	}
+
+	_, _, err = p.RestoreBackup(ctx, recreated.Name, backup.ID)
+	if err == nil || !strings.Contains(err.Error(), "restoring onto a recreated VM is not supported") {
+		t.Fatalf("RestoreBackup() error = %v", err)
+	}
+
+	stored, err := st.GetInstance(ctx, recreated.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(): %v", err)
+	}
+	if stored.ID != recreated.ID || stored.NetworkCIDR != recreated.NetworkCIDR || stored.GuestAddr != recreated.GuestAddr {
+		t.Fatalf("stored recreated instance changed after rejected restore: %#v", stored)
+	}
+	payload, err := os.ReadFile(recreated.RootFSPath)
+	if err != nil {
+		t.Fatalf("ReadFile(recreated rootfs): %v", err)
+	}
+	if string(payload) != "new-rootfs" {
+		t.Fatalf("recreated rootfs contents = %q, want %q", string(payload), "new-rootfs")
+	}
+}
+
+func TestRestoreBackupStagesFilesBeforeReplacingActiveInstance(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+	oldReflinkCloneFile := reflinkCloneFile
+	t.Cleanup(func() {
+		reflinkCloneFile = oldReflinkCloneFile
+	})
+	reflinkCloneFile = func(_ context.Context, src, dest string) error {
+		payload, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dest, payload, 0o644)
+	}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(instance dir): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("backup-rootfs"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.WriteFile(inst.SerialLogPath, []byte("backup-serial\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	backup, err := p.CreateBackup(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("CreateBackup(): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("live-rootfs"), 0o644); err != nil {
+		t.Fatalf("WriteFile(live rootfs): %v", err)
+	}
+	if err := os.WriteFile(inst.SerialLogPath, []byte("live-serial\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(live serial): %v", err)
+	}
+
+	reflinkCloneFile = func(_ context.Context, src, dest string) error {
+		if filepath.Base(src) == backupSerialLogName {
+			return errors.New("simulated restore failure")
+		}
+		payload, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dest, payload, 0o644)
+	}
+
+	_, _, err = p.RestoreBackup(ctx, inst.Name, backup.ID)
+	if err == nil || !strings.Contains(err.Error(), "simulated restore failure") {
+		t.Fatalf("RestoreBackup() error = %v", err)
+	}
+
+	rootfsPayload, err := os.ReadFile(inst.RootFSPath)
+	if err != nil {
+		t.Fatalf("ReadFile(rootfs): %v", err)
+	}
+	if string(rootfsPayload) != "live-rootfs" {
+		t.Fatalf("rootfs contents after failed staged restore = %q, want %q", string(rootfsPayload), "live-rootfs")
+	}
+	serialPayload, err := os.ReadFile(inst.SerialLogPath)
+	if err != nil {
+		t.Fatalf("ReadFile(serial): %v", err)
+	}
+	if string(serialPayload) != "live-serial\n" {
+		t.Fatalf("serial contents after failed staged restore = %q, want %q", string(serialPayload), "live-serial\n")
+	}
+	stored, err := st.GetInstance(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(): %v", err)
+	}
+	if stored.RootFSSizeBytes != inst.RootFSSizeBytes || stored.VCPUCount != inst.VCPUCount || stored.MemoryMiB != inst.MemoryMiB {
+		t.Fatalf("stored instance changed after failed staged restore: %#v", stored)
+	}
+}
+
+func TestCommitStagedRestoreFilesRollsBackEarlierReplacements(t *testing.T) {
+	dir := t.TempDir()
+	serialDest := filepath.Join(dir, "serial.log")
+	blockedDest := filepath.Join(dir, "rootfs.img")
+
+	if err := os.WriteFile(serialDest, []byte("live-serial\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial dest): %v", err)
+	}
+	if err := os.Mkdir(blockedDest, 0o755); err != nil {
+		t.Fatalf("Mkdir(blocked dest): %v", err)
+	}
+
+	writeStage := func(pattern, payload string) string {
+		t.Helper()
+		tmp, err := os.CreateTemp(dir, pattern)
+		if err != nil {
+			t.Fatalf("CreateTemp(%s): %v", pattern, err)
+		}
+		path := tmp.Name()
+		if _, err := tmp.WriteString(payload); err != nil {
+			_ = tmp.Close()
+			t.Fatalf("WriteString(%s): %v", path, err)
+		}
+		if err := tmp.Close(); err != nil {
+			t.Fatalf("Close(%s): %v", path, err)
+		}
+		return path
+	}
+
+	_, err := commitStagedRestoreFiles([]stagedRestoreFile{
+		{dest: serialDest, tmp: writeStage(".srv-stage-serial-*", "backup-serial\n")},
+		{dest: blockedDest, tmp: writeStage(".srv-stage-rootfs-*", "backup-rootfs")},
+	})
+	if err == nil {
+		t.Fatal("commitStagedRestoreFiles() unexpectedly succeeded")
+	}
+
+	serialPayload, err := os.ReadFile(serialDest)
+	if err != nil {
+		t.Fatalf("ReadFile(serial dest): %v", err)
+	}
+	if string(serialPayload) != "live-serial\n" {
+		t.Fatalf("serial contents after rollback = %q, want %q", string(serialPayload), "live-serial\n")
+	}
+	info, err := os.Stat(blockedDest)
+	if err != nil {
+		t.Fatalf("Stat(blocked dest): %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("blocked dest should remain a directory after rollback")
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".srv-restore-old-*"))
+	if err != nil {
+		t.Fatalf("Glob(restore old files): %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("rollback copies should be cleaned up, found %v", leftovers)
+	}
+}
+
 func TestWaitForTailnetJoinFailsFastWhenGuestProcessExits(t *testing.T) {
 	cfg := loadProvisionTestConfig(t, map[string]string{
 		"SRV_GUEST_READY_TIMEOUT": "30s",
@@ -310,6 +703,9 @@ func TestEnsureCreatePrereqsChecksReflinkCloneability(t *testing.T) {
 	if err := os.WriteFile(rootfsPath, []byte("rootfs"), 0o644); err != nil {
 		t.Fatalf("WriteFile(rootfs): %v", err)
 	}
+	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
+		t.Fatalf("MkdirAll(instances dir): %v", err)
+	}
 	cfg.BaseKernelPath = kernelPath
 	cfg.BaseRootFSPath = rootfsPath
 	oldLoopDevicesForPath := loopDevicesForPath
@@ -336,8 +732,45 @@ func TestEnsureCreatePrereqsChecksReflinkCloneability(t *testing.T) {
 		if src != cfg.BaseRootFSPath {
 			t.Fatalf("reflinkCloneFile src = %q, want %q", src, cfg.BaseRootFSPath)
 		}
-		if !strings.HasPrefix(dest, cfg.DataDirAbs()+string(os.PathSeparator)) {
-			t.Fatalf("reflinkCloneFile dest = %q, want path under %q", dest, cfg.DataDirAbs())
+		if !strings.HasPrefix(dest, cfg.InstancesDir()+string(os.PathSeparator)) {
+			t.Fatalf("reflinkCloneFile dest = %q, want path under %q", dest, cfg.InstancesDir())
+		}
+	})
+
+	t.Run("accepts installer-style data dir permissions", func(t *testing.T) {
+		dataDirInfo, err := os.Stat(cfg.DataDirAbs())
+		if err != nil {
+			t.Fatalf("Stat(data dir): %v", err)
+		}
+		dataDirMode := dataDirInfo.Mode().Perm()
+		t.Cleanup(func() {
+			if err := os.Chmod(cfg.DataDirAbs(), dataDirMode); err != nil {
+				t.Fatalf("restore data dir mode: %v", err)
+			}
+		})
+
+		if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
+			t.Fatalf("MkdirAll(instances dir): %v", err)
+		}
+		if err := os.Chmod(cfg.InstancesDir(), 0o770); err != nil {
+			t.Fatalf("Chmod(instances dir): %v", err)
+		}
+		if err := os.Chmod(cfg.DataDirAbs(), 0o555); err != nil {
+			t.Fatalf("Chmod(data dir): %v", err)
+		}
+
+		var dest string
+		reflinkCloneFile = func(_ context.Context, _, gotDest string) error {
+			dest = gotDest
+			return nil
+		}
+
+		p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
+		if err := p.ensureCreatePrereqs(context.Background(), false); err != nil {
+			t.Fatalf("ensureCreatePrereqs() with installer-style permissions error = %v", err)
+		}
+		if !strings.HasPrefix(dest, cfg.InstancesDir()+string(os.PathSeparator)) {
+			t.Fatalf("reflinkCloneFile dest = %q, want path under %q", dest, cfg.InstancesDir())
 		}
 	})
 

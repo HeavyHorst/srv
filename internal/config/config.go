@@ -197,6 +197,10 @@ func (c Config) InstancesDir() string {
 	return filepath.Join(c.dataDirAbs, "instances")
 }
 
+func (c Config) BackupsDir() string {
+	return filepath.Join(c.dataDirAbs, "backups")
+}
+
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

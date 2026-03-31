@@ -30,7 +30,7 @@ ssh root@srv new debug-session --cpus 2 --ram 4G
 ssh root@srv inspect <name>
 ```
 
-Returns JSON with state, tailnet_ip, cpus, ram, etc.
+Returns a text summary with fields like `state`, `tailscale-name`, `tailscale-ip`, `vcpu-count`, and `memory-mib`.
 
 ### View VM logs
 
@@ -44,7 +44,7 @@ ssh root@srv logs <name> firecracker
 
 ### Access the VM
 
-Once `inspect` shows state as "running" with a tailnet_ip:
+Once `inspect` shows state as `ready` with a `tailscale-ip`:
 
 ```bash
 ssh root@<tailnet_ip>
@@ -67,6 +67,18 @@ ssh root@srv resize <name> --cpus 4 --ram 8G
 ssh root@srv start <name>
 ```
 
+### Backup and restore (when stopped)
+
+```bash
+ssh root@srv stop <name>
+ssh root@srv backup create <name>
+ssh root@srv backup list <name>
+ssh root@srv restore <name> <backup-id>
+ssh root@srv start <name>
+```
+
+Backups are in-place stopped-VM snapshots of the writable rootfs and logs. Restore only works back onto the same original VM record, not a newly recreated VM with the same name.
+
 ### List all VMs
 
 ```bash
@@ -82,16 +94,19 @@ ssh root@srv delete <name>
 ## Debugging Workflow
 
 1. **Create**: `ssh root@srv new debug-vm --cpus 2 --ram 4G`
-2. **Wait for ready**: Poll `ssh root@srv inspect debug-vm` until state is "running"
+2. **Wait for ready**: Poll `ssh root@srv inspect debug-vm` until state is `ready`
 3. **Connect**: `ssh root@<tailnet_ip>` from inspect output
 4. **Run code**: Execute commands inside the VM
-5. **Check logs**: If issues occur, `ssh root@srv logs debug-vm serial`
-6. **Clean up**: `ssh root@srv delete debug-vm`
+5. **Checkpoint if needed**: `ssh root@srv stop debug-vm && ssh root@srv backup create debug-vm && ssh root@srv start debug-vm`
+6. **Check logs**: If issues occur, `ssh root@srv logs debug-vm serial`
+7. **Restore if needed**: stop the VM, `ssh root@srv backup list debug-vm`, `ssh root@srv restore debug-vm <backup-id>`, then start it again
+8. **Clean up**: `ssh root@srv delete debug-vm`
 
 ## Tips for Agents
 
-- VMs boot quickly (seconds) but still need polling - check `inspect` until state transitions to "running"
+- VMs boot quickly (seconds) but still need polling - check `inspect` until state transitions to `ready`
 - Rootfs is writable and persists across stop/start cycles
+- Use stopped backups before risky debugging sessions that may leave the VM in a bad state
 - Use `resize` to give more resources to long-running analysis tasks
 - Serial logs capture stdout/stderr - useful for capturing script output
 - VMs auto-join the Tailscale network - no manual network configuration needed
@@ -105,7 +120,7 @@ ssh root@srv delete <name>
 
 ## Error Handling
 
-If `inspect` shows errors or VM doesn't reach "running" state:
+If `inspect` shows errors or the VM doesn't reach `ready` state:
 1. Check Firecracker logs: `ssh root@srv logs <name> firecracker`
 2. Check serial output for boot failures: `ssh root@srv logs <name> serial`
 3. Verify host resources aren't exhausted: `ssh root@srv list` to see all VMs

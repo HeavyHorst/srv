@@ -99,8 +99,12 @@ func TestCmdListFormatsVisibleInstances(t *testing.T) {
 	if result.exitCode != 0 {
 		t.Fatalf("cmdList() exitCode = %d, want 0", result.exitCode)
 	}
-	if want := "alpha\tready\t100.64.0.10\talpha.tailnet\n"; result.stdout != want {
-		t.Fatalf("cmdList() stdout = %q, want %q", result.stdout, want)
+	if !strings.Contains(result.stdout, "Name") || !strings.Contains(result.stdout, "State") {
+		t.Fatalf("cmdList() stdout missing table headers\nfull output:\n%s", result.stdout)
+	}
+	rows := listOutputRows(result.stdout)
+	if got := rows["alpha"]; !reflect.DeepEqual(got, []string{"alpha", "ready", "100.64.0.10", "alpha.tailnet"}) {
+		t.Fatalf("cmdList() parsed row = %v, want %v\nfull output:\n%s", got, []string{"alpha", "ready", "100.64.0.10", "alpha.tailnet"}, result.stdout)
 	}
 }
 
@@ -127,11 +131,29 @@ func TestCmdListAdminSeesAllVisibleInstances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cmdList(): %v", err)
 	}
-	for _, want := range []string{"alpha\tready\n", "beta\tstopped\n"} {
-		if !strings.Contains(result.stdout, want) {
-			t.Fatalf("cmdList() stdout missing %q\nfull output:\n%s", want, result.stdout)
-		}
+	rows := listOutputRows(result.stdout)
+	if got := rows["alpha"]; len(got) < 2 || got[1] != "ready" {
+		t.Fatalf("cmdList() alpha row = %v\nfull output:\n%s", got, result.stdout)
 	}
+	if got := rows["beta"]; len(got) < 2 || got[1] != "stopped" {
+		t.Fatalf("cmdList() beta row = %v\nfull output:\n%s", got, result.stdout)
+	}
+}
+
+func listOutputRows(output string) map[string][]string {
+	rows := make(map[string][]string)
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.Trim(trimmed, "-") == "" {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) == 0 || fields[0] == "Name" {
+			continue
+		}
+		rows[fields[0]] = fields
+	}
+	return rows
 }
 
 func TestCmdInspectFormatsInstanceAndEvents(t *testing.T) {

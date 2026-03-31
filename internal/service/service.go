@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -23,6 +24,9 @@ import (
 	"time"
 
 	gssh "github.com/gliderlabs/ssh"
+	"github.com/olekukonko/tablewriter"
+	"github.com/olekukonko/tablewriter/renderer"
+	"github.com/olekukonko/tablewriter/tw"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/local"
@@ -354,16 +358,42 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor) (commandResult, er
 		return commandResult{stdout: "no instances\n", exitCode: 0}, nil
 	}
 
-	var b strings.Builder
+	rows := make([][]string, 0, len(instances))
 	for _, inst := range instances {
-		line := fmt.Sprintf("%s\t%s", inst.Name, inst.State)
-		if inst.TailscaleIP != "" {
-			line += fmt.Sprintf("\t%s", inst.TailscaleIP)
-		}
-		if inst.TailscaleName != "" {
-			line += fmt.Sprintf("\t%s", inst.TailscaleName)
-		}
-		b.WriteString(line + "\n")
+		rows = append(rows, []string{inst.Name, string(inst.State), inst.TailscaleIP, inst.TailscaleName})
+	}
+
+	var b bytes.Buffer
+	table := tablewriter.NewTable(&b,
+		tablewriter.WithRenderer(renderer.NewBlueprint(tw.Rendition{
+			Borders: tw.BorderNone,
+			Settings: tw.Settings{
+				Separators: tw.Separators{
+					BetweenColumns: tw.Off,
+					BetweenRows:    tw.Off,
+				},
+				Lines: tw.Lines{
+					ShowTop:        tw.Off,
+					ShowBottom:     tw.Off,
+					ShowHeaderLine: tw.On,
+					ShowFooterLine: tw.Off,
+				},
+			},
+		})),
+		tablewriter.WithConfig(tablewriter.Config{
+			Header: tw.CellConfig{
+				Alignment:  tw.CellAlignment{Global: tw.AlignLeft},
+				Formatting: tw.CellFormatting{AutoFormat: tw.Off},
+			},
+			Row: tw.CellConfig{Alignment: tw.CellAlignment{Global: tw.AlignLeft}},
+		}),
+	)
+	table.Header("Name", "State", "Tailscale IP", "Tailscale Name")
+	if err := table.Bulk(rows); err != nil {
+		return commandResult{stderr: fmt.Sprintf("format instance list: %v\n", err), exitCode: 1}, err
+	}
+	if err := table.Render(); err != nil {
+		return commandResult{stderr: fmt.Sprintf("render instance list: %v\n", err), exitCode: 1}, err
 	}
 	return commandResult{stdout: b.String(), exitCode: 0}, nil
 }

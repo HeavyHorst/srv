@@ -79,10 +79,10 @@ ssh root@srv start demo
 ## Host Requirements
 
 - Linux host with cgroup v2 and `/dev/kvm`
-- `SRV_DATA_DIR` on Btrfs
+- `SRV_DATA_DIR` on a reflink-capable filesystem, with `SRV_BASE_ROOTFS` on the same filesystem; for example `btrfs`, or `xfs` created with reflink support enabled
 - Tailscale installed and working on the host
 - Tailscale OAuth client credentials with permission to mint auth keys for the configured guest tags
-- `ip`, `iptables`, `cp`, `resize2fs`, and `stat` available on the host
+- `ip`, `iptables`, `cp`, and `resize2fs` available on the host
 - Official static Firecracker and jailer release pair, or let `contrib/systemd/install.sh` install them
 
 ## Key Configuration
@@ -95,7 +95,7 @@ Core environment variables live in [`contrib/systemd/srv.env.example`](contrib/s
 - `SRV_ADMIN_USERS`: optional comma-separated Tailscale login list with cross-instance visibility and management rights
 - `SRV_BASE_KERNEL`: Firecracker guest kernel image
 - `SRV_BASE_INITRD`: optional initrd image
-- `SRV_BASE_ROOTFS`: base guest rootfs image stored on Btrfs
+- `SRV_BASE_ROOTFS`: base guest rootfs image stored on the same reflink-capable filesystem as `SRV_DATA_DIR` such as `btrfs` or reflink-enabled `xfs`
 - `SRV_GUEST_AUTH_TAGS`: comma-separated tags applied to guest auth keys
 - `SRV_DATA_DIR`: host state directory, default `/var/lib/srv`
 - `SRV_JAILER_BASE_DIR`: base directory for jailer workspaces, default `SRV_DATA_DIR/jailer`
@@ -119,7 +119,7 @@ When debugging a failed host run, start with `ssh root@srv inspect <name>`, then
 - `tsnet` joins the tailnet as `srv` and exposes the control API on tailnet TCP port `22`.
 - `gliderlabs/ssh` handles `exec` requests and rejects shell sessions.
 - SQLite stores instances, events, command audits, and authz decisions.
-- Btrfs reflinks clone the base rootfs for fast per-instance writable disks.
+- Reflinks clone the base rootfs for fast per-instance writable disks.
 - A root-only network helper owns TAP and iptables mutations, while a separate root-owned VM runner invokes Firecracker through the official jailer, drops the microVM process to `srv-vm:srv`, and places each VM into its own cgroup v2 leaf.
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
 - Existing stopped guests pick up the currently configured `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` on their next `start` or `restart`.

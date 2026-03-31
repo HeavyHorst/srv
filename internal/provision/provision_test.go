@@ -295,6 +295,64 @@ func TestBaseRootFSInUse(t *testing.T) {
 	}
 }
 
+func TestEnsureCreatePrereqsChecksReflinkCloneability(t *testing.T) {
+	cfg := loadProvisionTestConfig(t, map[string]string{
+		"SRV_GUEST_AUTH_TAGS": "tag:microvm",
+	})
+	if err := os.MkdirAll(cfg.ImagesDir(), 0o755); err != nil {
+		t.Fatalf("MkdirAll(images): %v", err)
+	}
+	kernelPath := filepath.Join(cfg.ImagesDir(), "vmlinux")
+	rootfsPath := filepath.Join(cfg.ImagesDir(), "rootfs.img")
+	if err := os.WriteFile(kernelPath, []byte("kernel"), 0o644); err != nil {
+		t.Fatalf("WriteFile(kernel): %v", err)
+	}
+	if err := os.WriteFile(rootfsPath, []byte("rootfs"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	cfg.BaseKernelPath = kernelPath
+	cfg.BaseRootFSPath = rootfsPath
+	oldLoopDevicesForPath := loopDevicesForPath
+	oldReflinkCloneFile := reflinkCloneFile
+	t.Cleanup(func() {
+		loopDevicesForPath = oldLoopDevicesForPath
+		reflinkCloneFile = oldReflinkCloneFile
+	})
+	loopDevicesForPath = func(string) (string, error) {
+		return "", nil
+	}
+
+	t.Run("accepts reflink-capable storage", func(t *testing.T) {
+		var src, dest string
+		reflinkCloneFile = func(_ context.Context, gotSrc, gotDest string) error {
+			src = gotSrc
+			dest = gotDest
+			return nil
+		}
+		p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
+		if err := p.ensureCreatePrereqs(context.Background(), false); err != nil {
+			t.Fatalf("ensureCreatePrereqs() error = %v", err)
+		}
+		if src != cfg.BaseRootFSPath {
+			t.Fatalf("reflinkCloneFile src = %q, want %q", src, cfg.BaseRootFSPath)
+		}
+		if !strings.HasPrefix(dest, cfg.DataDirAbs()+string(os.PathSeparator)) {
+			t.Fatalf("reflinkCloneFile dest = %q, want path under %q", dest, cfg.DataDirAbs())
+		}
+	})
+
+	t.Run("rejects storage without reflink support", func(t *testing.T) {
+		reflinkCloneFile = func(context.Context, string, string) error {
+			return errors.New("operation not supported")
+		}
+		p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
+		err := p.ensureCreatePrereqs(context.Background(), false)
+		if err == nil || !strings.Contains(err.Error(), "must be reflink-cloneable into data dir") {
+			t.Fatalf("ensureCreatePrereqs() error = %v", err)
+		}
+	})
+}
+
 func TestResolveCreateOptions(t *testing.T) {
 	cfg := loadProvisionTestConfig(t, nil)
 	p := &Provisioner{cfg: cfg}

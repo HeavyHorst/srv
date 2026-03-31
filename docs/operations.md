@@ -1,6 +1,6 @@
 # Operations Runbook
 
-This runbook is for the supported prepared-host path: systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` on a Linux host with cgroup v2, `/dev/kvm`, Btrfs-backed `SRV_DATA_DIR`, and the official static Firecracker/jailer release pair.
+This runbook is for the supported prepared-host path: systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` on a Linux host with cgroup v2, `/dev/kvm`, `SRV_DATA_DIR` on a reflink-capable filesystem such as `btrfs` or reflink-enabled `xfs`, `SRV_BASE_ROOTFS` on the same filesystem, and the official static Firecracker/jailer release pair.
 
 Same-host reboot recovery is already built into the control plane: when `srv` comes back under systemd, previously active instances are restarted automatically. The steps below cover the larger operator workflows that were previously only implied.
 
@@ -49,7 +49,7 @@ Notes:
 
 ## Restore Or Rebuild A Host
 
-1. Prepare a fresh host with the normal prerequisites: Tailscale, cgroup v2, `/dev/kvm`, Btrfs for `SRV_DATA_DIR`, and the repo checkout.
+1. Prepare a fresh host with the normal prerequisites: Tailscale, cgroup v2, `/dev/kvm`, reflink-capable storage such as `btrfs` or reflink-enabled `xfs` shared by `SRV_DATA_DIR` and `SRV_BASE_ROOTFS`, and the repo checkout.
 2. Reinstall the managed assets.
 
 ```bash
@@ -131,5 +131,5 @@ Important caveat: existing guests keep their own writable `rootfs.img`. There is
 - Do not add `NoNewPrivileges=yes` to `srv-vm-runner.service`; the jailer must drop privileges and `exec` Firecracker on real hosts.
 - Keep using the official static Firecracker and jailer release pairing. Distro-provided dynamically linked binaries can fail after chroot before the API socket appears.
 - Preserve `/etc/srv/srv.env` across reinstall or upgrade unless you are intentionally changing configuration and have accounted for the stored absolute paths.
-- Keep `SRV_DATA_DIR` on Btrfs. Fast per-instance provisioning still depends on reflink cloning the configured base rootfs.
+- Keep `SRV_DATA_DIR` and `SRV_BASE_ROOTFS` on the same reflink-capable filesystem, such as `btrfs` or reflink-enabled `xfs`. Fast per-instance provisioning still depends on reflink cloning the configured base rootfs.
 - Run `sudo ./contrib/smoke/host-smoke.sh` after install, restore, control-plane upgrade, and base-image changes.

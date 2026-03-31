@@ -41,6 +41,13 @@ var (
 		}
 		return strings.TrimSpace(string(output)), nil
 	}
+	reflinkCloneFile = func(ctx context.Context, src, dest string) error {
+		cmd := exec.CommandContext(ctx, "cp", "--reflink=always", src, dest)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("reflink clone %s -> %s: %w: %s", src, dest, err, strings.TrimSpace(string(output)))
+		}
+		return nil
+	}
 )
 
 type Provisioner struct {
@@ -111,7 +118,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if err != nil {
 		return model.Instance{}, err
 	}
-	if err := p.ensureCreatePrereqs(needsResize); err != nil {
+	if err := p.ensureCreatePrereqs(ctx, needsResize); err != nil {
 		return model.Instance{}, err
 	}
 
@@ -582,7 +589,7 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 	return instanceDir, nil
 }
 
-func (p *Provisioner) ensureCreatePrereqs(needsResize bool) error {
+func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool) error {
 	for _, path := range []string{p.cfg.BaseKernelPath, p.cfg.BaseRootFSPath} {
 		if path == "" {
 			return errors.New("create requires SRV_BASE_KERNEL and SRV_BASE_ROOTFS")
@@ -609,12 +616,24 @@ func (p *Provisioner) ensureCreatePrereqs(needsResize bool) error {
 	if len(p.cfg.GuestAuthTags) == 0 {
 		return errors.New("create requires SRV_GUEST_AUTH_TAGS so minted guest auth keys carry an allowed tag")
 	}
-	fsType, err := p.fsType(p.cfg.DataDirAbs())
-	if err != nil {
+	if err := p.ensureRootFSReflinkSupport(ctx); err != nil {
 		return err
 	}
-	if fsType != "btrfs" {
-		return fmt.Errorf("data dir %s must live on btrfs, found %s", p.cfg.DataDirAbs(), fsType)
+	return nil
+}
+
+func (p *Provisioner) ensureRootFSReflinkSupport(ctx context.Context) error {
+	probeDir, err := os.MkdirTemp(p.cfg.DataDirAbs(), ".srv-reflink-check-")
+	if err != nil {
+		return fmt.Errorf("create reflink probe dir in %s: %w", p.cfg.DataDirAbs(), err)
+	}
+	defer func() {
+		_ = os.RemoveAll(probeDir)
+	}()
+
+	probePath := filepath.Join(probeDir, filepath.Base(p.cfg.BaseRootFSPath))
+	if err := reflinkCloneFile(ctx, p.cfg.BaseRootFSPath, probePath); err != nil {
+		return fmt.Errorf("base rootfs %s must be reflink-cloneable into data dir %s on the same reflink-capable filesystem: %w", p.cfg.BaseRootFSPath, p.cfg.DataDirAbs(), err)
 	}
 	return nil
 }
@@ -710,9 +729,8 @@ func (p *Provisioner) resolveCreateOptions(opts CreateOptions, baseRootFSSize in
 }
 
 func (p *Provisioner) cloneRootFS(ctx context.Context, dest string) error {
-	cmd := exec.CommandContext(ctx, "cp", "--reflink=always", p.cfg.BaseRootFSPath, dest)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("reflink rootfs clone: %w: %s", err, strings.TrimSpace(string(output)))
+	if err := reflinkCloneFile(ctx, p.cfg.BaseRootFSPath, dest); err != nil {
+		return fmt.Errorf("reflink rootfs clone: %w", err)
 	}
 	if err := os.Chmod(dest, 0o660); err != nil {
 		return fmt.Errorf("set rootfs permissions: %w", err)
@@ -979,14 +997,6 @@ func (p *Provisioner) stopFirecracker(name string, pid int) error {
 		return fmt.Errorf("stop firecracker for %q: %w", name, err)
 	}
 	return nil
-}
-
-func (p *Provisioner) fsType(path string) (string, error) {
-	output, err := exec.Command("stat", "-f", "-c", "%T", path).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("stat fs type: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return strings.TrimSpace(string(output)), nil
 }
 
 func (p *Provisioner) outboundInterface(ctx context.Context) (string, error) {

@@ -80,7 +80,7 @@ func Load() (Config, error) {
 
 	flag.StringVar(&cfg.BaseKernelPath, "base-kernel", getenv("SRV_BASE_KERNEL", ""), "path to the Firecracker kernel image")
 	flag.StringVar(&cfg.BaseInitrdPath, "base-initrd", getenv("SRV_BASE_INITRD", ""), "path to the optional initrd image")
-	flag.StringVar(&cfg.BaseRootFSPath, "base-rootfs", getenv("SRV_BASE_ROOTFS", ""), "path to the base rootfs image stored on btrfs")
+	flag.StringVar(&cfg.BaseRootFSPath, "base-rootfs", getenv("SRV_BASE_ROOTFS", ""), "path to the base rootfs image stored on the same reflink-capable filesystem as SRV_DATA_DIR, such as btrfs or reflink-enabled xfs")
 	flag.StringVar(&cfg.NetHelperSocketPath, "net-helper-socket", getenv("SRV_NET_HELPER_SOCKET", defaultNetHelperSocket), "unix socket used to reach the privileged network helper")
 	flag.StringVar(&cfg.VMRunnerSocketPath, "vm-runner-socket", getenv("SRV_VM_RUNNER_SOCKET", defaultVMRunnerSocket), "unix socket used to reach the Firecracker runner helper")
 	flag.StringVar(&cfg.FirecrackerBinary, "firecracker-bin", getenv("SRV_FIRECRACKER_BIN", defaultFirecrackerBin), "firecracker binary path")

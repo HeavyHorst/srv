@@ -81,9 +81,9 @@ sudo ./contrib/systemd/install.sh --enable-now
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SRV_DATA_DIR` | `/var/lib/srv` | State directory (must be Btrfs) |
+| `SRV_DATA_DIR` | `/var/lib/srv` | State directory on the same reflink-capable filesystem as `SRV_BASE_ROOTFS`, for example `btrfs` or reflink-enabled `xfs` |
 | `SRV_BASE_KERNEL` | - | Firecracker kernel path |
-| `SRV_BASE_ROOTFS` | - | Base rootfs image |
+| `SRV_BASE_ROOTFS` | - | Base rootfs image on the same reflink-capable filesystem as `SRV_DATA_DIR`, such as `btrfs` or reflink-enabled `xfs` |
 | `SRV_BASE_INITRD` | - | Optional initrd |
 | `SRV_ALLOWED_USERS` | - | Comma-separated Tailscale allowlist |
 | `SRV_ADMIN_USERS` | - | Cross-instance admin access |

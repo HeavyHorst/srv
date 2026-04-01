@@ -34,6 +34,8 @@ The service treats SSH as command transport only. Caller identity comes from Tai
 sudo OUTPUT_DIR=/var/lib/srv/images/arch-base ./images/arch-base/build.sh
 ```
 
+If your host is not Arch and does not provide `pacstrap`, use the documented `podman` workflow in [`images/arch-base/README.md`](images/arch-base/README.md) instead of running the builder directly on the host.
+
 2. Install the systemd assets:
 
 ```bash

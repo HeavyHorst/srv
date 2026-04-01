@@ -21,10 +21,10 @@ That `--ssh` flag is intentional: it makes the control plane's existing `connect
 
 ## Requirements
 
-- Arch Linux host or another system with `pacstrap` and `systemctl`
+- Arch Linux host, or another Linux system with `podman` available for the containerized workflow below
 - root privileges
 - network access to Arch package mirrors, `kernel.org`, and GitHub raw content
-- build dependencies such as `base-devel`, `arch-install-scripts`, `bc`, `e2fsprogs`, `rsync`, and `curl`
+- for direct host builds: dependencies such as `base-devel`, `arch-install-scripts`, `bc`, `e2fsprogs`, `rsync`, and `curl`
 
 ## Build
 
@@ -53,6 +53,51 @@ To write directly into the service's expected runtime image directory:
 ```bash
 sudo OUTPUT_DIR=/var/lib/srv/images/arch-base ./images/arch-base/build.sh
 ```
+
+## Podman Build On Non-Arch Linux Hosts
+
+If your host is not Arch and does not provide `pacstrap`, run the existing builder inside a privileged Arch Linux container instead of trying to recreate the Arch packaging environment on the host.
+
+Install `podman` with your distro's package manager, then from the repo root run:
+
+```bash
+sudo podman run --rm --privileged --network host \
+  -v "$PWD":/work \
+  -w /work \
+  docker.io/library/archlinux:latest \
+  bash -lc '
+    set -euo pipefail
+    pacman -Sy --noconfirm archlinux-keyring
+    pacman -Syu --noconfirm arch-install-scripts base-devel bc e2fsprogs rsync curl systemd
+    ./images/arch-base/build.sh
+  '
+```
+
+That keeps the build logic in one place: the host only needs `podman`, while the container supplies `pacstrap`, `pacman`, and the expected Arch userspace.
+
+If you want the built artifacts to land directly in the installed `srv` runtime path on the host, pass `OUTPUT_DIR` through to the containerized build:
+
+```bash
+sudo install -d -m 0755 /var/lib/srv/images/arch-base
+sudo podman run --rm --privileged --network host \
+  -v "$PWD":/work \
+  -v /var/lib/srv/images/arch-base:/var/lib/srv/images/arch-base \
+  -w /work \
+  docker.io/library/archlinux:latest \
+  bash -lc '
+    set -euo pipefail
+    pacman -Sy --noconfirm archlinux-keyring
+    pacman -Syu --noconfirm arch-install-scripts base-devel bc e2fsprogs rsync curl systemd
+    OUTPUT_DIR=/var/lib/srv/images/arch-base ./images/arch-base/build.sh
+  '
+```
+
+Notes for the containerized path:
+
+- `--privileged` is required because the builder uses `losetup`, `mkfs.ext4`, and `mount`.
+- `--network host` keeps mirror and kernel downloads simple and avoids container DNS surprises during `pacstrap`.
+- The output directory should still be on the same reflink-capable filesystem as `SRV_DATA_DIR` when you intend to use `rootfs-base.img` with an installed host.
+- If you build into the default repo-local output directory, move or copy `vmlinux` and `rootfs-base.img` to the paths configured by `SRV_BASE_KERNEL` and `SRV_BASE_ROOTFS` in `/etc/srv/srv.env` before creating guests.
 
 Changes under `overlay/` only reach new guests after you rebuild `rootfs-base.img` and refresh the host's configured base rootfs artifact.
 

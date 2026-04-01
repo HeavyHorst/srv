@@ -40,6 +40,10 @@ If your host is not Arch and does not provide `pacstrap`, use the documented `po
 
 ```bash
 sudo ./contrib/systemd/install.sh
+sudo tee /etc/sysctl.d/90-srv-ip-forward.conf >/dev/null <<'EOF'
+net.ipv4.ip_forward = 1
+EOF
+sudo sysctl --system
 sudoedit /etc/srv/srv.env
 sudo ./contrib/systemd/install.sh --enable-now
 ```
@@ -90,6 +94,7 @@ Per-VM backup and restore is currently an in-place stopped-instance workflow: cr
 ## Host Requirements
 
 - Linux host with cgroup v2 and `/dev/kvm`
+- IPv4 forwarding enabled on the host, for example `net.ipv4.ip_forward=1`
 - `SRV_DATA_DIR` on a reflink-capable filesystem, with `SRV_BASE_ROOTFS` on the same filesystem; for example `btrfs`, or `xfs` created with reflink support enabled
 - Tailscale installed and working on the host
 - Tailscale OAuth client credentials with permission to mint auth keys for the configured guest tags

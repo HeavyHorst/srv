@@ -34,6 +34,9 @@ var (
 	errGuestExited     = errors.New("guest exited before joining the tailnet")
 	validName          = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	signalProcess      = syscall.Kill
+	listTailnetDevices = func(ctx context.Context, client *tailscale.Client) ([]*tailscale.Device, error) {
+		return client.Devices(ctx, nil)
+	}
 	loopDevicesForPath = func(path string) (string, error) {
 		output, err := exec.Command("losetup", "-j", path, "--output", "NAME", "--noheadings").CombinedOutput()
 		if err != nil {
@@ -465,6 +468,15 @@ func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, e
 		return model.Instance{}, err
 	}
 	p.applyConfiguredBootArtifacts(&inst)
+	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) && !hasTailnetIdentity(inst) {
+		reconciled, err := p.reconcileLateTailnetJoin(ctx, &inst)
+		if err != nil {
+			return inst, err
+		}
+		if reconciled {
+			return inst, nil
+		}
+	}
 	if err := p.ensureStartPrereqs(inst); err != nil {
 		return inst, err
 	}
@@ -555,6 +567,32 @@ func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, e
 
 	cleanup = false
 	return inst, nil
+}
+
+func (p *Provisioner) reconcileLateTailnetJoin(ctx context.Context, inst *model.Instance) (bool, error) {
+	if inst == nil || hasTailnetIdentity(*inst) {
+		return false, nil
+	}
+	device, ok, err := p.findDevice(ctx, inst.Name)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	inst.State = model.StateReady
+	inst.TailscaleName = firstNonEmpty(device.Hostname, device.Name, inst.Name)
+	inst.TailscaleIP = ""
+	if len(device.Addresses) > 0 {
+		inst.TailscaleIP = device.Addresses[0]
+	}
+	inst.LastError = ""
+	inst.UpdatedAt = time.Now().UTC()
+	if err := p.store.UpdateInstance(ctx, *inst); err != nil {
+		return false, err
+	}
+	p.recordEvent(inst.ID, "tailnet", "guest joined the tailnet after readiness timeout; state reconciled on demand", map[string]any{"tailscale_name": inst.TailscaleName, "tailscale_ip": inst.TailscaleIP})
+	return true, nil
 }
 
 func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (string, error) {
@@ -965,7 +1003,7 @@ func (p *Provisioner) findDevice(ctx context.Context, name string) (tailscale.De
 	if p.tsClient == nil {
 		return tailscale.Device{}, false, errors.New("tailscale device client is unavailable")
 	}
-	devices, err := p.tsClient.Devices(ctx, nil)
+	devices, err := listTailnetDevices(ctx, p.tsClient)
 	if err != nil {
 		return tailscale.Device{}, false, fmt.Errorf("list tailscale devices: %w", err)
 	}

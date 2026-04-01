@@ -919,6 +919,54 @@ func TestEnsureStartPrereqsRequiresCompletedBootstrap(t *testing.T) {
 	}
 }
 
+func TestStartReconcilesLateTailnetJoinForRunningInstance(t *testing.T) {
+	oldListTailnetDevices := listTailnetDevices
+	t.Cleanup(func() { listTailnetDevices = oldListTailnetDevices })
+	listTailnetDevices = func(context.Context, *tailscale.Client) ([]*tailscale.Device, error) {
+		return []*tailscale.Device{{
+			Hostname:  "demo",
+			Name:      "demo.tailnet.ts.net",
+			Addresses: []string{"100.64.0.10"},
+		}}, nil
+	}
+
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st, tsClient: &tailscale.Client{}}
+	inst := provisionTestInstance(cfg, "demo", model.StateAwaitingTailnet, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.FirecrackerPID = os.Getpid()
+	inst.LastError = errGuestNotReady.Error()
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	got, err := p.Start(ctx, "demo")
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	if got.State != model.StateReady {
+		t.Fatalf("Start() state = %q, want %q", got.State, model.StateReady)
+	}
+	if got.TailscaleName != "demo" {
+		t.Fatalf("Start() tailscale name = %q, want demo", got.TailscaleName)
+	}
+	if got.TailscaleIP != "100.64.0.10" {
+		t.Fatalf("Start() tailscale ip = %q, want 100.64.0.10", got.TailscaleIP)
+	}
+	if got.LastError != "" {
+		t.Fatalf("Start() last error = %q, want empty", got.LastError)
+	}
+
+	stored, err := st.GetInstance(ctx, "demo")
+	if err != nil {
+		t.Fatalf("GetInstance(): %v", err)
+	}
+	if stored.State != model.StateReady || stored.TailscaleName != "demo" || stored.TailscaleIP != "100.64.0.10" {
+		t.Fatalf("stored instance = %#v", stored)
+	}
+}
+
 func TestEnsureStartPrereqsUsesCurrentBaseKernelPath(t *testing.T) {
 	currentKernel := filepath.Join(t.TempDir(), "images", "current-vmlinux")
 	cfg := loadProvisionTestConfig(t, map[string]string{

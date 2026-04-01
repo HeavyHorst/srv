@@ -364,8 +364,13 @@ installed:
 
 next:
   1. edit ${ENV_PATH}
-  2. run: systemctl enable --now srv
-  3. test: ssh root@srv help
+  2. enable IPv4 forwarding for guest NAT, for example:
+     tee /etc/sysctl.d/90-srv-ip-forward.conf >/dev/null <<'EOT'
+     net.ipv4.ip_forward = 1
+     EOT
+     sysctl --system
+  3. run: systemctl enable --now srv
+  4. test: ssh root@srv help
 EOF
 }
 

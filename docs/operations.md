@@ -56,16 +56,25 @@ Notes:
 sudo ./contrib/systemd/install.sh
 ```
 
-3. Restore `/etc/srv/srv.env` from backup and verify that `SRV_FIRECRACKER_BIN`, `SRV_JAILER_BIN`, `SRV_DATA_DIR`, `SRV_BASE_KERNEL`, `SRV_BASE_ROOTFS`, and any optional `SRV_BASE_INITRD` still point at the intended paths.
-4. Restore the saved `SRV_DATA_DIR` tree to the same path.
-5. Reload systemd and start the services.
+3. Re-enable IPv4 forwarding for guest NAT on the rebuilt host.
+
+```bash
+sudo tee /etc/sysctl.d/90-srv-ip-forward.conf >/dev/null <<'EOF'
+net.ipv4.ip_forward = 1
+EOF
+sudo sysctl --system
+```
+
+4. Restore `/etc/srv/srv.env` from backup and verify that `SRV_FIRECRACKER_BIN`, `SRV_JAILER_BIN`, `SRV_DATA_DIR`, `SRV_BASE_KERNEL`, `SRV_BASE_ROOTFS`, and any optional `SRV_BASE_INITRD` still point at the intended paths.
+5. Restore the saved `SRV_DATA_DIR` tree to the same path.
+6. Reload systemd and start the services.
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now srv-vm-runner srv-net-helper srv
 ```
 
-6. Run the prepared-host validation gate before handing the host back to users.
+7. Run the prepared-host validation gate before handing the host back to users.
 
 ```bash
 sudo ./contrib/smoke/host-smoke.sh
@@ -127,6 +136,7 @@ Important caveat: existing guests keep their own writable `rootfs.img`. There is
 ## Host Hardening And Caveats
 
 - cgroup v2 is required. The runner now depends on a delegated cgroup v2 subtree to place each VM into its own `firecracker-vms/<name>` leaf with enforced `cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`.
+- IPv4 forwarding must stay enabled on the host. Guest egress depends on forwarding packets from each TAP device through the host's outbound interface after the helper installs MASQUERADE and `FORWARD` rules.
 - `srv-vm-runner.service` must keep `User=root`, `Group=srv`, `Delegate=cpu memory pids`, and a group-accessible socket under `/run/srv-vm-runner/`.
 - Do not add `NoNewPrivileges=yes` to `srv-vm-runner.service`; the jailer must drop privileges and `exec` Firecracker on real hosts.
 - Keep using the official static Firecracker and jailer release pairing. Distro-provided dynamically linked binaries can fail after chroot before the API socket appears.

@@ -886,12 +886,12 @@ func TestEnsureInstanceRuntimePermissions(t *testing.T) {
 	assertMode(inst.SerialLogPath, 0o644)
 }
 
-func TestEnsureStartPrereqsRequiresCompletedBootstrap(t *testing.T) {
+func TestEnsureStartPrereqsAllowsStoppedInstanceWithoutStoredTailnetIdentity(t *testing.T) {
 	firecrackerBin := filepath.Join(t.TempDir(), "bin", "firecracker")
 	cfg := loadProvisionTestConfig(t, map[string]string{
 		"SRV_FIRECRACKER_BIN": firecrackerBin,
 	})
-	p := &Provisioner{cfg: cfg}
+	p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
 	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 	p.applyConfiguredBootArtifacts(&inst)
 
@@ -907,12 +907,10 @@ func TestEnsureStartPrereqsRequiresCompletedBootstrap(t *testing.T) {
 		}
 	}
 
-	err := p.ensureStartPrereqs(inst)
-	if err == nil || !strings.Contains(err.Error(), "has not completed initial tailnet bootstrap") {
-		t.Fatalf("ensureStartPrereqs() error = %v", err)
+	if err := p.ensureStartPrereqs(inst); err != nil {
+		t.Fatalf("ensureStartPrereqs() without prior tailnet identity: %v", err)
 	}
 
-	p.tsClient = &tailscale.Client{}
 	inst.TailscaleName = "demo.tailnet"
 	if err := p.ensureStartPrereqs(inst); err != nil {
 		t.Fatalf("ensureStartPrereqs() with prior tailnet identity: %v", err)

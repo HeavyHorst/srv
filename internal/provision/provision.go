@@ -703,9 +703,6 @@ func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
 	if inst.State == model.StateDeleted {
 		return fmt.Errorf("instance %q is deleted", inst.Name)
 	}
-	if !hasTailnetIdentity(inst) {
-		return fmt.Errorf("instance %q has not completed initial tailnet bootstrap yet; use inspect to debug or delete/new to reprovision", inst.Name)
-	}
 	if p.tsClient == nil {
 		return errors.New("start requires TS_TAILNET and TS_CLIENT_SECRET so the control plane can observe guest tailnet readiness")
 	}

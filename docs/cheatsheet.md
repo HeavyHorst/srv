@@ -47,6 +47,8 @@ ssh root@srv restore demo <backup-id>
 ssh root@srv logs demo
 ssh root@srv logs demo serial
 ssh root@srv logs demo firecracker
+ssh root@srv logs -f demo serial
+ssh root@srv logs -f demo firecracker
 ```
 
 ## Systemd Management

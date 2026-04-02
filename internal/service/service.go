@@ -64,13 +64,42 @@ type commandResult struct {
 
 type logTarget string
 
+type logsRequest struct {
+	name   string
+	target logTarget
+	follow bool
+}
+
 const (
 	logTargetAll         logTarget = "all"
 	logTargetSerial      logTarget = "serial"
 	logTargetFirecracker logTarget = "firecracker"
 	defaultLogTailLines            = 40
+	maxLogChunkBytes               = 1024 * 1024
 	mib                            = int64(1024 * 1024)
 )
+
+var (
+	logFollowPollInterval      = 250 * time.Millisecond
+	logFollowKeepAliveInterval = time.Minute
+)
+
+type terminalWriterState uint8
+
+const (
+	terminalWriterStateText terminalWriterState = iota
+	terminalWriterStateEscape
+	terminalWriterStateCSI
+	terminalWriterStateOSC
+	terminalWriterStateOSCEscape
+	terminalWriterStateEscapeString
+	terminalWriterStateEscapeStringEscape
+)
+
+type terminalSafeWriter struct {
+	dst   io.Writer
+	state terminalWriterState
+}
 
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	for _, dir := range []string{cfg.DataDirAbs(), cfg.StateDir(), cfg.ImagesDir(), cfg.InstancesDir(), cfg.BackupsDir(), cfg.TSNetDir()} {
@@ -169,7 +198,6 @@ func (a *App) Run(ctx context.Context) error {
 		Handler:     a.handleSession,
 		HostSigners: []gssh.Signer{hostSigner},
 		IdleTimeout: 5 * time.Minute,
-		MaxTimeout:  30 * time.Minute,
 		PtyCallback: func(ctx gssh.Context, pty gssh.Pty) bool { return false },
 		SessionRequestCallback: func(sess gssh.Session, requestType string) bool {
 			return requestType != "shell" && requestType != "subsystem"
@@ -284,6 +312,15 @@ func (a *App) handleSession(sess gssh.Session) {
 		_ = sess.Exit(1)
 		return
 	}
+	if args[0] == "logs" {
+		exitCode, err := a.handleLogsSession(sess, actor, args)
+		finalize(actor, true, reason, err)
+		if exitCode == 0 && err != nil {
+			exitCode = 1
+		}
+		_ = sess.Exit(exitCode)
+		return
+	}
 
 	result, err := a.dispatch(sess.Context(), actor, args)
 	if result.stdout != "" {
@@ -311,8 +348,6 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, args []string) (c
 		return a.cmdList(ctx, actor)
 	case "inspect":
 		return a.cmdInspect(ctx, actor, args)
-	case "logs":
-		return a.cmdLogs(ctx, actor, args)
 	case "restore":
 		return a.cmdRestore(ctx, actor, args)
 	case "start":
@@ -578,22 +613,352 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string) 
 	return commandResult{stdout: b.String(), exitCode: 0}, nil
 }
 
-func (a *App) cmdLogs(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
-	name, target, err := parseLogsArgs(args)
+func (a *App) cmdLogsRequest(ctx context.Context, actor model.Actor, req logsRequest) (commandResult, error) {
+	inst, err := a.lookupVisibleInstance(ctx, actor, req.name)
 	if err != nil {
-		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+		return missingInstanceResult("logs", req.name, err)
 	}
 
-	inst, err := a.lookupVisibleInstance(ctx, actor, name)
+	stdout, err := formatLogOutput(inst, req.target)
 	if err != nil {
-		return missingInstanceResult("logs", name, err)
-	}
-
-	stdout, err := formatLogOutput(inst, target)
-	if err != nil {
-		return commandResult{stderr: fmt.Sprintf("logs %s: %v\n", name, err), exitCode: 1}, err
+		return commandResult{stderr: fmt.Sprintf("logs %s: %v\n", req.name, err), exitCode: 1}, err
 	}
 	return commandResult{stdout: stdout, exitCode: 0}, nil
+}
+
+func (a *App) handleLogsSession(sess gssh.Session, actor model.Actor, args []string) (int, error) {
+	req, err := parseLogsArgs(args)
+	if err != nil {
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		return 2, err
+	}
+	if !req.follow {
+		result, err := a.cmdLogsRequest(sess.Context(), actor, req)
+		if result.stdout != "" {
+			_, _ = io.WriteString(sess, result.stdout)
+		}
+		if result.stderr != "" {
+			_, _ = io.WriteString(sess.Stderr(), result.stderr)
+		}
+		return result.exitCode, err
+	}
+
+	inst, err := a.lookupVisibleInstance(sess.Context(), actor, req.name)
+	if err != nil {
+		result, err := missingInstanceResult("logs", req.name, err)
+		if result.stderr != "" {
+			_, _ = io.WriteString(sess.Stderr(), result.stderr)
+		}
+		return result.exitCode, err
+	}
+
+	err = streamLogOutput(sess.Context(), sess, inst, req.target, func() error {
+		_, err := sess.SendRequest("keepalive@openssh.com", true, nil)
+		if sess.Context().Err() != nil {
+			return nil
+		}
+		return err
+	})
+	if err == nil || sess.Context().Err() != nil {
+		return 0, nil
+	}
+	wrapped := fmt.Errorf("logs %s: %w", req.name, err)
+	_, _ = io.WriteString(sess.Stderr(), wrapped.Error()+"\n")
+	return 1, wrapped
+}
+
+func helpResult() commandResult {
+	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], backup <create|list> <name>, list, inspect <name>, logs [-f|--follow] <name> [serial|firecracker], restore <name> <backup-id>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
+}
+
+func parseLogsArgs(args []string) (logsRequest, error) {
+	if len(args) < 2 {
+		return logsRequest{}, errors.New(logsUsage())
+	}
+
+	req := logsRequest{target: logTargetAll}
+	for _, arg := range args[1:] {
+		switch arg {
+		case "-f", "--follow":
+			if req.follow {
+				return logsRequest{}, fmt.Errorf("%s specified more than once\n%s", arg, logsUsage())
+			}
+			req.follow = true
+		case string(logTargetSerial):
+			if req.target != logTargetAll {
+				return logsRequest{}, fmt.Errorf("unexpected argument %q\n%s", arg, logsUsage())
+			}
+			req.target = logTargetSerial
+		case string(logTargetFirecracker):
+			if req.target != logTargetAll {
+				return logsRequest{}, fmt.Errorf("unexpected argument %q\n%s", arg, logsUsage())
+			}
+			req.target = logTargetFirecracker
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return logsRequest{}, fmt.Errorf("unknown option %q\n%s", arg, logsUsage())
+			}
+			if req.name != "" {
+				return logsRequest{}, fmt.Errorf("unexpected argument %q\n%s", arg, logsUsage())
+			}
+			req.name = arg
+		}
+	}
+
+	if req.name == "" {
+		return logsRequest{}, errors.New(logsUsage())
+	}
+	if req.follow && req.target == logTargetAll {
+		return logsRequest{}, fmt.Errorf("follow requires an explicit log target\n%s", logsUsage())
+	}
+	return req, nil
+}
+
+func logsUsage() string {
+	return "usage: logs [-f|--follow] <name> [serial|firecracker]"
+}
+
+func formatLogSection(label, path string) (string, error) {
+	var b strings.Builder
+	if _, _, err := writeLogSection(logContentWriter(&b, label), label, path); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+func streamLogOutput(ctx context.Context, w io.Writer, inst model.Instance, target logTarget, keepAlive func() error) error {
+	label, path, err := resolveSingleLogTarget(inst, target)
+	if err != nil {
+		return err
+	}
+	w = logContentWriter(w, label)
+
+	_, offset, err := writeLogSection(w, label, path)
+	if err != nil {
+		return err
+	}
+	return followLogFile(ctx, w, path, offset, keepAlive)
+}
+
+func resolveSingleLogTarget(inst model.Instance, target logTarget) (string, string, error) {
+	switch target {
+	case logTargetSerial:
+		return "serial", inst.SerialLogPath, nil
+	case logTargetFirecracker:
+		return "firecracker", inst.LogPath, nil
+	default:
+		return "", "", errors.New("follow requires an explicit log target")
+	}
+}
+
+func writeLogSection(w io.Writer, label, path string) ([]string, int64, error) {
+	lines, offset, exists, err := readLastLines(path, defaultLogTailLines)
+	if err != nil {
+		return nil, 0, err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("%s-log: %s\n", label, path)); err != nil {
+		return nil, 0, err
+	}
+	switch {
+	case !exists:
+		_, err = io.WriteString(w, "(log file has not been created yet)\n")
+	case len(lines) == 0:
+		_, err = io.WriteString(w, "(log is empty)\n")
+	default:
+		for _, line := range lines {
+			if _, err = io.WriteString(w, line); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	return lines, offset, nil
+}
+
+func followLogFile(ctx context.Context, w io.Writer, path string, offset int64, keepAlive func() error) error {
+	pollTicker := time.NewTicker(logFollowPollInterval)
+	defer pollTicker.Stop()
+	keepAliveTicker := time.NewTicker(logFollowKeepAliveInterval)
+	defer keepAliveTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-pollTicker.C:
+			if err := writeLogUpdates(w, path, &offset); err != nil {
+				return err
+			}
+		case <-keepAliveTicker.C:
+			if keepAlive == nil {
+				continue
+			}
+			if err := keepAlive(); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func writeLogUpdates(w io.Writer, path string, offset *int64) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			*offset = 0
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if *offset > info.Size() {
+		*offset = 0
+	}
+	if _, err := file.Seek(*offset, io.SeekStart); err != nil {
+		return err
+	}
+
+	written, err := io.Copy(w, file)
+	*offset += written
+	return err
+}
+
+func readLastLines(path string, limit int) ([]string, int64, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, 0, false, nil
+		}
+		return nil, 0, false, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLogChunkBytes)
+	scanner.Split(scanLogChunks)
+
+	lines := make([]string, 0, limit)
+	var offset int64
+	for scanner.Scan() {
+		chunk := scanner.Text()
+		offset += int64(len(chunk))
+		if len(lines) == limit {
+			copy(lines, lines[1:])
+			lines[len(lines)-1] = chunk
+			continue
+		}
+		lines = append(lines, chunk)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, 0, false, err
+	}
+	return lines, offset, true, nil
+}
+
+func scanLogChunks(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i+1], nil
+	}
+	if len(data) >= maxLogChunkBytes {
+		return maxLogChunkBytes, data[:maxLogChunkBytes], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
+func logContentWriter(w io.Writer, label string) io.Writer {
+	if label == string(logTargetSerial) {
+		return &terminalSafeWriter{dst: w}
+	}
+	return w
+}
+
+func (w *terminalSafeWriter) Write(p []byte) (int, error) {
+	buf := make([]byte, 0, len(p))
+	flush := func() error {
+		if len(buf) == 0 {
+			return nil
+		}
+		if _, err := w.dst.Write(buf); err != nil {
+			return err
+		}
+		buf = buf[:0]
+		return nil
+	}
+
+	for _, b := range p {
+		switch w.state {
+		case terminalWriterStateText:
+			switch {
+			case b == 0x1b:
+				if err := flush(); err != nil {
+					return 0, err
+				}
+				w.state = terminalWriterStateEscape
+			case b < 0x20 || b == 0x7f:
+				switch b {
+				case '\n', '\r', '\t':
+					buf = append(buf, b)
+				}
+			default:
+				buf = append(buf, b)
+			}
+		case terminalWriterStateEscape:
+			switch b {
+			case '[':
+				w.state = terminalWriterStateCSI
+			case ']':
+				w.state = terminalWriterStateOSC
+			case 'P', 'X', '^', '_':
+				w.state = terminalWriterStateEscapeString
+			default:
+				w.state = terminalWriterStateText
+			}
+		case terminalWriterStateCSI:
+			if b >= 0x40 && b <= 0x7e {
+				w.state = terminalWriterStateText
+			}
+		case terminalWriterStateOSC:
+			switch b {
+			case 0x07:
+				w.state = terminalWriterStateText
+			case 0x1b:
+				w.state = terminalWriterStateOSCEscape
+			}
+		case terminalWriterStateOSCEscape:
+			if b == '\\' {
+				w.state = terminalWriterStateText
+			} else if b != 0x1b {
+				w.state = terminalWriterStateOSC
+			}
+		case terminalWriterStateEscapeString:
+			if b == 0x1b {
+				w.state = terminalWriterStateEscapeStringEscape
+			}
+		case terminalWriterStateEscapeStringEscape:
+			if b == '\\' {
+				w.state = terminalWriterStateText
+			} else if b != 0x1b {
+				w.state = terminalWriterStateEscapeString
+			}
+		}
+	}
+
+	if err := flush(); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
@@ -729,10 +1094,6 @@ func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string) (
 	return commandResult{stdout: fmt.Sprintf("deleted: %s\nstate: %s\n", inst.Name, inst.State), exitCode: 0}, nil
 }
 
-func helpResult() commandResult {
-	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], backup <create|list> <name>, list, inspect <name>, logs <name> [serial|firecracker], restore <name> <backup-id>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
-}
-
 func lifecycleReadyResult(action string, inst model.Instance) commandResult {
 	stdout := fmt.Sprintf("%s: %s\nstate: %s\ntailscale-name: %s\ntailscale-ip: %s\nconnect: ssh root@%s\n", action, inst.Name, inst.State, inst.TailscaleName, inst.TailscaleIP, inst.Name)
 	return commandResult{stdout: stdout, exitCode: 0}
@@ -852,23 +1213,6 @@ func parseRestoreArgs(args []string) (string, string, error) {
 	return args[1], args[2], nil
 }
 
-func parseLogsArgs(args []string) (string, logTarget, error) {
-	if len(args) < 2 || len(args) > 3 {
-		return "", "", errors.New(logsUsage())
-	}
-	if len(args) == 2 {
-		return args[1], logTargetAll, nil
-	}
-	switch logTarget(args[2]) {
-	case logTargetSerial:
-		return args[1], logTargetSerial, nil
-	case logTargetFirecracker:
-		return args[1], logTargetFirecracker, nil
-	default:
-		return "", "", fmt.Errorf("unknown log target %q\n%s", args[2], logsUsage())
-	}
-}
-
 func parseSizedInstanceArgs(args []string, usage string) (string, provision.CreateOptions, error) {
 	if len(args) < 2 {
 		return "", provision.CreateOptions{}, errors.New(usage)
@@ -953,10 +1297,6 @@ func resizeUsage() string {
 
 func backupUsage() string {
 	return "usage: backup <create|list> <name>"
-}
-
-func logsUsage() string {
-	return "usage: logs <name> [serial|firecracker]"
 }
 
 func restoreUsage() string {
@@ -1094,55 +1434,6 @@ func formatLogOutput(inst model.Instance, target logTarget) (string, error) {
 		sections = append(sections, section)
 	}
 	return strings.Join(sections, "\n"), nil
-}
-
-func formatLogSection(label, path string) (string, error) {
-	lines, exists, err := readLastLines(path, defaultLogTailLines)
-	if err != nil {
-		return "", err
-	}
-
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%s-log: %s\n", label, path))
-	switch {
-	case !exists:
-		b.WriteString("(log file has not been created yet)\n")
-	case len(lines) == 0:
-		b.WriteString("(log is empty)\n")
-	default:
-		for _, line := range lines {
-			b.WriteString(line)
-			b.WriteString("\n")
-		}
-	}
-	return b.String(), nil
-}
-
-func readLastLines(path string, limit int) ([]string, bool, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, false, nil
-		}
-		return nil, false, err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	lines := make([]string, 0, limit)
-	for scanner.Scan() {
-		if len(lines) == limit {
-			copy(lines, lines[1:])
-			lines[len(lines)-1] = scanner.Text()
-			continue
-		}
-		lines = append(lines, scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, false, err
-	}
-	return lines, true, nil
 }
 
 func ensureHostSigner(path string) (ssh.Signer, error) {

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -381,7 +382,7 @@ func TestEnsureHostSignerPersistsKey(t *testing.T) {
 
 func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
-	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "backup <create|list> <name>", "logs <name> [serial|firecracker]", "restore <name> <backup-id>", "start <name>", "stop <name>", "restart <name>"} {
+	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "backup <create|list> <name>", "logs [-f|--follow] <name> [serial|firecracker]", "restore <name> <backup-id>", "start <name>", "stop <name>", "restart <name>"} {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("helpResult() missing %q in %q", want, result.stdout)
 		}
@@ -480,19 +481,19 @@ func TestCmdLogsReturnsRecentOutput(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
-	result, err := app.cmdLogs(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"logs", inst.Name})
+	result, err := app.cmdLogsRequest(ctx, model.Actor{UserLogin: "alice@example.com"}, logsRequest{name: inst.Name, target: logTargetAll})
 	if err != nil {
-		t.Fatalf("cmdLogs(): %v", err)
+		t.Fatalf("cmdLogsRequest(): %v", err)
 	}
 	for _, want := range []string{"serial-log: " + inst.SerialLogPath + "\n", "serial-1\n", "serial-2\n", "firecracker-log: " + inst.LogPath + "\n", "fc-1\n", "fc-2\n"} {
 		if !strings.Contains(result.stdout, want) {
-			t.Fatalf("cmdLogs() stdout missing %q\nfull output:\n%s", want, result.stdout)
+			t.Fatalf("cmdLogsRequest() stdout missing %q\nfull output:\n%s", want, result.stdout)
 		}
 	}
 	serialIndex := strings.Index(result.stdout, "serial-log: ")
 	firecrackerIndex := strings.Index(result.stdout, "firecracker-log: ")
 	if serialIndex < 0 || firecrackerIndex < 0 || serialIndex >= firecrackerIndex {
-		t.Fatalf("cmdLogs() stdout did not keep serial before firecracker:\n%s", result.stdout)
+		t.Fatalf("cmdLogsRequest() stdout did not keep serial before firecracker:\n%s", result.stdout)
 	}
 }
 
@@ -516,15 +517,246 @@ func TestCmdLogsCanSelectSingleSurface(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
-	result, err := app.cmdLogs(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"logs", inst.Name, "firecracker"})
+	result, err := app.cmdLogsRequest(ctx, model.Actor{UserLogin: "alice@example.com"}, logsRequest{name: inst.Name, target: logTargetFirecracker})
 	if err != nil {
-		t.Fatalf("cmdLogs(): %v", err)
+		t.Fatalf("cmdLogsRequest(): %v", err)
 	}
 	if strings.Contains(result.stdout, "serial-log: ") {
-		t.Fatalf("cmdLogs() unexpectedly included serial output:\n%s", result.stdout)
+		t.Fatalf("cmdLogsRequest() unexpectedly included serial output:\n%s", result.stdout)
 	}
 	if !strings.Contains(result.stdout, "firecracker-log: "+inst.LogPath+"\n") {
-		t.Fatalf("cmdLogs() stdout = %q", result.stdout)
+		t.Fatalf("cmdLogsRequest() stdout = %q", result.stdout)
+	}
+}
+
+func TestCmdLogsSanitizesSerialOutputOnly(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:   config.Config{Hostname: "srv"},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+	}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	baseDir := t.TempDir()
+	inst.SerialLogPath = filepath.Join(baseDir, "serial.log")
+	inst.LogPath = filepath.Join(baseDir, "firecracker.log")
+	serialPayload := []byte("prefix\x1b[43;1Rsuffix\nname\x1b]0;title\adone\nutf8: \xc4\x9b\nxy\x01\tz\r\n")
+	if err := os.WriteFile(inst.SerialLogPath, serialPayload, 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+	firecrackerPayload := []byte("fc\x1b[43;1Rraw\n")
+	if err := os.WriteFile(inst.LogPath, firecrackerPayload, 0o644); err != nil {
+		t.Fatalf("WriteFile(firecracker): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	serialResult, err := app.cmdLogsRequest(ctx, model.Actor{UserLogin: "alice@example.com"}, logsRequest{name: inst.Name, target: logTargetSerial})
+	if err != nil {
+		t.Fatalf("cmdLogsRequest(serial): %v", err)
+	}
+	utf8Line := "utf8: " + string([]byte{0xc4, 0x9b}) + "\n"
+	for _, want := range []string{"prefixsuffix\n", "namedone\n", utf8Line, "xy\tz\r\n"} {
+		if !strings.Contains(serialResult.stdout, want) {
+			t.Fatalf("cmdLogsRequest(serial) stdout missing %q\nfull output:\n%s", want, serialResult.stdout)
+		}
+	}
+	if strings.Contains(serialResult.stdout, "\x1b[") || strings.Contains(serialResult.stdout, "\x1b]") {
+		t.Fatalf("cmdLogsRequest(serial) leaked escape sequences:\n%s", serialResult.stdout)
+	}
+
+	firecrackerResult, err := app.cmdLogsRequest(ctx, model.Actor{UserLogin: "alice@example.com"}, logsRequest{name: inst.Name, target: logTargetFirecracker})
+	if err != nil {
+		t.Fatalf("cmdLogsRequest(firecracker): %v", err)
+	}
+	if !strings.Contains(firecrackerResult.stdout, string(firecrackerPayload)) {
+		t.Fatalf("cmdLogsRequest(firecracker) stdout = %q, want raw payload %q", firecrackerResult.stdout, string(firecrackerPayload))
+	}
+}
+
+func TestCmdLogsPreservesTrailingPartialLine(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:   config.Config{Hostname: "srv"},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+	}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.SerialLogPath = filepath.Join(t.TempDir(), "serial.log")
+	if err := os.WriteFile(inst.SerialLogPath, []byte("login: "), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	result, err := app.cmdLogsRequest(ctx, model.Actor{UserLogin: "alice@example.com"}, logsRequest{name: inst.Name, target: logTargetSerial})
+	if err != nil {
+		t.Fatalf("cmdLogsRequest(serial): %v", err)
+	}
+	if !strings.HasSuffix(result.stdout, "login: ") {
+		t.Fatalf("cmdLogsRequest(serial) should preserve trailing partial line:\n%s", result.stdout)
+	}
+	if strings.Contains(result.stdout, "login: \n") {
+		t.Fatalf("cmdLogsRequest(serial) injected a newline into trailing partial line:\n%s", result.stdout)
+	}
+}
+
+func TestReadLastLinesSplitsLongChunkWithoutError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "serial.log")
+	payload := bytes.Repeat([]byte("a"), maxLogChunkBytes+17)
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+
+	lines, offset, exists, err := readLastLines(path, 4)
+	if err != nil {
+		t.Fatalf("readLastLines(): %v", err)
+	}
+	if !exists {
+		t.Fatalf("readLastLines() exists = false, want true")
+	}
+	if offset != int64(len(payload)) {
+		t.Fatalf("readLastLines() offset = %d, want %d", offset, len(payload))
+	}
+	if got := strings.Join(lines, ""); got != string(payload) {
+		t.Fatalf("readLastLines() lost data for long chunk: got %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+func TestStreamLogOutputFollowsSingleLog(t *testing.T) {
+	oldPollInterval := logFollowPollInterval
+	oldKeepAliveInterval := logFollowKeepAliveInterval
+	logFollowPollInterval = 10 * time.Millisecond
+	logFollowKeepAliveInterval = time.Hour
+	t.Cleanup(func() {
+		logFollowPollInterval = oldPollInterval
+		logFollowKeepAliveInterval = oldKeepAliveInterval
+	})
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.SerialLogPath = filepath.Join(t.TempDir(), "serial.log")
+	if err := os.WriteFile(inst.SerialLogPath, []byte("serial-1\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	output := &lockedBuffer{}
+	done := make(chan error, 1)
+	go func() {
+		done <- streamLogOutput(ctx, output, inst, logTargetSerial, nil)
+	}()
+
+	waitForOutput(t, output, "serial-1\n")
+	file, err := os.OpenFile(inst.SerialLogPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile(serial): %v", err)
+	}
+	if _, err := io.WriteString(file, "serial-2\n"); err != nil {
+		_ = file.Close()
+		t.Fatalf("WriteString(serial): %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close(serial): %v", err)
+	}
+	waitForOutput(t, output, "serial-2\n")
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("streamLogOutput(): %v", err)
+	}
+	if strings.Contains(output.String(), "firecracker-log:") {
+		t.Fatalf("streamLogOutput() unexpectedly included firecracker output:\n%s", output.String())
+	}
+}
+
+func TestStreamLogOutputReturnsKeepAliveError(t *testing.T) {
+	oldPollInterval := logFollowPollInterval
+	oldKeepAliveInterval := logFollowKeepAliveInterval
+	logFollowPollInterval = time.Hour
+	logFollowKeepAliveInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		logFollowPollInterval = oldPollInterval
+		logFollowKeepAliveInterval = oldKeepAliveInterval
+	})
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.SerialLogPath = filepath.Join(t.TempDir(), "serial.log")
+	if err := os.WriteFile(inst.SerialLogPath, []byte("serial-1\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+
+	keepAliveErr := errors.New("keepalive failed")
+	output := &lockedBuffer{}
+	done := make(chan error, 1)
+	go func() {
+		done <- streamLogOutput(context.Background(), output, inst, logTargetSerial, func() error {
+			return keepAliveErr
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, keepAliveErr) {
+			t.Fatalf("streamLogOutput() error = %v, want %v", err, keepAliveErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("streamLogOutput() did not return keepalive error")
+	}
+}
+
+func TestStreamLogOutputSanitizesSplitEscapeSequence(t *testing.T) {
+	oldPollInterval := logFollowPollInterval
+	oldKeepAliveInterval := logFollowKeepAliveInterval
+	logFollowPollInterval = 10 * time.Millisecond
+	logFollowKeepAliveInterval = time.Hour
+	t.Cleanup(func() {
+		logFollowPollInterval = oldPollInterval
+		logFollowKeepAliveInterval = oldKeepAliveInterval
+	})
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.SerialLogPath = filepath.Join(t.TempDir(), "serial.log")
+	if err := os.WriteFile(inst.SerialLogPath, []byte("prefix\x1b[6"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	output := &lockedBuffer{}
+	done := make(chan error, 1)
+	go func() {
+		done <- streamLogOutput(ctx, output, inst, logTargetSerial, nil)
+	}()
+
+	waitForOutput(t, output, "serial-log: ")
+	file, err := os.OpenFile(inst.SerialLogPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile(serial): %v", err)
+	}
+	if _, err := io.WriteString(file, "n suffix\n"); err != nil {
+		_ = file.Close()
+		t.Fatalf("WriteString(serial): %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close(serial): %v", err)
+	}
+	waitForOutput(t, output, "prefix suffix\n")
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("streamLogOutput(): %v", err)
+	}
+	if strings.Contains(output.String(), "\x1b[") || strings.Contains(output.String(), "[6n") {
+		t.Fatalf("streamLogOutput() leaked split escape sequence:\n%s", output.String())
 	}
 }
 
@@ -691,20 +923,22 @@ func TestParseRestoreArgs(t *testing.T) {
 
 func TestParseLogsArgs(t *testing.T) {
 	tests := []struct {
-		name       string
-		args       []string
-		wantName   string
-		wantTarget logTarget
-		wantErr    string
+		name    string
+		args    []string
+		want    logsRequest
+		wantErr string
 	}{
-		{name: "default to both logs", args: []string{"logs", "demo"}, wantName: "demo", wantTarget: logTargetAll},
-		{name: "select serial", args: []string{"logs", "demo", "serial"}, wantName: "demo", wantTarget: logTargetSerial},
-		{name: "reject unknown target", args: []string{"logs", "demo", "kernel"}, wantErr: `unknown log target "kernel"`},
+		{name: "default to both logs", args: []string{"logs", "demo"}, want: logsRequest{name: "demo", target: logTargetAll}},
+		{name: "select serial", args: []string{"logs", "demo", "serial"}, want: logsRequest{name: "demo", target: logTargetSerial}},
+		{name: "follow before name", args: []string{"logs", "-f", "demo", "serial"}, want: logsRequest{name: "demo", target: logTargetSerial, follow: true}},
+		{name: "follow after target", args: []string{"logs", "demo", "firecracker", "--follow"}, want: logsRequest{name: "demo", target: logTargetFirecracker, follow: true}},
+		{name: "reject unknown target", args: []string{"logs", "demo", "kernel"}, wantErr: `unexpected argument "kernel"`},
+		{name: "reject follow without explicit target", args: []string{"logs", "-f", "demo"}, wantErr: "follow requires an explicit log target"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotName, gotTarget, err := parseLogsArgs(tt.args)
+			got, err := parseLogsArgs(tt.args)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("parseLogsArgs() error = %v, want substring %q", err, tt.wantErr)
@@ -714,11 +948,40 @@ func TestParseLogsArgs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseLogsArgs() error = %v", err)
 			}
-			if gotName != tt.wantName || gotTarget != tt.wantTarget {
-				t.Fatalf("parseLogsArgs() = (%q, %q), want (%q, %q)", gotName, gotTarget, tt.wantName, tt.wantTarget)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("parseLogsArgs() = %#v, want %#v", got, tt.want)
 			}
 		})
 	}
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+func waitForOutput(t *testing.T, output *lockedBuffer, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(output.String(), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %q in output:\n%s", want, output.String())
 }
 
 func newServiceTestStore(t *testing.T) *store.Store {

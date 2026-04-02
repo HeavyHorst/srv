@@ -25,7 +25,6 @@ import (
 
 	gssh "github.com/gliderlabs/ssh"
 	"github.com/olekukonko/tablewriter"
-	"github.com/olekukonko/tablewriter/renderer"
 	"github.com/olekukonko/tablewriter/tw"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/errgroup"
@@ -515,35 +514,12 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor) (commandResult, er
 
 func renderTextTable(headers []string, rows [][]string) (string, error) {
 	var b bytes.Buffer
-	headerCells := make([]any, 0, len(headers))
-	for _, header := range headers {
-		headerCells = append(headerCells, header)
+	displayHeaders := make([]string, len(headers))
+	for i, header := range headers {
+		displayHeaders[i] = strings.ToUpper(header)
 	}
-	table := tablewriter.NewTable(&b,
-		tablewriter.WithRenderer(renderer.NewBlueprint(tw.Rendition{
-			Borders: tw.BorderNone,
-			Settings: tw.Settings{
-				Separators: tw.Separators{
-					BetweenColumns: tw.Off,
-					BetweenRows:    tw.Off,
-				},
-				Lines: tw.Lines{
-					ShowTop:        tw.Off,
-					ShowBottom:     tw.Off,
-					ShowHeaderLine: tw.On,
-					ShowFooterLine: tw.Off,
-				},
-			},
-		})),
-		tablewriter.WithConfig(tablewriter.Config{
-			Header: tw.CellConfig{
-				Alignment:  tw.CellAlignment{Global: tw.AlignLeft},
-				Formatting: tw.CellFormatting{AutoFormat: tw.Off},
-			},
-			Row: tw.CellConfig{Alignment: tw.CellAlignment{Global: tw.AlignLeft}},
-		}),
-	)
-	table.Header(headerCells...)
+	table := tablewriter.NewTable(&b, tablewriter.WithHeaderAutoFormat(tw.Off))
+	table.Header(displayHeaders)
 	if err := table.Bulk(rows); err != nil {
 		return "", err
 	}

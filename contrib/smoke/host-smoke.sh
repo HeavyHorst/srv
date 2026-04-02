@@ -231,13 +231,25 @@ trim_file() {
 	tr -d '\n' <"$1"
 }
 
+list_output_contains() {
+	local file_path="$1"
+	local name="$2"
+	local state="${3:-}"
+	awk -v name="${name}" -v state="${state}" '
+		index($0, name) == 0 { next }
+		state != "" && index($0, state) == 0 { next }
+		{ found = 1; exit }
+		END { exit(found ? 0 : 1) }
+	' "${file_path}"
+}
+
 assert_instance_listed() {
 	local label="$1"
 	local expected_state="$2"
 	if ! srv_ssh_capture "${label}" list; then
 		fail "list failed during ${label}"
 	fi
-	if ! awk -v name="${INSTANCE_NAME}" -v state="${expected_state}" '$1 == name && $2 == state { found = 1 } END { exit(found ? 0 : 1) }' "${ARTIFACT_DIR}/${label}.stdout"; then
+	if ! list_output_contains "${ARTIFACT_DIR}/${label}.stdout" "${INSTANCE_NAME}" "${expected_state}"; then
 		fail "instance ${INSTANCE_NAME} did not appear in list output with state ${expected_state} during ${label}"
 	fi
 }
@@ -605,7 +617,7 @@ log "confirming teardown"
 if ! srv_ssh_capture list-after-delete list; then
 	fail "list after delete failed"
 fi
-if awk -v name="${INSTANCE_NAME}" '$1 == name { found = 1 } END { exit(found ? 0 : 1) }' "${ARTIFACT_DIR}/list-after-delete.stdout"; then
+if list_output_contains "${ARTIFACT_DIR}/list-after-delete.stdout" "${INSTANCE_NAME}"; then
 	fail "instance ${INSTANCE_NAME} still appears in list output after delete"
 fi
 if [[ -e "${INSTANCE_DIR}" ]]; then

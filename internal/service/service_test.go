@@ -102,7 +102,7 @@ func TestCmdListFormatsVisibleInstances(t *testing.T) {
 	if result.exitCode != 0 {
 		t.Fatalf("cmdList() exitCode = %d, want 0", result.exitCode)
 	}
-	if !strings.Contains(result.stdout, "Name") || !strings.Contains(result.stdout, "State") {
+	if !strings.Contains(strings.ToUpper(result.stdout), "NAME") || !strings.Contains(strings.ToUpper(result.stdout), "STATE") {
 		t.Fatalf("cmdList() stdout missing table headers\nfull output:\n%s", result.stdout)
 	}
 	rows := listOutputRows(result.stdout)
@@ -191,8 +191,9 @@ func TestCmdBackupListFormatsBackupsAsTable(t *testing.T) {
 	if result.exitCode != 0 {
 		t.Fatalf("cmdBackup(list) exitCode = %d, want 0", result.exitCode)
 	}
+	upperOutput := strings.ToUpper(result.stdout)
 	for _, want := range []string{"backups for alpha:", "ID", "Created At", "RootFS Size", "VCPUs", "Memory", "Logs", backupID, "8.0 GiB", "serial,firecracker"} {
-		if !strings.Contains(result.stdout, want) {
+		if !strings.Contains(upperOutput, strings.ToUpper(want)) {
 			t.Fatalf("cmdBackup(list) stdout missing %q\nfull output:\n%s", want, result.stdout)
 		}
 	}
@@ -202,16 +203,48 @@ func listOutputRows(output string) map[string][]string {
 	rows := make(map[string][]string)
 	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.Trim(trimmed, "-") == "" {
+		if trimmed == "" {
+			continue
+		}
+		if fields := boxedTableFields(trimmed); len(fields) > 0 {
+			if strings.EqualFold(fields[0], "name") {
+				continue
+			}
+			rows[fields[0]] = fields
+			continue
+		}
+		if strings.Trim(trimmed, "-+┌┐└┘├┤┬┴┼─ ") == "" {
 			continue
 		}
 		fields := strings.Fields(trimmed)
-		if len(fields) == 0 || fields[0] == "Name" {
+		if len(fields) == 0 || strings.EqualFold(fields[0], "name") {
 			continue
 		}
 		rows[fields[0]] = fields
 	}
 	return rows
+}
+
+func boxedTableFields(line string) []string {
+	separator := ""
+	if strings.Contains(line, "│") {
+		separator = "│"
+	} else if strings.Count(line, "|") >= 2 {
+		separator = "|"
+	}
+	if separator == "" {
+		return nil
+	}
+	parts := strings.Split(line, separator)
+	fields := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		fields = append(fields, part)
+	}
+	return fields
 }
 
 func TestCmdInspectFormatsInstanceAndEvents(t *testing.T) {

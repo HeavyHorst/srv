@@ -34,7 +34,7 @@ sudo ./images/arch-base/build.sh
 
 By default this currently builds Linux `6.12.79` while reusing Firecracker's `microvm-kernel-ci-x86_64-6.1.config` as the baseline config.
 
-The default guest image is now intentionally less minimal: it includes `docker`, `docker-compose`, boot-time module loading for `overlay` and `br_netfilter`, Docker-friendly sysctls, and the matching kernel modules installed from the custom Firecracker kernel build.
+The default guest image is now intentionally less minimal: it includes `docker`, `docker-compose`, boot-time module loading for `overlay` and `br_netfilter`, Docker-friendly sysctls, nftables IPv4/IPv6 family support for Arch's `iptables-nft` userspace, and a matching kernel module tree with real Docker-related `.ko` files installed from the custom Firecracker kernel build.
 
 The kernel build parallelism is conservative by default. Override it if needed:
 
@@ -120,6 +120,8 @@ You can then point the service at those paths with `-base-kernel` and `-base-roo
 - The kernel build starts from Firecracker's `microvm-kernel-ci-x86_64-6.1.config` and runs `olddefconfig` against the selected source tree, so newer longterm kernels can reuse Firecracker's known-good microVM baseline.
 - On current Firecracker x86 builds, the guest kernel needs `CONFIG_PCI=y` for ACPI initialization even when the microVM is still using MMIO virtio devices instead of PCI transport. The fragment also disables `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` so the kernel prefers ACPI discovery instead of probing the same virtio devices twice.
 - The builder now runs `make ... modules` and installs the resulting module tree into the guest rootfs with `modules_install` plus `depmod`, so guests have a matching `/lib/modules/<kernel>` tree for the separately booted custom kernel.
+- The Docker-related bridge and overlay pieces are built as loadable modules, while the kernel fragment also forces the nftables `ip`, `ip6`, and `inet` families on. That avoids the previous broken state where the guest only had depmod metadata and `nft add table ip ...` failed with `Operation not supported`.
+- The builder now validates the merged kernel `.config` and refuses to finish if required Docker symbols are dropped by Kconfig or if `modules_install` would ship only metadata without any real `.ko` files.
 - The kernel fragment also enables Landlock and adds it to `CONFIG_LSM`, which keeps pacman's default download sandbox working inside the guest on current Arch releases. Without that, package installs can fail with `landlock is not supported by the kernel` unless you disable pacman's sandbox manually.
 - If the kernel build still fails with a generic top-level `Makefile:... Error 2`, retry with `KERNEL_JOBS=1` to surface the first real error line.
 - The rootfs intentionally still omits the Arch `linux` package. The custom kernel is supplied separately as `vmlinux`, which matches how Firecracker boots guests, and the builder disables `90-mkinitcpio-install.hook` during `pacstrap` because no guest initramfs is needed.

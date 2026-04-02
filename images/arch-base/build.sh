@@ -173,6 +173,48 @@ Include = /etc/pacman.d/mirrorlist
 EOF
 }
 
+require_kernel_config() {
+	local kernel_config="$1"
+	local pattern="$2"
+	local description="$3"
+	if grep -Eq "^${pattern}$" "${kernel_config}"; then
+		return
+	fi
+	echo "kernel config is missing ${description}; expected ${pattern}" >&2
+	exit 1
+}
+
+validate_kernel_config() {
+	local kernel_config="$1"
+	# Docker on Arch uses the iptables-nft userspace, so the guest kernel needs
+	# both the nf_tables family implementations and the classic xtables pieces.
+	require_kernel_config "${kernel_config}" 'CONFIG_MODULES=y' 'loadable module support'
+	require_kernel_config "${kernel_config}" 'CONFIG_NETFILTER=y' 'the netfilter core'
+	require_kernel_config "${kernel_config}" 'CONFIG_NF_CONNTRACK=[ym]' 'connection tracking'
+	require_kernel_config "${kernel_config}" 'CONFIG_NF_NAT=[ym]' 'core NAT support'
+	require_kernel_config "${kernel_config}" 'CONFIG_NF_TABLES=y' 'the nf_tables core'
+	require_kernel_config "${kernel_config}" 'CONFIG_NF_TABLES_IPV4=y' 'IPv4 nf_tables support'
+	require_kernel_config "${kernel_config}" 'CONFIG_NF_TABLES_IPV6=y' 'IPv6 nf_tables support'
+	require_kernel_config "${kernel_config}" 'CONFIG_NF_TABLES_INET=y' 'mixed inet nf_tables support'
+	require_kernel_config "${kernel_config}" 'CONFIG_NFT_COMPAT=[ym]' 'nf_tables xtables compatibility'
+	require_kernel_config "${kernel_config}" 'CONFIG_NFT_CT=[ym]' 'nf_tables conntrack expressions'
+	require_kernel_config "${kernel_config}" 'CONFIG_NFT_MASQ=[ym]' 'nf_tables masquerade support'
+	require_kernel_config "${kernel_config}" 'CONFIG_NFT_NAT=[ym]' 'nf_tables NAT expressions'
+	require_kernel_config "${kernel_config}" 'CONFIG_NFT_REDIR=[ym]' 'nf_tables redirect support'
+	require_kernel_config "${kernel_config}" 'CONFIG_IP_NF_IPTABLES=[ym]' 'IPv4 iptables compatibility'
+	require_kernel_config "${kernel_config}" 'CONFIG_IP_NF_FILTER=[ym]' 'IPv4 iptables filter support'
+	require_kernel_config "${kernel_config}" 'CONFIG_IP_NF_NAT=[ym]' 'IPv4 iptables NAT support'
+	require_kernel_config "${kernel_config}" 'CONFIG_IP_NF_TARGET_MASQUERADE=[ym]' 'IPv4 masquerade target support'
+	require_kernel_config "${kernel_config}" 'CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=[ym]' 'xt_addrtype matching'
+	require_kernel_config "${kernel_config}" 'CONFIG_NETFILTER_XT_MATCH_CONNTRACK=[ym]' 'xt_conntrack matching'
+	require_kernel_config "${kernel_config}" 'CONFIG_VETH=[ym]' 'veth support'
+	require_kernel_config "${kernel_config}" 'CONFIG_BRIDGE=[ym]' 'bridge support'
+	require_kernel_config "${kernel_config}" 'CONFIG_BRIDGE_NETFILTER=[ym]' 'bridge netfilter support'
+	require_kernel_config "${kernel_config}" 'CONFIG_NF_TABLES_BRIDGE=[ym]' 'bridge nf_tables support'
+	require_kernel_config "${kernel_config}" 'CONFIG_NF_CONNTRACK_BRIDGE=[ym]' 'bridge conntrack support'
+	require_kernel_config "${kernel_config}" 'CONFIG_OVERLAY_FS=[ym]' 'overlayfs support'
+}
+
 build_kernel() {
 	local jobs kernel_config
 	jobs="$(kernel_jobs)"
@@ -191,6 +233,7 @@ build_kernel() {
 		"${kernel_config}" \
 		"${SCRIPT_DIR}/kernel-fragment.config"
 	make -C "${KERNEL_SOURCE_DIR}" KCONFIG_CONFIG="${kernel_config}" olddefconfig
+	validate_kernel_config "${kernel_config}"
 	KERNEL_RELEASE="$(make -s -C "${KERNEL_SOURCE_DIR}" KCONFIG_CONFIG="${kernel_config}" kernelrelease)"
 	echo "building kernel with ${jobs} parallel job(s)"
 	make -C "${KERNEL_SOURCE_DIR}" KCONFIG_CONFIG="${kernel_config}" -j"${jobs}" vmlinux modules
@@ -212,6 +255,10 @@ install_kernel_modules() {
 		modules_install
 	depmod -b "${ROOTFS_MOUNT_DIR}" "${KERNEL_RELEASE}"
 	modules_dir="${ROOTFS_MOUNT_DIR}/lib/modules/${KERNEL_RELEASE}"
+	if [[ -z "$(find "${modules_dir}" -type f \( -name '*.ko' -o -name '*.ko.xz' -o -name '*.ko.zst' \) -print -quit)" ]]; then
+		echo "no loadable kernel modules were installed into ${modules_dir}; refusing to ship a Docker guest image with only depmod metadata" >&2
+		exit 1
+	fi
 	rm -f "${modules_dir}/build" "${modules_dir}/source"
 }
 

@@ -45,6 +45,11 @@ type App struct {
 	tailscale   *tsnet.Server
 	localAPI    *local.Client
 	sshServer   *gssh.Server
+	commandMu   sync.Mutex
+	commandCond *sync.Cond
+	commandOnce sync.Once
+	snapshotOn  bool
+	inFlight    int
 	mu          sync.Mutex
 	lockMu      sync.Mutex
 	locks       map[string]*instanceLockEntry
@@ -252,6 +257,13 @@ func (a *App) handleSession(sess gssh.Session) {
 	if len(args) > 0 {
 		command = args[0]
 	}
+	lease, err := a.beginCommand()
+	if err != nil {
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		_ = sess.Exit(1)
+		return
+	}
+	defer lease.Release()
 	argsJSON, _ := json.Marshal(args)
 	audit := model.CommandAudit{
 		CreatedAt:  started,
@@ -271,6 +283,8 @@ func (a *App) handleSession(sess gssh.Session) {
 		if err != nil {
 			audit.ErrorText = err.Error()
 		}
+		lease.Release()
+		a.waitForSnapshotBarrierToLift()
 		if derr := a.store.RecordCommand(context.Background(), audit); derr != nil {
 			a.log.Error("record command audit", "err", derr)
 		}
@@ -312,12 +326,37 @@ func (a *App) handleSession(sess gssh.Session) {
 		return
 	}
 	if args[0] == "logs" {
-		exitCode, err := a.handleLogsSession(sess, actor, args)
+		req, err := parseLogsArgs(args)
+		if err != nil {
+			_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+			finalize(actor, true, reason, err)
+			_ = sess.Exit(2)
+			return
+		}
+		if req.follow {
+			lease.Release()
+		}
+		exitCode, err := a.handleLogsSession(sess, actor, req)
 		finalize(actor, true, reason, err)
 		if exitCode == 0 && err != nil {
 			exitCode = 1
 		}
 		_ = sess.Exit(exitCode)
+		return
+	}
+	if args[0] == "snapshot" {
+		result, err := a.cmdSnapshot(sess.Context(), args, lease)
+		if result.stdout != "" {
+			_, _ = io.WriteString(sess, result.stdout)
+		}
+		if result.stderr != "" {
+			_, _ = io.WriteString(sess.Stderr(), result.stderr)
+		}
+		finalize(actor, true, reason, err)
+		if result.exitCode == 0 && err != nil {
+			result.exitCode = 1
+		}
+		_ = sess.Exit(result.exitCode)
 		return
 	}
 
@@ -602,12 +641,7 @@ func (a *App) cmdLogsRequest(ctx context.Context, actor model.Actor, req logsReq
 	return commandResult{stdout: stdout, exitCode: 0}, nil
 }
 
-func (a *App) handleLogsSession(sess gssh.Session, actor model.Actor, args []string) (int, error) {
-	req, err := parseLogsArgs(args)
-	if err != nil {
-		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
-		return 2, err
-	}
+func (a *App) handleLogsSession(sess gssh.Session, actor model.Actor, req logsRequest) (int, error) {
 	if !req.follow {
 		result, err := a.cmdLogsRequest(sess.Context(), actor, req)
 		if result.stdout != "" {
@@ -644,7 +678,7 @@ func (a *App) handleLogsSession(sess gssh.Session, actor model.Actor, args []str
 }
 
 func helpResult() commandResult {
-	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], backup <create|list> <name>, list, inspect <name>, logs [-f|--follow] <name> [serial|firecracker], restore <name> <backup-id>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
+	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], backup <create|list> <name>, list, inspect <name>, logs [-f|--follow] <name> [serial|firecracker], snapshot create, restore <name> <backup-id>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
 }
 
 func parseLogsArgs(args []string) (logsRequest, error) {
@@ -1094,6 +1128,20 @@ func (a *App) resolveActor(ctx context.Context, sess gssh.Session) (model.Actor,
 }
 
 func (a *App) authorize(actor model.Actor, command string) (bool, string) {
+	if command == "snapshot" {
+		if !a.isAdmin(actor) {
+			return false, fmt.Sprintf("%s is not in SRV_ADMIN_USERS", actor.UserLogin)
+		}
+		if len(a.cfg.AllowedUsers) == 0 {
+			return true, fmt.Sprintf("%s allowed to run snapshot as admin", actor.UserLogin)
+		}
+		for _, user := range a.cfg.AllowedUsers {
+			if strings.EqualFold(user, actor.UserLogin) {
+				return true, fmt.Sprintf("%s allowed to run snapshot as admin", actor.UserLogin)
+			}
+		}
+		return false, fmt.Sprintf("%s is not in SRV_ALLOWED_USERS", actor.UserLogin)
+	}
 	if len(a.cfg.AllowedUsers) == 0 {
 		return true, "allowed because SRV_ALLOWED_USERS is empty"
 	}

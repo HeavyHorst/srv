@@ -53,6 +53,9 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	if cfg.DataDirAbs() != expectedAbs {
 		t.Fatalf("DataDirAbs = %q, want %q", cfg.DataDirAbs(), expectedAbs)
 	}
+	if cfg.SnapshotsDir() != filepath.Join(expectedAbs, ".snapshots") {
+		t.Fatalf("SnapshotsDir = %q, want %q", cfg.SnapshotsDir(), filepath.Join(expectedAbs, ".snapshots"))
+	}
 	if cfg.NetHelperSocketPath != "/run/srv/custom-net-helper.sock" {
 		t.Fatalf("NetHelperSocketPath = %q, want %q", cfg.NetHelperSocketPath, "/run/srv/custom-net-helper.sock")
 	}

@@ -45,6 +45,13 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+func (s *Store) Checkpoint(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+		return fmt.Errorf("checkpoint sqlite wal: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO instances (

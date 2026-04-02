@@ -15,6 +15,26 @@ Same-host reboot recovery is already built into the control plane: when `srv` co
 
 Take backups from a quiesced host so `SRV_DATA_DIR` and the SQLite WAL state are self-consistent.
 
+If you need a fast host-local point-in-time copy without shutting the control plane down first, use the built-in snapshot barrier instead:
+
+```bash
+ssh root@srv snapshot create
+```
+
+That command is admin-only. It briefly rejects every other SSH command, waits for already admitted commands to finish, checkpoints SQLite, flushes the filesystem, and then creates a readonly btrfs snapshot of `SRV_DATA_DIR` under `SRV_DATA_DIR/.snapshots/<timestamp>`.
+
+Snapshot semantics are intentionally limited and explicit:
+
+- control-plane consistent
+- stopped guests fully safe
+- running guests crash-consistent
+
+Important caveats for this path:
+
+- `SRV_DATA_DIR` itself must be a btrfs subvolume root. A plain directory on btrfs is not enough.
+- The app snapshots `SRV_DATA_DIR` only. `/etc/srv`, environment files, and unit overrides still need the existing operator-managed backup flow below.
+- Remote `btrfs send/receive` replication is intentionally out of the barrier path. If you use it for DR or warm standby, run it after the local snapshot already exists.
+
 1. Stop the services.
 
 ```bash

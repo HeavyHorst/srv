@@ -80,6 +80,9 @@ ssh root@srv start demo
 ssh root@srv restart demo
 ssh root@srv delete demo
 
+# host-local snapshot barrier
+ssh root@srv snapshot create
+
 # stopped-VM backups
 ssh root@srv backup create demo
 ssh root@srv backup list demo
@@ -93,11 +96,14 @@ ssh root@srv start demo
 
 Per-VM backup and restore is currently an in-place stopped-instance workflow: create a backup from a stopped VM, then restore that backup back onto the same VM later. Backups are tied to the original VM record and are not restored onto a newly recreated VM that happens to reuse the same name.
 
+`snapshot create` is a separate host-local disaster-recovery primitive. It briefly blocks all SSH commands, checkpoints SQLite, flushes the filesystem, and creates a readonly btrfs snapshot of `SRV_DATA_DIR` under `SRV_DATA_DIR/.snapshots/<timestamp>`. The semantics are intentionally simple: control-plane consistent, stopped guests fully safe, and running guests crash-consistent only.
+
 ## Host Requirements
 
 - Linux host with cgroup v2 and `/dev/kvm`
 - IPv4 forwarding enabled on the host, for example `net.ipv4.ip_forward=1`
 - `SRV_DATA_DIR` on a reflink-capable filesystem, with `SRV_BASE_ROOTFS` on the same filesystem; for example `btrfs`, or `xfs` created with reflink support enabled
+- `snapshot create` additionally requires `SRV_DATA_DIR` itself to be a btrfs subvolume root, not just a directory on btrfs
 - Tailscale installed and working on the host
 - Tailscale OAuth client credentials with permission to mint auth keys for the configured guest tags
 - `ip`, `iptables`, `cp`, and `resize2fs` available on the host
@@ -140,6 +146,7 @@ When debugging a failed host run, start with `ssh root@srv inspect <name>`, then
 - Reflinks clone the base rootfs for fast per-instance writable disks.
 - A root-only network helper owns TAP and iptables mutations, while a separate root-owned VM runner invokes Firecracker through the official jailer, drops the microVM process to `srv-vm:srv`, and places each VM into its own cgroup v2 leaf.
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
+- `snapshot create` is an admin-only global barrier; while it is active, all other SSH commands are rejected until the local readonly btrfs snapshot has been created.
 - Existing stopped guests pick up the currently configured `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` on their next `start` or `restart`.
 - Rootfs changes only affect newly created guests after you rebuild the base image artifacts and refresh `SRV_BASE_ROOTFS`.
 

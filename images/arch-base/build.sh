@@ -25,14 +25,18 @@ ROOTFS_OUTPUT="${OUTPUT_DIR}/rootfs-base.img"
 MANIFEST_OUTPUT="${OUTPUT_DIR}/manifest.txt"
 PACMAN_CONFIG_PATH="${WORK_DIR}/pacman.conf"
 PACMAN_HOOKS_DIR="${WORK_DIR}/pacman-hooks"
+KERNEL_RELEASE=""
 
 ROOTFS_PACKAGES=(
 	base
 	ca-certificates
 	curl
+	docker
+	docker-compose
 	iproute2
 	iptables-nft
 	jq
+	kmod
 	tailscale
 )
 
@@ -52,6 +56,7 @@ require_commands() {
 		bc \
 		bison \
 		curl \
+		depmod \
 		flex \
 		gcc \
 		losetup \
@@ -186,16 +191,34 @@ build_kernel() {
 		"${kernel_config}" \
 		"${SCRIPT_DIR}/kernel-fragment.config"
 	make -C "${KERNEL_SOURCE_DIR}" KCONFIG_CONFIG="${kernel_config}" olddefconfig
+	KERNEL_RELEASE="$(make -s -C "${KERNEL_SOURCE_DIR}" KCONFIG_CONFIG="${kernel_config}" kernelrelease)"
 	echo "building kernel with ${jobs} parallel job(s)"
-	make -C "${KERNEL_SOURCE_DIR}" KCONFIG_CONFIG="${kernel_config}" -j"${jobs}" vmlinux
+	make -C "${KERNEL_SOURCE_DIR}" KCONFIG_CONFIG="${kernel_config}" -j"${jobs}" vmlinux modules
 
 	install -m 0644 "${KERNEL_SOURCE_DIR}/vmlinux" "${VMLINUX_OUTPUT}"
+}
+
+install_kernel_modules() {
+	local kernel_config modules_dir
+	kernel_config="${KERNEL_SOURCE_DIR}/.config"
+	if [[ -z "${KERNEL_RELEASE}" ]]; then
+		echo "kernel release is unset; build_kernel must run before build_rootfs" >&2
+		exit 1
+	fi
+
+	make -C "${KERNEL_SOURCE_DIR}" \
+		KCONFIG_CONFIG="${kernel_config}" \
+		INSTALL_MOD_PATH="${ROOTFS_MOUNT_DIR}" \
+		modules_install
+	depmod -b "${ROOTFS_MOUNT_DIR}" "${KERNEL_RELEASE}"
+	modules_dir="${ROOTFS_MOUNT_DIR}/lib/modules/${KERNEL_RELEASE}"
+	rm -f "${modules_dir}/build" "${modules_dir}/source"
 }
 
 configure_rootfs() {
 	install -d "${ROOTFS_MOUNT_DIR}/var/lib/srv"
 	chmod 0755 "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/bootstrap.sh"
-	systemctl --root="${ROOTFS_MOUNT_DIR}" enable tailscaled.service srv-bootstrap.service >/dev/null
+	systemctl --root="${ROOTFS_MOUNT_DIR}" enable docker.service tailscaled.service srv-bootstrap.service >/dev/null
 	truncate -s 0 "${ROOTFS_MOUNT_DIR}/etc/machine-id"
 	rm -f "${ROOTFS_MOUNT_DIR}/var/lib/dbus/machine-id"
 	rm -rf "${ROOTFS_MOUNT_DIR}/var/cache/pacman/pkg"
@@ -215,6 +238,7 @@ build_rootfs() {
 
 	write_pacman_config
 	pacstrap -C "${PACMAN_CONFIG_PATH}" -K -c "${ROOTFS_MOUNT_DIR}" "${ROOTFS_PACKAGES[@]}"
+	install_kernel_modules
 
 	rsync -a "${SCRIPT_DIR}/overlay/" "${ROOTFS_MOUNT_DIR}/"
 	configure_rootfs
@@ -226,6 +250,7 @@ write_manifest() {
 built_at=$(date --iso-8601=seconds)
 arch=${ARCH}
 kernel_version=${KERNEL_VERSION}
+kernel_release=${KERNEL_RELEASE}
 firecracker_config_url=${FIRECRACKER_CONFIG_URL}
 rootfs_size=${ROOTFS_SIZE}
 packages=$(IFS=,; echo "${ROOTFS_PACKAGES[*]}")

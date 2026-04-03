@@ -32,6 +32,7 @@ import (
 	"tailscale.com/tsnet"
 
 	"srv/internal/config"
+	"srv/internal/format"
 	"srv/internal/model"
 	"srv/internal/provision"
 	"srv/internal/store"
@@ -455,7 +456,7 @@ func (a *App) cmdResize(ctx context.Context, actor model.Actor, args []string) (
 		inst.State,
 		effectiveInstanceVCPUCount(inst, a.cfg),
 		effectiveInstanceMemoryMiB(inst, a.cfg),
-		formatBinarySize(effectiveInstanceRootFSSizeBytes(inst)),
+		format.BinarySize(effectiveInstanceRootFSSizeBytes(inst)),
 	)
 	return commandResult{stdout: stdout, exitCode: 0}, nil
 }
@@ -487,7 +488,7 @@ func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string) (
 			name,
 			info.ID,
 			info.CreatedAt.Format(time.RFC3339),
-			formatBinarySize(info.RootFSSizeBytes),
+			format.BinarySize(info.RootFSSizeBytes),
 			info.Path,
 		)
 		return commandResult{stdout: stdout, exitCode: 0}, nil
@@ -512,7 +513,7 @@ func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string) (
 			rows = append(rows, []string{
 				backup.ID,
 				backup.CreatedAt.Format(time.RFC3339),
-				formatBinarySize(backup.RootFSSizeBytes),
+				format.BinarySize(backup.RootFSSizeBytes),
 				strconv.FormatInt(backup.VCPUCount, 10),
 				fmt.Sprintf("%d MiB", backup.MemoryMiB),
 				strings.Join(logs, ","),
@@ -545,8 +546,8 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor) (commandResult, er
 			inst.Name,
 			string(inst.State),
 			fmt.Sprintf("%d", effectiveInstanceVCPUCount(inst, a.cfg)),
-			formatBinarySize(effectiveInstanceMemoryMiB(inst, a.cfg) * mib),
-			formatBinarySize(effectiveInstanceRootFSSizeBytes(inst)),
+			format.BinarySize(effectiveInstanceMemoryMiB(inst, a.cfg) * mib),
+			format.BinarySize(effectiveInstanceRootFSSizeBytes(inst)),
 			inst.TailscaleIP,
 			inst.TailscaleName,
 		})
@@ -605,7 +606,7 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string) 
 	}
 	b.WriteString(fmt.Sprintf("rootfs: %s\n", inst.RootFSPath))
 	if size := effectiveInstanceRootFSSizeBytes(inst); size > 0 {
-		b.WriteString(fmt.Sprintf("rootfs-size: %s\n", formatBinarySize(size)))
+		b.WriteString(fmt.Sprintf("rootfs-size: %s\n", format.BinarySize(size)))
 	}
 	b.WriteString(fmt.Sprintf("firecracker-pid: %d\n", inst.FirecrackerPID))
 	b.WriteString(fmt.Sprintf("tap-device: %s\n", inst.TapDevice))
@@ -1006,7 +1007,7 @@ func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string) 
 		inst.Name,
 		info.ID,
 		inst.State,
-		formatBinarySize(effectiveInstanceRootFSSizeBytes(inst)),
+		format.BinarySize(effectiveInstanceRootFSSizeBytes(inst)),
 		info.CreatedAt.Format(time.RFC3339),
 	)
 	return commandResult{stdout: stdout, exitCode: 0}, nil
@@ -1409,23 +1410,6 @@ func effectiveInstanceRootFSSizeBytes(inst model.Instance) int64 {
 		return 0
 	}
 	return info.Size()
-}
-
-func formatBinarySize(sizeBytes int64) string {
-	if sizeBytes < 1024 {
-		return fmt.Sprintf("%d B", sizeBytes)
-	}
-	units := []string{"KiB", "MiB", "GiB", "TiB"}
-	size := float64(sizeBytes)
-	unit := "B"
-	for _, next := range units {
-		size /= 1024
-		unit = next
-		if size < 1024 {
-			break
-		}
-	}
-	return fmt.Sprintf("%.1f %s", size, unit)
 }
 
 func missingInstanceResult(command, name string, err error) (commandResult, error) {

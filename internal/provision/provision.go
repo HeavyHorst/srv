@@ -14,7 +14,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,10 +25,18 @@ import (
 	"tailscale.com/client/tailscale"
 
 	"srv/internal/config"
+	"srv/internal/format"
 	"srv/internal/model"
 	"srv/internal/nethelper"
 	"srv/internal/store"
 	"srv/internal/vmrunner"
+)
+
+const (
+	kiB                  = int64(1024)
+	miB                  = 1024 * kiB
+	hostMemoryReserveMiB = int64(512)
+	hostDiskReserveBytes = int64(1 << 30)
 )
 
 var (
@@ -54,12 +64,15 @@ var (
 )
 
 type Provisioner struct {
-	cfg           config.Config
-	log           *slog.Logger
-	store         *store.Store
-	tsClient      *tailscale.Client
-	networkHelper networkHelper
-	vmRunner      vmRunner
+	cfg                 config.Config
+	log                 *slog.Logger
+	store               *store.Store
+	tsClient            *tailscale.Client
+	networkHelper       networkHelper
+	vmRunner            vmRunner
+	readHostMemoryBytes func() (int64, error)
+	readFilesystemBytes func(path string) (int64, error)
+	admissionMu         sync.Mutex
 }
 
 type networkHelper interface {
@@ -88,11 +101,13 @@ type CreateOptions struct {
 
 func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner, error) {
 	p := &Provisioner{
-		cfg:           cfg,
-		log:           logger,
-		store:         st,
-		networkHelper: nethelper.NewClient(cfg.NetHelperSocketPath),
-		vmRunner:      vmrunner.NewClient(cfg.VMRunnerSocketPath),
+		cfg:                 cfg,
+		log:                 logger,
+		store:               st,
+		networkHelper:       nethelper.NewClient(cfg.NetHelperSocketPath),
+		vmRunner:            vmrunner.NewClient(cfg.VMRunnerSocketPath),
+		readHostMemoryBytes: defaultReadHostMemoryBytes,
+		readFilesystemBytes: defaultReadFilesystemBytes,
 	}
 	if cfg.Tailnet != "" && cfg.TailscaleClientSecret != "" {
 		credentials := clientcredentials.Config{
@@ -109,7 +124,7 @@ func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner,
 	return p, nil
 }
 
-func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor, opts CreateOptions) (model.Instance, error) {
+func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor, opts CreateOptions) (inst model.Instance, err error) {
 	if !validName.MatchString(name) {
 		return model.Instance{}, fmt.Errorf("invalid instance name %q", name)
 	}
@@ -124,46 +139,61 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if err := p.ensureCreatePrereqs(ctx, needsResize); err != nil {
 		return model.Instance{}, err
 	}
+	err = func() error {
+		p.admissionMu.Lock()
+		defer p.admissionMu.Unlock()
 
-	instanceDir, err := p.prepareInstanceDir(ctx, name)
+		if err := p.ensureHostMemoryCapacity(ctx, "", resolved.MemoryMiB); err != nil {
+			return err
+		}
+		if err := p.ensureHostDiskCapacity(ctx, "", resolved.RootFSSizeBytes); err != nil {
+			return err
+		}
+
+		instanceDir, err := p.prepareInstanceDir(ctx, name)
+		if err != nil {
+			return err
+		}
+
+		networkCIDR, hostAddr, guestAddr, gateway, err := p.allocateNetwork(ctx)
+		if err != nil {
+			_ = os.RemoveAll(instanceDir)
+			return err
+		}
+
+		now := time.Now().UTC()
+		inst = model.Instance{
+			ID:              uuid.NewString(),
+			Name:            name,
+			State:           model.StateProvisioning,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+			CreatedByUser:   actor.UserLogin,
+			CreatedByNode:   actor.NodeName,
+			VCPUCount:       resolved.VCPUCount,
+			MemoryMiB:       resolved.MemoryMiB,
+			RootFSSizeBytes: resolved.RootFSSizeBytes,
+			RootFSPath:      filepath.Join(instanceDir, "rootfs.img"),
+			KernelPath:      p.cfg.BaseKernelPath,
+			InitrdPath:      p.cfg.BaseInitrdPath,
+			SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
+			LogPath:         filepath.Join(instanceDir, "firecracker.log"),
+			SerialLogPath:   filepath.Join(instanceDir, "serial.log"),
+			TapDevice:       tapName(name),
+			GuestMAC:        guestMAC(name),
+			NetworkCIDR:     networkCIDR,
+			HostAddr:        hostAddr,
+			GuestAddr:       guestAddr,
+			GatewayAddr:     gateway,
+		}
+
+		if err := p.store.CreateInstance(ctx, inst); err != nil {
+			_ = os.RemoveAll(instanceDir)
+			return err
+		}
+		return nil
+	}()
 	if err != nil {
-		return model.Instance{}, err
-	}
-
-	networkCIDR, hostAddr, guestAddr, gateway, err := p.allocateNetwork(ctx)
-	if err != nil {
-		_ = os.RemoveAll(instanceDir)
-		return model.Instance{}, err
-	}
-
-	now := time.Now().UTC()
-	inst := model.Instance{
-		ID:              uuid.NewString(),
-		Name:            name,
-		State:           model.StateProvisioning,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		CreatedByUser:   actor.UserLogin,
-		CreatedByNode:   actor.NodeName,
-		VCPUCount:       resolved.VCPUCount,
-		MemoryMiB:       resolved.MemoryMiB,
-		RootFSSizeBytes: resolved.RootFSSizeBytes,
-		RootFSPath:      filepath.Join(instanceDir, "rootfs.img"),
-		KernelPath:      p.cfg.BaseKernelPath,
-		InitrdPath:      p.cfg.BaseInitrdPath,
-		SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
-		LogPath:         filepath.Join(instanceDir, "firecracker.log"),
-		SerialLogPath:   filepath.Join(instanceDir, "serial.log"),
-		TapDevice:       tapName(name),
-		GuestMAC:        guestMAC(name),
-		NetworkCIDR:     networkCIDR,
-		HostAddr:        hostAddr,
-		GuestAddr:       guestAddr,
-		GatewayAddr:     gateway,
-	}
-
-	if err := p.store.CreateInstance(ctx, inst); err != nil {
-		_ = os.RemoveAll(instanceDir)
 		return model.Instance{}, err
 	}
 	p.recordEvent(inst.ID, "create", "instance record created", nil)
@@ -402,68 +432,83 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 }
 
 func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOptions) (model.Instance, error) {
-	inst, err := p.store.GetInstance(ctx, name)
-	if err != nil {
-		return model.Instance{}, err
-	}
-	if inst.State == model.StateDeleted {
-		return inst, fmt.Errorf("instance %q is deleted", name)
-	}
-	if inst.State != model.StateStopped {
-		return inst, fmt.Errorf("instance %q must be stopped before resize (current state: %s)", name, inst.State)
-	}
-	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
-		return inst, fmt.Errorf("instance %q must be stopped before resize", name)
-	}
+	var inst model.Instance
+	err := func() error {
+		p.admissionMu.Lock()
+		defer p.admissionMu.Unlock()
 
-	resized := inst
-	if resized.FirecrackerPID > 0 {
-		resized.FirecrackerPID = 0
-	}
-	if opts.VCPUCount > 0 {
-		resized.VCPUCount = opts.VCPUCount
-	}
-	if opts.MemoryMiB > 0 {
-		resized.MemoryMiB = opts.MemoryMiB
-	}
-	if err := validateMachineShape(p.effectiveVCPUCount(resized), p.effectiveMemoryMiB(resized)); err != nil {
-		return inst, err
-	}
-	if opts.RootFSSizeBytes > 0 {
-		currentSize, err := p.rootFSSize(resized.RootFSPath)
+		current, err := p.store.GetInstance(ctx, name)
 		if err != nil {
-			return inst, err
+			return err
 		}
-		if opts.RootFSSizeBytes < currentSize {
-			return inst, fmt.Errorf("rootfs size %d bytes is smaller than the current image size %d bytes", opts.RootFSSizeBytes, currentSize)
+		inst = current
+		if current.State == model.StateDeleted {
+			return fmt.Errorf("instance %q is deleted", name)
 		}
-		if opts.RootFSSizeBytes > currentSize {
-			if _, err := exec.LookPath("resize2fs"); err != nil {
-				return inst, errors.New("resize with a larger rootfs requires resize2fs on the host")
-			}
-			if err := p.growRootFS(resized.RootFSPath, opts.RootFSSizeBytes); err != nil {
-				return inst, err
-			}
-			p.recordEvent(inst.ID, "storage", "rootfs expanded for instance", map[string]any{"size_bytes": opts.RootFSSizeBytes})
+		if current.State != model.StateStopped {
+			return fmt.Errorf("instance %q must be stopped before resize (current state: %s)", name, current.State)
 		}
-		resized.RootFSSizeBytes = opts.RootFSSizeBytes
-	}
+		if current.FirecrackerPID > 0 && processExists(current.FirecrackerPID) {
+			return fmt.Errorf("instance %q must be stopped before resize", name)
+		}
 
-	resized.LastError = ""
-	resized.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, resized); err != nil {
+		resized := current
+		if resized.FirecrackerPID > 0 {
+			resized.FirecrackerPID = 0
+		}
+		if opts.VCPUCount > 0 {
+			resized.VCPUCount = opts.VCPUCount
+		}
+		if opts.MemoryMiB > 0 {
+			resized.MemoryMiB = opts.MemoryMiB
+		}
+		if err := validateMachineShape(p.effectiveVCPUCount(resized), p.effectiveMemoryMiB(resized)); err != nil {
+			return err
+		}
+		if opts.RootFSSizeBytes > 0 {
+			currentSize, err := p.rootFSSize(resized.RootFSPath)
+			if err != nil {
+				return err
+			}
+			if opts.RootFSSizeBytes < currentSize {
+				return fmt.Errorf("rootfs size %d bytes is smaller than the current image size %d bytes", opts.RootFSSizeBytes, currentSize)
+			}
+			if opts.RootFSSizeBytes > currentSize {
+				if _, err := exec.LookPath("resize2fs"); err != nil {
+					return errors.New("resize with a larger rootfs requires resize2fs on the host")
+				}
+				if err := p.ensureHostDiskCapacity(ctx, current.Name, opts.RootFSSizeBytes); err != nil {
+					return err
+				}
+				if err := p.growRootFS(resized.RootFSPath, opts.RootFSSizeBytes); err != nil {
+					return err
+				}
+				p.recordEvent(current.ID, "storage", "rootfs expanded for instance", map[string]any{"size_bytes": opts.RootFSSizeBytes})
+			}
+			resized.RootFSSizeBytes = opts.RootFSSizeBytes
+		}
+
+		resized.LastError = ""
+		resized.UpdatedAt = time.Now().UTC()
+		if err := p.store.UpdateInstance(ctx, resized); err != nil {
+			return err
+		}
+		p.recordEvent(resized.ID, "resize", "instance config updated", map[string]any{
+			"vcpus":             p.effectiveVCPUCount(resized),
+			"memory_mib":        p.effectiveMemoryMiB(resized),
+			"rootfs_size_bytes": resized.RootFSSizeBytes,
+		})
+		inst = resized
+		return nil
+	}()
+	if err != nil {
 		return inst, err
 	}
-	p.recordEvent(resized.ID, "resize", "instance config updated", map[string]any{
-		"vcpus":             p.effectiveVCPUCount(resized),
-		"memory_mib":        p.effectiveMemoryMiB(resized),
-		"rootfs_size_bytes": resized.RootFSSizeBytes,
-	})
-	return resized, nil
+	return inst, nil
 }
 
-func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, error) {
-	inst, err := p.store.GetInstance(ctx, name)
+func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instance, err error) {
+	inst, err = p.store.GetInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
 	}
@@ -484,18 +529,42 @@ func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, e
 		return inst, fmt.Errorf("instance %q is already running", name)
 	}
 
-	previousDevice, hadPreviousDevice, err := p.currentDeviceSnapshot(ctx, inst.Name)
+	err = func() error {
+		p.admissionMu.Lock()
+		defer p.admissionMu.Unlock()
+
+		current, err := p.store.GetInstance(ctx, name)
+		if err != nil {
+			return err
+		}
+		p.applyConfiguredBootArtifacts(&current)
+		inst = current
+		if current.State == model.StateProvisioning {
+			return fmt.Errorf("instance %q is already starting", name)
+		}
+		if err := p.ensureStartPrereqs(current); err != nil {
+			return err
+		}
+		if current.FirecrackerPID > 0 && processExists(current.FirecrackerPID) {
+			return fmt.Errorf("instance %q is already running", name)
+		}
+		if err := p.ensureHostMemoryCapacity(ctx, current.Name, p.effectiveMemoryMiB(current)); err != nil {
+			return err
+		}
+
+		current.State = model.StateProvisioning
+		current.FirecrackerPID = 0
+		current.LastError = ""
+		current.UpdatedAt = time.Now().UTC()
+		if err := p.store.UpdateInstance(ctx, current); err != nil {
+			return err
+		}
+		inst = current
+		return nil
+	}()
 	if err != nil {
 		return inst, err
 	}
-	if err := p.cleanupNetworking(inst); err != nil {
-		p.log.Warn("cleanup stale networking before start", "name", inst.Name, "err", err)
-	}
-	if err := p.ensureInstanceRuntimePermissions(inst); err != nil {
-		return inst, err
-	}
-	p.recordEvent(inst.ID, "start", "start requested", nil)
-
 	cleanup := true
 	startedMachine := false
 	defer func() {
@@ -511,6 +580,17 @@ func (p *Provisioner) Start(ctx context.Context, name string) (model.Instance, e
 			_ = p.store.UpdateInstance(context.Background(), inst)
 		}
 	}()
+	previousDevice, hadPreviousDevice, err := p.currentDeviceSnapshot(ctx, inst.Name)
+	if err != nil {
+		return inst, err
+	}
+	if err := p.cleanupNetworking(inst); err != nil {
+		p.log.Warn("cleanup stale networking before start", "name", inst.Name, "err", err)
+	}
+	if err := p.ensureInstanceRuntimePermissions(inst); err != nil {
+		return inst, err
+	}
+	p.recordEvent(inst.ID, "start", "start requested", nil)
 
 	if err := p.setupNetworking(ctx, inst); err != nil {
 		inst.LastError = err.Error()
@@ -746,6 +826,125 @@ func (p *Provisioner) rootFSSize(path string) (int64, error) {
 	return info.Size(), nil
 }
 
+func (p *Provisioner) ensureHostMemoryCapacity(ctx context.Context, excludeName string, requestedMemoryMiB int64) error {
+	readHostMemoryBytes := p.readHostMemoryBytes
+	if readHostMemoryBytes == nil {
+		readHostMemoryBytes = defaultReadHostMemoryBytes
+	}
+	totalBytes, err := readHostMemoryBytes()
+	if err != nil {
+		return fmt.Errorf("read host memory status: %w", err)
+	}
+	reservedBytes, err := p.sumReservedCapacity(ctx, excludeName, "memory", false, func(inst model.Instance) int64 {
+		if !instanceReservesHostMemory(inst) {
+			return 0
+		}
+		return p.effectiveMemoryMiB(inst) * miB
+	})
+	if err != nil {
+		return err
+	}
+	requestedBytes := requestedMemoryMiB * miB
+	budgetBytes := max(totalBytes-hostMemoryReserveMiB*miB, int64(0))
+	if reservedBytes+requestedBytes > budgetBytes {
+		return fmt.Errorf(
+			"insufficient host memory reservation budget: reserving %s across running VMs would exceed %s (%s total minus %s reserve)",
+			format.BinarySize(reservedBytes+requestedBytes),
+			format.BinarySize(budgetBytes),
+			format.BinarySize(totalBytes),
+			format.BinarySize(hostMemoryReserveMiB*miB),
+		)
+	}
+	return nil
+}
+
+func (p *Provisioner) ensureHostDiskCapacity(ctx context.Context, excludeName string, requestedRootFSBytes int64) error {
+	readFilesystemBytes := p.readFilesystemBytes
+	if readFilesystemBytes == nil {
+		readFilesystemBytes = defaultReadFilesystemBytes
+	}
+	totalBytes, err := readFilesystemBytes(p.cfg.InstancesDir())
+	if err != nil {
+		return fmt.Errorf("read filesystem status for %s: %w", p.cfg.InstancesDir(), err)
+	}
+	reservedBytes, err := p.sumReservedCapacity(ctx, excludeName, "disk", true, func(inst model.Instance) int64 {
+		return reservedInstanceRootFSBytes(inst)
+	})
+	if err != nil {
+		return err
+	}
+	budgetBytes := max(totalBytes-hostDiskReserveBytes, int64(0))
+	if reservedBytes+requestedRootFSBytes > budgetBytes {
+		return fmt.Errorf(
+			"insufficient host disk reservation budget in %s: reserving %s of rootfs capacity would exceed %s (%s total minus %s reserve)",
+			p.cfg.InstancesDir(),
+			format.BinarySize(reservedBytes+requestedRootFSBytes),
+			format.BinarySize(budgetBytes),
+			format.BinarySize(totalBytes),
+			format.BinarySize(hostDiskReserveBytes),
+		)
+	}
+	return nil
+}
+
+func (p *Provisioner) sumReservedCapacity(ctx context.Context, excludeName, label string, includeDeleted bool, measure func(model.Instance) int64) (int64, error) {
+	instances, err := p.store.ListInstances(ctx, includeDeleted)
+	if err != nil {
+		return 0, fmt.Errorf("list instances for %s capacity: %w", label, err)
+	}
+	var total int64
+	for _, inst := range instances {
+		if strings.EqualFold(inst.Name, excludeName) {
+			continue
+		}
+		total += measure(inst)
+	}
+	return total, nil
+}
+
+func instanceReservesHostMemory(inst model.Instance) bool {
+	if inst.FirecrackerPID > 0 {
+		return processExists(inst.FirecrackerPID)
+	}
+	return inst.State == model.StateProvisioning
+}
+
+func reservedInstanceRootFSBytes(inst model.Instance) int64 {
+	if inst.State == model.StateDeleted || inst.State == model.StateFailed {
+		return allocatedFileBytes(inst.RootFSPath)
+	}
+	if inst.RootFSSizeBytes > 0 {
+		return inst.RootFSSizeBytes
+	}
+	return fileSizeBytes(inst.RootFSPath)
+}
+
+func fileSizeBytes(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func allocatedFileBytes(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return info.Size()
+	}
+	return st.Blocks * 512
+}
+
 func (p *Provisioner) resolveCreateOptions(opts CreateOptions, baseRootFSSize int64) (CreateOptions, bool, error) {
 	resolved := CreateOptions{
 		VCPUCount:       p.effectiveVCPUCount(model.Instance{VCPUCount: opts.VCPUCount}),
@@ -963,6 +1162,42 @@ func (p *Provisioner) effectiveMemoryMiB(inst model.Instance) int64 {
 
 func validateMachineShape(vcpus, memoryMiB int64) error {
 	return config.ValidateMachineShape(vcpus, memoryMiB)
+}
+
+func defaultReadHostMemoryBytes() (int64, error) {
+	return loadHostMemoryBytes("/proc/meminfo")
+}
+
+func defaultReadFilesystemBytes(path string) (int64, error) {
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(path, &fs); err != nil {
+		return 0, err
+	}
+	return int64(fs.Blocks) * int64(fs.Bsize), nil
+}
+
+func loadHostMemoryBytes(path string) (int64, error) {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	var totalKiB int64
+	for _, line := range strings.Split(string(payload), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "MemTotal:" {
+			continue
+		}
+		value, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse %s from %s: %w", fields[0], path, err)
+		}
+		totalKiB = value
+		break
+	}
+	if totalKiB == 0 {
+		return 0, fmt.Errorf("MemTotal missing from %s", path)
+	}
+	return totalKiB * kiB, nil
 }
 
 func (p *Provisioner) waitForTailnetJoin(ctx context.Context, name string, firecrackerPID int) (string, string, error) {

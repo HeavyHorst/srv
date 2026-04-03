@@ -21,7 +21,9 @@ import (
 
 	"srv/internal/config"
 	"srv/internal/model"
+	"srv/internal/nethelper"
 	"srv/internal/store"
+	"srv/internal/vmrunner"
 )
 
 func TestPrepareInstanceDirAllowsReuseOfFailedAndDeletedInstances(t *testing.T) {
@@ -88,7 +90,12 @@ func TestPrepareInstanceDirRejectsActiveOrOrphanedNames(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+	p := &Provisioner{
+		cfg:                 cfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               st,
+		readFilesystemBytes: defaultReadFilesystemBytes,
+	}
 
 	active := provisionTestInstance(cfg, "busy", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 	if err := st.CreateInstance(ctx, active); err != nil {
@@ -166,7 +173,12 @@ func TestAllocateNetworkSkipsDeletedSubnetsAndDetectsExhaustion(t *testing.T) {
 		"SRV_VM_NETWORK_CIDR": "10.0.0.0/29",
 	})
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+	p := &Provisioner{
+		cfg:                 cfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               st,
+		readFilesystemBytes: defaultReadFilesystemBytes,
+	}
 
 	used := provisionTestInstance(cfg, "used", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 	used.NetworkCIDR = "10.0.0.0/30"
@@ -254,7 +266,12 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+	p := &Provisioner{
+		cfg:                 cfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               st,
+		readFilesystemBytes: defaultReadFilesystemBytes,
+	}
 
 	oldReflinkCloneFile := reflinkCloneFile
 	t.Cleanup(func() {
@@ -411,7 +428,12 @@ func TestBackupRequiresStoppedInstance(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+	p := &Provisioner{
+		cfg:                 cfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               st,
+		readFilesystemBytes: defaultReadFilesystemBytes,
+	}
 
 	inst := provisionTestInstance(cfg, "demo", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
@@ -823,6 +845,66 @@ func TestResolveCreateOptions(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsWhenHostDiskSpaceIsLow(t *testing.T) {
+	oldLoopDevicesForPath := loopDevicesForPath
+	oldReflinkCloneFile := reflinkCloneFile
+	t.Cleanup(func() {
+		loopDevicesForPath = oldLoopDevicesForPath
+		reflinkCloneFile = oldReflinkCloneFile
+	})
+
+	baseDir := t.TempDir()
+	baseKernel := filepath.Join(baseDir, "images", "vmlinux")
+	baseRootFS := filepath.Join(baseDir, "images", "rootfs.img")
+	cfg := loadProvisionTestConfig(t, map[string]string{
+		"SRV_BASE_KERNEL":     baseKernel,
+		"SRV_BASE_ROOTFS":     baseRootFS,
+		"TS_TAILNET":          "tailnet.example.com",
+		"TS_CLIENT_SECRET":    "secret",
+		"SRV_GUEST_AUTH_TAGS": "tag:microvm",
+	})
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:      cfg,
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:    st,
+		tsClient: &tailscale.Client{},
+		readHostMemoryBytes: func() (int64, error) {
+			return 8 * 1024 * miB, nil
+		},
+		readFilesystemBytes: func(string) (int64, error) {
+			return 512 * miB, nil
+		},
+	}
+	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
+		t.Fatalf("MkdirAll(instances dir): %v", err)
+	}
+
+	for _, path := range []string{baseKernel, baseRootFS} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+	if err := os.Truncate(baseRootFS, 4*miB); err != nil {
+		t.Fatalf("Truncate(baseRootFS): %v", err)
+	}
+
+	loopDevicesForPath = func(string) (string, error) { return "", nil }
+	reflinkCloneFile = func(context.Context, string, string) error { return nil }
+
+	if _, err := p.Create(context.Background(), "demo", model.Actor{UserLogin: "alice@example.com"}, CreateOptions{}); err == nil || !strings.Contains(err.Error(), "insufficient host disk") {
+		t.Fatalf("Create() disk capacity error = %v", err)
+	}
+	if _, found, err := st.FindInstance(context.Background(), "demo"); err != nil {
+		t.Fatalf("FindInstance(): %v", err)
+	} else if found {
+		t.Fatal("Create() should fail before persisting an instance row")
+	}
+}
+
 func TestEffectiveMachineConfigUsesInstanceOverrides(t *testing.T) {
 	cfg := loadProvisionTestConfig(t, nil)
 	p := &Provisioner{cfg: cfg}
@@ -914,6 +996,42 @@ func TestEnsureStartPrereqsAllowsStoppedInstanceWithoutStoredTailnetIdentity(t *
 	inst.TailscaleName = "demo.tailnet"
 	if err := p.ensureStartPrereqs(inst); err != nil {
 		t.Fatalf("ensureStartPrereqs() with prior tailnet identity: %v", err)
+	}
+}
+
+func TestStartRejectsWhenHostMemoryIsLow(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:           cfg,
+		log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:         st,
+		tsClient:      &tailscale.Client{},
+		networkHelper: panicNetworkHelper{t: t},
+		vmRunner:      panicVMRunner{t: t},
+		readHostMemoryBytes: func() (int64, error) {
+			return 1024 * miB, nil
+		},
+	}
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(rootfs dir): %v", err)
+	}
+	for _, path := range []string{inst.RootFSPath, inst.KernelPath, inst.InitrdPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	if _, err := p.Start(ctx, inst.Name); err == nil || !strings.Contains(err.Error(), "insufficient host memory") {
+		t.Fatalf("Start() memory capacity error = %v", err)
 	}
 }
 
@@ -1107,6 +1225,128 @@ func TestResizeRejectsShrinkingRootFS(t *testing.T) {
 	}
 }
 
+func TestResizeRejectsGrowingRootFSWhenHostDiskSpaceIsLow(t *testing.T) {
+	const testMiB = int64(1024 * 1024)
+
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:   cfg,
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+		readFilesystemBytes: func(string) (int64, error) {
+			return 256 * miB, nil
+		},
+	}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.RootFSSizeBytes = 8 * testMiB
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(rootfs dir): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.Truncate(inst.RootFSPath, inst.RootFSSizeBytes); err != nil {
+		t.Fatalf("Truncate(rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(bin): %v", err)
+	}
+	resize2fs := filepath.Join(binDir, "resize2fs")
+	if err := os.WriteFile(resize2fs, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(resize2fs): %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if _, err := p.Resize(ctx, inst.Name, CreateOptions{RootFSSizeBytes: 12 * testMiB}); err == nil || !strings.Contains(err.Error(), "insufficient host disk") {
+		t.Fatalf("Resize() disk capacity error = %v", err)
+	}
+}
+
+func TestReservedInstanceRootFSBytesUsesAllocatedBytesForDeletedInstances(t *testing.T) {
+	rootfsPath := filepath.Join(t.TempDir(), "rootfs.img")
+	if err := os.WriteFile(rootfsPath, []byte("payload"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.Truncate(rootfsPath, 64*miB); err != nil {
+		t.Fatalf("Truncate(rootfs): %v", err)
+	}
+
+	info, err := os.Stat(rootfsPath)
+	if err != nil {
+		t.Fatalf("Stat(rootfs): %v", err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("Stat(rootfs) sys = %T, want *syscall.Stat_t", info.Sys())
+	}
+
+	inst := model.Instance{
+		State:           model.StateDeleted,
+		RootFSPath:      rootfsPath,
+		RootFSSizeBytes: 64 * miB,
+	}
+	if got, want := reservedInstanceRootFSBytes(inst), st.Blocks*512; got != want {
+		t.Fatalf("reservedInstanceRootFSBytes() = %d, want %d", got, want)
+	}
+}
+
+func TestEnsureHostDiskCapacityCountsDeletedInstancesStillPresentInStore(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	rootfsPath := filepath.Join(cfg.InstancesDir(), "deleted", "rootfs.img")
+	if err := os.MkdirAll(filepath.Dir(rootfsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(rootfs dir): %v", err)
+	}
+	if err := os.WriteFile(rootfsPath, []byte("payload"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.Truncate(rootfsPath, 64*miB); err != nil {
+		t.Fatalf("Truncate(rootfs): %v", err)
+	}
+
+	info, err := os.Stat(rootfsPath)
+	if err != nil {
+		t.Fatalf("Stat(rootfs): %v", err)
+	}
+	stInfo, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("Stat(rootfs) sys = %T, want *syscall.Stat_t", info.Sys())
+	}
+	allocatedBytes := stInfo.Blocks * 512
+
+	deleted := provisionTestInstance(cfg, "deleted", model.StateDeleted, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	deleted.RootFSPath = rootfsPath
+	deleted.RootFSSizeBytes = 64 * miB
+	deletedAt := deleted.CreatedAt.Add(time.Minute)
+	deleted.DeletedAt = &deletedAt
+	if err := st.CreateInstance(ctx, deleted); err != nil {
+		t.Fatalf("CreateInstance(deleted): %v", err)
+	}
+
+	requestedBytes := int64(8 * miB)
+	p := &Provisioner{
+		cfg:   cfg,
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+		readFilesystemBytes: func(string) (int64, error) {
+			return hostDiskReserveBytes + allocatedBytes + requestedBytes - 1, nil
+		},
+	}
+
+	if err := p.ensureHostDiskCapacity(ctx, "", requestedBytes); err == nil || !strings.Contains(err.Error(), "insufficient host disk") {
+		t.Fatalf("ensureHostDiskCapacity() error = %v", err)
+	}
+}
+
 func TestDeviceUpdatedSince(t *testing.T) {
 	previous := tailnetDeviceSnapshot{DeviceID: "device-1", LastSeen: "2026-03-29T12:00:00Z"}
 	if deviceUpdatedSince(tailscale.Device{DeviceID: "device-1", LastSeen: previous.LastSeen}, previous, true) {
@@ -1283,4 +1523,32 @@ func provisionTestInstance(cfg config.Config, name, state string, createdAt time
 		GuestAddr:       "10.0.0.2/30",
 		GatewayAddr:     "10.0.0.1",
 	}
+}
+
+type panicNetworkHelper struct {
+	t *testing.T
+}
+
+func (h panicNetworkHelper) SetupInstanceNetwork(context.Context, nethelper.SetupRequest) error {
+	h.t.Fatalf("SetupInstanceNetwork() should not be called")
+	return nil
+}
+
+func (h panicNetworkHelper) CleanupInstanceNetwork(context.Context, nethelper.CleanupRequest) error {
+	h.t.Fatalf("CleanupInstanceNetwork() should not be called")
+	return nil
+}
+
+type panicVMRunner struct {
+	t *testing.T
+}
+
+func (r panicVMRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (vmrunner.StartResponse, error) {
+	r.t.Fatalf("StartInstanceVM() should not be called")
+	return vmrunner.StartResponse{}, nil
+}
+
+func (r panicVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {
+	r.t.Fatalf("StopInstanceVM() should not be called")
+	return nil
 }

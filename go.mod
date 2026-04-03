@@ -8,10 +8,11 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/olekukonko/tablewriter v1.1.4
 	golang.org/x/crypto v0.46.0
-	golang.org/x/oauth2 v0.33.0
 	golang.org/x/sync v0.19.0
+	golang.org/x/sys v0.42.0
 	modernc.org/sqlite v1.48.0
 	tailscale.com v1.96.5
+	tailscale.com/client/tailscale/v2 v2.9.0
 )
 
 require (
@@ -103,7 +104,7 @@ require (
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/net v0.48.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/term v0.38.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
 	golang.org/x/time v0.12.0 // indirect

@@ -10,6 +10,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,8 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/oauth2/clientcredentials"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/tailscale/v2"
 
 	"srv/internal/config"
 	"srv/internal/format"
@@ -44,8 +44,8 @@ var (
 	errGuestExited     = errors.New("guest exited before joining the tailnet")
 	validName          = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	signalProcess      = syscall.Kill
-	listTailnetDevices = func(ctx context.Context, client *tailscale.Client) ([]*tailscale.Device, error) {
-		return client.Devices(ctx, nil)
+	listTailnetDevices = func(ctx context.Context, client *tailscale.Client) ([]tailscale.Device, error) {
+		return client.Devices().List(ctx)
 	}
 	loopDevicesForPath = func(path string) (string, error) {
 		output, err := exec.Command("losetup", "-j", path, "--output", "NAME", "--noheadings").CombinedOutput()
@@ -110,15 +110,21 @@ func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner,
 		readFilesystemBytes: defaultReadFilesystemBytes,
 	}
 	if cfg.Tailnet != "" && cfg.TailscaleClientSecret != "" {
-		credentials := clientcredentials.Config{
-			ClientID:     firstNonEmpty(cfg.TailscaleClientID, "srv-control-plane"),
-			ClientSecret: cfg.TailscaleClientSecret,
-			TokenURL:     strings.TrimRight(cfg.TailscaleAPIBaseURL, "/") + "/api/v2/oauth/token",
+		client := &tailscale.Client{
+			Tailnet:   cfg.Tailnet,
+			UserAgent: "srv-control-plane",
+			Auth: &tailscale.OAuth{
+				ClientID:     firstNonEmpty(cfg.TailscaleClientID, "srv-control-plane"),
+				ClientSecret: cfg.TailscaleClientSecret,
+			},
 		}
-		client := tailscale.NewClient(cfg.Tailnet, nil)
-		client.BaseURL = strings.TrimRight(cfg.TailscaleAPIBaseURL, "/")
-		client.HTTPClient = credentials.Client(context.Background())
-		client.UserAgent = "srv-control-plane"
+		if baseURL := strings.TrimRight(cfg.TailscaleAPIBaseURL, "/"); baseURL != "" {
+			parsedBaseURL, err := url.Parse(baseURL)
+			if err != nil {
+				return nil, fmt.Errorf("parse tailscale api base url: %w", err)
+			}
+			client.BaseURL = parsedBaseURL
+		}
 		p.tsClient = client
 	}
 	return p, nil
@@ -334,7 +340,7 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 	}
 	if p.tsClient != nil {
 		if device, ok, err := p.findDevice(ctx, inst.Name); err == nil && ok {
-			if err := p.tsClient.DeleteDevice(ctx, device.DeviceID); err != nil {
+			if err := p.tsClient.Devices().Delete(ctx, deviceIdentifier(device)); err != nil {
 				p.log.Warn("delete tailscale device", "name", inst.Name, "err", err)
 			}
 		}
@@ -1065,21 +1071,29 @@ func (p *Provisioner) cleanupNetworking(inst model.Instance) error {
 
 func (p *Provisioner) mintGuestAuthKey(ctx context.Context) (secret string, keyID string, err error) {
 	caps := tailscale.KeyCapabilities{
-		Devices: tailscale.KeyDeviceCapabilities{
-			Create: tailscale.KeyDeviceCreateCapabilities{
-				Reusable:      false,
-				Ephemeral:     false,
-				Preauthorized: true,
-				Tags:          p.cfg.GuestAuthTags,
-			},
-		},
+		Devices: struct {
+			Create struct {
+				Reusable      bool     `json:"reusable"`
+				Ephemeral     bool     `json:"ephemeral"`
+				Tags          []string `json:"tags"`
+				Preauthorized bool     `json:"preauthorized"`
+			} `json:"create"`
+		}{},
 	}
-	secret, meta, err := p.tsClient.CreateKeyWithExpiry(ctx, caps, p.cfg.GuestAuthExpiry)
+	caps.Devices.Create.Reusable = false
+	caps.Devices.Create.Ephemeral = false
+	caps.Devices.Create.Preauthorized = true
+	caps.Devices.Create.Tags = p.cfg.GuestAuthTags
+	meta, err := p.tsClient.Keys().CreateAuthKey(ctx, tailscale.CreateKeyRequest{
+		Capabilities:  caps,
+		ExpirySeconds: int64(p.cfg.GuestAuthExpiry / time.Second),
+	})
 	if err != nil {
 		return "", "", fmt.Errorf("mint guest auth key: %w", err)
 	}
 	if meta != nil {
 		keyID = meta.ID
+		secret = meta.Key
 	}
 	return secret, keyID, nil
 }
@@ -1088,7 +1102,7 @@ func (p *Provisioner) deleteAuthKey(ctx context.Context, id string) error {
 	if id == "" || p.tsClient == nil {
 		return nil
 	}
-	return p.tsClient.DeleteKey(ctx, id)
+	return p.tsClient.Keys().Delete(ctx, id)
 }
 
 func (p *Provisioner) writeMetadataFile(inst model.Instance, bootstrap guestBootstrap) error {
@@ -1241,7 +1255,7 @@ func (p *Provisioner) findDevice(ctx context.Context, name string) (tailscale.De
 	}
 	for _, device := range devices {
 		if strings.EqualFold(device.Hostname, name) || strings.EqualFold(trimDot(prefixBeforeDot(device.Name)), name) {
-			return *device, true, nil
+			return device, true, nil
 		}
 	}
 	return tailscale.Device{}, false, nil
@@ -1255,7 +1269,21 @@ func (p *Provisioner) currentDeviceSnapshot(ctx context.Context, name string) (t
 	if !ok {
 		return tailnetDeviceSnapshot{}, false, nil
 	}
-	return tailnetDeviceSnapshot{DeviceID: device.DeviceID, LastSeen: device.LastSeen}, true, nil
+	return tailnetDeviceSnapshot{DeviceID: deviceIdentifier(device), LastSeen: deviceLastSeen(device)}, true, nil
+}
+
+func deviceIdentifier(device tailscale.Device) string {
+	if device.NodeID != "" {
+		return device.NodeID
+	}
+	return device.ID
+}
+
+func deviceLastSeen(device tailscale.Device) string {
+	if device.LastSeen == nil || device.LastSeen.IsZero() {
+		return ""
+	}
+	return device.LastSeen.UTC().Format(time.RFC3339)
 }
 
 func (p *Provisioner) stopFirecracker(name string, pid int) error {
@@ -1322,10 +1350,12 @@ func deviceUpdatedSince(device tailscale.Device, previous tailnetDeviceSnapshot,
 	if !hadPrevious {
 		return true
 	}
-	if previous.DeviceID != "" && device.DeviceID != "" && device.DeviceID != previous.DeviceID {
+	deviceID := deviceIdentifier(device)
+	if previous.DeviceID != "" && deviceID != "" && deviceID != previous.DeviceID {
 		return true
 	}
-	return strings.TrimSpace(device.LastSeen) != "" && device.LastSeen != previous.LastSeen
+	lastSeen := deviceLastSeen(device)
+	return strings.TrimSpace(lastSeen) != "" && lastSeen != previous.LastSeen
 }
 
 func readUnifiedCgroupPath(path string) (string, error) {

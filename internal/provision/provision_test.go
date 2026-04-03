@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/tailscale/v2"
 
 	"srv/internal/config"
 	"srv/internal/model"
@@ -1038,8 +1038,8 @@ func TestStartRejectsWhenHostMemoryIsLow(t *testing.T) {
 func TestStartReconcilesLateTailnetJoinForRunningInstance(t *testing.T) {
 	oldListTailnetDevices := listTailnetDevices
 	t.Cleanup(func() { listTailnetDevices = oldListTailnetDevices })
-	listTailnetDevices = func(context.Context, *tailscale.Client) ([]*tailscale.Device, error) {
-		return []*tailscale.Device{{
+	listTailnetDevices = func(context.Context, *tailscale.Client) ([]tailscale.Device, error) {
+		return []tailscale.Device{{
 			Hostname:  "demo",
 			Name:      "demo.tailnet.ts.net",
 			Addresses: []string{"100.64.0.10"},
@@ -1348,17 +1348,26 @@ func TestEnsureHostDiskCapacityCountsDeletedInstancesStillPresentInStore(t *test
 }
 
 func TestDeviceUpdatedSince(t *testing.T) {
+	tsTime := func(value string) *tailscale.Time {
+		t.Helper()
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			t.Fatalf("time.Parse(%q): %v", value, err)
+		}
+		return &tailscale.Time{Time: parsed}
+	}
+
 	previous := tailnetDeviceSnapshot{DeviceID: "device-1", LastSeen: "2026-03-29T12:00:00Z"}
-	if deviceUpdatedSince(tailscale.Device{DeviceID: "device-1", LastSeen: previous.LastSeen}, previous, true) {
+	if deviceUpdatedSince(tailscale.Device{NodeID: "device-1", LastSeen: tsTime(previous.LastSeen)}, previous, true) {
 		t.Fatalf("deviceUpdatedSince() reported unchanged device as updated")
 	}
-	if !deviceUpdatedSince(tailscale.Device{DeviceID: "device-1", LastSeen: "2026-03-29T12:01:00Z"}, previous, true) {
+	if !deviceUpdatedSince(tailscale.Device{NodeID: "device-1", LastSeen: tsTime("2026-03-29T12:01:00Z")}, previous, true) {
 		t.Fatalf("deviceUpdatedSince() should treat newer last-seen as updated")
 	}
-	if !deviceUpdatedSince(tailscale.Device{DeviceID: "device-2", LastSeen: previous.LastSeen}, previous, true) {
+	if !deviceUpdatedSince(tailscale.Device{NodeID: "device-2", LastSeen: tsTime(previous.LastSeen)}, previous, true) {
 		t.Fatalf("deviceUpdatedSince() should treat a new device ID as updated")
 	}
-	if !deviceUpdatedSince(tailscale.Device{DeviceID: "device-1"}, tailnetDeviceSnapshot{}, false) {
+	if !deviceUpdatedSince(tailscale.Device{NodeID: "device-1"}, tailnetDeviceSnapshot{}, false) {
 		t.Fatalf("deviceUpdatedSince() should accept the first matching device when no previous snapshot exists")
 	}
 }

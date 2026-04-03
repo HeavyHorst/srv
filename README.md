@@ -7,24 +7,25 @@ Self-hosted control-plane service for creating Firecracker microVMs over SSH on 
 `srv` exposes an SSH command surface on one Linux host and manages Firecracker microVMs behind it.
 
 ```bash
-ssh root@srv new demo
+ssh srv new demo
 ```
 
 Per-instance sizing can be overridden at create time:
 
 ```bash
-ssh root@srv new demo --cpus 4 --ram 8G --rootfs-size 20G
+ssh srv new demo --cpus 4 --ram 8G --rootfs-size 20G
 ```
 
 Existing stopped instances can be resized later:
 
 ```bash
-ssh root@srv stop demo
-ssh root@srv resize demo --cpus 4 --ram 8G --rootfs-size 20G
-ssh root@srv start demo
+ssh srv stop demo
+ssh srv resize demo --cpus 4 --ram 8G --rootfs-size 20G
+ssh srv start demo
 ```
 
 The service treats SSH as command transport only. Caller identity comes from Tailscale `WhoIs` data resolved from the incoming tailnet connection.
+Control-plane examples omit a username because authorization is based on that Tailscale identity, not the SSH username.
 
 ## Quickstart
 
@@ -62,36 +63,36 @@ The prepared-host systemd path is the one the repo currently validates. Manual f
 
 ```bash
 # create
-ssh root@srv new demo
-ssh root@srv new demo --cpus 4 --ram 8G --rootfs-size 20G
+ssh srv new demo
+ssh srv new demo --cpus 4 --ram 8G --rootfs-size 20G
 
 # inspect and logs
-ssh root@srv list
-ssh root@srv inspect demo
-ssh root@srv logs demo
-ssh root@srv logs demo serial
-ssh root@srv logs demo firecracker
-ssh root@srv logs -f demo serial
-ssh root@srv logs -f demo firecracker
+ssh srv list
+ssh srv inspect demo
+ssh srv logs demo
+ssh srv logs demo serial
+ssh srv logs demo firecracker
+ssh srv logs -f demo serial
+ssh srv logs -f demo firecracker
 
 # lifecycle
-ssh root@srv stop demo
-ssh root@srv start demo
-ssh root@srv restart demo
-ssh root@srv delete demo
+ssh srv stop demo
+ssh srv start demo
+ssh srv restart demo
+ssh srv delete demo
 
 # host-local snapshot barrier
-ssh root@srv snapshot create
+ssh srv snapshot create
 
 # stopped-VM backups
-ssh root@srv backup create demo
-ssh root@srv backup list demo
-ssh root@srv restore demo <backup-id>
+ssh srv backup create demo
+ssh srv backup list demo
+ssh srv restore demo <backup-id>
 
 # resize while stopped
-ssh root@srv stop demo
-ssh root@srv resize demo --cpus 4 --ram 8G --rootfs-size 20G
-ssh root@srv start demo
+ssh srv stop demo
+ssh srv resize demo --cpus 4 --ram 8G --rootfs-size 20G
+ssh srv start demo
 ```
 
 Per-VM backup and restore is currently an in-place stopped-instance workflow: create a backup from a stopped VM, then restore that backup back onto the same VM later. Backups are tied to the original VM record and are not restored onto a newly recreated VM that happens to reuse the same name.
@@ -136,7 +137,7 @@ sudo ./contrib/smoke/host-smoke.sh
 
 That harness validates the systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` units, confirms the SSH control surface is reachable, creates a real guest, waits for `inspect` readiness, polls for a real guest SSH session after each ready transition, verifies `list`, exercises a full stop/backup/start/restore cycle, proves restore actually rolls the guest rootfs back, checks the live per-VM cgroup limit files, and finally deletes the guest while confirming TAP, jailer, and cgroup cleanup.
 
-When debugging a failed host run, start with `ssh root@srv inspect <name>`, then compare the newest lines from `ssh root@srv logs <name> serial`, `ssh root@srv logs <name> firecracker`, and `journalctl -u srv-vm-runner`.
+When debugging a failed host run, start with `ssh srv inspect <name>`, then compare the newest lines from `ssh srv logs <name> serial`, `ssh srv logs <name> firecracker`, and `journalctl -u srv-vm-runner`.
 
 ## Architecture Notes
 

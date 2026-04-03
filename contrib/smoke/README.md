@@ -20,8 +20,8 @@ It is intentionally not part of `go test ./...`. The harness assumes:
 The harness validates the host-managed deployment end to end by:
 
 1. Verifying `/dev/kvm`, the configured base kernel/rootfs, and the required systemd units.
-2. Running `ssh root@<srv> help` to confirm the SSH control surface is reachable.
-3. Creating a real guest with `ssh root@<srv> new <name>`.
+2. Running `ssh <srv> help` to confirm the SSH control surface is reachable.
+3. Creating a real guest with `ssh <srv> new <name>`.
 4. Polling `inspect <name>` until the guest reports `state: ready` plus `tailscale-name` and `tailscale-ip`, or timing out.
 5. Polling for a real SSH session to the guest over the tailnet after each ready transition, so tailnet-ready and SSH-ready can converge separately on warm boots.
 6. Verifying the instance appears in `list` while ready.
@@ -73,9 +73,9 @@ Those files are meant to be enough to debug the host without rerunning immediate
 
 When a host run fails, the fastest useful surfaces are:
 
-- `ssh root@srv inspect <name>` for the control-plane view and recorded events
-- `ssh root@srv logs <name> serial` for guest boot and bootstrap failures
-- `ssh root@srv logs <name> firecracker` for Firecracker API and VMM failures
+- `ssh srv inspect <name>` for the control-plane view and recorded events
+- `ssh srv logs <name> serial` for guest boot and bootstrap failures
+- `ssh srv logs <name> firecracker` for Firecracker API and VMM failures
 - `journalctl -u srv-vm-runner --no-pager` for jailer and stop-time cleanup failures
 
 The serial and Firecracker log files are append-only. Always trust the newest lines first when comparing multiple attempts against the same instance name.

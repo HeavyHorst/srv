@@ -5,7 +5,7 @@ Quick reference for the srv control plane.
 ## Commands (via SSH)
 
 ```bash
-ssh root@srv <command> [args]
+ssh srv <command> [args]
 ```
 
 | Command | Description |
@@ -27,28 +27,28 @@ ssh root@srv <command> [args]
 
 ```bash
 # Create VM
-ssh root@srv new demo
+ssh srv new demo
 
 # With sizing
-ssh root@srv new demo --cpus 4 --ram 8G --rootfs-size 20G
+ssh srv new demo --cpus 4 --ram 8G --rootfs-size 20G
 
 # Resize (must be stopped)
-ssh root@srv stop demo
-ssh root@srv resize demo --cpus 4 --ram 8G
-ssh root@srv start demo
+ssh srv stop demo
+ssh srv resize demo --cpus 4 --ram 8G
+ssh srv start demo
 
 # Backup and restore (VM must be stopped)
-ssh root@srv stop demo
-ssh root@srv backup create demo
-ssh root@srv backup list demo
-ssh root@srv restore demo <backup-id>
+ssh srv stop demo
+ssh srv backup create demo
+ssh srv backup list demo
+ssh srv restore demo <backup-id>
 
 # View logs
-ssh root@srv logs demo
-ssh root@srv logs demo serial
-ssh root@srv logs demo firecracker
-ssh root@srv logs -f demo serial
-ssh root@srv logs -f demo firecracker
+ssh srv logs demo
+ssh srv logs demo serial
+ssh srv logs demo firecracker
+ssh srv logs -f demo serial
+ssh srv logs -f demo firecracker
 ```
 
 ## Systemd Management
@@ -122,11 +122,11 @@ sudo ./contrib/smoke/host-smoke.sh
 
 ```bash
 # VM inspection
-ssh root@srv inspect <name>
+ssh srv inspect <name>
 
 # Recent logs
-ssh root@srv logs <name> serial
-ssh root@srv logs <name> firecracker
+ssh srv logs <name> serial
+ssh srv logs <name> firecracker
 
 # System logs
 journalctl -u srv-vm-runner | tail

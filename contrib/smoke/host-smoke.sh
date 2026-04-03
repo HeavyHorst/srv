@@ -497,7 +497,7 @@ done
 
 log "verifying SSH control plane reachability"
 if ! srv_ssh_capture preflight-help help; then
-	fail "ssh root@${CONTROL_HOST} help failed"
+	fail "ssh ${CONTROL_HOST} help failed"
 fi
 
 log "creating ${INSTANCE_NAME}"

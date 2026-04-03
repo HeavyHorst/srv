@@ -9,25 +9,25 @@ The `srv` service provides SSH-accessible VM management. Connect to the control 
 ## Prerequisites
 
 - Connected to the Tailscale tailnet where `srv` is running
-- SSH access to `root@srv` (or configured hostname)
+- SSH access to `srv` (or configured hostname)
 
 ## Common Operations
 
 ### Create a VM for debugging
 
 ```bash
-ssh root@srv new <name> [--cpus N] [--ram NG] [--rootfs-size NG]
+ssh srv new <name> [--cpus N] [--ram NG] [--rootfs-size NG]
 ```
 
 Example:
 ```bash
-ssh root@srv new debug-session --cpus 2 --ram 4G
+ssh srv new debug-session --cpus 2 --ram 4G
 ```
 
 ### Check VM status and get Tailscale IP
 
 ```bash
-ssh root@srv inspect <name>
+ssh srv inspect <name>
 ```
 
 Returns a text summary with fields like `state`, `tailscale-name`, `tailscale-ip`, `vcpu-count`, and `memory-mib`.
@@ -36,10 +36,10 @@ Returns a text summary with fields like `state`, `tailscale-name`, `tailscale-ip
 
 ```bash
 # Serial console output (stdout/stderr from guest)
-ssh root@srv logs <name> serial
+ssh srv logs <name> serial
 
 # Firecracker logs (VM-level events)
-ssh root@srv logs <name> firecracker
+ssh srv logs <name> firecracker
 ```
 
 ### Access the VM
@@ -55,26 +55,26 @@ Or use the instance name if configured in SSH config.
 ### Stop and restart
 
 ```bash
-ssh root@srv stop <name>
-ssh root@srv start <name>
+ssh srv stop <name>
+ssh srv start <name>
 ```
 
 ### Resize (when stopped)
 
 ```bash
-ssh root@srv stop <name>
-ssh root@srv resize <name> --cpus 4 --ram 8G
-ssh root@srv start <name>
+ssh srv stop <name>
+ssh srv resize <name> --cpus 4 --ram 8G
+ssh srv start <name>
 ```
 
 ### Backup and restore (when stopped)
 
 ```bash
-ssh root@srv stop <name>
-ssh root@srv backup create <name>
-ssh root@srv backup list <name>
-ssh root@srv restore <name> <backup-id>
-ssh root@srv start <name>
+ssh srv stop <name>
+ssh srv backup create <name>
+ssh srv backup list <name>
+ssh srv restore <name> <backup-id>
+ssh srv start <name>
 ```
 
 Backups are in-place stopped-VM snapshots of the writable rootfs and logs. Restore only works back onto the same original VM record, not a newly recreated VM with the same name.
@@ -82,25 +82,25 @@ Backups are in-place stopped-VM snapshots of the writable rootfs and logs. Resto
 ### List all VMs
 
 ```bash
-ssh root@srv list
+ssh srv list
 ```
 
 ### Clean up
 
 ```bash
-ssh root@srv delete <name>
+ssh srv delete <name>
 ```
 
 ## Debugging Workflow
 
-1. **Create**: `ssh root@srv new debug-vm --cpus 2 --ram 4G`
-2. **Wait for ready**: Poll `ssh root@srv inspect debug-vm` until state is `ready`
+1. **Create**: `ssh srv new debug-vm --cpus 2 --ram 4G`
+2. **Wait for ready**: Poll `ssh srv inspect debug-vm` until state is `ready`
 3. **Connect**: `ssh root@<tailnet_ip>` from inspect output
 4. **Run code**: Execute commands inside the VM
-5. **Checkpoint if needed**: `ssh root@srv stop debug-vm && ssh root@srv backup create debug-vm && ssh root@srv start debug-vm`
-6. **Check logs**: If issues occur, `ssh root@srv logs debug-vm serial`
-7. **Restore if needed**: stop the VM, `ssh root@srv backup list debug-vm`, `ssh root@srv restore debug-vm <backup-id>`, then start it again
-8. **Clean up**: `ssh root@srv delete debug-vm`
+5. **Checkpoint if needed**: `ssh srv stop debug-vm && ssh srv backup create debug-vm && ssh srv start debug-vm`
+6. **Check logs**: If issues occur, `ssh srv logs debug-vm serial`
+7. **Restore if needed**: stop the VM, `ssh srv backup list debug-vm`, `ssh srv restore debug-vm <backup-id>`, then start it again
+8. **Clean up**: `ssh srv delete debug-vm`
 
 ## Tips for Agents
 
@@ -121,7 +121,7 @@ ssh root@srv delete <name>
 ## Error Handling
 
 If `inspect` shows errors or the VM doesn't reach `ready` state:
-1. Check Firecracker logs: `ssh root@srv logs <name> firecracker`
-2. Check serial output for boot failures: `ssh root@srv logs <name> serial`
-3. Verify host resources aren't exhausted: `ssh root@srv list` to see all VMs
+1. Check Firecracker logs: `ssh srv logs <name> firecracker`
+2. Check serial output for boot failures: `ssh srv logs <name> serial`
+3. Verify host resources aren't exhausted: `ssh srv list` to see all VMs
 4. Try recreating with more resources if OOM issues suspected

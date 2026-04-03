@@ -18,7 +18,7 @@ Take backups from a quiesced host so `SRV_DATA_DIR` and the SQLite WAL state are
 If you need a fast host-local point-in-time copy without shutting the control plane down first, use the built-in snapshot barrier instead:
 
 ```bash
-ssh root@srv snapshot create
+ssh srv snapshot create
 ```
 
 That command is admin-only. It briefly rejects every other SSH command, waits for already admitted commands to finish, checkpoints SQLite, flushes the filesystem, and then creates a readonly btrfs snapshot of `SRV_DATA_DIR` under `SRV_DATA_DIR/.snapshots/<timestamp>`.
@@ -143,7 +143,7 @@ Rollback is just pointing `SRV_BASE_KERNEL` or `SRV_BASE_INITRD` back to the pre
 
 1. Rebuild `rootfs-base.img` under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
 2. Point `SRV_BASE_ROOTFS` at the new image.
-3. Create a canary guest with `ssh root@srv new <name>` and validate it.
+3. Create a canary guest with `ssh srv new <name>` and validate it.
 4. After the canary passes, new guests will clone from the new base image.
 
 Rollback for the golden rootfs lane is also path-based: point `SRV_BASE_ROOTFS` back to the previous image before creating more guests.

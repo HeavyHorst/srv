@@ -370,7 +370,7 @@ next:
      EOT
      sysctl --system
   3. run: systemctl enable --now srv
-  4. test: ssh root@srv help
+  4. test: ssh srv help
 EOF
 }
 

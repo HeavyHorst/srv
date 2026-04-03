@@ -292,7 +292,7 @@ func (a *App) handleSession(sess gssh.Session) {
 	}
 
 	if len(args) == 0 {
-		err := errors.New("shell sessions are disabled; use an exec request such as: ssh root@srv list")
+		err := errors.New("shell sessions are disabled; use an exec request such as: ssh srv list")
 		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
 		finalize(model.Actor{SSHUser: sess.User(), RemoteAddr: sess.RemoteAddr().String()}, false, "shell denied", err)
 		_ = sess.Exit(2)
@@ -625,8 +625,8 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string) 
 	if inst.DeletedAt != nil {
 		b.WriteString(fmt.Sprintf("deleted-at: %s\n", inst.DeletedAt.Format(time.RFC3339)))
 	}
-	b.WriteString(fmt.Sprintf("logs-serial: ssh root@%s logs %s serial\n", a.cfg.Hostname, inst.Name))
-	b.WriteString(fmt.Sprintf("logs-firecracker: ssh root@%s logs %s firecracker\n", a.cfg.Hostname, inst.Name))
+	b.WriteString(fmt.Sprintf("logs-serial: ssh %s logs %s serial\n", a.cfg.Hostname, inst.Name))
+	b.WriteString(fmt.Sprintf("logs-firecracker: ssh %s logs %s firecracker\n", a.cfg.Hostname, inst.Name))
 	if hint := inspectDebugHint(inst); hint != "" {
 		b.WriteString(fmt.Sprintf("debug-hint: %s\n", hint))
 	}
@@ -1430,7 +1430,7 @@ func inspectDebugHint(inst model.Instance) string {
 }
 
 func instanceDebugHints(hostname string, inst model.Instance) string {
-	return fmt.Sprintf("inspect: ssh root@%s inspect %s\nlogs-serial: ssh root@%s logs %s serial\nlogs-firecracker: ssh root@%s logs %s firecracker\n", hostname, inst.Name, hostname, inst.Name, hostname, inst.Name)
+	return fmt.Sprintf("inspect: ssh %s inspect %s\nlogs-serial: ssh %s logs %s serial\nlogs-firecracker: ssh %s logs %s firecracker\n", hostname, inst.Name, hostname, inst.Name, hostname, inst.Name)
 }
 
 func formatLogOutput(inst model.Instance, target logTarget) (string, error) {

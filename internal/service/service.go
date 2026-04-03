@@ -541,10 +541,18 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor) (commandResult, er
 
 	rows := make([][]string, 0, len(instances))
 	for _, inst := range instances {
-		rows = append(rows, []string{inst.Name, string(inst.State), inst.TailscaleIP, inst.TailscaleName})
+		rows = append(rows, []string{
+			inst.Name,
+			string(inst.State),
+			fmt.Sprintf("%d", effectiveInstanceVCPUCount(inst, a.cfg)),
+			formatBinarySize(effectiveInstanceMemoryMiB(inst, a.cfg) * mib),
+			formatBinarySize(effectiveInstanceRootFSSizeBytes(inst)),
+			inst.TailscaleIP,
+			inst.TailscaleName,
+		})
 	}
 
-	tableOutput, err := renderTextTable([]string{"Name", "State", "Tailscale IP", "Tailscale Name"}, rows)
+	tableOutput, err := renderTextTable([]string{"Name", "State", "VCPUs", "Memory", "RootFS Size", "Tailscale IP", "Tailscale Name"}, rows)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("render instance list: %v\n", err), exitCode: 1}, err
 	}

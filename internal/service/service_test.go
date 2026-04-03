@@ -102,12 +102,15 @@ func TestCmdListFormatsVisibleInstances(t *testing.T) {
 	if result.exitCode != 0 {
 		t.Fatalf("cmdList() exitCode = %d, want 0", result.exitCode)
 	}
-	if !strings.Contains(strings.ToUpper(result.stdout), "NAME") || !strings.Contains(strings.ToUpper(result.stdout), "STATE") {
-		t.Fatalf("cmdList() stdout missing table headers\nfull output:\n%s", result.stdout)
+	upperOutput := strings.ToUpper(result.stdout)
+	for _, want := range []string{"NAME", "STATE", "VCPUS", "MEMORY", "ROOTFS SIZE", "TAILSCALE IP", "TAILSCALE NAME"} {
+		if !strings.Contains(upperOutput, want) {
+			t.Fatalf("cmdList() stdout missing table header %q\nfull output:\n%s", want, result.stdout)
+		}
 	}
 	rows := listOutputRows(result.stdout)
-	if got := rows["alpha"]; !reflect.DeepEqual(got, []string{"alpha", "ready", "100.64.0.10", "alpha.tailnet"}) {
-		t.Fatalf("cmdList() parsed row = %v, want %v\nfull output:\n%s", got, []string{"alpha", "ready", "100.64.0.10", "alpha.tailnet"}, result.stdout)
+	if got := rows["alpha"]; !reflect.DeepEqual(got, []string{"alpha", "ready", "2", "2.0 GiB", "4.0 GiB", "100.64.0.10", "alpha.tailnet"}) {
+		t.Fatalf("cmdList() parsed row = %v, want %v\nfull output:\n%s", got, []string{"alpha", "ready", "2", "2.0 GiB", "4.0 GiB", "100.64.0.10", "alpha.tailnet"}, result.stdout)
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
+	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 )
 
 func TestRequestsValidate(t *testing.T) {
@@ -53,6 +54,27 @@ func TestRequestsValidate(t *testing.T) {
 		if tc.err == nil {
 			t.Fatalf("%s unexpectedly passed validation", tc.name)
 		}
+	}
+}
+
+func TestNewRootDriveUsesWritebackCache(t *testing.T) {
+	path := "/var/lib/srv/instances/demo/rootfs.img"
+	drive := newRootDrive(path)
+
+	if drive.CacheType == nil || *drive.CacheType != models.DriveCacheTypeWriteback {
+		t.Fatalf("newRootDrive() cache type = %v, want %q", drive.CacheType, models.DriveCacheTypeWriteback)
+	}
+	if drive.DriveID == nil || *drive.DriveID != "rootfs" {
+		t.Fatalf("newRootDrive() drive ID = %v, want %q", drive.DriveID, "rootfs")
+	}
+	if drive.PathOnHost == nil || *drive.PathOnHost != path {
+		t.Fatalf("newRootDrive() path = %v, want %q", drive.PathOnHost, path)
+	}
+	if drive.IsReadOnly == nil || *drive.IsReadOnly {
+		t.Fatalf("newRootDrive() IsReadOnly = %v, want false", drive.IsReadOnly)
+	}
+	if drive.IsRootDevice == nil || !*drive.IsRootDevice {
+		t.Fatalf("newRootDrive() IsRootDevice = %v, want true", drive.IsRootDevice)
 	}
 }
 

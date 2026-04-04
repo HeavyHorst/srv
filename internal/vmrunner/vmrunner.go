@@ -374,9 +374,6 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 		return StartResponse{}, fmt.Errorf("parse guest addr: %w", err)
 	}
 
-	rootDriveID := "rootfs"
-	isReadOnly := false
-	isRootDevice := true
 	vcpus := req.VCPUCount
 	mem := req.MemoryMiB
 	uid := s.config.JailerUID
@@ -389,12 +386,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 		KernelImagePath: s.config.KernelPath,
 		InitrdPath:      s.config.InitrdPath,
 		KernelArgs:      req.KernelArgs,
-		Drives: []models.Drive{{
-			DriveID:      &rootDriveID,
-			PathOnHost:   &paths.RootFSPath,
-			IsReadOnly:   &isReadOnly,
-			IsRootDevice: &isRootDevice,
-		}},
+		Drives:          []models.Drive{newRootDrive(paths.RootFSPath)},
 		NetworkInterfaces: firecracker.NetworkInterfaces{{
 			StaticConfiguration: &firecracker.StaticNetworkConfiguration{
 				MacAddress:  req.GuestMAC,
@@ -448,6 +440,21 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	}
 	cleanupRuntime = false
 	return StartResponse{PID: pid}, nil
+}
+
+func newRootDrive(path string) models.Drive {
+	rootDriveID := "rootfs"
+	cacheType := models.DriveCacheTypeWriteback
+	isReadOnly := false
+	isRootDevice := true
+
+	return models.Drive{
+		CacheType:    &cacheType,
+		DriveID:      &rootDriveID,
+		PathOnHost:   &path,
+		IsReadOnly:   &isReadOnly,
+		IsRootDevice: &isRootDevice,
+	}
 }
 
 func (s *Server) stopVM(ctx context.Context, req StopRequest) error {

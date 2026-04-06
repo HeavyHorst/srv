@@ -887,7 +887,89 @@ func formatImportProgress(progress provision.ImportProgress) string {
 }
 
 func helpResult() commandResult {
-	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], backup <create|list> <name>, export <name>, import, list, inspect <name>, logs [-f|--follow] <name> [serial|firecracker], snapshot create, restore <name> <backup-id>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
+	var b strings.Builder
+	b.WriteString("usage: ssh srv <command>\n\n")
+
+	type helpEntry struct {
+		command     string
+		description string
+	}
+
+	groups := []struct {
+		name    string
+		entries []helpEntry
+	}{
+		{
+			name: "instances",
+			entries: []helpEntry{
+				{"new <name>", "Create a new microvm instance"},
+				{"list", "List all instances"},
+				{"inspect <name>", "Show instance details and recent events"},
+				{"start <name>", "Start a stopped instance"},
+				{"stop <name>", "Stop a running instance"},
+				{"restart <name>", "Restart an instance"},
+				{"resize <name>", "Change instance resources"},
+				{"delete <name>", "Delete an instance"},
+			},
+		},
+		{
+			name: "backup",
+			entries: []helpEntry{
+				{"backup create <name>", "Create a backup of an instance"},
+				{"backup list <name>", "List backups for an instance"},
+				{"restore <name> <backup-id>", "Restore an instance from a backup"},
+				{"export <name>", "Export instance as a portable archive to stdout"},
+				{"import", "Import instance from stdin"},
+			},
+		},
+		{
+			name: "diagnostics",
+			entries: []helpEntry{
+				{"logs <name> [target]", "View instance logs (serial|firecracker)"},
+				{"logs -f <name> <target>", "Follow logs in real time"},
+			},
+		},
+		{
+			name: "admin",
+			entries: []helpEntry{
+				{"snapshot create", "Create a read-only btrfs data snapshot"},
+			},
+		},
+	}
+
+	for _, group := range groups {
+		b.WriteString(group.name + "\n")
+		rows := make([][]string, 0, len(group.entries))
+		for _, e := range group.entries {
+			rows = append(rows, []string{e.command, e.description})
+		}
+		tableOutput, err := renderTextTable([]string{"command", "description"}, rows)
+		if err != nil {
+			for _, e := range group.entries {
+				b.WriteString(fmt.Sprintf("  %-35s %s\n", e.command, e.description))
+			}
+		} else {
+			b.WriteString(tableOutput)
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("new and resize options:\n")
+	optionRows := [][]string{
+		{"--cpus N", "Number of vCPUs"},
+		{"--ram SIZE", "Memory (e.g. 512m, 2g)"},
+		{"--rootfs-size SIZE", "Root filesystem size (e.g. 4g, 10g)"},
+	}
+	optionOutput, err := renderTextTable([]string{"flag", "description"}, optionRows)
+	if err != nil {
+		b.WriteString("  --cpus N             Number of vCPUs\n")
+		b.WriteString("  --ram SIZE           Memory (e.g. 512m, 2g)\n")
+		b.WriteString("  --rootfs-size SIZE   Root filesystem size (e.g. 4g, 10g)\n")
+	} else {
+		b.WriteString(optionOutput)
+	}
+
+	return commandResult{stdout: b.String(), exitCode: 0}
 }
 
 func parseLogsArgs(args []string) (logsRequest, error) {

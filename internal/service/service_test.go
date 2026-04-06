@@ -418,7 +418,7 @@ func TestEnsureHostSignerPersistsKey(t *testing.T) {
 
 func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
-	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "backup <create|list> <name>", "logs [-f|--follow] <name> [serial|firecracker]", "restore <name> <backup-id>", "start <name>", "stop <name>", "restart <name>"} {
+	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "backup <create|list> <name>", "export <name>", "import", "logs [-f|--follow] <name> [serial|firecracker]", "restore <name> <backup-id>", "start <name>", "stop <name>", "restart <name>"} {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("helpResult() missing %q in %q", want, result.stdout)
 		}
@@ -954,6 +954,75 @@ func TestParseRestoreArgs(t *testing.T) {
 				t.Fatalf("parseRestoreArgs() = (%q, %q), want (%q, %q)", gotName, gotBackupID, tt.wantName, tt.wantBackupID)
 			}
 		})
+	}
+}
+
+func TestParseExportArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantName string
+		wantErr  string
+	}{
+		{name: "valid", args: []string{"export", "demo"}, wantName: "demo"},
+		{name: "requires name", args: []string{"export"}, wantErr: exportUsage()},
+		{name: "rejects extra args", args: []string{"export", "demo", "extra"}, wantErr: exportUsage()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, err := parseExportArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseExportArgs() error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseExportArgs() error = %v", err)
+			}
+			if gotName != tt.wantName {
+				t.Fatalf("parseExportArgs() name = %q, want %q", gotName, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestParseImportArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{name: "valid", args: []string{"import"}},
+		{name: "rejects extra args", args: []string{"import", "demo", "extra"}, wantErr: importUsage()},
+		{name: "rejects rename arg", args: []string{"import", "demo-moved"}, wantErr: importUsage()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := parseImportArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseImportArgs() error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseImportArgs() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestFormatImportProgress(t *testing.T) {
+	got := formatImportProgress(provision.ImportProgress{
+		Name:           "rootfs.img",
+		CompletedBytes: 6 * 1024 * 1024,
+		TotalBytes:     18 * 1024 * 1024,
+	})
+	if got != "import rootfs.img 6.0 MiB / 18.0 MiB (33%)" {
+		t.Fatalf("formatImportProgress() = %q", got)
 	}
 }
 

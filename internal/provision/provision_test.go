@@ -1,6 +1,8 @@
 package provision
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -422,6 +424,501 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 	if !sawBackupCreate || !sawBackupRestore {
 		t.Fatalf("expected backup create and restore events, got %#v", events)
 	}
+}
+
+func TestExportAndImportPortableArtifact(t *testing.T) {
+	ctx := context.Background()
+	sourceKernel := filepath.Join(t.TempDir(), "source-vmlinux")
+	sourceInitrd := filepath.Join(t.TempDir(), "source-initrd.img")
+	destKernel := filepath.Join(t.TempDir(), "dest-vmlinux")
+	destInitrd := filepath.Join(t.TempDir(), "dest-initrd.img")
+	for _, path := range []string{sourceKernel, sourceInitrd, destKernel, destInitrd} {
+		if err := os.WriteFile(path, []byte(filepath.Base(path)), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", path, err)
+		}
+	}
+
+	sourceCfg := loadProvisionTestConfig(t, map[string]string{
+		"SRV_BASE_KERNEL": sourceKernel,
+		"SRV_BASE_INITRD": sourceInitrd,
+	})
+	destCfg := loadProvisionTestConfig(t, map[string]string{
+		"SRV_BASE_KERNEL":     destKernel,
+		"SRV_BASE_INITRD":     destInitrd,
+		"SRV_VM_NETWORK_CIDR": "10.1.0.0/29",
+	})
+	sourceStore := newProvisionTestStore(t, sourceCfg)
+	destStore := newProvisionTestStore(t, destCfg)
+	source := &Provisioner{
+		cfg:                 sourceCfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               sourceStore,
+		readFilesystemBytes: defaultReadFilesystemBytes,
+	}
+	dest := &Provisioner{
+		cfg:                 destCfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               destStore,
+		readFilesystemBytes: defaultReadFilesystemBytes,
+	}
+	for _, dir := range []string{sourceCfg.InstancesDir(), destCfg.InstancesDir()} {
+		if err := os.MkdirAll(dir, 0o770); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", dir, err)
+		}
+	}
+
+	rootfsPayload := bytes.Repeat([]byte("rootfs-data\n"), 32)
+	serialPayload := []byte("serial-data\n")
+	fcPayload := []byte("firecracker-data\n")
+	sourceInst := provisionTestInstance(sourceCfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	sourceInst.VCPUCount = 4
+	sourceInst.MemoryMiB = 4096
+	sourceInst.RootFSSizeBytes = int64(len(rootfsPayload))
+	sourceInst.TailscaleName = "demo.tailnet"
+	sourceInst.TailscaleIP = "100.64.0.10"
+	if err := os.MkdirAll(filepath.Dir(sourceInst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(source instance dir): %v", err)
+	}
+	if err := os.WriteFile(sourceInst.RootFSPath, rootfsPayload, 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.WriteFile(sourceInst.SerialLogPath, serialPayload, 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+	if err := os.WriteFile(sourceInst.LogPath, fcPayload, 0o644); err != nil {
+		t.Fatalf("WriteFile(firecracker): %v", err)
+	}
+	if err := sourceStore.CreateInstance(ctx, sourceInst); err != nil {
+		t.Fatalf("CreateInstance(source): %v", err)
+	}
+
+	var stream bytes.Buffer
+	exportedInfo, err := source.ExportInstance(ctx, sourceInst.Name, &stream)
+	if err != nil {
+		t.Fatalf("ExportInstance(): %v", err)
+	}
+	if exportedInfo.Name != sourceInst.Name {
+		t.Fatalf("ExportInstance() name = %q, want %q", exportedInfo.Name, sourceInst.Name)
+	}
+
+	progressByFile := make(map[string]ImportProgress)
+	imported, importedInfo, err := dest.ImportInstance(
+		ctx,
+		model.Actor{UserLogin: "alice@example.com", NodeName: "workstation"},
+		bytes.NewReader(stream.Bytes()),
+		func(progress ImportProgress) {
+			progressByFile[progress.Name] = progress
+		},
+	)
+	if err != nil {
+		t.Fatalf("ImportInstance(): %v", err)
+	}
+	if importedInfo.Name != sourceInst.Name {
+		t.Fatalf("ImportInstance() source name = %q, want %q", importedInfo.Name, sourceInst.Name)
+	}
+	if imported.Name != sourceInst.Name {
+		t.Fatalf("ImportInstance() target name = %q, want %q", imported.Name, sourceInst.Name)
+	}
+	if imported.ID != sourceInst.ID {
+		t.Fatalf("ImportInstance() id = %q, want %q", imported.ID, sourceInst.ID)
+	}
+	if imported.State != model.StateStopped {
+		t.Fatalf("ImportInstance() state = %q, want %q", imported.State, model.StateStopped)
+	}
+	if !imported.CreatedAt.Equal(sourceInst.CreatedAt) {
+		t.Fatalf("ImportInstance() created_at = %s, want %s", imported.CreatedAt, sourceInst.CreatedAt)
+	}
+	if imported.CreatedByUser != sourceInst.CreatedByUser || imported.CreatedByNode != sourceInst.CreatedByNode {
+		t.Fatalf("ImportInstance() creator = %q/%q, want %q/%q", imported.CreatedByUser, imported.CreatedByNode, sourceInst.CreatedByUser, sourceInst.CreatedByNode)
+	}
+	if imported.VCPUCount != sourceInst.VCPUCount || imported.MemoryMiB != sourceInst.MemoryMiB || imported.RootFSSizeBytes != sourceInst.RootFSSizeBytes {
+		t.Fatalf("ImportInstance() sizing = %#v, want %#v", imported, sourceInst)
+	}
+	if imported.TailscaleName != sourceInst.TailscaleName || imported.TailscaleIP != sourceInst.TailscaleIP {
+		t.Fatalf("ImportInstance() tailscale fields = %#v, want %#v", imported, sourceInst)
+	}
+	if imported.RootFSPath == sourceInst.RootFSPath || !strings.HasPrefix(imported.RootFSPath, destCfg.InstancesDir()+string(os.PathSeparator)) {
+		t.Fatalf("ImportInstance() rootfs path = %q, want path under %q", imported.RootFSPath, destCfg.InstancesDir())
+	}
+	if imported.KernelPath != destKernel || imported.InitrdPath != destInitrd {
+		t.Fatalf("ImportInstance() runtime paths = %q/%q, want %q/%q", imported.KernelPath, imported.InitrdPath, destKernel, destInitrd)
+	}
+	if imported.NetworkCIDR != "10.1.0.0/30" || imported.HostAddr != "10.1.0.1/30" || imported.GuestAddr != "10.1.0.2/30" || imported.GatewayAddr != "10.1.0.1" {
+		t.Fatalf("ImportInstance() network = %q %q %q %q", imported.NetworkCIDR, imported.HostAddr, imported.GuestAddr, imported.GatewayAddr)
+	}
+
+	gotRootFS, err := os.ReadFile(imported.RootFSPath)
+	if err != nil {
+		t.Fatalf("ReadFile(imported rootfs): %v", err)
+	}
+	if !bytes.Equal(gotRootFS, rootfsPayload) {
+		t.Fatalf("imported rootfs payload mismatch")
+	}
+	gotSerial, err := os.ReadFile(imported.SerialLogPath)
+	if err != nil {
+		t.Fatalf("ReadFile(imported serial): %v", err)
+	}
+	if !bytes.Equal(gotSerial, serialPayload) {
+		t.Fatalf("imported serial payload mismatch")
+	}
+	gotFirecracker, err := os.ReadFile(imported.LogPath)
+	if err != nil {
+		t.Fatalf("ReadFile(imported firecracker): %v", err)
+	}
+	if !bytes.Equal(gotFirecracker, fcPayload) {
+		t.Fatalf("imported firecracker payload mismatch")
+	}
+	if progressByFile[backupRootFSName].CompletedBytes != int64(len(rootfsPayload)) || progressByFile[backupRootFSName].TotalBytes != int64(len(rootfsPayload)) {
+		t.Fatalf("rootfs progress = %#v, want %d/%d", progressByFile[backupRootFSName], len(rootfsPayload), len(rootfsPayload))
+	}
+	if progressByFile[backupSerialLogName].CompletedBytes != int64(len(serialPayload)) || progressByFile[backupSerialLogName].TotalBytes != int64(len(serialPayload)) {
+		t.Fatalf("serial progress = %#v, want %d/%d", progressByFile[backupSerialLogName], len(serialPayload), len(serialPayload))
+	}
+	if progressByFile[backupFirecrackerName].CompletedBytes != int64(len(fcPayload)) || progressByFile[backupFirecrackerName].TotalBytes != int64(len(fcPayload)) {
+		t.Fatalf("firecracker progress = %#v, want %d/%d", progressByFile[backupFirecrackerName], len(fcPayload), len(fcPayload))
+	}
+
+	stored, err := destStore.GetInstance(ctx, imported.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(imported): %v", err)
+	}
+	if stored.ID != imported.ID || stored.RootFSPath != imported.RootFSPath || stored.NetworkCIDR != imported.NetworkCIDR {
+		t.Fatalf("stored imported instance = %#v, want %#v", stored, imported)
+	}
+
+	sourceEvents, err := sourceStore.ListEvents(ctx, sourceInst.ID, 10)
+	if err != nil {
+		t.Fatalf("ListEvents(source): %v", err)
+	}
+	var sawExport bool
+	for _, evt := range sourceEvents {
+		if evt.Type == "export" && evt.Message == "instance exported as portable artifact" {
+			sawExport = true
+		}
+	}
+	if !sawExport {
+		t.Fatalf("expected export event, got %#v", sourceEvents)
+	}
+
+	importedEvents, err := destStore.ListEvents(ctx, imported.ID, 10)
+	if err != nil {
+		t.Fatalf("ListEvents(imported): %v", err)
+	}
+	var sawImport bool
+	for _, evt := range importedEvents {
+		if evt.Type == "import" && evt.Message == "instance imported from portable artifact" {
+			sawImport = true
+		}
+	}
+	if !sawImport {
+		t.Fatalf("expected import event, got %#v", importedEvents)
+	}
+}
+
+func TestPeekPortableArtifactInfoReplaysStream(t *testing.T) {
+	exportedAt := time.Date(2026, time.April, 5, 10, 30, 0, 0, time.UTC)
+	manifest := portableManifest{
+		Version:    portableManifestVersion,
+		ExportedAt: exportedAt,
+		Instance: portableInstance{
+			Name:      "demo",
+			CreatedAt: exportedAt.Add(-time.Hour),
+		},
+		Files: backupFiles{RootFS: backupRootFSName},
+	}
+	stream := portableArtifactTestStream(t, manifest, map[string][]byte{
+		backupRootFSName: []byte("rootfs"),
+	})
+
+	info, replay, err := PeekPortableArtifactInfo(bytes.NewReader(stream))
+	if err != nil {
+		t.Fatalf("PeekPortableArtifactInfo(): %v", err)
+	}
+	if info.Name != manifest.Instance.Name {
+		t.Fatalf("PeekPortableArtifactInfo() name = %q, want %q", info.Name, manifest.Instance.Name)
+	}
+	replayed, err := io.ReadAll(replay)
+	if err != nil {
+		t.Fatalf("ReadAll(replay): %v", err)
+	}
+	if !bytes.Equal(replayed, stream) {
+		t.Fatalf("PeekPortableArtifactInfo() replay did not preserve stream bytes")
+	}
+}
+
+func TestImportInstanceRejectsAliasedPortableArtifactEntries(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:                 cfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               st,
+		readFilesystemBytes: defaultReadFilesystemBytes,
+	}
+	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
+		t.Fatalf("MkdirAll(instances dir): %v", err)
+	}
+
+	manifest := portableManifest{
+		Version:    portableManifestVersion,
+		ExportedAt: time.Date(2026, time.April, 5, 11, 0, 0, 0, time.UTC),
+		Instance: portableInstance{
+			Name:            "demo",
+			CreatedAt:       time.Date(2026, time.April, 4, 11, 0, 0, 0, time.UTC),
+			RootFSSizeBytes: int64(len("rootfs")),
+		},
+		Files: backupFiles{
+			RootFS:    backupRootFSName,
+			SerialLog: backupRootFSName,
+		},
+	}
+	stream := portableArtifactTestStream(t, manifest, map[string][]byte{
+		backupRootFSName: []byte("rootfs"),
+	})
+
+	_, _, err := p.ImportInstance(ctx, model.Actor{UserLogin: "alice@example.com", NodeName: "workstation"}, bytes.NewReader(stream))
+	if err == nil || !strings.Contains(err.Error(), `serial log entry must be "serial.log"`) {
+		t.Fatalf("ImportInstance() error = %v", err)
+	}
+}
+
+func TestImportInstanceRejectsOversizedPortableLogs(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:                 cfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               st,
+		readFilesystemBytes: defaultReadFilesystemBytes,
+	}
+	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
+		t.Fatalf("MkdirAll(instances dir): %v", err)
+	}
+
+	manifest := portableManifest{
+		Version:    portableManifestVersion,
+		ExportedAt: time.Date(2026, time.April, 5, 12, 0, 0, 0, time.UTC),
+		Instance: portableInstance{
+			Name:            "demo",
+			CreatedAt:       time.Date(2026, time.April, 4, 12, 0, 0, 0, time.UTC),
+			RootFSSizeBytes: int64(len("rootfs")),
+		},
+		Files: backupFiles{
+			RootFS:    backupRootFSName,
+			SerialLog: backupSerialLogName,
+		},
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		payload, err := json.Marshal(manifest)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		tw := tar.NewWriter(pw)
+		if err := writeTarBytes(tw, backupManifestName, payload, 0o640, manifest.ExportedAt); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := writeTarBytes(tw, backupRootFSName, []byte("rootfs"), 0o660, manifest.ExportedAt); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: backupSerialLogName, Mode: 0o660, Size: portableLogMaxSize + 1, ModTime: manifest.ExportedAt}); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
+
+	_, _, err := p.ImportInstance(ctx, model.Actor{UserLogin: "alice@example.com", NodeName: "workstation"}, pr)
+	if err == nil || !strings.Contains(err.Error(), "portable artifact serial log is too large") {
+		t.Fatalf("ImportInstance() error = %v", err)
+	}
+}
+
+func TestWriteTarFileTailExportsNewestBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "serial.log")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+
+	var stream bytes.Buffer
+	tw := tar.NewWriter(&stream)
+	truncated, err := writeTarFileTail(tw, backupSerialLogName, path, 0o660, 4)
+	if err != nil {
+		t.Fatalf("writeTarFileTail(): %v", err)
+	}
+	if !truncated {
+		t.Fatal("writeTarFileTail() did not report truncation")
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("Close(tar writer): %v", err)
+	}
+
+	tr := tar.NewReader(bytes.NewReader(stream.Bytes()))
+	hdr, err := tr.Next()
+	if err != nil {
+		t.Fatalf("Next(): %v", err)
+	}
+	if hdr.Name != backupSerialLogName {
+		t.Fatalf("header name = %q, want %q", hdr.Name, backupSerialLogName)
+	}
+	if hdr.Size != 4 {
+		t.Fatalf("header size = %d, want 4", hdr.Size)
+	}
+	payload, err := io.ReadAll(tr)
+	if err != nil {
+		t.Fatalf("ReadAll(tar entry): %v", err)
+	}
+	if string(payload) != "6789" {
+		t.Fatalf("payload = %q, want %q", payload, "6789")
+	}
+}
+
+func TestImportInstanceReleasesAdmissionLockDuringStreaming(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:                 cfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               st,
+		readFilesystemBytes: defaultReadFilesystemBytes,
+	}
+	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
+		t.Fatalf("MkdirAll(instances dir): %v", err)
+	}
+
+	manifest := portableManifest{
+		Version:    portableManifestVersion,
+		ExportedAt: time.Date(2026, time.April, 5, 13, 0, 0, 0, time.UTC),
+		Instance: portableInstance{
+			Name:            "demo",
+			CreatedAt:       time.Date(2026, time.April, 4, 13, 0, 0, 0, time.UTC),
+			RootFSSizeBytes: 1,
+		},
+		Files: backupFiles{RootFS: backupRootFSName},
+	}
+
+	pr, pw := io.Pipe()
+	headerWritten := make(chan struct{})
+	allowPayload := make(chan struct{})
+	importDone := make(chan error, 1)
+	go func() {
+		_, _, err := p.ImportInstance(ctx, model.Actor{UserLogin: "alice@example.com", NodeName: "workstation"}, pr)
+		importDone <- err
+	}()
+	go func() {
+		payload, err := json.Marshal(manifest)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		tw := tar.NewWriter(pw)
+		if err := writeTarBytes(tw, backupManifestName, payload, 0o640, manifest.ExportedAt); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: backupRootFSName, Mode: 0o660, Size: 1, ModTime: manifest.ExportedAt}); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		close(headerWritten)
+		<-allowPayload
+		if _, err := tw.Write([]byte{'x'}); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := tw.Close(); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
+
+	select {
+	case <-headerWritten:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for import stream header")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		inst, found, err := st.FindInstance(ctx, manifest.Instance.Name)
+		if err != nil {
+			t.Fatalf("FindInstance(): %v", err)
+		}
+		if found {
+			if inst.State != model.StateProvisioning {
+				t.Fatalf("provisional import state = %q, want %q", inst.State, model.StateProvisioning)
+			}
+			break
+		}
+		select {
+		case err := <-importDone:
+			t.Fatalf("ImportInstance() finished early: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for provisional imported instance")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	admissionReleased := make(chan struct{})
+	go func() {
+		p.admissionMu.Lock()
+		p.admissionMu.Unlock()
+		close(admissionReleased)
+	}()
+
+	select {
+	case <-admissionReleased:
+	case err := <-importDone:
+		t.Fatalf("ImportInstance() finished before admission lock check: %v", err)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("admissionMu remained locked during streaming import")
+	}
+
+	close(allowPayload)
+	select {
+	case err := <-importDone:
+		if err != nil {
+			t.Fatalf("ImportInstance(): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for import completion")
+	}
+}
+
+func portableArtifactTestStream(t *testing.T, manifest portableManifest, files map[string][]byte) []byte {
+	t.Helper()
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("json.Marshal(manifest): %v", err)
+	}
+	var stream bytes.Buffer
+	tw := tar.NewWriter(&stream)
+	if err := writeTarBytes(tw, backupManifestName, payload, 0o640, manifest.ExportedAt); err != nil {
+		t.Fatalf("writeTarBytes(manifest): %v", err)
+	}
+	for _, name := range []string{backupRootFSName, backupSerialLogName, backupFirecrackerName} {
+		payload, ok := files[name]
+		if !ok {
+			continue
+		}
+		if err := writeTarBytes(tw, name, payload, 0o660, manifest.ExportedAt); err != nil {
+			t.Fatalf("writeTarBytes(%s): %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("Close(tar writer): %v", err)
+	}
+	return stream.Bytes()
 }
 
 func TestBackupRequiresStoppedInstance(t *testing.T) {

@@ -67,6 +67,24 @@ Notes:
 - Preserve the configured paths in `/etc/srv/srv.env`. Instance rows store absolute runtime paths such as `SRV_DATA_DIR/instances/<name>/rootfs.img`, so changing `SRV_DATA_DIR`, `SRV_JAILER_BASE_DIR`, or the base artifact paths during restore is not a supported relocation workflow.
 - Keep `SRV_JAILER_BASE_DIR` on the same filesystem as `SRV_DATA_DIR`; the runner hard-links log files into the jail and cross-filesystem links fail.
 
+## Move One Stopped VM Between Hosts
+
+For single-VM cutover, use the portable stopped-VM stream instead of copying SQLite rows or the whole host state directory:
+
+```bash
+ssh srv-a export demo | ssh srv-b import
+```
+
+Operational notes:
+
+- The source VM must be stopped before export.
+- Import recreates the VM under the same name and leaves it stopped. Start it explicitly on the destination after the stream completes.
+- The artifact preserves portable metadata such as name, creator, machine shape, rootfs size, and last-known Tailscale name or IP.
+- Serial and Firecracker logs are included when present, but each is capped to the newest `256 MiB` during export.
+- Import regenerates destination-local runtime state such as absolute file paths, tap device wiring, guest MAC, and VM subnet allocation.
+- The copied rootfs carries the guest's durable Tailscale identity, so do not boot the source and destination copies at the same time.
+- The destination host uses its currently configured `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` on the first later `start`; only the writable guest disk and optional logs come from the streamed artifact.
+
 ## Restore Or Rebuild A Host
 
 1. Prepare a fresh host with the normal prerequisites: Tailscale, cgroup v2, `/dev/kvm`, reflink-capable storage such as `btrfs` or reflink-enabled `xfs` shared by `SRV_DATA_DIR` and `SRV_BASE_ROOTFS`, and the repo checkout.

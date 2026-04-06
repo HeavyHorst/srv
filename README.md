@@ -89,6 +89,9 @@ ssh srv backup create demo
 ssh srv backup list demo
 ssh srv restore demo <backup-id>
 
+# stopped-VM transfer between hosts
+ssh srv export demo | ssh srv-dr import
+
 # resize while stopped
 ssh srv stop demo
 ssh srv resize demo --cpus 4 --ram 8G --rootfs-size 20G
@@ -96,6 +99,10 @@ ssh srv start demo
 ```
 
 Per-VM backup and restore is currently an in-place stopped-instance workflow: create a backup from a stopped VM, then restore that backup back onto the same VM later. Backups are tied to the original VM record and are not restored onto a newly recreated VM that happens to reuse the same name.
+
+`export | import` is the portable stopped-VM path. It streams a tar artifact with a versioned manifest, the writable `rootfs.img`, and any present serial or Firecracker logs. When a log is larger than `256 MiB`, export sends only its newest `256 MiB`. Import recreates the VM under the same name on the destination host, creates destination-local runtime paths and network allocation, leaves the VM stopped, and keeps the source guest's last-known Tailscale metadata as cached state.
+
+Because the guest's durable Tailscale identity lives in the copied rootfs, treat this as cutover or move semantics, not cloning semantics: do not boot the source and imported copies at the same time.
 
 `snapshot create` is a separate host-local disaster-recovery primitive. It briefly blocks all SSH commands, checkpoints SQLite, flushes the filesystem, and creates a readonly btrfs snapshot of `SRV_DATA_DIR` under `SRV_DATA_DIR/.snapshots/<timestamp>`. The semantics are intentionally simple: control-plane consistent, stopped guests fully safe, and running guests crash-consistent only.
 

@@ -345,6 +345,24 @@ func (a *App) handleSession(sess gssh.Session) {
 		_ = sess.Exit(exitCode)
 		return
 	}
+	if args[0] == "export" {
+		exitCode, err := a.handleExportSession(sess, actor, args)
+		finalize(actor, true, reason, err)
+		if exitCode == 0 && err != nil {
+			exitCode = 1
+		}
+		_ = sess.Exit(exitCode)
+		return
+	}
+	if args[0] == "import" {
+		exitCode, err := a.handleImportSession(sess, actor, args)
+		finalize(actor, true, reason, err)
+		if exitCode == 0 && err != nil {
+			exitCode = 1
+		}
+		_ = sess.Exit(exitCode)
+		return
+	}
 	if args[0] == "snapshot" {
 		result, err := a.cmdSnapshot(sess.Context(), args, lease)
 		if result.stdout != "" {
@@ -686,8 +704,190 @@ func (a *App) handleLogsSession(sess gssh.Session, actor model.Actor, req logsRe
 	return 1, wrapped
 }
 
+func (a *App) handleExportSession(sess gssh.Session, actor model.Actor, args []string) (int, error) {
+	name, err := parseExportArgs(args)
+	if err != nil {
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		return 2, err
+	}
+
+	unlock := a.lockInstance(name)
+	defer unlock()
+
+	if _, err := a.lookupVisibleInstance(sess.Context(), actor, name); err != nil {
+		result, err := missingInstanceResult("export", name, err)
+		if result.stderr != "" {
+			_, _ = io.WriteString(sess.Stderr(), result.stderr)
+		}
+		return result.exitCode, err
+	}
+
+	if _, err := a.provisioner.ExportInstance(sess.Context(), name, sess); err != nil {
+		wrapped := fmt.Errorf("export %s: %w", name, err)
+		_, _ = io.WriteString(sess.Stderr(), wrapped.Error()+"\n")
+		return 1, wrapped
+	}
+	return 0, nil
+}
+
+func (a *App) handleImportSession(sess gssh.Session, actor model.Actor, args []string) (int, error) {
+	if err := parseImportArgs(args); err != nil {
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		return 2, err
+	}
+
+	artifactInfo, stream, err := provision.PeekPortableArtifactInfo(sess)
+	if err != nil {
+		wrapped := fmt.Errorf("import: %w", err)
+		_, _ = io.WriteString(sess.Stderr(), wrapped.Error()+"\n")
+		return 1, wrapped
+	}
+
+	unlock := a.lockInstance(artifactInfo.Name)
+	defer unlock()
+
+	reporter := newImportProgressReporter(sess.Stderr(), 350*time.Millisecond)
+	inst, info, err := a.provisioner.ImportInstance(sess.Context(), actor, stream, reporter.Update)
+	reporter.Close(err == nil)
+	if err != nil {
+		wrapped := fmt.Errorf("import: %w", err)
+		_, _ = io.WriteString(sess.Stderr(), wrapped.Error()+"\n")
+		return 1, wrapped
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("imported: %s\n", inst.Name))
+	if info.Name != "" && info.Name != inst.Name {
+		b.WriteString(fmt.Sprintf("source-name: %s\n", info.Name))
+	}
+	b.WriteString(fmt.Sprintf("state: %s\n", inst.State))
+	b.WriteString(fmt.Sprintf("rootfs-size: %s\n", format.BinarySize(effectiveInstanceRootFSSizeBytes(inst))))
+	b.WriteString(fmt.Sprintf("exported-at: %s\n", info.ExportedAt.Format(time.RFC3339)))
+	if inst.TailscaleName != "" {
+		b.WriteString(fmt.Sprintf("tailscale-name: %s\n", inst.TailscaleName))
+	}
+	if inst.TailscaleIP != "" {
+		b.WriteString(fmt.Sprintf("tailscale-ip: %s\n", inst.TailscaleIP))
+	}
+	_, _ = io.WriteString(sess, b.String())
+	return 0, nil
+}
+
+type importProgressReporter struct {
+	mu           sync.Mutex
+	w            io.Writer
+	interval     time.Duration
+	current      provision.ImportProgress
+	haveProgress bool
+	lastLen      int
+	rendered     bool
+	stopOnce     sync.Once
+	stopCh       chan struct{}
+	doneCh       chan struct{}
+}
+
+func newImportProgressReporter(w io.Writer, interval time.Duration) *importProgressReporter {
+	r := &importProgressReporter{
+		w:        w,
+		interval: interval,
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
+	}
+	go r.loop()
+	return r
+}
+
+func (r *importProgressReporter) loop() {
+	defer close(r.doneCh)
+	ticker := time.NewTicker(r.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.render(false)
+		case <-r.stopCh:
+			return
+		}
+	}
+}
+
+func (r *importProgressReporter) Update(progress provision.ImportProgress) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.current = progress
+	r.haveProgress = true
+	r.mu.Unlock()
+}
+
+func (r *importProgressReporter) Close(success bool) {
+	if r == nil {
+		return
+	}
+	r.stopOnce.Do(func() {
+		close(r.stopCh)
+		<-r.doneCh
+		if success {
+			r.render(true)
+			return
+		}
+		r.endLine()
+	})
+}
+
+func (r *importProgressReporter) render(final bool) {
+	r.mu.Lock()
+	if !r.haveProgress {
+		r.mu.Unlock()
+		return
+	}
+	line := formatImportProgress(r.current)
+	padding := ""
+	if diff := r.lastLen - len(line); diff > 0 {
+		padding = strings.Repeat(" ", diff)
+	}
+	r.lastLen = len(line)
+	r.rendered = true
+	r.mu.Unlock()
+
+	if final {
+		_, _ = io.WriteString(r.w, "\r"+line+padding+"\n")
+		return
+	}
+	_, _ = io.WriteString(r.w, "\r"+line+padding)
+}
+
+func (r *importProgressReporter) endLine() {
+	r.mu.Lock()
+	rendered := r.rendered
+	r.mu.Unlock()
+	if rendered {
+		_, _ = io.WriteString(r.w, "\n")
+	}
+}
+
+func formatImportProgress(progress provision.ImportProgress) string {
+	completed := max(progress.CompletedBytes, int64(0))
+	total := max(progress.TotalBytes, int64(0))
+	percent := int64(100)
+	if total > 0 {
+		if completed > total {
+			completed = total
+		}
+		percent = (completed * 100) / total
+	}
+	return fmt.Sprintf(
+		"import %s %s / %s (%d%%)",
+		progress.Name,
+		format.BinarySize(completed),
+		format.BinarySize(total),
+		percent,
+	)
+}
+
 func helpResult() commandResult {
-	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], backup <create|list> <name>, list, inspect <name>, logs [-f|--follow] <name> [serial|firecracker], snapshot create, restore <name> <backup-id>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
+	return commandResult{stdout: "commands: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE], backup <create|list> <name>, export <name>, import, list, inspect <name>, logs [-f|--follow] <name> [serial|firecracker], snapshot create, restore <name> <backup-id>, start <name>, stop <name>, restart <name>, delete <name>\n", exitCode: 0}
 }
 
 func parseLogsArgs(args []string) (logsRequest, error) {
@@ -1246,6 +1446,20 @@ func parseRestoreArgs(args []string) (string, string, error) {
 	return args[1], args[2], nil
 }
 
+func parseExportArgs(args []string) (string, error) {
+	if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
+		return "", errors.New(exportUsage())
+	}
+	return args[1], nil
+}
+
+func parseImportArgs(args []string) error {
+	if len(args) != 1 {
+		return errors.New(importUsage())
+	}
+	return nil
+}
+
 func parseSizedInstanceArgs(args []string, usage string) (string, provision.CreateOptions, error) {
 	if len(args) < 2 {
 		return "", provision.CreateOptions{}, errors.New(usage)
@@ -1318,6 +1532,14 @@ func parseSizedInstanceArgs(args []string, usage string) (string, provision.Crea
 		return "", provision.CreateOptions{}, errors.New(usage)
 	}
 	return name, opts, nil
+}
+
+func exportUsage() string {
+	return "usage: export <name>"
+}
+
+func importUsage() string {
+	return "usage: import"
 }
 
 func newUsage() string {

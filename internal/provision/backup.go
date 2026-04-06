@@ -1,24 +1,33 @@
 package provision
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
+
+	"srv/internal/format"
 	"srv/internal/model"
 )
 
 const (
-	backupManifestVersion = 1
-	backupManifestName    = "manifest.json"
-	backupRootFSName      = "rootfs.img"
-	backupSerialLogName   = "serial.log"
-	backupFirecrackerName = "firecracker.log"
+	backupManifestVersion   = 1
+	portableManifestVersion = 1
+	portableManifestMaxSize = 1 << 20
+	portableLogMaxSize      = 256 << 20
+	backupManifestName      = "manifest.json"
+	backupRootFSName        = "rootfs.img"
+	backupSerialLogName     = "serial.log"
+	backupFirecrackerName   = "firecracker.log"
 )
 
 type BackupInfo struct {
@@ -33,6 +42,22 @@ type BackupInfo struct {
 	HasFirecrackerLog bool
 }
 
+type PortableArtifactInfo struct {
+	Name              string
+	ExportedAt        time.Time
+	RootFSSizeBytes   int64
+	VCPUCount         int64
+	MemoryMiB         int64
+	HasSerialLog      bool
+	HasFirecrackerLog bool
+}
+
+type ImportProgress struct {
+	Name           string
+	CompletedBytes int64
+	TotalBytes     int64
+}
+
 type backupManifest struct {
 	Version   int            `json:"version"`
 	ID        string         `json:"id"`
@@ -45,6 +70,26 @@ type backupFiles struct {
 	RootFS         string `json:"rootfs"`
 	SerialLog      string `json:"serial_log,omitempty"`
 	FirecrackerLog string `json:"firecracker_log,omitempty"`
+}
+
+type portableManifest struct {
+	Version    int              `json:"version"`
+	ExportedAt time.Time        `json:"exported_at"`
+	Instance   portableInstance `json:"instance"`
+	Files      backupFiles      `json:"files"`
+}
+
+type portableInstance struct {
+	ID              string    `json:"id,omitempty"`
+	Name            string    `json:"name"`
+	CreatedAt       time.Time `json:"created_at"`
+	CreatedByUser   string    `json:"created_by_user,omitempty"`
+	CreatedByNode   string    `json:"created_by_node,omitempty"`
+	VCPUCount       int64     `json:"vcpu_count"`
+	MemoryMiB       int64     `json:"memory_mib"`
+	RootFSSizeBytes int64     `json:"rootfs_size_bytes"`
+	TailscaleName   string    `json:"tailscale_name,omitempty"`
+	TailscaleIP     string    `json:"tailscale_ip,omitempty"`
 }
 
 type stagedRestoreFile struct {
@@ -328,6 +373,463 @@ func backupInfoFromManifest(path string, manifest backupManifest) BackupInfo {
 	}
 }
 
+func (p *Provisioner) ExportInstance(ctx context.Context, name string, w io.Writer) (PortableArtifactInfo, error) {
+	inst, err := p.requireStoppedInstance(ctx, name)
+	if err != nil {
+		return PortableArtifactInfo{}, err
+	}
+
+	exportedAt := time.Now().UTC()
+	manifest := portableManifestFromInstance(exportedAt, inst)
+	serialPresent, err := regularFileExists(inst.SerialLogPath)
+	if err != nil {
+		return PortableArtifactInfo{}, fmt.Errorf("stat serial log for %q: %w", name, err)
+	}
+	if serialPresent {
+		manifest.Files.SerialLog = backupSerialLogName
+	}
+	fcPresent, err := regularFileExists(inst.LogPath)
+	if err != nil {
+		return PortableArtifactInfo{}, fmt.Errorf("stat firecracker log for %q: %w", name, err)
+	}
+	if fcPresent {
+		manifest.Files.FirecrackerLog = backupFirecrackerName
+	}
+
+	payload, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return PortableArtifactInfo{}, fmt.Errorf("marshal portable artifact manifest: %w", err)
+	}
+
+	tw := tar.NewWriter(w)
+	if err := writeTarBytes(tw, backupManifestName, payload, 0o640, exportedAt); err != nil {
+		_ = tw.Close()
+		return PortableArtifactInfo{}, fmt.Errorf("write portable artifact manifest: %w", err)
+	}
+	if err := writeTarFile(tw, manifest.Files.RootFS, inst.RootFSPath, 0o660); err != nil {
+		_ = tw.Close()
+		return PortableArtifactInfo{}, fmt.Errorf("write rootfs to portable artifact: %w", err)
+	}
+	serialTruncated := false
+	if manifest.Files.SerialLog != "" {
+		serialTruncated, err = writeTarFileTail(tw, manifest.Files.SerialLog, inst.SerialLogPath, 0o660, portableLogMaxSize)
+		if err != nil {
+			_ = tw.Close()
+			return PortableArtifactInfo{}, fmt.Errorf("write serial log to portable artifact: %w", err)
+		}
+	}
+	firecrackerTruncated := false
+	if manifest.Files.FirecrackerLog != "" {
+		firecrackerTruncated, err = writeTarFileTail(tw, manifest.Files.FirecrackerLog, inst.LogPath, 0o660, portableLogMaxSize)
+		if err != nil {
+			_ = tw.Close()
+			return PortableArtifactInfo{}, fmt.Errorf("write firecracker log to portable artifact: %w", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return PortableArtifactInfo{}, fmt.Errorf("finalize portable artifact stream: %w", err)
+	}
+
+	info := portableArtifactInfoFromManifest(manifest)
+	p.recordEvent(inst.ID, "export", "instance exported as portable artifact", map[string]any{
+		"exported_at":               info.ExportedAt,
+		"has_serial_log":            info.HasSerialLog,
+		"has_firecracker_log":       info.HasFirecrackerLog,
+		"rootfs_size_bytes":         info.RootFSSizeBytes,
+		"serial_log_truncated":      serialTruncated,
+		"firecracker_log_truncated": firecrackerTruncated,
+	})
+	return info, nil
+}
+
+func PeekPortableArtifactInfo(r io.Reader) (PortableArtifactInfo, io.Reader, error) {
+	var prefix bytes.Buffer
+	manifest, err := readPortableManifest(tar.NewReader(io.TeeReader(r, &prefix)))
+	if err != nil {
+		return PortableArtifactInfo{}, nil, err
+	}
+	return portableArtifactInfoFromManifest(manifest), io.MultiReader(bytes.NewReader(prefix.Bytes()), r), nil
+}
+
+func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r io.Reader, progressFns ...func(ImportProgress)) (model.Instance, PortableArtifactInfo, error) {
+	tr := tar.NewReader(r)
+	manifest, err := readPortableManifest(tr)
+	if err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, err
+	}
+	var progress func(ImportProgress)
+	if len(progressFns) > 0 {
+		progress = progressFns[0]
+	}
+	info := portableArtifactInfoFromManifest(manifest)
+
+	targetName := manifest.Instance.Name
+	if !validName.MatchString(targetName) {
+		return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("invalid instance name %q", targetName)
+	}
+	if manifest.Instance.RootFSSizeBytes <= 0 {
+		return model.Instance{}, PortableArtifactInfo{}, errors.New("portable artifact manifest is missing rootfs_size_bytes")
+	}
+	resolvedVCPUCount := p.effectiveVCPUCount(model.Instance{VCPUCount: manifest.Instance.VCPUCount})
+	resolvedMemoryMiB := p.effectiveMemoryMiB(model.Instance{MemoryMiB: manifest.Instance.MemoryMiB})
+	if err := validateMachineShape(resolvedVCPUCount, resolvedMemoryMiB); err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("portable artifact machine shape: %w", err)
+	}
+
+	var (
+		instanceDir string
+		imported    model.Instance
+	)
+	if err := func() error {
+		p.admissionMu.Lock()
+		defer p.admissionMu.Unlock()
+
+		if err := p.ensureHostDiskCapacity(ctx, "", manifest.Instance.RootFSSizeBytes); err != nil {
+			return err
+		}
+		preparedDir, err := p.prepareInstanceDir(ctx, targetName)
+		if err != nil {
+			return err
+		}
+		instanceDir = preparedDir
+
+		networkCIDR, hostAddr, guestAddr, gateway, err := p.allocateNetwork(ctx)
+		if err != nil {
+			_ = os.RemoveAll(instanceDir)
+			return err
+		}
+
+		now := time.Now().UTC()
+		imported = model.Instance{
+			ID:              firstNonEmpty(manifest.Instance.ID, uuid.NewString()),
+			Name:            targetName,
+			State:           model.StateProvisioning,
+			CreatedAt:       manifest.Instance.CreatedAt,
+			UpdatedAt:       now,
+			CreatedByUser:   firstNonEmpty(manifest.Instance.CreatedByUser, actor.UserLogin),
+			CreatedByNode:   firstNonEmpty(manifest.Instance.CreatedByNode, actor.NodeName),
+			VCPUCount:       resolvedVCPUCount,
+			MemoryMiB:       resolvedMemoryMiB,
+			RootFSSizeBytes: manifest.Instance.RootFSSizeBytes,
+			RootFSPath:      filepath.Join(instanceDir, backupRootFSName),
+			KernelPath:      p.cfg.BaseKernelPath,
+			InitrdPath:      p.cfg.BaseInitrdPath,
+			SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
+			LogPath:         filepath.Join(instanceDir, backupFirecrackerName),
+			SerialLogPath:   filepath.Join(instanceDir, backupSerialLogName),
+			TapDevice:       tapName(targetName),
+			GuestMAC:        guestMAC(targetName),
+			NetworkCIDR:     networkCIDR,
+			HostAddr:        hostAddr,
+			GuestAddr:       guestAddr,
+			GatewayAddr:     gateway,
+			TailscaleName:   manifest.Instance.TailscaleName,
+			TailscaleIP:     manifest.Instance.TailscaleIP,
+		}
+		if err := p.store.CreateInstance(ctx, imported); err != nil {
+			_ = os.RemoveAll(instanceDir)
+			return fmt.Errorf("create imported instance %q reservation: %w", targetName, err)
+		}
+		return nil
+	}(); err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, err
+	}
+
+	cleanupReservation := true
+	defer func() {
+		if !cleanupReservation {
+			return
+		}
+		_ = p.store.DeleteInstance(context.Background(), imported.Name)
+		_ = os.RemoveAll(instanceDir)
+	}()
+
+	staged := make([]stagedRestoreFile, 0, 3)
+	cleanupStaged := func() {
+		for _, file := range staged {
+			_ = os.Remove(file.tmp)
+		}
+	}
+	defer cleanupStaged()
+
+	targets := map[string]struct {
+		dest     string
+		label    string
+		required bool
+	}{
+		manifest.Files.RootFS: {dest: imported.RootFSPath, label: "rootfs", required: true},
+	}
+	if manifest.Files.SerialLog != "" {
+		targets[manifest.Files.SerialLog] = struct {
+			dest     string
+			label    string
+			required bool
+		}{dest: imported.SerialLogPath, label: "serial log", required: true}
+	}
+	if manifest.Files.FirecrackerLog != "" {
+		targets[manifest.Files.FirecrackerLog] = struct {
+			dest     string
+			label    string
+			required bool
+		}{dest: imported.LogPath, label: "firecracker log", required: true}
+	}
+
+	seen := make(map[string]bool, len(targets))
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("read portable artifact entry: %w", err)
+		}
+		target, ok := targets[hdr.Name]
+		if !ok {
+			return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("portable artifact contains unexpected entry %q", hdr.Name)
+		}
+		if seen[hdr.Name] {
+			return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("portable artifact entry %q appears more than once", hdr.Name)
+		}
+		if !isRegularTarEntry(hdr) {
+			return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("portable artifact entry %q is not a regular file", hdr.Name)
+		}
+		if hdr.Size < 0 {
+			return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("portable artifact entry %q has invalid size %d", hdr.Name, hdr.Size)
+		}
+		if hdr.Name == manifest.Files.RootFS && hdr.Size != imported.RootFSSizeBytes {
+			return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf(
+				"portable artifact rootfs size %d does not match manifest size %d",
+				hdr.Size,
+				imported.RootFSSizeBytes,
+			)
+		}
+		if hdr.Name != manifest.Files.RootFS && hdr.Size > portableLogMaxSize {
+			return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf(
+				"portable artifact %s is too large: %s exceeds %s",
+				target.label,
+				format.BinarySize(hdr.Size),
+				format.BinarySize(portableLogMaxSize),
+			)
+		}
+		entryReader := io.Reader(tr)
+		if progress != nil {
+			progress(ImportProgress{Name: hdr.Name, TotalBytes: hdr.Size})
+			entryReader = &importProgressReader{
+				src:      tr,
+				name:     hdr.Name,
+				total:    hdr.Size,
+				progress: progress,
+			}
+		}
+		stagedFile, err := prepareStagedRestoreFileFromReader(entryReader, target.dest, 0o660)
+		if err != nil {
+			return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("stage %s from portable artifact: %w", target.label, err)
+		}
+		staged = append(staged, stagedFile)
+		seen[hdr.Name] = true
+	}
+
+	for name, target := range targets {
+		if target.required && !seen[name] {
+			return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("portable artifact is missing %s entry %q", target.label, name)
+		}
+	}
+
+	if _, err := commitStagedRestoreFiles(staged); err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("commit portable artifact files for %q: %w", targetName, err)
+	}
+	imported.State = model.StateStopped
+	imported.FirecrackerPID = 0
+	imported.LastError = ""
+	imported.DeletedAt = nil
+	imported.UpdatedAt = time.Now().UTC()
+	if err := p.store.UpdateInstance(ctx, imported); err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("finalize imported instance %q: %w", targetName, err)
+	}
+
+	cleanupReservation = false
+	p.recordEvent(imported.ID, "import", "instance imported from portable artifact", map[string]any{
+		"source_name":         manifest.Instance.Name,
+		"source_instance_id":  manifest.Instance.ID,
+		"exported_at":         info.ExportedAt,
+		"has_serial_log":      info.HasSerialLog,
+		"has_firecracker_log": info.HasFirecrackerLog,
+	})
+	return imported, info, nil
+}
+
+func portableManifestFromInstance(exportedAt time.Time, inst model.Instance) portableManifest {
+	return portableManifest{
+		Version:    portableManifestVersion,
+		ExportedAt: exportedAt,
+		Instance: portableInstance{
+			ID:              inst.ID,
+			Name:            inst.Name,
+			CreatedAt:       inst.CreatedAt,
+			CreatedByUser:   inst.CreatedByUser,
+			CreatedByNode:   inst.CreatedByNode,
+			VCPUCount:       inst.VCPUCount,
+			MemoryMiB:       inst.MemoryMiB,
+			RootFSSizeBytes: inst.RootFSSizeBytes,
+			TailscaleName:   inst.TailscaleName,
+			TailscaleIP:     inst.TailscaleIP,
+		},
+		Files: backupFiles{RootFS: backupRootFSName},
+	}
+}
+
+func portableArtifactInfoFromManifest(manifest portableManifest) PortableArtifactInfo {
+	return PortableArtifactInfo{
+		Name:              manifest.Instance.Name,
+		ExportedAt:        manifest.ExportedAt,
+		RootFSSizeBytes:   manifest.Instance.RootFSSizeBytes,
+		VCPUCount:         manifest.Instance.VCPUCount,
+		MemoryMiB:         manifest.Instance.MemoryMiB,
+		HasSerialLog:      manifest.Files.SerialLog != "",
+		HasFirecrackerLog: manifest.Files.FirecrackerLog != "",
+	}
+}
+
+func readPortableManifest(tr *tar.Reader) (portableManifest, error) {
+	hdr, err := tr.Next()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return portableManifest{}, errors.New("portable artifact stream is empty")
+		}
+		return portableManifest{}, fmt.Errorf("read portable artifact manifest: %w", err)
+	}
+	if hdr.Name != backupManifestName {
+		return portableManifest{}, fmt.Errorf("portable artifact must begin with %s, found %q", backupManifestName, hdr.Name)
+	}
+	if !isRegularTarEntry(hdr) {
+		return portableManifest{}, errors.New("portable artifact manifest is not a regular file")
+	}
+	if hdr.Size <= 0 {
+		return portableManifest{}, errors.New("portable artifact manifest is empty")
+	}
+	if hdr.Size > portableManifestMaxSize {
+		return portableManifest{}, fmt.Errorf("portable artifact manifest is too large: %d bytes", hdr.Size)
+	}
+	payload, err := io.ReadAll(io.LimitReader(tr, hdr.Size))
+	if err != nil {
+		return portableManifest{}, fmt.Errorf("read portable artifact manifest payload: %w", err)
+	}
+	var manifest portableManifest
+	if err := json.Unmarshal(payload, &manifest); err != nil {
+		return portableManifest{}, fmt.Errorf("parse portable artifact manifest: %w", err)
+	}
+	if err := manifest.validate(); err != nil {
+		return portableManifest{}, err
+	}
+	return manifest, nil
+}
+
+func (m portableManifest) validate() error {
+	if m.Version != portableManifestVersion {
+		return fmt.Errorf("portable artifact uses unsupported manifest version %d", m.Version)
+	}
+	if m.ExportedAt.IsZero() {
+		return errors.New("portable artifact manifest is missing exported_at")
+	}
+	if m.Instance.Name == "" {
+		return errors.New("portable artifact manifest is missing instance name")
+	}
+	if m.Instance.CreatedAt.IsZero() {
+		return errors.New("portable artifact manifest is missing instance created_at")
+	}
+	if m.Files.RootFS == "" {
+		return errors.New("portable artifact manifest is missing a rootfs entry")
+	}
+	if m.Files.RootFS != backupRootFSName {
+		return fmt.Errorf("portable artifact rootfs entry must be %q, got %q", backupRootFSName, m.Files.RootFS)
+	}
+	if m.Files.SerialLog != "" && m.Files.SerialLog != backupSerialLogName {
+		return fmt.Errorf("portable artifact serial log entry must be %q, got %q", backupSerialLogName, m.Files.SerialLog)
+	}
+	if m.Files.FirecrackerLog != "" && m.Files.FirecrackerLog != backupFirecrackerName {
+		return fmt.Errorf("portable artifact firecracker log entry must be %q, got %q", backupFirecrackerName, m.Files.FirecrackerLog)
+	}
+	return nil
+}
+
+func regularFileExists(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.IsDir() {
+		return false, fmt.Errorf("%s is a directory", path)
+	}
+	return true, nil
+}
+
+func writeTarBytes(tw *tar.Writer, name string, payload []byte, mode os.FileMode, modTime time.Time) error {
+	if err := tw.WriteHeader(&tar.Header{
+		Name:    name,
+		Mode:    int64(mode),
+		Size:    int64(len(payload)),
+		ModTime: modTime,
+	}); err != nil {
+		return err
+	}
+	_, err := tw.Write(payload)
+	return err
+}
+
+func writeTarFile(tw *tar.Writer, name, path string, mode os.FileMode) error {
+	_, err := writeTarFileTail(tw, name, path, mode, 0)
+	return err
+}
+
+func writeTarFileTail(tw *tar.Writer, name, path string, mode os.FileMode, maxBytes int64) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return false, err
+	}
+	if info.IsDir() {
+		return false, fmt.Errorf("%s is a directory", path)
+	}
+
+	size := info.Size()
+	offset := int64(0)
+	truncated := false
+	if maxBytes > 0 && size > maxBytes {
+		offset = size - maxBytes
+		size = maxBytes
+		truncated = true
+	}
+	if offset > 0 {
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			return false, err
+		}
+	}
+	if err := tw.WriteHeader(&tar.Header{
+		Name:    name,
+		Mode:    int64(mode),
+		Size:    size,
+		ModTime: info.ModTime(),
+	}); err != nil {
+		return false, err
+	}
+	if _, err := io.CopyN(tw, file, size); err != nil {
+		return false, err
+	}
+	return truncated, nil
+}
+
+func isRegularTarEntry(hdr *tar.Header) bool {
+	return hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeRegA || hdr.Typeflag == 0
+}
+
 func cloneBackupFileIfPresent(ctx context.Context, src, dest string) (bool, error) {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -372,6 +874,50 @@ func prepareStagedRestoreFile(ctx context.Context, src, dest string, mode os.Fil
 		}
 	}
 	return stagedRestoreFile{dest: dest, tmp: tmpPath}, nil
+}
+
+func prepareStagedRestoreFileFromReader(src io.Reader, dest string, mode os.FileMode) (stagedRestoreFile, error) {
+	if err := os.MkdirAll(filepath.Dir(dest), 0o770); err != nil {
+		return stagedRestoreFile{}, fmt.Errorf("create destination directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".srv-restore-*")
+	if err != nil {
+		return stagedRestoreFile{}, fmt.Errorf("create temporary restore file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := io.Copy(tmp, src); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return stagedRestoreFile{}, fmt.Errorf("write temporary restore file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return stagedRestoreFile{}, fmt.Errorf("close temporary restore file: %w", err)
+	}
+	if mode != 0 {
+		if err := os.Chmod(tmpPath, mode); err != nil {
+			_ = os.Remove(tmpPath)
+			return stagedRestoreFile{}, fmt.Errorf("set restored file permissions: %w", err)
+		}
+	}
+	return stagedRestoreFile{dest: dest, tmp: tmpPath}, nil
+}
+
+type importProgressReader struct {
+	src       io.Reader
+	name      string
+	total     int64
+	completed int64
+	progress  func(ImportProgress)
+}
+
+func (r *importProgressReader) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	if n > 0 {
+		r.completed += int64(n)
+		r.progress(ImportProgress{Name: r.name, CompletedBytes: r.completed, TotalBytes: r.total})
+	}
+	return n, err
 }
 
 func commitStagedRestoreFiles(files []stagedRestoreFile) ([]replacedRestoreFile, error) {

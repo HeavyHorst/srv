@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -646,6 +647,67 @@ func TestPeekPortableArtifactInfoReplaysStream(t *testing.T) {
 	}
 }
 
+func TestPeekPortableArtifactInfoDoesNotDrainCompressedStream(t *testing.T) {
+	exportedAt := time.Date(2026, time.April, 5, 10, 45, 0, 0, time.UTC)
+	manifest := portableManifest{
+		Version:    portableManifestVersion,
+		ExportedAt: exportedAt,
+		Instance: portableInstance{
+			Name:            "demo",
+			CreatedAt:       exportedAt.Add(-time.Hour),
+			RootFSSizeBytes: 1 << 20,
+		},
+		Files: backupFiles{RootFS: backupRootFSName},
+	}
+	rootfsPayload := make([]byte, 1<<20)
+	if _, err := cryptorand.Read(rootfsPayload); err != nil {
+		t.Fatalf("crypto/rand.Read(rootfs): %v", err)
+	}
+	stream := portableArtifactFlushedManifestTestStream(t, manifest, map[string][]byte{
+		backupRootFSName: rootfsPayload,
+	})
+	manifestOnlyStream := portableArtifactFlushedManifestTestStream(t, manifest, nil)
+	release := make(chan struct{})
+	reader := &gatedReadCloser{
+		data:    stream,
+		limit:   len(manifestOnlyStream),
+		release: release,
+	}
+
+	type peekResult struct {
+		info   PortableArtifactInfo
+		replay io.Reader
+		err    error
+	}
+	resultCh := make(chan peekResult, 1)
+	go func() {
+		info, replay, err := PeekPortableArtifactInfo(reader)
+		resultCh <- peekResult{info: info, replay: replay, err: err}
+	}()
+
+	var result peekResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("PeekPortableArtifactInfo() blocked waiting for data past the manifest")
+	}
+	if result.err != nil {
+		t.Fatalf("PeekPortableArtifactInfo(): %v", result.err)
+	}
+	if result.info.Name != manifest.Instance.Name {
+		t.Fatalf("PeekPortableArtifactInfo() name = %q, want %q", result.info.Name, manifest.Instance.Name)
+	}
+
+	close(release)
+	replayed, err := io.ReadAll(result.replay)
+	if err != nil {
+		t.Fatalf("ReadAll(replay): %v", err)
+	}
+	if !bytes.Equal(replayed, stream) {
+		t.Fatalf("PeekPortableArtifactInfo() replay did not preserve gated stream bytes")
+	}
+}
+
 func TestImportInstanceRejectsAliasedPortableArtifactEntries(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
@@ -718,16 +780,28 @@ func TestImportInstanceRejectsOversizedPortableLogs(t *testing.T) {
 			_ = pw.CloseWithError(err)
 			return
 		}
-		tw := tar.NewWriter(pw)
+		tw, zw, err := newPortableArtifactTarWriter(pw)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
 		if err := writeTarBytes(tw, backupManifestName, payload, 0o640, manifest.ExportedAt); err != nil {
+			_ = closePortableArtifactTarWriter(tw, zw)
 			_ = pw.CloseWithError(err)
 			return
 		}
 		if err := writeTarBytes(tw, backupRootFSName, []byte("rootfs"), 0o660, manifest.ExportedAt); err != nil {
+			_ = closePortableArtifactTarWriter(tw, zw)
 			_ = pw.CloseWithError(err)
 			return
 		}
 		if err := tw.WriteHeader(&tar.Header{Name: backupSerialLogName, Mode: 0o660, Size: portableLogMaxSize + 1, ModTime: manifest.ExportedAt}); err != nil {
+			_ = closePortableArtifactTarWriter(tw, zw)
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := zw.Flush(); err != nil {
+			_ = closePortableArtifactTarWriter(tw, zw)
 			_ = pw.CloseWithError(err)
 			return
 		}
@@ -818,22 +892,34 @@ func TestImportInstanceReleasesAdmissionLockDuringStreaming(t *testing.T) {
 			_ = pw.CloseWithError(err)
 			return
 		}
-		tw := tar.NewWriter(pw)
+		tw, zw, err := newPortableArtifactTarWriter(pw)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
 		if err := writeTarBytes(tw, backupManifestName, payload, 0o640, manifest.ExportedAt); err != nil {
+			_ = closePortableArtifactTarWriter(tw, zw)
 			_ = pw.CloseWithError(err)
 			return
 		}
 		if err := tw.WriteHeader(&tar.Header{Name: backupRootFSName, Mode: 0o660, Size: 1, ModTime: manifest.ExportedAt}); err != nil {
+			_ = closePortableArtifactTarWriter(tw, zw)
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := zw.Flush(); err != nil {
+			_ = closePortableArtifactTarWriter(tw, zw)
 			_ = pw.CloseWithError(err)
 			return
 		}
 		close(headerWritten)
 		<-allowPayload
 		if _, err := tw.Write([]byte{'x'}); err != nil {
+			_ = closePortableArtifactTarWriter(tw, zw)
 			_ = pw.CloseWithError(err)
 			return
 		}
-		if err := tw.Close(); err != nil {
+		if err := closePortableArtifactTarWriter(tw, zw); err != nil {
 			_ = pw.CloseWithError(err)
 			return
 		}
@@ -902,7 +988,10 @@ func portableArtifactTestStream(t *testing.T, manifest portableManifest, files m
 		t.Fatalf("json.Marshal(manifest): %v", err)
 	}
 	var stream bytes.Buffer
-	tw := tar.NewWriter(&stream)
+	tw, zw, err := newPortableArtifactTarWriter(&stream)
+	if err != nil {
+		t.Fatalf("newPortableArtifactTarWriter(): %v", err)
+	}
 	if err := writeTarBytes(tw, backupManifestName, payload, 0o640, manifest.ExportedAt); err != nil {
 		t.Fatalf("writeTarBytes(manifest): %v", err)
 	}
@@ -915,10 +1004,70 @@ func portableArtifactTestStream(t *testing.T, manifest portableManifest, files m
 			t.Fatalf("writeTarBytes(%s): %v", name, err)
 		}
 	}
-	if err := tw.Close(); err != nil {
-		t.Fatalf("Close(tar writer): %v", err)
+	if err := closePortableArtifactTarWriter(tw, zw); err != nil {
+		t.Fatalf("closePortableArtifactTarWriter(): %v", err)
 	}
 	return stream.Bytes()
+}
+
+func portableArtifactFlushedManifestTestStream(t *testing.T, manifest portableManifest, files map[string][]byte) []byte {
+	t.Helper()
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("json.Marshal(manifest): %v", err)
+	}
+	var stream bytes.Buffer
+	tw, zw, err := newPortableArtifactTarWriter(&stream)
+	if err != nil {
+		t.Fatalf("newPortableArtifactTarWriter(): %v", err)
+	}
+	if err := writeTarBytes(tw, backupManifestName, payload, 0o640, manifest.ExportedAt); err != nil {
+		t.Fatalf("writeTarBytes(manifest): %v", err)
+	}
+	if err := zw.Flush(); err != nil {
+		t.Fatalf("zw.Flush(): %v", err)
+	}
+	for _, name := range []string{backupRootFSName, backupSerialLogName, backupFirecrackerName} {
+		payload, ok := files[name]
+		if !ok {
+			continue
+		}
+		if err := writeTarBytes(tw, name, payload, 0o660, manifest.ExportedAt); err != nil {
+			t.Fatalf("writeTarBytes(%s): %v", name, err)
+		}
+	}
+	if err := closePortableArtifactTarWriter(tw, zw); err != nil {
+		t.Fatalf("closePortableArtifactTarWriter(): %v", err)
+	}
+	return stream.Bytes()
+}
+
+type gatedReadCloser struct {
+	data    []byte
+	limit   int
+	pos     int
+	release <-chan struct{}
+}
+
+func (r *gatedReadCloser) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	if r.pos >= r.limit {
+		<-r.release
+	}
+	maxRead := len(p)
+	if r.pos < r.limit {
+		if remaining := r.limit - r.pos; remaining < maxRead {
+			maxRead = remaining
+		}
+	}
+	if remaining := len(r.data) - r.pos; remaining < maxRead {
+		maxRead = remaining
+	}
+	n := copy(p, r.data[r.pos:r.pos+maxRead])
+	r.pos += n
+	return n, nil
 }
 
 func TestBackupRequiresStoppedInstance(t *testing.T) {

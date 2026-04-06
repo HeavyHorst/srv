@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 
 	"srv/internal/format"
 	"srv/internal/model"
@@ -401,20 +402,23 @@ func (p *Provisioner) ExportInstance(ctx context.Context, name string, w io.Writ
 		return PortableArtifactInfo{}, fmt.Errorf("marshal portable artifact manifest: %w", err)
 	}
 
-	tw := tar.NewWriter(w)
+	tw, zw, err := newPortableArtifactTarWriter(w)
+	if err != nil {
+		return PortableArtifactInfo{}, err
+	}
 	if err := writeTarBytes(tw, backupManifestName, payload, 0o640, exportedAt); err != nil {
-		_ = tw.Close()
+		_ = closePortableArtifactTarWriter(tw, zw)
 		return PortableArtifactInfo{}, fmt.Errorf("write portable artifact manifest: %w", err)
 	}
 	if err := writeTarFile(tw, manifest.Files.RootFS, inst.RootFSPath, 0o660); err != nil {
-		_ = tw.Close()
+		_ = closePortableArtifactTarWriter(tw, zw)
 		return PortableArtifactInfo{}, fmt.Errorf("write rootfs to portable artifact: %w", err)
 	}
 	serialTruncated := false
 	if manifest.Files.SerialLog != "" {
 		serialTruncated, err = writeTarFileTail(tw, manifest.Files.SerialLog, inst.SerialLogPath, 0o660, portableLogMaxSize)
 		if err != nil {
-			_ = tw.Close()
+			_ = closePortableArtifactTarWriter(tw, zw)
 			return PortableArtifactInfo{}, fmt.Errorf("write serial log to portable artifact: %w", err)
 		}
 	}
@@ -422,11 +426,11 @@ func (p *Provisioner) ExportInstance(ctx context.Context, name string, w io.Writ
 	if manifest.Files.FirecrackerLog != "" {
 		firecrackerTruncated, err = writeTarFileTail(tw, manifest.Files.FirecrackerLog, inst.LogPath, 0o660, portableLogMaxSize)
 		if err != nil {
-			_ = tw.Close()
+			_ = closePortableArtifactTarWriter(tw, zw)
 			return PortableArtifactInfo{}, fmt.Errorf("write firecracker log to portable artifact: %w", err)
 		}
 	}
-	if err := tw.Close(); err != nil {
+	if err := closePortableArtifactTarWriter(tw, zw); err != nil {
 		return PortableArtifactInfo{}, fmt.Errorf("finalize portable artifact stream: %w", err)
 	}
 
@@ -444,15 +448,26 @@ func (p *Provisioner) ExportInstance(ctx context.Context, name string, w io.Writ
 
 func PeekPortableArtifactInfo(r io.Reader) (PortableArtifactInfo, io.Reader, error) {
 	var prefix bytes.Buffer
-	manifest, err := readPortableManifest(tar.NewReader(io.TeeReader(r, &prefix)))
+	tr, zr, err := newPortableArtifactTarReader(io.TeeReader(r, &prefix), zstd.WithDecoderConcurrency(1))
 	if err != nil {
 		return PortableArtifactInfo{}, nil, err
 	}
-	return portableArtifactInfoFromManifest(manifest), io.MultiReader(bytes.NewReader(prefix.Bytes()), r), nil
+	manifest, err := readPortableManifest(tr)
+	if err != nil {
+		zr.Close()
+		return PortableArtifactInfo{}, nil, err
+	}
+	zr.Close()
+	replayPrefix := append([]byte(nil), prefix.Bytes()...)
+	return portableArtifactInfoFromManifest(manifest), io.MultiReader(bytes.NewReader(replayPrefix), r), nil
 }
 
 func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r io.Reader, progressFns ...func(ImportProgress)) (model.Instance, PortableArtifactInfo, error) {
-	tr := tar.NewReader(r)
+	tr, zr, err := newPortableArtifactTarReader(r)
+	if err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, err
+	}
+	defer zr.Close()
 	manifest, err := readPortableManifest(tr)
 	if err != nil {
 		return model.Instance{}, PortableArtifactInfo{}, err
@@ -764,6 +779,30 @@ func regularFileExists(path string) (bool, error) {
 		return false, fmt.Errorf("%s is a directory", path)
 	}
 	return true, nil
+}
+
+func newPortableArtifactTarWriter(w io.Writer) (*tar.Writer, *zstd.Encoder, error) {
+	zw, err := zstd.NewWriter(w)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create portable artifact compressor: %w", err)
+	}
+	return tar.NewWriter(zw), zw, nil
+}
+
+func closePortableArtifactTarWriter(tw *tar.Writer, zw *zstd.Encoder) error {
+	if err := tw.Close(); err != nil {
+		_ = zw.Close()
+		return err
+	}
+	return zw.Close()
+}
+
+func newPortableArtifactTarReader(r io.Reader, opts ...zstd.DOption) (*tar.Reader, *zstd.Decoder, error) {
+	zr, err := zstd.NewReader(r, opts...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open portable artifact stream: %w", err)
+	}
+	return tar.NewReader(zr), zr, nil
 }
 
 func writeTarBytes(tw *tar.Writer, name string, payload []byte, mode os.FileMode, modTime time.Time) error {

@@ -7,7 +7,7 @@ WORK_DIR="${WORK_DIR:-${OUTPUT_DIR}/work}"
 ROOTFS_MOUNT_DIR="${WORK_DIR}/rootfs"
 
 ARCH="${ARCH:-x86_64}"
-ROOTFS_SIZE="${ROOTFS_SIZE:-4G}"
+ROOTFS_SIZE="${ROOTFS_SIZE:-10G}"
 ROOTFS_LABEL="${ROOTFS_LABEL:-srv-root}"
 # Use the current 6.12 longterm series by default to avoid older-kernel
 # toolchain friction on modern distros such as Arch with GCC 15.
@@ -31,13 +31,23 @@ ROOTFS_PACKAGES=(
 	base
 	ca-certificates
 	curl
+	fd
 	docker
 	docker-compose
+	gcc
+	git
+	go
 	iproute2
 	iptables-nft
 	jq
 	kmod
+	neovim
+	odin
+	odinfmt
+	ols
+	ripgrep
 	tailscale
+	tree-sitter-cli
 )
 
 LOOP_DEVICE=""

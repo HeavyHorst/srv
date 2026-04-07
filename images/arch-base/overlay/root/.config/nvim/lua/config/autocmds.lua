@@ -1,0 +1,2 @@
+-- Autocmds are automatically loaded on the VeryLazy event.
+-- Add any root guest defaults here if the base LazyVim autocmds need overrides.

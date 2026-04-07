@@ -5,7 +5,7 @@ This directory builds the Arch guest image expected by `srv`.
 It produces two artifacts:
 
 - `vmlinux`: an x86_64 Firecracker-compatible kernel built from the upstream 6.12 LTS kernel using Firecracker's recommended 6.1 guest config as a seed plus a small fragment for Tailscale, Arch guest usability, and Firecracker's current x86 ACPI boot requirements.
-- `rootfs-base.img`: a sparse ext4 image populated with an Arch userspace via `pacstrap`, including Docker tooling plus a matching `/lib/modules/<kernel>` tree for the separately built guest kernel.
+- `rootfs-base.img`: a sparse ext4 image populated with an Arch userspace via `pacstrap`, including Docker tooling, a small developer toolset (`go`, `neovim`, `odin`, `odinfmt`, `ols`), a root LazyVim starter config with its baseline helper tools, and a matching `/lib/modules/<kernel>` tree for the separately built guest kernel.
 
 The guest rootfs includes a boot-time `srv-bootstrap.service` that:
 
@@ -34,7 +34,11 @@ sudo ./images/arch-base/build.sh
 
 By default this currently builds Linux `6.12.79` while reusing Firecracker's `microvm-kernel-ci-x86_64-6.1.config` as the baseline config.
 
-The default guest image is now intentionally less minimal: it includes `docker`, `docker-compose`, boot-time module loading for `overlay` and `br_netfilter`, Docker-friendly sysctls, nftables IPv4/IPv6 family support for Arch's `iptables-nft` userspace, and a matching kernel module tree with real Docker-related `.ko` files installed from the custom Firecracker kernel build.
+The default guest rootfs size is `10G`. Override it with `ROOTFS_SIZE` if you want a different image size.
+
+The default guest image is now intentionally less minimal: it includes `docker`, `docker-compose`, `go`, `neovim`, `odin`, `odinfmt`, `ols`, `git`, `fd`, `ripgrep`, `tree-sitter-cli`, `gcc`, a root LazyVim starter config, boot-time module loading for `overlay` and `br_netfilter`, Docker-friendly sysctls, nftables IPv4/IPv6 family support for Arch's `iptables-nft` userspace, and a matching kernel module tree with real Docker-related `.ko` files installed from the custom Firecracker kernel build.
+
+The LazyVim config lives under `/root/.config/nvim`. Its plugins are still bootstrapped on first `nvim` launch, so the first run needs network access to GitHub.
 
 The kernel build parallelism is conservative by default. Override it if needed:
 
@@ -125,7 +129,7 @@ You can then point the service at those paths with `-base-kernel` and `-base-roo
 - The kernel fragment also enables Landlock and adds it to `CONFIG_LSM`, which keeps pacman's default download sandbox working inside the guest on current Arch releases. Without that, package installs can fail with `landlock is not supported by the kernel` unless you disable pacman's sandbox manually.
 - If the kernel build still fails with a generic top-level `Makefile:... Error 2`, retry with `KERNEL_JOBS=1` to surface the first real error line.
 - The rootfs intentionally still omits the Arch `linux` package. The custom kernel is supplied separately as `vmlinux`, which matches how Firecracker boots guests, and the builder disables `90-mkinitcpio-install.hook` during `pacstrap` because no guest initramfs is needed.
-- The rootfs package set now includes `docker`, `docker-compose`, `iptables-nft`, and `kmod`, which makes fresh guests ready for Docker-based workloads without additional package installs.
+- The rootfs package set now includes `docker`, `docker-compose`, `go`, `neovim`, `odin`, `odinfmt`, `ols`, `git`, `fd`, `ripgrep`, `tree-sitter-cli`, `gcc`, `iptables-nft`, and `kmod`, which makes fresh guests ready for both Docker-based workloads and Odin development without additional package installs while giving the default LazyVim setup the core tools it expects.
 - The builder uses its own minimal `pacman.conf` with only the standard Arch repositories so host-local repos and pacman hooks do not leak into the guest image build.
 - `/etc/resolv.conf` is symlinked to `/proc/net/pnp` so the kernel `ip=` boot parameter inserted by `firecracker-go-sdk` provides working DNS before `tailscale up` runs.
 - Journald is configured to forward logs to `ttyS0`, which makes the guest bootstrap flow visible in each instance's `serial.log`.

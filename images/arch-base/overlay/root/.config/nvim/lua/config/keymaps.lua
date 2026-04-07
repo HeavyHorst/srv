@@ -1,0 +1,2 @@
+-- Keymaps are automatically loaded on the VeryLazy event.
+-- Add any root guest defaults here if the base LazyVim keymaps need overrides.

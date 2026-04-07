@@ -1,0 +1,2 @@
+-- Options are automatically loaded before lazy.nvim startup.
+-- Add any root guest defaults here if the base LazyVim options need overrides.

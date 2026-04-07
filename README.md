@@ -27,6 +27,13 @@ ssh srv start demo
 The service treats SSH as command transport only. Caller identity comes from Tailscale `WhoIs` data resolved from the incoming tailnet connection.
 Control-plane examples omit a username because authorization is based on that Tailscale identity, not the SSH username.
 
+## Use Cases
+
+- **Throwaway debug VMs** — spin up an isolated environment, break things, and delete it without affecting the host
+- **Sandboxed agent VMs** — give AI coding agents their own cgroup-limited VM with per-instance Tailscale identity and a scoped Zen API proxy
+- **Dev/test environments** — fast reflink-based clones from a single base image, with backup/restore for instant reset
+- **Isolated workloads** — run services in separate microVMs with per-VM networking, auth, and resource limits
+
 ## Quickstart
 
 1. Build the Arch base image artifacts:

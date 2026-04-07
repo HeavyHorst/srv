@@ -37,15 +37,19 @@ ROOTFS_PACKAGES=(
 	gcc
 	git
 	go
+	gopls
 	iproute2
 	iptables-nft
 	jq
 	kmod
+	lua-language-server
 	neovim
 	odin
 	odinfmt
 	ols
 	ripgrep
+	shfmt
+	stylua
 	tailscale
 	tree-sitter-cli
 )
@@ -64,6 +68,7 @@ require_commands() {
 	local cmd
 	for cmd in \
 		bc \
+		arch-chroot \
 		bison \
 		curl \
 		depmod \
@@ -225,6 +230,19 @@ validate_kernel_config() {
 	require_kernel_config "${kernel_config}" 'CONFIG_OVERLAY_FS=[ym]' 'overlayfs support'
 }
 
+bootstrap_lazyvim() {
+	# Do this before configure_rootfs rewrites resolv.conf for Firecracker MMDS.
+	echo "bootstrapping LazyVim plugins into the guest rootfs"
+	arch-chroot "${ROOTFS_MOUNT_DIR}" /usr/bin/env \
+		HOME=/root \
+		XDG_CONFIG_HOME=/root/.config \
+		XDG_DATA_HOME=/root/.local/share \
+		XDG_STATE_HOME=/root/.local/state \
+		XDG_CACHE_HOME=/root/.cache \
+		TERM=xterm-256color \
+		nvim --headless "+Lazy! sync" "+qa"
+}
+
 build_kernel() {
 	local jobs kernel_config
 	jobs="$(kernel_jobs)"
@@ -298,6 +316,7 @@ build_rootfs() {
 	install_kernel_modules
 
 	rsync -a "${SCRIPT_DIR}/overlay/" "${ROOTFS_MOUNT_DIR}/"
+	bootstrap_lazyvim
 	configure_rootfs
 	detach_rootfs
 }

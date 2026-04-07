@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,6 +20,8 @@ const (
 	defaultVMRunnerSocket   = "/run/srv-vm-runner/vm-runner.sock"
 	defaultFirecrackerBin   = "/usr/bin/firecracker"
 	defaultVMNetworkCIDR    = "172.28.0.0/16"
+	defaultZenBaseURL       = "https://opencode.ai/zen"
+	defaultZenGatewayPort   = 11434
 	defaultGuestAuthExpiry  = 15 * time.Minute
 	defaultGuestReadyTimout = 2 * time.Minute
 	MaxVCPUCount            = 32
@@ -56,6 +59,9 @@ type Config struct {
 	GuestTailscaleControlURL string
 	GuestTailscaleAuthOnce   bool
 	ExtraKernelArgs          string
+	ZenAPIKey                string
+	ZenBaseURL               string
+	ZenGatewayPort           int
 
 	LogLevel string
 
@@ -92,6 +98,9 @@ func Load() (Config, error) {
 	guestReadyTimeout := flag.String("guest-ready-timeout", getenv("SRV_GUEST_READY_TIMEOUT", defaultGuestReadyTimout.String()), "time to wait for a guest to join the tailnet")
 	flag.StringVar(&cfg.GuestTailscaleControlURL, "guest-tailscale-control-url", getenv("SRV_GUEST_TAILSCALE_CONTROL_URL", os.Getenv("TS_CONTROL_URL")), "optional alternate control URL injected into the guest bootstrap contract")
 	flag.StringVar(&cfg.ExtraKernelArgs, "extra-kernel-args", getenv("SRV_EXTRA_KERNEL_ARGS", ""), "additional kernel arguments appended to the guest boot line")
+	flag.StringVar(&cfg.ZenAPIKey, "zen-api-key", getenv("SRV_ZEN_API_KEY", ""), "optional OpenCode Zen API key used by the host-side guest gateway")
+	flag.StringVar(&cfg.ZenBaseURL, "zen-base-url", getenv("SRV_ZEN_BASE_URL", defaultZenBaseURL), "base URL for the upstream OpenCode Zen API")
+	flag.IntVar(&cfg.ZenGatewayPort, "zen-gateway-port", getenvInt("SRV_ZEN_GATEWAY_PORT", defaultZenGatewayPort), "TCP port exposed on each VM host/gateway IP for the host-side OpenCode Zen proxy")
 	flag.Int64Var(&cfg.VCPUCount, "vm-vcpus", getenvInt64("SRV_VM_VCPUS", 1), "number of guest vCPUs")
 	flag.Int64Var(&cfg.MemoryMiB, "vm-memory-mib", getenvInt64("SRV_VM_MEMORY_MIB", 1024), "guest memory in MiB")
 	flag.StringVar(&cfg.LogLevel, "log-level", getenv("SRV_LOG_LEVEL", "info"), "log level")
@@ -149,6 +158,15 @@ func (c Config) Validate() error {
 	}
 	if c.GuestReadyTimeout <= 0 {
 		return errors.New("guest ready timeout must be positive")
+	}
+	if c.ZenGatewayPort < 1 || c.ZenGatewayPort > 65535 {
+		return errors.New("zen gateway port must be between 1 and 65535")
+	}
+	if strings.TrimSpace(c.ZenBaseURL) == "" {
+		return errors.New("zen base url is required")
+	}
+	if _, err := parseZenBaseURL(c.ZenBaseURL); err != nil {
+		return err
 	}
 	return nil
 }
@@ -222,6 +240,37 @@ func getenvInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	return parsed
+}
+
+func getenvInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func parseZenBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("zen base url is required")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse zen base url: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", errors.New("zen base url must use http or https")
+	}
+	if parsed.Host == "" {
+		return "", errors.New("zen base url must include a host")
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String(), nil
 }
 
 func splitCSV(v string) []string {

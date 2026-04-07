@@ -239,6 +239,7 @@ func TestWriteMetadataFileRedactsAuthKey(t *testing.T) {
 		TailscaleAuthKey:    "tskey-auth-secret",
 		TailscaleControlURL: "https://control.example.com",
 		TailscaleTags:       []string{"tag:microvm"},
+		ZenGatewayPort:      11434,
 	}
 
 	if err := p.writeMetadataFile(inst, bootstrap); err != nil {
@@ -259,6 +260,9 @@ func TestWriteMetadataFileRedactsAuthKey(t *testing.T) {
 	}
 	if meta.SRV.TailscaleAuthKey != "[redacted]" {
 		t.Fatalf("TailscaleAuthKey = %q, want [redacted]", meta.SRV.TailscaleAuthKey)
+	}
+	if meta.SRV.ZenGatewayPort != 11434 {
+		t.Fatalf("ZenGatewayPort = %d, want 11434", meta.SRV.ZenGatewayPort)
 	}
 	if meta.SRV.Hostname != "demo" || !reflect.DeepEqual(meta.SRV.TailscaleTags, []string{"tag:microvm"}) {
 		t.Fatalf("unexpected metadata payload: %#v", meta)
@@ -955,19 +959,23 @@ func TestImportInstanceReleasesAdmissionLockDuringStreaming(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	admissionReleased := make(chan struct{})
-	go func() {
-		p.admissionMu.Lock()
-		p.admissionMu.Unlock()
-		close(admissionReleased)
-	}()
-
-	select {
-	case <-admissionReleased:
-	case err := <-importDone:
-		t.Fatalf("ImportInstance() finished before admission lock check: %v", err)
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("admissionMu remained locked during streaming import")
+	admissionAvailable := false
+	admissionDeadline := time.Now().Add(500 * time.Millisecond)
+	for !admissionAvailable {
+		if p.admissionMu.TryLock() {
+			admissionAvailable = true
+			p.admissionMu.Unlock()
+			break
+		}
+		select {
+		case err := <-importDone:
+			t.Fatalf("ImportInstance() finished before admission lock check: %v", err)
+		default:
+		}
+		if time.Now().After(admissionDeadline) {
+			t.Fatal("admissionMu remained locked during streaming import")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	close(allowPayload)

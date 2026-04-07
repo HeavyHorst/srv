@@ -418,7 +418,24 @@ func TestEnsureHostSignerPersistsKey(t *testing.T) {
 
 func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
-	for _, want := range []string{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "backup <create|list> <name>", "export <name>", "import", "logs [-f|--follow] <name> [serial|firecracker]", "restore <name> <backup-id>", "start <name>", "stop <name>", "restart <name>"} {
+	for _, want := range []string{
+		"new <name>",
+		"resize <name>",
+		"backup create <name>",
+		"backup list <name>",
+		"export <name>",
+		"import",
+		"logs <name> [target]",
+		"logs -f <name> <target>",
+		"restore <name> <backup-id>",
+		"start <name>",
+		"stop <name>",
+		"restart <name>",
+		"new and resize options:",
+		"--cpus N",
+		"--ram SIZE",
+		"--rootfs-size SIZE",
+	} {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("helpResult() missing %q in %q", want, result.stdout)
 		}

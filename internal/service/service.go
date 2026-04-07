@@ -46,6 +46,7 @@ type App struct {
 	tailscale   *tsnet.Server
 	localAPI    *local.Client
 	sshServer   *gssh.Server
+	zenGateway  *zenGatewayManager
 	commandMu   sync.Mutex
 	commandCond *sync.Cond
 	commandOnce sync.Once
@@ -119,6 +120,11 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, fmt.Errorf("set backups dir permissions: %w", err)
 	}
 
+	zenGateway, err := newZenGatewayManager(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+
 	st, err := store.Open(cfg.DatabasePath())
 	if err != nil {
 		return nil, err
@@ -130,7 +136,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 
-	return &App{cfg: cfg, log: logger, store: st, provisioner: prov}, nil
+	return &App{cfg: cfg, log: logger, store: st, provisioner: prov, zenGateway: zenGateway}, nil
 }
 
 func (a *App) lockInstance(name string) func() {
@@ -225,6 +231,9 @@ func (a *App) Run(ctx context.Context) error {
 		<-groupCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if a.zenGateway != nil {
+			a.zenGateway.Close()
+		}
 		if a.sshServer != nil {
 			_ = a.sshServer.Shutdown(shutdownCtx)
 		}
@@ -245,8 +254,10 @@ func (a *App) Run(ctx context.Context) error {
 
 func (a *App) restoreInstances(ctx context.Context) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.provisioner.RestoreInstances(ctx); err != nil && ctx.Err() == nil {
+	err := a.provisioner.RestoreInstances(ctx)
+	a.mu.Unlock()
+	a.syncZenGatewayBestEffort()
+	if err != nil && ctx.Err() == nil {
 		a.log.Error("restore instances on startup", "err", err)
 	}
 }
@@ -429,7 +440,10 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string) (com
 	}
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	defer func() {
+		a.mu.Unlock()
+		a.syncZenGatewayBestEffort()
+	}()
 
 	inst, err := a.provisioner.Create(ctx, name, actor, opts)
 	if err != nil {
@@ -611,46 +625,49 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string) 
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("name: %s\n", inst.Name))
-	b.WriteString(fmt.Sprintf("state: %s\n", inst.State))
-	b.WriteString(fmt.Sprintf("created-by: %s via %s\n", inst.CreatedByUser, inst.CreatedByNode))
-	b.WriteString(fmt.Sprintf("created-at: %s\n", inst.CreatedAt.Format(time.RFC3339)))
-	b.WriteString(fmt.Sprintf("updated-at: %s\n", inst.UpdatedAt.Format(time.RFC3339)))
+	fmt.Fprintf(&b, "name: %s\n", inst.Name)
+	fmt.Fprintf(&b, "state: %s\n", inst.State)
+	fmt.Fprintf(&b, "created-by: %s via %s\n", inst.CreatedByUser, inst.CreatedByNode)
+	fmt.Fprintf(&b, "created-at: %s\n", inst.CreatedAt.Format(time.RFC3339))
+	fmt.Fprintf(&b, "updated-at: %s\n", inst.UpdatedAt.Format(time.RFC3339))
 	if vcpus := effectiveInstanceVCPUCount(inst, a.cfg); vcpus > 0 {
-		b.WriteString(fmt.Sprintf("vcpus: %d\n", vcpus))
+		fmt.Fprintf(&b, "vcpus: %d\n", vcpus)
 	}
 	if mem := effectiveInstanceMemoryMiB(inst, a.cfg); mem > 0 {
-		b.WriteString(fmt.Sprintf("memory: %d MiB\n", mem))
+		fmt.Fprintf(&b, "memory: %d MiB\n", mem)
 	}
-	b.WriteString(fmt.Sprintf("rootfs: %s\n", inst.RootFSPath))
+	fmt.Fprintf(&b, "rootfs: %s\n", inst.RootFSPath)
 	if size := effectiveInstanceRootFSSizeBytes(inst); size > 0 {
-		b.WriteString(fmt.Sprintf("rootfs-size: %s\n", format.BinarySize(size)))
+		fmt.Fprintf(&b, "rootfs-size: %s\n", format.BinarySize(size))
 	}
-	b.WriteString(fmt.Sprintf("firecracker-pid: %d\n", inst.FirecrackerPID))
-	b.WriteString(fmt.Sprintf("tap-device: %s\n", inst.TapDevice))
-	b.WriteString(fmt.Sprintf("network: %s\n", inst.NetworkCIDR))
-	b.WriteString(fmt.Sprintf("host-ip: %s\n", inst.HostAddr))
-	b.WriteString(fmt.Sprintf("guest-ip: %s\n", inst.GuestAddr))
+	fmt.Fprintf(&b, "firecracker-pid: %d\n", inst.FirecrackerPID)
+	fmt.Fprintf(&b, "tap-device: %s\n", inst.TapDevice)
+	fmt.Fprintf(&b, "network: %s\n", inst.NetworkCIDR)
+	fmt.Fprintf(&b, "host-ip: %s\n", inst.HostAddr)
+	fmt.Fprintf(&b, "guest-ip: %s\n", inst.GuestAddr)
+	if gatewayURL := a.zenGatewayBaseURL(inst); gatewayURL != "" {
+		fmt.Fprintf(&b, "zen-gateway: %s\n", gatewayURL)
+	}
 	if inst.TailscaleName != "" {
-		b.WriteString(fmt.Sprintf("tailscale-name: %s\n", inst.TailscaleName))
+		fmt.Fprintf(&b, "tailscale-name: %s\n", inst.TailscaleName)
 	}
 	if inst.TailscaleIP != "" {
-		b.WriteString(fmt.Sprintf("tailscale-ip: %s\n", inst.TailscaleIP))
+		fmt.Fprintf(&b, "tailscale-ip: %s\n", inst.TailscaleIP)
 	}
 	if inst.LastError != "" {
-		b.WriteString(fmt.Sprintf("last-error: %s\n", inst.LastError))
+		fmt.Fprintf(&b, "last-error: %s\n", inst.LastError)
 	}
 	if inst.DeletedAt != nil {
-		b.WriteString(fmt.Sprintf("deleted-at: %s\n", inst.DeletedAt.Format(time.RFC3339)))
+		fmt.Fprintf(&b, "deleted-at: %s\n", inst.DeletedAt.Format(time.RFC3339))
 	}
-	b.WriteString(fmt.Sprintf("logs-serial: ssh %s logs %s serial\n", a.cfg.Hostname, inst.Name))
-	b.WriteString(fmt.Sprintf("logs-firecracker: ssh %s logs %s firecracker\n", a.cfg.Hostname, inst.Name))
+	fmt.Fprintf(&b, "logs-serial: ssh %s logs %s serial\n", a.cfg.Hostname, inst.Name)
+	fmt.Fprintf(&b, "logs-firecracker: ssh %s logs %s firecracker\n", a.cfg.Hostname, inst.Name)
 	if hint := inspectDebugHint(inst); hint != "" {
-		b.WriteString(fmt.Sprintf("debug-hint: %s\n", hint))
+		fmt.Fprintf(&b, "debug-hint: %s\n", hint)
 	}
 	b.WriteString("events:\n")
 	for _, evt := range events {
-		b.WriteString(fmt.Sprintf("- %s [%s] %s\n", evt.CreatedAt.Format(time.RFC3339), evt.Type, evt.Message))
+		fmt.Fprintf(&b, "- %s [%s] %s\n", evt.CreatedAt.Format(time.RFC3339), evt.Type, evt.Message)
 	}
 	return commandResult{stdout: b.String(), exitCode: 0}, nil
 }
@@ -744,7 +761,10 @@ func (a *App) handleImportSession(sess gssh.Session, actor model.Actor, args []s
 	}
 
 	unlock := a.lockInstance(artifactInfo.Name)
-	defer unlock()
+	defer func() {
+		unlock()
+		a.syncZenGatewayBestEffort()
+	}()
 
 	reporter := newImportProgressReporter(sess.Stderr(), 350*time.Millisecond)
 	inst, info, err := a.provisioner.ImportInstance(sess.Context(), actor, stream, reporter.Update)
@@ -756,18 +776,18 @@ func (a *App) handleImportSession(sess gssh.Session, actor model.Actor, args []s
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("imported: %s\n", inst.Name))
+	fmt.Fprintf(&b, "imported: %s\n", inst.Name)
 	if info.Name != "" && info.Name != inst.Name {
-		b.WriteString(fmt.Sprintf("source-name: %s\n", info.Name))
+		fmt.Fprintf(&b, "source-name: %s\n", info.Name)
 	}
-	b.WriteString(fmt.Sprintf("state: %s\n", inst.State))
-	b.WriteString(fmt.Sprintf("rootfs-size: %s\n", format.BinarySize(effectiveInstanceRootFSSizeBytes(inst))))
-	b.WriteString(fmt.Sprintf("exported-at: %s\n", info.ExportedAt.Format(time.RFC3339)))
+	fmt.Fprintf(&b, "state: %s\n", inst.State)
+	fmt.Fprintf(&b, "rootfs-size: %s\n", format.BinarySize(effectiveInstanceRootFSSizeBytes(inst)))
+	fmt.Fprintf(&b, "exported-at: %s\n", info.ExportedAt.Format(time.RFC3339))
 	if inst.TailscaleName != "" {
-		b.WriteString(fmt.Sprintf("tailscale-name: %s\n", inst.TailscaleName))
+		fmt.Fprintf(&b, "tailscale-name: %s\n", inst.TailscaleName)
 	}
 	if inst.TailscaleIP != "" {
-		b.WriteString(fmt.Sprintf("tailscale-ip: %s\n", inst.TailscaleIP))
+		fmt.Fprintf(&b, "tailscale-ip: %s\n", inst.TailscaleIP)
 	}
 	_, _ = io.WriteString(sess, b.String())
 	return 0, nil
@@ -946,7 +966,7 @@ func helpResult() commandResult {
 		tableOutput, err := renderTextTable([]string{"command", "description"}, rows)
 		if err != nil {
 			for _, e := range group.entries {
-				b.WriteString(fmt.Sprintf("  %-35s %s\n", e.command, e.description))
+				fmt.Fprintf(&b, "  %-35s %s\n", e.command, e.description)
 			}
 		} else {
 			b.WriteString(tableOutput)
@@ -1269,7 +1289,10 @@ func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string) 
 	}
 
 	unlock := a.lockInstance(name)
-	defer unlock()
+	defer func() {
+		unlock()
+		a.syncZenGatewayBestEffort()
+	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
 		return missingInstanceResult("restore", name, err)
@@ -1302,7 +1325,10 @@ func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string) (c
 	}
 
 	unlock := a.lockInstance(args[1])
-	defer unlock()
+	defer func() {
+		unlock()
+		a.syncZenGatewayBestEffort()
+	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
 		return missingInstanceResult("start", args[1], err)
@@ -1326,7 +1352,10 @@ func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string) (co
 	}
 
 	unlock := a.lockInstance(args[1])
-	defer unlock()
+	defer func() {
+		unlock()
+		a.syncZenGatewayBestEffort()
+	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
 		return missingInstanceResult("stop", args[1], err)
@@ -1349,7 +1378,10 @@ func (a *App) cmdRestart(ctx context.Context, actor model.Actor, args []string) 
 	}
 
 	unlock := a.lockInstance(args[1])
-	defer unlock()
+	defer func() {
+		unlock()
+		a.syncZenGatewayBestEffort()
+	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
 		return missingInstanceResult("restart", args[1], err)
@@ -1379,7 +1411,10 @@ func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string) (
 	}
 
 	unlock := a.lockInstance(args[1])
-	defer unlock()
+	defer func() {
+		unlock()
+		a.syncZenGatewayBestEffort()
+	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
 		return missingInstanceResult("delete", args[1], err)

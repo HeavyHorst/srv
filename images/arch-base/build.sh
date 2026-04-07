@@ -44,6 +44,7 @@ ROOTFS_PACKAGES=(
 	kmod
 	lua-language-server
 	neovim
+	opencode
 	odin
 	odinfmt
 	ols

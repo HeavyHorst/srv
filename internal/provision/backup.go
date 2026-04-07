@@ -866,7 +866,7 @@ func writeTarFileTail(tw *tar.Writer, name, path string, mode os.FileMode, maxBy
 }
 
 func isRegularTarEntry(hdr *tar.Header) bool {
-	return hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeRegA || hdr.Typeflag == 0
+	return hdr.Typeflag == tar.TypeReg || hdr.Typeflag == 0
 }
 
 func cloneBackupFileIfPresent(ctx context.Context, src, dest string) (bool, error) {

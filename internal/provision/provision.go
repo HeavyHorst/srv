@@ -253,6 +253,10 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		return inst, err
 	}
 	mintedKeyID = keyID
+	zenGatewayPort := 0
+	if strings.TrimSpace(p.cfg.ZenAPIKey) != "" {
+		zenGatewayPort = p.cfg.ZenGatewayPort
+	}
 
 	bootstrap := guestBootstrap{
 		Version:             1,
@@ -260,6 +264,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		TailscaleAuthKey:    authKey,
 		TailscaleControlURL: p.cfg.GuestTailscaleControlURL,
 		TailscaleTags:       p.cfg.GuestAuthTags,
+		ZenGatewayPort:      zenGatewayPort,
 	}
 	if err := p.writeMetadataFile(inst, bootstrap); err != nil {
 		inst.LastError = err.Error()
@@ -603,12 +608,17 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		return inst, err
 	}
 	p.recordEvent(inst.ID, "network", "tap device and NAT configured", map[string]any{"tap": inst.TapDevice, "network": inst.NetworkCIDR})
+	zenGatewayPort := 0
+	if strings.TrimSpace(p.cfg.ZenAPIKey) != "" {
+		zenGatewayPort = p.cfg.ZenGatewayPort
+	}
 
 	bootstrap := guestBootstrap{
 		Version:             1,
 		Hostname:            inst.Name,
 		TailscaleControlURL: p.cfg.GuestTailscaleControlURL,
 		TailscaleTags:       p.cfg.GuestAuthTags,
+		ZenGatewayPort:      zenGatewayPort,
 	}
 	pid, err := p.startFirecracker(ctx, inst, bootstrap)
 	if err != nil {
@@ -1356,27 +1366,6 @@ func deviceUpdatedSince(device tailscale.Device, previous tailnetDeviceSnapshot,
 	}
 	lastSeen := deviceLastSeen(device)
 	return strings.TrimSpace(lastSeen) != "" && lastSeen != previous.LastSeen
-}
-
-func readUnifiedCgroupPath(path string) (string, error) {
-	payload, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", path, err)
-	}
-	for _, line := range strings.Split(string(payload), "\n") {
-		if !strings.HasPrefix(line, "0::") {
-			continue
-		}
-		cgroupPath := strings.TrimSpace(strings.TrimPrefix(line, "0::"))
-		if cgroupPath == "" {
-			return "/", nil
-		}
-		if !filepath.IsAbs(cgroupPath) {
-			return "", fmt.Errorf("unified cgroup path %q is not absolute", cgroupPath)
-		}
-		return cgroupPath, nil
-	}
-	return "", fmt.Errorf("could not find a unified cgroup entry in %s", path)
 }
 
 func directChildPath(base, name string) (string, error) {

@@ -32,6 +32,9 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_GUEST_READY_TIMEOUT", "3m")
 	t.Setenv("SRV_NET_HELPER_SOCKET", "/run/srv/custom-net-helper.sock")
 	t.Setenv("SRV_VM_RUNNER_SOCKET", "/run/srv-vm-runner/custom-vm-runner.sock")
+	t.Setenv("SRV_ZEN_API_KEY", "zen-key")
+	t.Setenv("SRV_ZEN_BASE_URL", "https://zen.example.test/base")
+	t.Setenv("SRV_ZEN_GATEWAY_PORT", "12456")
 	t.Setenv("SRV_VM_VCPUS", "2")
 	t.Setenv("SRV_VM_MEMORY_MIB", "2048")
 	t.Setenv("SRV_LOG_LEVEL", "debug")
@@ -61,6 +64,15 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	}
 	if cfg.VMRunnerSocketPath != "/run/srv-vm-runner/custom-vm-runner.sock" {
 		t.Fatalf("VMRunnerSocketPath = %q, want %q", cfg.VMRunnerSocketPath, "/run/srv-vm-runner/custom-vm-runner.sock")
+	}
+	if cfg.ZenAPIKey != "zen-key" {
+		t.Fatalf("ZenAPIKey = %q, want %q", cfg.ZenAPIKey, "zen-key")
+	}
+	if cfg.ZenBaseURL != "https://zen.example.test/base" {
+		t.Fatalf("ZenBaseURL = %q, want %q", cfg.ZenBaseURL, "https://zen.example.test/base")
+	}
+	if cfg.ZenGatewayPort != 12456 {
+		t.Fatalf("ZenGatewayPort = %d, want 12456", cfg.ZenGatewayPort)
 	}
 	if !reflect.DeepEqual(cfg.AllowedUsers, []string{"alice@example.com", "bob@example.com"}) {
 		t.Fatalf("AllowedUsers = %#v", cfg.AllowedUsers)
@@ -158,6 +170,16 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 			mutate:  func(cfg *Config) { cfg.GuestReadyTimeout = 0 },
 			wantErr: "guest ready timeout must be positive",
 		},
+		{
+			name:    "invalid zen gateway port",
+			mutate:  func(cfg *Config) { cfg.ZenGatewayPort = 70000 },
+			wantErr: "zen gateway port must be between 1 and 65535",
+		},
+		{
+			name:    "invalid zen base url",
+			mutate:  func(cfg *Config) { cfg.ZenBaseURL = "mailto:zen@example.com" },
+			wantErr: "zen base url must use http or https",
+		},
 	}
 
 	for _, tt := range tests {
@@ -211,6 +233,8 @@ func validConfig() Config {
 		ListenAddr:          ":22",
 		NetHelperSocketPath: "/run/srv/net-helper.sock",
 		VMRunnerSocketPath:  "/run/srv-vm-runner/vm-runner.sock",
+		ZenBaseURL:          "https://opencode.ai/zen",
+		ZenGatewayPort:      11434,
 		VCPUCount:           2,
 		MemoryMiB:           1024,
 		GuestAuthExpiry:     15 * time.Minute,

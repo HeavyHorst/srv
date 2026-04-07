@@ -77,6 +77,7 @@ type Bootstrap struct {
 	TailscaleAuthKey    string   `json:"tailscale_auth_key,omitempty"`
 	TailscaleControlURL string   `json:"tailscale_control_url,omitempty"`
 	TailscaleTags       []string `json:"tailscale_tags,omitempty"`
+	ZenGatewayPort      int      `json:"zen_gateway_port,omitempty"`
 }
 
 type Metadata struct {
@@ -900,10 +901,6 @@ func respondError(w http.ResponseWriter, status int, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(errorResponse{Error: err.Error()})
-}
-
-func stopProcess(pid int) error {
-	return stopProcessWithGrace(pid, forcedStopTimeout)
 }
 
 func stopProcessWithGrace(pid int, timeout time.Duration) error {

@@ -1,3 +1,8 @@
+---
+name: srv-microvm-debugging
+description: Guides debugging and testing work inside srv-managed Firecracker microVMs over SSH with Tailscale networking. Use when running isolated code, inspecting VM state, viewing logs, resizing instances, or restoring backups.
+---
+
 # srv-microvm-debugging
 
 Use `srv` to spawn isolated Firecracker microVMs for running code, debugging, and testing with full isolation and automatic Tailscale networking.

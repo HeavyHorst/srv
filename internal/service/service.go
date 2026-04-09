@@ -166,6 +166,10 @@ type restoreResponseJSON struct {
 	Backup   backupJSON          `json:"backup"`
 }
 
+type statusResponseJSON = provision.CapacitySummary
+type statusInstancesJSON = provision.CapacityInstances
+type statusResourceJSON = provision.CapacityResource
+
 type logTarget string
 
 type logsRequest struct {
@@ -643,6 +647,8 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 		return a.cmdList(ctx, actor, req.format)
 	case "inspect":
 		return a.cmdInspect(ctx, actor, req.args, req.format)
+	case "status":
+		return a.cmdStatus(ctx, actor, req.args, req.format)
 	case "restore":
 		return a.cmdRestore(ctx, actor, req.args, req.format)
 	case "start":
@@ -930,6 +936,42 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	return commandResult{stdout: b.String(), exitCode: 0}, nil
 }
 
+func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
+	if len(args) != 1 {
+		err := errors.New("usage: status")
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+	summary, err := a.provisioner.CapacitySummary(ctx)
+	if err != nil {
+		return commandResult{stderr: fmt.Sprintf("status: %v\n", err), exitCode: 1}, err
+	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(summary)
+	}
+
+	tableRows := make([][]string, 0, len(summary.Capacity))
+	for _, resource := range summary.Capacity {
+		tableRows = append(tableRows, []string{
+			resource.Resource,
+			formatStatusValue(resource.Unit, resource.Allocated),
+			formatStatusValue(resource.Unit, resource.Budget),
+			formatStatusValue(resource.Unit, resource.Left),
+			resource.Note,
+		})
+	}
+	tableOutput, err := renderTextTable([]string{"Resource", "Allocated", "Budget", "Left", "Notes"}, tableRows)
+	if err != nil {
+		return commandResult{stderr: fmt.Sprintf("render status: %v\n", err), exitCode: 1}, err
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "server: %s\n", summary.Hostname)
+	fmt.Fprintf(&b, "instances: %s\n\n", formatStatusInstanceSummary(summary.Instances))
+	b.WriteString("capacity\n")
+	b.WriteString(tableOutput)
+	return commandResult{stdout: b.String(), exitCode: 0}, nil
+}
+
 func (a *App) cmdLogsRequest(ctx context.Context, actor model.Actor, req logsRequest) (commandResult, error) {
 	inst, err := a.lookupVisibleInstance(ctx, actor, req.name)
 	if err != nil {
@@ -1166,95 +1208,91 @@ func formatImportProgress(progress provision.ImportProgress) string {
 
 func helpResult() commandResult {
 	var b strings.Builder
-	b.WriteString("usage: ssh srv [--json] <command>\n\n")
+
+	fmt.Fprintln(&b, "NAME")
+	fmt.Fprintln(&b, "    srv - manage Firecracker microVM instances over SSH")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "SYNOPSIS")
+	fmt.Fprintln(&b, "    ssh srv [--json] <command> [args...]")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "DESCRIPTION")
+	fmt.Fprintln(&b, "    Create, inspect, and control isolated microVM instances")
+	fmt.Fprintln(&b, "    with automatic Tailscale networking.")
 
 	type helpEntry struct {
-		command     string
+		synopsis    string
 		description string
 	}
 
 	groups := []struct {
-		name    string
+		header  string
 		entries []helpEntry
 	}{
 		{
-			name: "instances",
+			header: "INSTANCE COMMANDS",
 			entries: []helpEntry{
-				{"new <name>", "Create a new microvm instance"},
-				{"list", "List all instances"},
-				{"inspect <name>", "Show instance details and recent events"},
-				{"start <name>", "Start a stopped instance"},
-				{"stop <name>", "Stop a running instance"},
-				{"restart <name>", "Restart an instance"},
-				{"resize <name>", "Change instance resources"},
-				{"delete <name>", "Delete an instance"},
+				{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "Create a new microvm instance."},
+				{"list", "List all instances."},
+				{"inspect <name>", "Show instance details and recent events."},
+				{"start <name>", "Start a stopped instance."},
+				{"stop <name>", "Stop a running instance."},
+				{"restart <name>", "Restart an instance."},
+				{"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
+				{"delete <name>", "Delete an instance."},
 			},
 		},
 		{
-			name: "backup",
+			header: "BACKUP COMMANDS",
 			entries: []helpEntry{
-				{"backup create <name>", "Create a backup of an instance"},
-				{"backup list <name>", "List backups for an instance"},
-				{"restore <name> <backup-id>", "Restore an instance from a backup"},
-				{"export <name>", "Export instance as a portable archive to stdout"},
-				{"import", "Import instance from stdin"},
+				{"backup create <name>", "Create a backup of an instance."},
+				{"backup list <name>", "List backups for an instance."},
+				{"restore <name> <backup-id>", "Restore an instance from a backup."},
+				{"export <name>", "Export instance as a portable archive to stdout."},
+				{"import", "Import instance from stdin."},
 			},
 		},
 		{
-			name: "diagnostics",
+			header: "DIAGNOSTICS",
 			entries: []helpEntry{
-				{"logs <name> [target]", "View instance logs (serial|firecracker)"},
-				{"logs -f <name> <target>", "Follow logs in real time"},
+				{"logs <name> [serial|firecracker]", "View instance logs."},
+				{"logs -f <name> <target>", "Follow logs in real time."},
 			},
 		},
 		{
-			name: "admin",
+			header: "ADMIN COMMANDS",
 			entries: []helpEntry{
-				{"snapshot create", "Create a read-only btrfs data snapshot"},
+				{"status", "Show host capacity and allocation summary."},
+				{"snapshot create", "Create a read-only btrfs data snapshot."},
 			},
 		},
 	}
 
 	for _, group := range groups {
-		b.WriteString(group.name + "\n")
-		rows := make([][]string, 0, len(group.entries))
+		fmt.Fprintln(&b)
+		fmt.Fprintln(&b, group.header)
+		fmt.Fprintln(&b)
 		for _, e := range group.entries {
-			rows = append(rows, []string{e.command, e.description})
+			fmt.Fprintf(&b, "    %s\n", e.synopsis)
+			fmt.Fprintf(&b, "        %s\n", e.description)
 		}
-		tableOutput, err := renderTextTable([]string{"command", "description"}, rows)
-		if err != nil {
-			for _, e := range group.entries {
-				fmt.Fprintf(&b, "  %-35s %s\n", e.command, e.description)
-			}
-		} else {
-			b.WriteString(tableOutput)
-		}
-		b.WriteString("\n")
 	}
 
-	b.WriteString("global options:\n")
-	globalOptionOutput, err := renderTextTable([]string{"flag", "description"}, [][]string{{"--json", "Return machine-readable JSON for supported non-streaming commands"}})
-	if err != nil {
-		b.WriteString("  --json               Return machine-readable JSON for supported non-streaming commands\n")
-	} else {
-		b.WriteString(globalOptionOutput)
-	}
-	b.WriteString("\n")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "GLOBAL OPTIONS")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "    --json")
+	fmt.Fprintln(&b, "        Return machine-readable JSON for supported non-streaming")
+	fmt.Fprintln(&b, "        commands.")
 
-	b.WriteString("new and resize options:\n")
-	optionRows := [][]string{
-		{"--cpus N", "Number of vCPUs"},
-		{"--ram SIZE", "Memory (e.g. 512m, 2g)"},
-		{"--rootfs-size SIZE", "Root filesystem size (e.g. 4g, 10g)"},
-	}
-	optionOutput, err := renderTextTable([]string{"flag", "description"}, optionRows)
-	if err != nil {
-		b.WriteString("  --cpus N             Number of vCPUs\n")
-		b.WriteString("  --ram SIZE           Memory (e.g. 512m, 2g)\n")
-		b.WriteString("  --rootfs-size SIZE   Root filesystem size (e.g. 4g, 10g)\n")
-	} else {
-		b.WriteString(optionOutput)
-	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "NEW AND RESIZE OPTIONS")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "    --cpus N")
+	fmt.Fprintln(&b, "        Number of vCPUs.")
+	fmt.Fprintln(&b, "    --ram SIZE")
+	fmt.Fprintln(&b, "        Memory (e.g. 512m, 2g).")
+	fmt.Fprintln(&b, "    --rootfs-size SIZE")
+	fmt.Fprintln(&b, "        Root filesystem size (e.g. 4g, 10g).")
 
 	return commandResult{stdout: b.String(), exitCode: 0}
 }
@@ -1736,16 +1774,16 @@ func (a *App) resolveActor(ctx context.Context, sess gssh.Session) (model.Actor,
 }
 
 func (a *App) authorize(actor model.Actor, command string) (bool, string) {
-	if command == "snapshot" {
+	if command == "snapshot" || command == "status" {
 		if !a.isAdmin(actor) {
 			return false, fmt.Sprintf("%s is not in SRV_ADMIN_USERS", actor.UserLogin)
 		}
 		if len(a.cfg.AllowedUsers) == 0 {
-			return true, fmt.Sprintf("%s allowed to run snapshot as admin", actor.UserLogin)
+			return true, fmt.Sprintf("%s allowed to run %s as admin", actor.UserLogin, command)
 		}
 		for _, user := range a.cfg.AllowedUsers {
 			if strings.EqualFold(user, actor.UserLogin) {
-				return true, fmt.Sprintf("%s allowed to run snapshot as admin", actor.UserLogin)
+				return true, fmt.Sprintf("%s allowed to run %s as admin", actor.UserLogin, command)
 			}
 		}
 		return false, fmt.Sprintf("%s is not in SRV_ALLOWED_USERS", actor.UserLogin)
@@ -2031,6 +2069,35 @@ func effectiveInstanceRootFSSizeBytes(inst model.Instance) int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+func formatStatusInstanceSummary(instances statusInstancesJSON) string {
+	parts := []string{
+		fmt.Sprintf("%d total", instances.Total),
+		fmt.Sprintf("%d running", instances.Running),
+		fmt.Sprintf("%d stopped", instances.Stopped),
+		fmt.Sprintf("%d failed", instances.Failed),
+	}
+	for _, state := range []string{model.StateDeleting} {
+		if count := instances.ByState[state]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", count, state))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatStatusValue(unit string, value int64) string {
+	switch unit {
+	case "vcpu":
+		return fmt.Sprintf("%d vCPU", value)
+	case "bytes":
+		if value < 0 {
+			return "-" + format.BinarySize(-value)
+		}
+		return format.BinarySize(value)
+	default:
+		return strconv.FormatInt(value, 10)
+	}
 }
 
 func missingInstanceResult(command, name string, err error) (commandResult, error) {

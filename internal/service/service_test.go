@@ -11,12 +11,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"srv/internal/config"
+	"srv/internal/format"
 	"srv/internal/model"
 	"srv/internal/provision"
 	"srv/internal/store"
@@ -28,6 +31,7 @@ func TestAuthorize(t *testing.T) {
 	tests := []struct {
 		name         string
 		allowedUsers []string
+		adminUsers   []string
 		actor        model.Actor
 		command      string
 		wantAllowed  bool
@@ -57,11 +61,26 @@ func TestAuthorize(t *testing.T) {
 			wantAllowed:  false,
 			wantReason:   "alice@example.com is not in SRV_ALLOWED_USERS",
 		},
+		{
+			name:        "status requires admin",
+			actor:       actor,
+			command:     "status",
+			wantAllowed: false,
+			wantReason:  "alice@example.com is not in SRV_ADMIN_USERS",
+		},
+		{
+			name:        "status allows admin",
+			adminUsers:  []string{"alice@example.com"},
+			actor:       actor,
+			command:     "status",
+			wantAllowed: true,
+			wantReason:  "alice@example.com allowed to run status as admin",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			app := &App{cfg: config.Config{AllowedUsers: tt.allowedUsers}}
+			app := &App{cfg: config.Config{AllowedUsers: tt.allowedUsers, AdminUsers: tt.adminUsers}}
 			allowed, reason := app.authorize(tt.actor, tt.command)
 			if allowed != tt.wantAllowed {
 				t.Fatalf("authorize() allowed = %v, want %v", allowed, tt.wantAllowed)
@@ -179,6 +198,160 @@ func TestCmdListJSONReturnsStructuredInstances(t *testing.T) {
 	got := payload.Instances[0]
 	if got.Name != "alpha" || got.State != model.StateReady || got.VCPUCount != 2 || got.MemoryMiB != 2048 || got.RootFSSizeBytes != 4<<30 || got.TailscaleIP != "100.64.0.10" || got.TailscaleName != "alpha.tailnet" {
 		t.Fatalf("cmdList(json) instance = %#v", got)
+	}
+}
+
+func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadServiceTestConfig(t, nil)
+	cfg.AdminUsers = []string{"ops@example.com"}
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatalf("provision.New(): %v", err)
+	}
+	app := &App{
+		cfg:         cfg,
+		log:         logger,
+		store:       st,
+		provisioner: prov,
+	}
+
+	ready := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC))
+	ready.FirecrackerPID = os.Getpid()
+	stopped := serviceTestInstance("beta", model.StateStopped, ready.CreatedAt.Add(time.Minute))
+	failed := serviceTestInstance("gamma", model.StateFailed, ready.CreatedAt.Add(2*time.Minute))
+	failed.RootFSPath = filepath.Join(cfg.InstancesDir(), failed.Name, "rootfs.img")
+	failed.RootFSSizeBytes = 2 << 30
+	failedAllocated := writeSparseServiceTestFile(t, failed.RootFSPath, failed.RootFSSizeBytes)
+	deleting := serviceTestInstance("epsilon", model.StateDeleting, ready.CreatedAt.Add(3*time.Minute))
+	deleting.RootFSPath = filepath.Join(cfg.InstancesDir(), deleting.Name, "rootfs.img")
+	deleting.RootFSSizeBytes = 2 << 30
+	deletingAllocated := writeSparseServiceTestFile(t, deleting.RootFSPath, deleting.RootFSSizeBytes)
+	deleted := serviceTestInstance("delta", model.StateDeleted, ready.CreatedAt.Add(3*time.Minute))
+	deleted.RootFSPath = filepath.Join(cfg.InstancesDir(), deleted.Name, "rootfs.img")
+	deleted.RootFSSizeBytes = 2 << 30
+	deletedAllocated := writeSparseServiceTestFile(t, deleted.RootFSPath, deleted.RootFSSizeBytes)
+	deletedAt := deleted.CreatedAt.Add(time.Minute)
+	deleted.DeletedAt = &deletedAt
+	expectedDiskAllocated := ready.RootFSSizeBytes + stopped.RootFSSizeBytes + failedAllocated + deletingAllocated + deletedAllocated
+
+	for _, inst := range []model.Instance{ready, stopped, failed, deleting, deleted} {
+		if err := st.CreateInstance(ctx, inst); err != nil {
+			t.Fatalf("CreateInstance(%s): %v", inst.Name, err)
+		}
+	}
+
+	result, err := app.cmdStatus(ctx, model.Actor{UserLogin: "ops@example.com"}, []string{"status"}, outputFormatText)
+	if err != nil {
+		t.Fatalf("cmdStatus(): %v", err)
+	}
+	if result.exitCode != 0 {
+		t.Fatalf("cmdStatus() exitCode = %d, want 0", result.exitCode)
+	}
+	for _, want := range []string{
+		"server: srv\n",
+		"instances: 4 total, 1 running, 1 stopped, 1 failed, 1 deleting\n",
+		"capacity\n",
+		"RESOURCE",
+		"ALLOCATED",
+		"BUDGET",
+		"LEFT",
+		"cpu",
+		"memory",
+		"disk",
+		"advisory only; overcommit allowed",
+		format.BinarySize(expectedDiskAllocated),
+	} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("cmdStatus() stdout missing %q\nfull output:\n%s", want, result.stdout)
+		}
+	}
+	if strings.Contains(result.stdout, "\nready:") {
+		t.Fatalf("cmdStatus() included duplicated state block\nfull output:\n%s", result.stdout)
+	}
+}
+
+func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadServiceTestConfig(t, nil)
+	cfg.AdminUsers = []string{"ops@example.com"}
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatalf("provision.New(): %v", err)
+	}
+	app := &App{
+		cfg:         cfg,
+		log:         logger,
+		store:       st,
+		provisioner: prov,
+	}
+
+	ready := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC))
+	ready.FirecrackerPID = os.Getpid()
+	stopped := serviceTestInstance("beta", model.StateStopped, ready.CreatedAt.Add(time.Minute))
+	failed := serviceTestInstance("gamma", model.StateFailed, ready.CreatedAt.Add(2*time.Minute))
+	failed.RootFSPath = filepath.Join(cfg.InstancesDir(), failed.Name, "rootfs.img")
+	failed.RootFSSizeBytes = 2 << 30
+	failedAllocated := writeSparseServiceTestFile(t, failed.RootFSPath, failed.RootFSSizeBytes)
+	deleting := serviceTestInstance("epsilon", model.StateDeleting, ready.CreatedAt.Add(3*time.Minute))
+	deleting.RootFSPath = filepath.Join(cfg.InstancesDir(), deleting.Name, "rootfs.img")
+	deleting.RootFSSizeBytes = 2 << 30
+	deletingAllocated := writeSparseServiceTestFile(t, deleting.RootFSPath, deleting.RootFSSizeBytes)
+	deleted := serviceTestInstance("delta", model.StateDeleted, ready.CreatedAt.Add(3*time.Minute))
+	deleted.RootFSPath = filepath.Join(cfg.InstancesDir(), deleted.Name, "rootfs.img")
+	deleted.RootFSSizeBytes = 2 << 30
+	deletedAllocated := writeSparseServiceTestFile(t, deleted.RootFSPath, deleted.RootFSSizeBytes)
+	deletedAt := deleted.CreatedAt.Add(time.Minute)
+	deleted.DeletedAt = &deletedAt
+	expectedDiskAllocated := ready.RootFSSizeBytes + stopped.RootFSSizeBytes + failedAllocated + deletingAllocated + deletedAllocated
+
+	for _, inst := range []model.Instance{ready, stopped, failed, deleting, deleted} {
+		if err := st.CreateInstance(ctx, inst); err != nil {
+			t.Fatalf("CreateInstance(%s): %v", inst.Name, err)
+		}
+	}
+
+	result, err := app.cmdStatus(ctx, model.Actor{UserLogin: "ops@example.com"}, []string{"status"}, outputFormatJSON)
+	if err != nil {
+		t.Fatalf("cmdStatus(json): %v", err)
+	}
+
+	var payload statusResponseJSON
+	if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(cmdStatus): %v\noutput:\n%s", err, result.stdout)
+	}
+	if payload.Hostname != "srv" {
+		t.Fatalf("status hostname = %q, want %q", payload.Hostname, "srv")
+	}
+	if payload.Instances.Total != 4 || payload.Instances.Running != 1 || payload.Instances.Stopped != 1 || payload.Instances.Failed != 1 {
+		t.Fatalf("status instances = %#v", payload.Instances)
+	}
+	if payload.Instances.ByState[model.StateReady] != 1 || payload.Instances.ByState[model.StateStopped] != 1 || payload.Instances.ByState[model.StateFailed] != 1 || payload.Instances.ByState[model.StateDeleting] != 1 {
+		t.Fatalf("status by_state = %#v", payload.Instances.ByState)
+	}
+	if _, ok := payload.Instances.ByState[model.StateDeleted]; ok {
+		t.Fatalf("status by_state unexpectedly included deleted state: %#v", payload.Instances.ByState)
+	}
+
+	resources := make(map[string]statusResourceJSON, len(payload.Capacity))
+	for _, resource := range payload.Capacity {
+		resources[resource.Resource] = resource
+	}
+	cpu := resources["cpu"]
+	if cpu.Allocated != 2 || cpu.Budget != int64(runtime.NumCPU()) || cpu.Left != cpu.Budget-cpu.Allocated || !cpu.Advisory {
+		t.Fatalf("cpu status = %#v", cpu)
+	}
+	memory := resources["memory"]
+	if memory.Allocated != 2048*mib || memory.Reserve != 512*mib || memory.Budget != max(memory.Total-memory.Reserve, int64(0)) || memory.Left != memory.Budget-memory.Allocated {
+		t.Fatalf("memory status = %#v", memory)
+	}
+	disk := resources["disk"]
+	if disk.Allocated != expectedDiskAllocated || disk.Reserve != 1<<30 || disk.Budget != max(disk.Total-disk.Reserve, int64(0)) || disk.Left != disk.Budget-disk.Allocated {
+		t.Fatalf("disk status = %#v", disk)
 	}
 }
 
@@ -561,22 +734,23 @@ func TestEnsureHostSignerPersistsKey(t *testing.T) {
 func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
 	for _, want := range []string{
-		"usage: ssh srv [--json] <command>",
-		"new <name>",
-		"resize <name>",
+		"ssh srv [--json] <command>",
+		"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]",
+		"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]",
 		"backup create <name>",
 		"backup list <name>",
 		"export <name>",
 		"import",
-		"logs <name> [target]",
+		"logs <name> [serial|firecracker]",
 		"logs -f <name> <target>",
+		"status",
 		"restore <name> <backup-id>",
 		"start <name>",
 		"stop <name>",
 		"restart <name>",
-		"global options:",
+		"GLOBAL OPTIONS",
 		"--json",
-		"new and resize options:",
+		"NEW AND RESIZE OPTIONS",
 		"--cpus N",
 		"--ram SIZE",
 		"--rootfs-size SIZE",
@@ -1388,4 +1562,26 @@ func serviceTestInstance(name, state string, createdAt time.Time) model.Instance
 		GuestAddr:       "172.28.0.2/30",
 		GatewayAddr:     "172.28.0.1",
 	}
+}
+
+func writeSparseServiceTestFile(t *testing.T, path string, size int64) int64 {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte("payload"), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+	if err := os.Truncate(path, size); err != nil {
+		t.Fatalf("Truncate(%q): %v", path, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(%q): %v", path, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("Stat(%q) sys = %T, want *syscall.Stat_t", path, info.Sys())
+	}
+	return stat.Blocks * 512
 }

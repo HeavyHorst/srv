@@ -77,8 +77,10 @@ ssh srv new demo --cpus 4 --ram 8G --rootfs-size 20G
 
 # inspect and logs
 ssh srv list
+ssh srv status
 ssh srv inspect demo
 ssh srv -- --json list
+ssh srv -- --json status
 ssh srv -- --json inspect demo
 ssh srv logs demo
 ssh srv logs demo serial
@@ -93,6 +95,7 @@ ssh srv restart demo
 ssh srv delete demo
 
 # host-local snapshot barrier
+ssh srv status
 ssh srv snapshot create
 
 # stopped-VM backups
@@ -116,6 +119,8 @@ Per-VM backup and restore is currently an in-place stopped-instance workflow: cr
 Because the guest's durable Tailscale identity lives in the copied rootfs, treat this as cutover or move semantics, not cloning semantics: do not boot the source and imported copies at the same time.
 
 `snapshot create` is a separate host-local disaster-recovery primitive. It briefly blocks all SSH commands, checkpoints SQLite, flushes the filesystem, and creates a readonly btrfs snapshot of `SRV_DATA_DIR` under `SRV_DATA_DIR/.snapshots/<timestamp>`. The semantics are intentionally simple: control-plane consistent, stopped guests fully safe, and running guests crash-consistent only.
+
+`status` is an admin-only host summary. It reports instance counts plus host CPU, memory, and disk allocation headroom. CPU is intentionally advisory so hosts can be overcommitted; memory and disk reflect the same reservation budgets that gate `new`, `start`, and grow-style `resize`.
 
 ## Host Requirements
 

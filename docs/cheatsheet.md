@@ -14,6 +14,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 |---------|-------------|
 | `new <name>` | Create new VM with optional `--cpus`, `--ram`, `--rootfs-size` |
 | `list` | Show all VMs |
+| `status` | Admin-only host capacity and allocation summary |
 | `inspect <name>` | Show VM details and status |
 | `logs <name>` | View serial or firecracker logs |
 | `start <name>` | Start a stopped VM |
@@ -30,6 +31,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 ```bash
 # Create VM
 ssh srv new demo
+ssh srv status
 ssh srv -- --json inspect demo
 
 # With sizing

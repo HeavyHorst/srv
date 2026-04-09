@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,7 @@ var (
 		}
 		return strings.TrimSpace(string(output)), nil
 	}
+	removePathAll    = os.RemoveAll
 	reflinkCloneFile = func(ctx context.Context, src, dest string) error {
 		cmd := exec.CommandContext(ctx, "cp", "--reflink=always", src, dest)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -97,6 +99,32 @@ type CreateOptions struct {
 	VCPUCount       int64
 	MemoryMiB       int64
 	RootFSSizeBytes int64
+}
+
+type CapacitySummary struct {
+	Hostname  string             `json:"hostname"`
+	Instances CapacityInstances  `json:"instances"`
+	Capacity  []CapacityResource `json:"capacity"`
+}
+
+type CapacityInstances struct {
+	Total   int            `json:"total"`
+	Running int            `json:"running"`
+	Stopped int            `json:"stopped"`
+	Failed  int            `json:"failed"`
+	ByState map[string]int `json:"by_state,omitempty"`
+}
+
+type CapacityResource struct {
+	Resource  string `json:"resource"`
+	Unit      string `json:"unit"`
+	Allocated int64  `json:"allocated"`
+	Budget    int64  `json:"budget"`
+	Left      int64  `json:"left"`
+	Total     int64  `json:"total,omitempty"`
+	Reserve   int64  `json:"reserve,omitempty"`
+	Advisory  bool   `json:"advisory,omitempty"`
+	Note      string `json:"note,omitempty"`
 }
 
 func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner, error) {
@@ -341,7 +369,13 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 		p.log.Warn("cleanup networking", "name", inst.Name, "err", err)
 	}
 	if err := p.removeInstanceDir(inst.Name); err != nil {
-		p.log.Warn("remove instance directory", "name", inst.Name, "err", err)
+		inst.LastError = fmt.Sprintf("delete failed: %v", err)
+		inst.UpdatedAt = time.Now().UTC()
+		if updateErr := p.store.UpdateInstance(ctx, inst); updateErr != nil {
+			return inst, fmt.Errorf("remove instance directory for %q: %w (also failed to persist delete error: %v)", name, err, updateErr)
+		}
+		p.recordEvent(inst.ID, "delete", "instance delete failed before disk cleanup completed", map[string]any{"error": err.Error()})
+		return inst, fmt.Errorf("remove instance directory for %q: %w", name, err)
 	}
 	if p.tsClient != nil {
 		if device, ok, err := p.findDevice(ctx, inst.Name); err == nil && ok {
@@ -799,6 +833,9 @@ func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
 	if inst.State == model.StateDeleted {
 		return fmt.Errorf("instance %q is deleted", inst.Name)
 	}
+	if inst.State == model.StateDeleting {
+		return fmt.Errorf("instance %q is being deleted", inst.Name)
+	}
 	if p.tsClient == nil {
 		return errors.New("start requires TS_TAILNET and TS_CLIENT_SECRET so the control plane can observe guest tailnet readiness")
 	}
@@ -840,6 +877,105 @@ func (p *Provisioner) rootFSSize(path string) (int64, error) {
 		return 0, fmt.Errorf("stat rootfs %s: %w", path, err)
 	}
 	return info.Size(), nil
+}
+
+func (p *Provisioner) CapacitySummary(ctx context.Context) (CapacitySummary, error) {
+	if p == nil || p.store == nil {
+		return CapacitySummary{}, errors.New("provisioner is unavailable")
+	}
+
+	instances, err := p.store.ListInstances(ctx, false)
+	if err != nil {
+		return CapacitySummary{}, fmt.Errorf("list instances: %w", err)
+	}
+
+	stateCounts := make(map[string]int)
+	var runningCount int
+	var allocatedVCPUs int64
+	var allocatedMemoryBytes int64
+	for _, inst := range instances {
+		stateCounts[inst.State]++
+		if instanceReservesHostMemory(inst) {
+			runningCount++
+			allocatedVCPUs += p.effectiveVCPUCount(inst)
+			allocatedMemoryBytes += p.effectiveMemoryMiB(inst) * miB
+		}
+	}
+
+	readHostMemoryBytes := p.readHostMemoryBytes
+	if readHostMemoryBytes == nil {
+		readHostMemoryBytes = defaultReadHostMemoryBytes
+	}
+	totalMemoryBytes, err := readHostMemoryBytes()
+	if err != nil {
+		return CapacitySummary{}, fmt.Errorf("read host memory status: %w", err)
+	}
+	memoryReserveBytes := hostMemoryReserveMiB * miB
+	memoryBudgetBytes := max(totalMemoryBytes-memoryReserveBytes, int64(0))
+
+	statusFilesystemPath := p.cfg.InstancesDir()
+	if _, statErr := os.Stat(statusFilesystemPath); errors.Is(statErr, os.ErrNotExist) {
+		statusFilesystemPath = p.cfg.DataDirAbs()
+	}
+	readFilesystemBytes := p.readFilesystemBytes
+	if readFilesystemBytes == nil {
+		readFilesystemBytes = defaultReadFilesystemBytes
+	}
+	totalDiskBytes, err := readFilesystemBytes(statusFilesystemPath)
+	if err != nil {
+		return CapacitySummary{}, fmt.Errorf("read filesystem status for %s: %w", statusFilesystemPath, err)
+	}
+	allocatedDiskBytes, err := p.sumReservedCapacity(ctx, "", "disk", true, func(inst model.Instance) int64 {
+		return reservedInstanceRootFSBytes(inst)
+	})
+	if err != nil {
+		return CapacitySummary{}, err
+	}
+	diskBudgetBytes := max(totalDiskBytes-hostDiskReserveBytes, int64(0))
+
+	hostCPUs := int64(runtime.NumCPU())
+	return CapacitySummary{
+		Hostname: p.cfg.Hostname,
+		Instances: CapacityInstances{
+			Total:   len(instances),
+			Running: runningCount,
+			Stopped: stateCounts[model.StateStopped],
+			Failed:  stateCounts[model.StateFailed],
+			ByState: stateCounts,
+		},
+		Capacity: []CapacityResource{
+			{
+				Resource:  "cpu",
+				Unit:      "vcpu",
+				Allocated: allocatedVCPUs,
+				Budget:    hostCPUs,
+				Left:      hostCPUs - allocatedVCPUs,
+				Total:     hostCPUs,
+				Advisory:  true,
+				Note:      "advisory only; overcommit allowed",
+			},
+			{
+				Resource:  "memory",
+				Unit:      "bytes",
+				Allocated: allocatedMemoryBytes,
+				Budget:    memoryBudgetBytes,
+				Left:      memoryBudgetBytes - allocatedMemoryBytes,
+				Total:     totalMemoryBytes,
+				Reserve:   memoryReserveBytes,
+				Note:      fmt.Sprintf("%s total - %s host reserve", format.BinarySize(totalMemoryBytes), format.BinarySize(memoryReserveBytes)),
+			},
+			{
+				Resource:  "disk",
+				Unit:      "bytes",
+				Allocated: allocatedDiskBytes,
+				Budget:    diskBudgetBytes,
+				Left:      diskBudgetBytes - allocatedDiskBytes,
+				Total:     totalDiskBytes,
+				Reserve:   hostDiskReserveBytes,
+				Note:      fmt.Sprintf("%s total - %s host reserve", format.BinarySize(totalDiskBytes), format.BinarySize(hostDiskReserveBytes)),
+			},
+		},
+	}, nil
 }
 
 func (p *Provisioner) ensureHostMemoryCapacity(ctx context.Context, excludeName string, requestedMemoryMiB int64) error {
@@ -926,7 +1062,7 @@ func instanceReservesHostMemory(inst model.Instance) bool {
 }
 
 func reservedInstanceRootFSBytes(inst model.Instance) int64 {
-	if inst.State == model.StateDeleted || inst.State == model.StateFailed {
+	if inst.State == model.StateDeleted || inst.State == model.StateDeleting || inst.State == model.StateFailed {
 		return allocatedFileBytes(inst.RootFSPath)
 	}
 	if inst.RootFSSizeBytes > 0 {
@@ -1164,7 +1300,7 @@ func (p *Provisioner) removeInstanceDir(name string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.RemoveAll(instanceDir); err != nil {
+	if err := removePathAll(instanceDir); err != nil {
 		return fmt.Errorf("remove instance directory %s: %w", instanceDir, err)
 	}
 	return nil
@@ -1349,7 +1485,7 @@ func hasTailnetIdentity(inst model.Instance) bool {
 
 func shouldAutoStartAfterStartup(inst model.Instance) bool {
 	switch inst.State {
-	case model.StateDeleted, model.StateFailed, model.StateStopped:
+	case model.StateDeleted, model.StateDeleting, model.StateFailed, model.StateStopped:
 		return false
 	default:
 		return true

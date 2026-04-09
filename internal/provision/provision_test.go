@@ -170,6 +170,68 @@ func TestRemoveInstanceDirDeletesOnlyCanonicalPath(t *testing.T) {
 	}
 }
 
+func TestDeleteDoesNotMarkInstanceDeletedWhenDiskCleanupFails(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:      cfg,
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:    st,
+		vmRunner: noopVMRunner{},
+	}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(instance dir): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("vm"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	oldRemovePathAll := removePathAll
+	removePathAll = func(string) error {
+		return errors.New("disk busy")
+	}
+	t.Cleanup(func() {
+		removePathAll = oldRemovePathAll
+	})
+
+	deletedInst, err := p.Delete(ctx, inst.Name)
+	if err == nil || !strings.Contains(err.Error(), `remove instance directory for "demo"`) {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if deletedInst.State != model.StateDeleting {
+		t.Fatalf("Delete() state = %q, want %q", deletedInst.State, model.StateDeleting)
+	}
+	if deletedInst.DeletedAt != nil {
+		t.Fatalf("Delete() DeletedAt = %v, want nil", deletedInst.DeletedAt)
+	}
+	if !strings.Contains(deletedInst.LastError, "delete failed:") {
+		t.Fatalf("Delete() LastError = %q", deletedInst.LastError)
+	}
+
+	stored, getErr := st.GetInstance(ctx, inst.Name)
+	if getErr != nil {
+		t.Fatalf("GetInstance(): %v", getErr)
+	}
+	if stored.State != model.StateDeleting {
+		t.Fatalf("stored state = %q, want %q", stored.State, model.StateDeleting)
+	}
+	if stored.DeletedAt != nil {
+		t.Fatalf("stored DeletedAt = %v, want nil", stored.DeletedAt)
+	}
+	if !strings.Contains(stored.LastError, "delete failed:") {
+		t.Fatalf("stored LastError = %q", stored.LastError)
+	}
+	if _, statErr := os.Stat(inst.RootFSPath); statErr != nil {
+		t.Fatalf("rootfs should remain after failed delete, stat err = %v", statErr)
+	}
+}
+
 func TestAllocateNetworkSkipsDeletedSubnetsAndDetectsExhaustion(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, map[string]string{
@@ -1653,6 +1715,16 @@ func TestEnsureStartPrereqsAllowsStoppedInstanceWithoutStoredTailnetIdentity(t *
 	}
 }
 
+func TestEnsureStartPrereqsRejectsDeletingInstance(t *testing.T) {
+	cfg := loadProvisionTestConfig(t, nil)
+	p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
+	inst := provisionTestInstance(cfg, "demo", model.StateDeleting, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+
+	if err := p.ensureStartPrereqs(inst); err == nil || !strings.Contains(err.Error(), `instance "demo" is being deleted`) {
+		t.Fatalf("ensureStartPrereqs() error = %v", err)
+	}
+}
+
 func TestStartRejectsWhenHostMemoryIsLow(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
@@ -1924,7 +1996,7 @@ func TestResizeRejectsGrowingRootFSWhenHostDiskSpaceIsLow(t *testing.T) {
 	}
 }
 
-func TestReservedInstanceRootFSBytesUsesAllocatedBytesForDeletedInstances(t *testing.T) {
+func TestReservedInstanceRootFSBytesUsesAllocatedBytesForDeletedAndDeletingInstances(t *testing.T) {
 	rootfsPath := filepath.Join(t.TempDir(), "rootfs.img")
 	if err := os.WriteFile(rootfsPath, []byte("payload"), 0o644); err != nil {
 		t.Fatalf("WriteFile(rootfs): %v", err)
@@ -1942,13 +2014,15 @@ func TestReservedInstanceRootFSBytesUsesAllocatedBytesForDeletedInstances(t *tes
 		t.Fatalf("Stat(rootfs) sys = %T, want *syscall.Stat_t", info.Sys())
 	}
 
-	inst := model.Instance{
-		State:           model.StateDeleted,
-		RootFSPath:      rootfsPath,
-		RootFSSizeBytes: 64 * miB,
-	}
-	if got, want := reservedInstanceRootFSBytes(inst), st.Blocks*512; got != want {
-		t.Fatalf("reservedInstanceRootFSBytes() = %d, want %d", got, want)
+	for _, state := range []string{model.StateDeleted, model.StateDeleting} {
+		inst := model.Instance{
+			State:           state,
+			RootFSPath:      rootfsPath,
+			RootFSSizeBytes: 64 * miB,
+		}
+		if got, want := reservedInstanceRootFSBytes(inst), st.Blocks*512; got != want {
+			t.Fatalf("reservedInstanceRootFSBytes(%q) = %d, want %d", state, got, want)
+		}
 	}
 }
 
@@ -2063,6 +2137,7 @@ func TestShouldAutoStartAfterStartup(t *testing.T) {
 		{state: model.StateAwaitingTailnet, want: true},
 		{state: model.StateStopped, want: false},
 		{state: model.StateFailed, want: false},
+		{state: model.StateDeleting, want: false},
 		{state: model.StateDeleted, want: false},
 	}
 	for _, tt := range tests {
@@ -2213,5 +2288,15 @@ func (r panicVMRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (
 
 func (r panicVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {
 	r.t.Fatalf("StopInstanceVM() should not be called")
+	return nil
+}
+
+type noopVMRunner struct{}
+
+func (noopVMRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (vmrunner.StartResponse, error) {
+	return vmrunner.StartResponse{}, nil
+}
+
+func (noopVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {
 	return nil
 }

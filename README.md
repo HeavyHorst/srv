@@ -182,7 +182,7 @@ The current Arch guest image expects a boot-time service that reads MMDS, sets t
 
 ## Docs
 
-- [`docs/operations.md`](docs/operations.md): backup, restore, rebuild, upgrade, rollback, and host hardening
+- [`docs/reference/operations.md`](docs/reference/operations.md): backup, restore, rebuild, upgrade, rollback, and host hardening
 - [`contrib/smoke/README.md`](contrib/smoke/README.md): smoke-test prerequisites, behavior, overrides, and artifacts
 - [`docs/cheatsheet.md`](docs/cheatsheet.md): operator command reference
 - [`images/arch-base/README.md`](images/arch-base/README.md): guest image builder and overlay details

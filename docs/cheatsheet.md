@@ -13,7 +13,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | Command | Description |
 |---------|-------------|
 | `new <name>` | Create new VM with optional `--cpus`, `--ram`, `--rootfs-size` |
-| `list` | Show all VMs |
+| `list` | Show visible VMs (all for admins, own for regular users) |
 | `status` | Admin-only host capacity and allocation summary |
 | `inspect <name>` | Show VM details and status |
 | `logs <name>` | View serial or firecracker logs |
@@ -21,7 +21,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | `stop <name>` | Stop VM (graceful shutdown) |
 | `restart <name>` | Restart VM |
 | `delete <name>` | Remove VM |
-| `resize <name>` | Resize stopped VM (grow-only) |
+| `resize <name>` | Resize stopped VM (CPU/RAM up or down, rootfs grow-only) |
 | `backup create <name>` | Create an in-place backup for a stopped VM |
 | `backup list <name>` | List stored backups for a VM |
 | `restore <name> <backup-id>` | Restore a stopped VM from one of its backups |
@@ -145,7 +145,7 @@ cat /sys/fs/cgroup/firecracker-vms/<name>/memory.max
 
 - VM disks at: `SRV_DATA_DIR/instances/<name>/rootfs.img`
 - VM backups live at: `SRV_DATA_DIR/backups/<name>/<backup-id>/`
-- Resize is grow-only (shrink rejected)
+- Resize requires a stopped VM; CPU and RAM can go up or down within limits, but rootfs shrink is rejected
 - Resize only works on stopped VMs
 - Backup and restore only work on stopped VMs and only restore onto the original VM record, not a newly recreated VM with the same name
 - Creators manage their own VMs; admins manage all VMs

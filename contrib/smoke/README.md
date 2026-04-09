@@ -2,7 +2,7 @@
 
 `contrib/smoke/host-smoke.sh` is the repo's repeatable end-to-end validation path for a real prepared host.
 
-Treat it as the post-install, post-restore, and post-upgrade gate for the prepared-host path. The supported rebuild and upgrade workflows in [docs/operations.md](file:///home/rene/Code/srv/docs/operations.md) assume a clean smoke pass before the host is considered ready again.
+Treat it as the post-install, post-restore, and post-upgrade gate for the prepared-host path. The supported rebuild and upgrade workflows in [docs/reference/operations.md](../../docs/reference/operations.md) assume a clean smoke pass before the host is considered ready again.
 
 It is intentionally not part of `go test ./...`. The harness assumes:
 

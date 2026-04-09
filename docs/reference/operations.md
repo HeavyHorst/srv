@@ -1,4 +1,4 @@
-# Operations Runbook
+# Operations runbook
 
 This runbook is for the supported prepared-host path: systemd-managed `srv`, `srv-net-helper`, and `srv-vm-runner` on a Linux host with cgroup v2, `/dev/kvm`, `SRV_DATA_DIR` on a reflink-capable filesystem such as `btrfs` or reflink-enabled `xfs`, `SRV_BASE_ROOTFS` on the same filesystem, and the official static Firecracker/jailer release pair.
 
@@ -149,7 +149,7 @@ Rollback for control-plane or schema regressions is restore-based:
 
 ### Kernel Rollout For Existing Guests
 
-1. Rebuild the kernel artifact under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
+1. Rebuild the kernel artifact under [images/arch-base/](../../images/arch-base/README.md).
 2. Update `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` in `/etc/srv/srv.env`.
 3. Restart the units if needed so the runner sees the new base paths.
 4. Stop and start guests one at a time, or let already stopped guests pick up the new boot artifacts on their next `start`.
@@ -159,7 +159,7 @@ Rollback is just pointing `SRV_BASE_KERNEL` or `SRV_BASE_INITRD` back to the pre
 
 ### Golden Rootfs Rollout
 
-1. Rebuild `rootfs-base.img` under [images/arch-base/](file:///home/rene/Code/srv/images/arch-base/README.md).
+1. Rebuild `rootfs-base.img` under [images/arch-base/](../../images/arch-base/README.md).
 2. Point `SRV_BASE_ROOTFS` at the new image.
 3. Create a canary guest with `ssh srv new <name>` and validate it.
 4. After the canary passes, new guests will clone from the new base image.

@@ -95,7 +95,7 @@ func TestCmdListFormatsVisibleInstances(t *testing.T) {
 		}
 	}
 
-	result, err := app.cmdList(ctx, model.Actor{UserLogin: "alice@example.com"})
+	result, err := app.cmdList(ctx, model.Actor{UserLogin: "alice@example.com"}, outputFormatText)
 	if err != nil {
 		t.Fatalf("cmdList(): %v", err)
 	}
@@ -133,7 +133,7 @@ func TestCmdListAdminSeesAllVisibleInstances(t *testing.T) {
 		}
 	}
 
-	result, err := app.cmdList(ctx, model.Actor{UserLogin: "ops@example.com"})
+	result, err := app.cmdList(ctx, model.Actor{UserLogin: "ops@example.com"}, outputFormatText)
 	if err != nil {
 		t.Fatalf("cmdList(): %v", err)
 	}
@@ -143,6 +143,42 @@ func TestCmdListAdminSeesAllVisibleInstances(t *testing.T) {
 	}
 	if got := rows["beta"]; len(got) < 2 || got[1] != "stopped" {
 		t.Fatalf("cmdList() beta row = %v\nfull output:\n%s", got, result.stdout)
+	}
+}
+
+func TestCmdListJSONReturnsStructuredInstances(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:   config.Config{Hostname: "srv"},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+	}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.TailscaleIP = "100.64.0.10"
+	inst.TailscaleName = "alpha.tailnet"
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	result, err := app.cmdList(ctx, model.Actor{UserLogin: "alice@example.com"}, outputFormatJSON)
+	if err != nil {
+		t.Fatalf("cmdList(json): %v", err)
+	}
+
+	var payload struct {
+		Instances []instanceSummaryJSON `json:"instances"`
+	}
+	if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(cmdList): %v\noutput:\n%s", err, result.stdout)
+	}
+	if len(payload.Instances) != 1 {
+		t.Fatalf("cmdList(json) instances = %#v", payload.Instances)
+	}
+	got := payload.Instances[0]
+	if got.Name != "alpha" || got.State != model.StateReady || got.VCPUCount != 2 || got.MemoryMiB != 2048 || got.RootFSSizeBytes != 4<<30 || got.TailscaleIP != "100.64.0.10" || got.TailscaleName != "alpha.tailnet" {
+		t.Fatalf("cmdList(json) instance = %#v", got)
 	}
 }
 
@@ -187,7 +223,7 @@ func TestCmdBackupListFormatsBackupsAsTable(t *testing.T) {
 		t.Fatalf("WriteFile(manifest): %v", err)
 	}
 
-	result, err := app.cmdBackup(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"backup", "list", inst.Name})
+	result, err := app.cmdBackup(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"backup", "list", inst.Name}, outputFormatText)
 	if err != nil {
 		t.Fatalf("cmdBackup(list): %v", err)
 	}
@@ -199,6 +235,65 @@ func TestCmdBackupListFormatsBackupsAsTable(t *testing.T) {
 		if !strings.Contains(upperOutput, strings.ToUpper(want)) {
 			t.Fatalf("cmdBackup(list) stdout missing %q\nfull output:\n%s", want, result.stdout)
 		}
+	}
+}
+
+func TestCmdBackupListJSONReturnsStructuredBackups(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadServiceTestConfig(t, nil)
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatalf("provision.New(): %v", err)
+	}
+	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+
+	inst := serviceTestInstance("alpha", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.RootFSSizeBytes = 8 << 30
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	backupID := "20260331T120000.000000000Z"
+	backupDir := filepath.Join(cfg.BackupsDir(), inst.Name, backupID)
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(backup dir): %v", err)
+	}
+	manifest := map[string]any{
+		"version":    1,
+		"id":         backupID,
+		"created_at": inst.CreatedAt.Add(5 * time.Minute),
+		"instance":   inst,
+		"files": map[string]any{
+			"rootfs":          "rootfs.img",
+			"serial_log":      "serial.log",
+			"firecracker_log": "firecracker.log",
+		},
+	}
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("json.Marshal(manifest): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "manifest.json"), payload, 0o644); err != nil {
+		t.Fatalf("WriteFile(manifest): %v", err)
+	}
+
+	result, err := app.cmdBackup(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"backup", "list", inst.Name}, outputFormatJSON)
+	if err != nil {
+		t.Fatalf("cmdBackup(list json): %v", err)
+	}
+
+	var response backupListResponseJSON
+	if err := json.Unmarshal([]byte(result.stdout), &response); err != nil {
+		t.Fatalf("json.Unmarshal(cmdBackup): %v\noutput:\n%s", err, result.stdout)
+	}
+	if response.Instance != inst.Name || len(response.Backups) != 1 {
+		t.Fatalf("cmdBackup(list json) response = %#v", response)
+	}
+	backup := response.Backups[0]
+	if backup.ID != backupID || backup.RootFSSizeBytes != 8<<30 || !backup.HasSerialLog || !backup.HasFirecrackerLog {
+		t.Fatalf("cmdBackup(list json) backup = %#v", backup)
 	}
 }
 
@@ -278,7 +373,7 @@ func TestCmdInspectFormatsInstanceAndEvents(t *testing.T) {
 		t.Fatalf("RecordEvent: %v", err)
 	}
 
-	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name})
+	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name}, outputFormatText)
 	if err != nil {
 		t.Fatalf("cmdInspect(): %v", err)
 	}
@@ -309,6 +404,53 @@ func TestCmdInspectFormatsInstanceAndEvents(t *testing.T) {
 	}
 }
 
+func TestCmdInspectJSONReturnsStructuredInstanceAndEvents(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:   config.Config{Hostname: "srv", VCPUCount: 1, MemoryMiB: 1024},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+	}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.VCPUCount = 4
+	inst.MemoryMiB = 4096
+	inst.RootFSSizeBytes = 8 << 30
+	inst.TailscaleName = "alpha.tailnet"
+	inst.TailscaleIP = "100.64.0.10"
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if err := st.RecordEvent(ctx, model.InstanceEvent{
+		InstanceID: inst.ID,
+		CreatedAt:  inst.CreatedAt.Add(10 * time.Second),
+		Type:       "create",
+		Message:    "instance record created",
+	}); err != nil {
+		t.Fatalf("RecordEvent: %v", err)
+	}
+
+	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name}, outputFormatJSON)
+	if err != nil {
+		t.Fatalf("cmdInspect(json): %v", err)
+	}
+
+	var payload inspectResponseJSON
+	if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(cmdInspect): %v\noutput:\n%s", err, result.stdout)
+	}
+	if payload.Instance.Name != inst.Name || payload.Instance.State != model.StateReady || payload.Instance.VCPUCount != 4 || payload.Instance.MemoryMiB != 4096 || payload.Instance.RootFSSizeBytes != 8<<30 {
+		t.Fatalf("cmdInspect(json) instance = %#v", payload.Instance)
+	}
+	if payload.Instance.Logs.SerialCommand != "ssh srv logs alpha serial" || payload.Instance.Logs.FirecrackerCommand != "ssh srv logs alpha firecracker" {
+		t.Fatalf("cmdInspect(json) logs = %#v", payload.Instance.Logs)
+	}
+	if len(payload.Events) != 1 || payload.Events[0].Type != "create" || payload.Events[0].Message != "instance record created" {
+		t.Fatalf("cmdInspect(json) events = %#v", payload.Events)
+	}
+}
+
 func TestCmdInspectMissingInstanceReturnsFriendlyError(t *testing.T) {
 	app := &App{
 		cfg:   config.Config{Hostname: "srv"},
@@ -316,7 +458,7 @@ func TestCmdInspectMissingInstanceReturnsFriendlyError(t *testing.T) {
 		store: newServiceTestStore(t),
 	}
 
-	result, err := app.cmdInspect(context.Background(), model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", "missing"})
+	result, err := app.cmdInspect(context.Background(), model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", "missing"}, outputFormatText)
 	if err == nil {
 		t.Fatalf("cmdInspect() error = nil, want non-nil")
 	}
@@ -348,7 +490,7 @@ func TestCmdInspectHidesInstancesFromOtherUsers(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
-	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "bob@example.com"}, []string{"inspect", inst.Name})
+	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "bob@example.com"}, []string{"inspect", inst.Name}, outputFormatText)
 	if err == nil {
 		t.Fatalf("cmdInspect() error = nil, want non-nil")
 	}
@@ -374,7 +516,7 @@ func TestCmdInspectAwaitingTailnetPointsToSerialLog(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
-	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name})
+	result, err := app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name}, outputFormatText)
 	if err != nil {
 		t.Fatalf("cmdInspect(): %v", err)
 	}
@@ -419,6 +561,7 @@ func TestEnsureHostSignerPersistsKey(t *testing.T) {
 func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
 	for _, want := range []string{
+		"usage: ssh srv [--json] <command>",
 		"new <name>",
 		"resize <name>",
 		"backup create <name>",
@@ -431,6 +574,8 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 		"start <name>",
 		"stop <name>",
 		"restart <name>",
+		"global options:",
+		"--json",
 		"new and resize options:",
 		"--cpus N",
 		"--ram SIZE",
@@ -439,6 +584,75 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("helpResult() missing %q in %q", want, result.stdout)
 		}
+	}
+}
+
+func TestParseCommandRequestSupportsGlobalJSONFlag(t *testing.T) {
+	req, err := parseCommandRequest([]string{"--json", "inspect", "alpha"})
+	if err != nil {
+		t.Fatalf("parseCommandRequest(): %v", err)
+	}
+	if req.format != outputFormatJSON {
+		t.Fatalf("parseCommandRequest() format = %v, want %v", req.format, outputFormatJSON)
+	}
+	if !reflect.DeepEqual(req.args, []string{"inspect", "alpha"}) {
+		t.Fatalf("parseCommandRequest() args = %#v", req.args)
+	}
+}
+
+func TestMaybeUnsupportedJSONCommand(t *testing.T) {
+	tests := []struct {
+		name         string
+		command      string
+		format       outputFormat
+		wantRejected bool
+		wantStderr   string
+	}{
+		{name: "logs json rejected", command: "logs", format: outputFormatJSON, wantRejected: true, wantStderr: "logs does not support --json\n"},
+		{name: "export json rejected", command: "export", format: outputFormatJSON, wantRejected: true, wantStderr: "export does not support --json\n"},
+		{name: "import json rejected", command: "import", format: outputFormatJSON, wantRejected: true, wantStderr: "import does not support --json\n"},
+		{name: "snapshot json rejected", command: "snapshot", format: outputFormatJSON, wantRejected: true, wantStderr: "snapshot does not support --json\n"},
+		{name: "help json rejected", command: "help", format: outputFormatJSON, wantRejected: true, wantStderr: "help does not support --json\n"},
+		{name: "list json allowed", command: "list", format: outputFormatJSON, wantRejected: false},
+		{name: "logs text allowed", command: "logs", format: outputFormatText, wantRejected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err, rejected := maybeUnsupportedJSONCommand(tt.command, tt.format)
+			if rejected != tt.wantRejected {
+				t.Fatalf("maybeUnsupportedJSONCommand() rejected = %v, want %v", rejected, tt.wantRejected)
+			}
+			if !tt.wantRejected {
+				if err != nil {
+					t.Fatalf("maybeUnsupportedJSONCommand() unexpected error = %v", err)
+				}
+				if result != (commandResult{}) {
+					t.Fatalf("maybeUnsupportedJSONCommand() unexpected result = %#v", result)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("maybeUnsupportedJSONCommand() error = nil, want non-nil")
+			}
+			if result.exitCode != 2 || result.stderr != tt.wantStderr {
+				t.Fatalf("maybeUnsupportedJSONCommand() result = %#v, want stderr %q exitCode 2", result, tt.wantStderr)
+			}
+		})
+	}
+}
+
+func TestDispatchRejectsJSONHelp(t *testing.T) {
+	app := &App{}
+	result, err := app.dispatch(context.Background(), model.Actor{}, commandRequest{args: []string{"help"}, format: outputFormatJSON})
+	if err == nil {
+		t.Fatalf("dispatch(help json) error = nil, want non-nil")
+	}
+	if result.exitCode != 2 {
+		t.Fatalf("dispatch(help json) exitCode = %d, want 2", result.exitCode)
+	}
+	if result.stderr != "help does not support --json\n" {
+		t.Fatalf("dispatch(help json) stderr = %q", result.stderr)
 	}
 }
 
@@ -458,7 +672,7 @@ func TestCmdResizeUpdatesStoppedInstance(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
-	result, err := app.cmdResize(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"resize", inst.Name, "--cpus", "4", "--ram", "6G"})
+	result, err := app.cmdResize(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"resize", inst.Name, "--cpus", "4", "--ram", "6G"}, outputFormatText)
 	if err != nil {
 		t.Fatalf("cmdResize(): %v", err)
 	}
@@ -499,7 +713,7 @@ func TestCmdResizeDeniesOtherUsers(t *testing.T) {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
-	result, err := app.cmdResize(ctx, model.Actor{UserLogin: "bob@example.com"}, []string{"resize", inst.Name, "--cpus", "4"})
+	result, err := app.cmdResize(ctx, model.Actor{UserLogin: "bob@example.com"}, []string{"resize", inst.Name, "--cpus", "4"}, outputFormatText)
 	if err == nil {
 		t.Fatalf("cmdResize() error = nil, want non-nil")
 	}

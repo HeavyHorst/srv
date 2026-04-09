@@ -5,8 +5,10 @@ Quick reference for the srv control plane.
 ## Commands (via SSH)
 
 ```bash
-ssh srv <command> [args]
+ssh srv -- [--json] <command> [args]
 ```
+
+Use `--json` with the non-streaming instance and backup commands when you need machine-readable output.
 
 | Command | Description |
 |---------|-------------|
@@ -28,6 +30,7 @@ ssh srv <command> [args]
 ```bash
 # Create VM
 ssh srv new demo
+ssh srv -- --json inspect demo
 
 # With sizing
 ssh srv new demo --cpus 4 --ram 8G --rootfs-size 20G

@@ -11,6 +11,8 @@ Use `srv` to spawn isolated Firecracker microVMs for running code, debugging, an
 
 The `srv` service provides SSH-accessible VM management. Connect to the control plane via Tailscale SSH and create disposable VMs with configurable resources.
 
+Most non-streaming instance and backup commands also support a global `--json` flag. With OpenSSH, use `ssh srv -- --json <command> ...`, for example `ssh srv -- --json inspect <name>`. Prefer that when an agent needs stable machine-readable output.
+
 ## Prerequisites
 
 - Connected to the Tailscale tailnet where `srv` is running
@@ -36,6 +38,14 @@ ssh srv inspect <name>
 ```
 
 Returns a text summary with fields like `state`, `tailscale-name`, `tailscale-ip`, `vcpu-count`, and `memory-mib`.
+
+For automation or LLM-driven workflows, prefer:
+
+```bash
+ssh srv -- --json inspect <name>
+```
+
+That returns an `instance` object plus recent `events`, including `instance.state`, `instance.tailscale_ip`, and log commands under `instance.logs`.
 
 ### View VM logs
 
@@ -90,6 +100,12 @@ Backups are in-place stopped-VM snapshots of the writable rootfs and logs. Resto
 ssh srv list
 ```
 
+For machine-readable inventory output:
+
+```bash
+ssh srv -- --json list
+```
+
 ### Clean up
 
 ```bash
@@ -99,8 +115,8 @@ ssh srv delete <name>
 ## Debugging Workflow
 
 1. **Create**: `ssh srv new debug-vm --cpus 2 --ram 4G`
-2. **Wait for ready**: Poll `ssh srv inspect debug-vm` until state is `ready`
-3. **Connect**: `ssh root@<tailnet_ip>` from inspect output
+2. **Wait for ready**: Poll `ssh srv -- --json inspect debug-vm` until `instance.state` is `ready`
+3. **Connect**: `ssh root@<tailnet_ip>` using `instance.tailscale_ip` from the inspect JSON
 4. **Run code**: Execute commands inside the VM
 5. **Checkpoint if needed**: `ssh srv stop debug-vm && ssh srv backup create debug-vm && ssh srv start debug-vm`
 6. **Check logs**: If issues occur, `ssh srv logs debug-vm serial`
@@ -110,6 +126,7 @@ ssh srv delete <name>
 ## Tips for Agents
 
 - VMs boot quickly (seconds) but still need polling - check `inspect` until state transitions to `ready`
+- Prefer `ssh srv -- --json inspect <name>` and `ssh srv -- --json list` when another tool or agent needs to parse output reliably
 - Rootfs is writable and persists across stop/start cycles
 - Use stopped backups before risky debugging sessions that may leave the VM in a bad state
 - Use `resize` to give more resources to long-running analysis tasks

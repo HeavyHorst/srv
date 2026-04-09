@@ -68,6 +68,104 @@ type commandResult struct {
 	exitCode int
 }
 
+type outputFormat uint8
+
+const (
+	outputFormatText outputFormat = iota
+	outputFormatJSON
+)
+
+type commandRequest struct {
+	args   []string
+	format outputFormat
+}
+
+type commandActionJSON struct {
+	Action   string              `json:"action"`
+	Instance instanceSummaryJSON `json:"instance"`
+}
+
+type instanceSummaryJSON struct {
+	Name            string `json:"name"`
+	State           string `json:"state"`
+	VCPUCount       int64  `json:"vcpu_count,omitempty"`
+	MemoryMiB       int64  `json:"memory_mib,omitempty"`
+	RootFSSizeBytes int64  `json:"rootfs_size_bytes,omitempty"`
+	TailscaleName   string `json:"tailscale_name,omitempty"`
+	TailscaleIP     string `json:"tailscale_ip,omitempty"`
+	Connect         string `json:"connect,omitempty"`
+}
+
+type inspectResponseJSON struct {
+	Instance inspectInstanceJSON `json:"instance"`
+	Events   []inspectEventJSON  `json:"events"`
+}
+
+type inspectInstanceJSON struct {
+	Name            string          `json:"name"`
+	State           string          `json:"state"`
+	CreatedByUser   string          `json:"created_by_user,omitempty"`
+	CreatedByNode   string          `json:"created_by_node,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	VCPUCount       int64           `json:"vcpu_count,omitempty"`
+	MemoryMiB       int64           `json:"memory_mib,omitempty"`
+	RootFSPath      string          `json:"rootfs_path"`
+	RootFSSizeBytes int64           `json:"rootfs_size_bytes,omitempty"`
+	FirecrackerPID  int             `json:"firecracker_pid"`
+	TapDevice       string          `json:"tap_device,omitempty"`
+	NetworkCIDR     string          `json:"network_cidr,omitempty"`
+	HostIP          string          `json:"host_ip,omitempty"`
+	GuestIP         string          `json:"guest_ip,omitempty"`
+	ZenGateway      string          `json:"zen_gateway,omitempty"`
+	TailscaleName   string          `json:"tailscale_name,omitempty"`
+	TailscaleIP     string          `json:"tailscale_ip,omitempty"`
+	LastError       string          `json:"last_error,omitempty"`
+	DeletedAt       *time.Time      `json:"deleted_at,omitempty"`
+	Logs            inspectLogsJSON `json:"logs"`
+	DebugHint       string          `json:"debug_hint,omitempty"`
+}
+
+type inspectLogsJSON struct {
+	SerialCommand      string `json:"serial_command"`
+	FirecrackerCommand string `json:"firecracker_command"`
+}
+
+type inspectEventJSON struct {
+	CreatedAt time.Time `json:"created_at"`
+	Type      string    `json:"type"`
+	Message   string    `json:"message"`
+}
+
+type backupJSON struct {
+	ID                string    `json:"id"`
+	Name              string    `json:"name,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	Path              string    `json:"path,omitempty"`
+	RootFSSizeBytes   int64     `json:"rootfs_size_bytes,omitempty"`
+	VCPUCount         int64     `json:"vcpu_count,omitempty"`
+	MemoryMiB         int64     `json:"memory_mib,omitempty"`
+	HasSerialLog      bool      `json:"has_serial_log"`
+	HasFirecrackerLog bool      `json:"has_firecracker_log"`
+}
+
+type backupCreateResponseJSON struct {
+	Action   string     `json:"action"`
+	Instance string     `json:"instance"`
+	Backup   backupJSON `json:"backup"`
+}
+
+type backupListResponseJSON struct {
+	Instance string       `json:"instance"`
+	Backups  []backupJSON `json:"backups"`
+}
+
+type restoreResponseJSON struct {
+	Action   string              `json:"action"`
+	Instance instanceSummaryJSON `json:"instance"`
+	Backup   backupJSON          `json:"backup"`
+}
+
 type logTarget string
 
 type logsRequest struct {
@@ -105,6 +203,117 @@ const (
 type terminalSafeWriter struct {
 	dst   io.Writer
 	state terminalWriterState
+}
+
+func parseCommandRequest(args []string) (commandRequest, error) {
+	req := commandRequest{args: args, format: outputFormatText}
+	if len(args) == 0 || args[0] != "--json" {
+		return req, nil
+	}
+	if len(args) == 1 {
+		return commandRequest{}, errors.New("usage: ssh srv [--json] <command>")
+	}
+	req.args = args[1:]
+	req.format = outputFormatJSON
+	return req, nil
+}
+
+func jsonResult(payload any) (commandResult, error) {
+	encoded, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return commandResult{stderr: fmt.Sprintf("marshal json output: %v\n", err), exitCode: 1}, err
+	}
+	return commandResult{stdout: string(encoded) + "\n", exitCode: 0}, nil
+}
+
+func unsupportedJSONResult(command string) (commandResult, error) {
+	err := fmt.Errorf("%s does not support --json", command)
+	return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+}
+
+func maybeUnsupportedJSONCommand(command string, format outputFormat) (commandResult, error, bool) {
+	if format != outputFormatJSON {
+		return commandResult{}, nil, false
+	}
+	switch command {
+	case "logs", "export", "import", "snapshot", "help":
+		result, err := unsupportedJSONResult(command)
+		return result, err, true
+	default:
+		return commandResult{}, nil, false
+	}
+}
+
+func instanceSummaryPayload(cfg config.Config, inst model.Instance, includeConnect bool) instanceSummaryJSON {
+	payload := instanceSummaryJSON{
+		Name:            inst.Name,
+		State:           inst.State,
+		VCPUCount:       effectiveInstanceVCPUCount(inst, cfg),
+		MemoryMiB:       effectiveInstanceMemoryMiB(inst, cfg),
+		RootFSSizeBytes: effectiveInstanceRootFSSizeBytes(inst),
+		TailscaleName:   inst.TailscaleName,
+		TailscaleIP:     inst.TailscaleIP,
+	}
+	if includeConnect {
+		payload.Connect = fmt.Sprintf("ssh root@%s", inst.Name)
+	}
+	return payload
+}
+
+func backupPayload(info provision.BackupInfo) backupJSON {
+	return backupJSON{
+		ID:                info.ID,
+		Name:              info.Name,
+		CreatedAt:         info.CreatedAt,
+		Path:              info.Path,
+		RootFSSizeBytes:   info.RootFSSizeBytes,
+		VCPUCount:         info.VCPUCount,
+		MemoryMiB:         info.MemoryMiB,
+		HasSerialLog:      info.HasSerialLog,
+		HasFirecrackerLog: info.HasFirecrackerLog,
+	}
+}
+
+func (a *App) inspectPayload(inst model.Instance, events []model.InstanceEvent) inspectResponseJSON {
+	debugHint := inspectDebugHint(inst)
+	payload := inspectResponseJSON{
+		Instance: inspectInstanceJSON{
+			Name:            inst.Name,
+			State:           inst.State,
+			CreatedByUser:   inst.CreatedByUser,
+			CreatedByNode:   inst.CreatedByNode,
+			CreatedAt:       inst.CreatedAt,
+			UpdatedAt:       inst.UpdatedAt,
+			VCPUCount:       effectiveInstanceVCPUCount(inst, a.cfg),
+			MemoryMiB:       effectiveInstanceMemoryMiB(inst, a.cfg),
+			RootFSPath:      inst.RootFSPath,
+			RootFSSizeBytes: effectiveInstanceRootFSSizeBytes(inst),
+			FirecrackerPID:  inst.FirecrackerPID,
+			TapDevice:       inst.TapDevice,
+			NetworkCIDR:     inst.NetworkCIDR,
+			HostIP:          inst.HostAddr,
+			GuestIP:         inst.GuestAddr,
+			ZenGateway:      a.zenGatewayBaseURL(inst),
+			TailscaleName:   inst.TailscaleName,
+			TailscaleIP:     inst.TailscaleIP,
+			LastError:       inst.LastError,
+			DeletedAt:       inst.DeletedAt,
+			Logs: inspectLogsJSON{
+				SerialCommand:      fmt.Sprintf("ssh %s logs %s serial", a.cfg.Hostname, inst.Name),
+				FirecrackerCommand: fmt.Sprintf("ssh %s logs %s firecracker", a.cfg.Hostname, inst.Name),
+			},
+			DebugHint: debugHint,
+		},
+		Events: make([]inspectEventJSON, 0, len(events)),
+	}
+	for _, evt := range events {
+		payload.Events = append(payload.Events, inspectEventJSON{
+			CreatedAt: evt.CreatedAt,
+			Type:      evt.Type,
+			Message:   evt.Message,
+		})
+	}
+	return payload
 }
 
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
@@ -264,10 +473,10 @@ func (a *App) restoreInstances(ctx context.Context) {
 
 func (a *App) handleSession(sess gssh.Session) {
 	started := time.Now().UTC()
-	args := sess.Command()
+	rawArgs := sess.Command()
 	command := ""
-	if len(args) > 0 {
-		command = args[0]
+	if len(rawArgs) > 0 {
+		command = rawArgs[0]
 	}
 	lease, err := a.beginCommand()
 	if err != nil {
@@ -276,7 +485,7 @@ func (a *App) handleSession(sess gssh.Session) {
 		return
 	}
 	defer lease.Release()
-	argsJSON, _ := json.Marshal(args)
+	argsJSON, _ := json.Marshal(rawArgs)
 	audit := model.CommandAudit{
 		CreatedAt:  started,
 		RemoteAddr: sess.RemoteAddr().String(),
@@ -302,7 +511,7 @@ func (a *App) handleSession(sess gssh.Session) {
 		}
 	}
 
-	if len(args) == 0 {
+	if len(rawArgs) == 0 {
 		err := errors.New("shell sessions are disabled; use an exec request such as: ssh srv list")
 		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
 		finalize(model.Actor{SSHUser: sess.User(), RemoteAddr: sess.RemoteAddr().String()}, false, "shell denied", err)
@@ -317,6 +526,16 @@ func (a *App) handleSession(sess gssh.Session) {
 		_ = sess.Exit(1)
 		return
 	}
+
+	req, err := parseCommandRequest(rawArgs)
+	if err != nil {
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		finalize(actor, false, "invalid request", err)
+		_ = sess.Exit(2)
+		return
+	}
+	command = req.args[0]
+	audit.Command = command
 
 	allowed, reason := a.authorize(actor, command)
 	if err := a.store.RecordAuthz(context.Background(), model.AuthzDecision{
@@ -337,18 +556,26 @@ func (a *App) handleSession(sess gssh.Session) {
 		_ = sess.Exit(1)
 		return
 	}
-	if args[0] == "logs" {
-		req, err := parseLogsArgs(args)
+	if result, err, rejected := maybeUnsupportedJSONCommand(req.args[0], req.format); rejected {
+		if result.stderr != "" {
+			_, _ = io.WriteString(sess.Stderr(), result.stderr)
+		}
+		finalize(actor, true, reason, err)
+		_ = sess.Exit(result.exitCode)
+		return
+	}
+	if req.args[0] == "logs" {
+		logsReq, err := parseLogsArgs(req.args)
 		if err != nil {
 			_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
 			finalize(actor, true, reason, err)
 			_ = sess.Exit(2)
 			return
 		}
-		if req.follow {
+		if logsReq.follow {
 			lease.Release()
 		}
-		exitCode, err := a.handleLogsSession(sess, actor, req)
+		exitCode, err := a.handleLogsSession(sess, actor, logsReq)
 		finalize(actor, true, reason, err)
 		if exitCode == 0 && err != nil {
 			exitCode = 1
@@ -356,8 +583,8 @@ func (a *App) handleSession(sess gssh.Session) {
 		_ = sess.Exit(exitCode)
 		return
 	}
-	if args[0] == "export" {
-		exitCode, err := a.handleExportSession(sess, actor, args)
+	if req.args[0] == "export" {
+		exitCode, err := a.handleExportSession(sess, actor, req.args)
 		finalize(actor, true, reason, err)
 		if exitCode == 0 && err != nil {
 			exitCode = 1
@@ -365,8 +592,8 @@ func (a *App) handleSession(sess gssh.Session) {
 		_ = sess.Exit(exitCode)
 		return
 	}
-	if args[0] == "import" {
-		exitCode, err := a.handleImportSession(sess, actor, args)
+	if req.args[0] == "import" {
+		exitCode, err := a.handleImportSession(sess, actor, req.args)
 		finalize(actor, true, reason, err)
 		if exitCode == 0 && err != nil {
 			exitCode = 1
@@ -374,8 +601,8 @@ func (a *App) handleSession(sess gssh.Session) {
 		_ = sess.Exit(exitCode)
 		return
 	}
-	if args[0] == "snapshot" {
-		result, err := a.cmdSnapshot(sess.Context(), args, lease)
+	if req.args[0] == "snapshot" {
+		result, err := a.cmdSnapshot(sess.Context(), req.args, lease)
 		if result.stdout != "" {
 			_, _ = io.WriteString(sess, result.stdout)
 		}
@@ -390,7 +617,7 @@ func (a *App) handleSession(sess gssh.Session) {
 		return
 	}
 
-	result, err := a.dispatch(sess.Context(), actor, args)
+	result, err := a.dispatch(sess.Context(), actor, req)
 	if result.stdout != "" {
 		_, _ = io.WriteString(sess, result.stdout)
 	}
@@ -404,36 +631,39 @@ func (a *App) handleSession(sess gssh.Session) {
 	_ = sess.Exit(result.exitCode)
 }
 
-func (a *App) dispatch(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
-	switch args[0] {
+func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandRequest) (commandResult, error) {
+	switch req.args[0] {
 	case "new":
-		return a.cmdNew(ctx, actor, args)
+		return a.cmdNew(ctx, actor, req.args, req.format)
 	case "resize":
-		return a.cmdResize(ctx, actor, args)
+		return a.cmdResize(ctx, actor, req.args, req.format)
 	case "backup":
-		return a.cmdBackup(ctx, actor, args)
+		return a.cmdBackup(ctx, actor, req.args, req.format)
 	case "list":
-		return a.cmdList(ctx, actor)
+		return a.cmdList(ctx, actor, req.format)
 	case "inspect":
-		return a.cmdInspect(ctx, actor, args)
+		return a.cmdInspect(ctx, actor, req.args, req.format)
 	case "restore":
-		return a.cmdRestore(ctx, actor, args)
+		return a.cmdRestore(ctx, actor, req.args, req.format)
 	case "start":
-		return a.cmdStart(ctx, actor, args)
+		return a.cmdStart(ctx, actor, req.args, req.format)
 	case "stop":
-		return a.cmdStop(ctx, actor, args)
+		return a.cmdStop(ctx, actor, req.args, req.format)
 	case "restart":
-		return a.cmdRestart(ctx, actor, args)
+		return a.cmdRestart(ctx, actor, req.args, req.format)
 	case "delete":
-		return a.cmdDelete(ctx, actor, args)
+		return a.cmdDelete(ctx, actor, req.args, req.format)
 	case "help":
+		if result, err, rejected := maybeUnsupportedJSONCommand(req.args[0], req.format); rejected {
+			return result, err
+		}
 		return helpResult(), nil
 	default:
-		return commandResult{stderr: fmt.Sprintf("unknown command %q\n", args[0]), exitCode: 2}, fmt.Errorf("unknown command %q", args[0])
+		return commandResult{stderr: fmt.Sprintf("unknown command %q\n", req.args[0]), exitCode: 2}, fmt.Errorf("unknown command %q", req.args[0])
 	}
 }
 
-func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
 	name, opts, err := parseNewArgs(args)
 	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -454,10 +684,13 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string) (com
 		return commandResult{stderr: stderr, exitCode: 1}, err
 	}
 
+	if outFormat == outputFormatJSON {
+		return jsonResult(commandActionJSON{Action: "created", Instance: instanceSummaryPayload(a.cfg, inst, true)})
+	}
 	return lifecycleReadyResult("created", inst), nil
 }
 
-func (a *App) cmdResize(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+func (a *App) cmdResize(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
 	name, opts, err := parseResizeArgs(args)
 	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -490,10 +723,13 @@ func (a *App) cmdResize(ctx context.Context, actor model.Actor, args []string) (
 		effectiveInstanceMemoryMiB(inst, a.cfg),
 		format.BinarySize(effectiveInstanceRootFSSizeBytes(inst)),
 	)
+	if outFormat == outputFormatJSON {
+		return jsonResult(commandActionJSON{Action: "resized", Instance: instanceSummaryPayload(a.cfg, inst, false)})
+	}
 	return commandResult{stdout: stdout, exitCode: 0}, nil
 }
 
-func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
 	action, name, err := parseBackupArgs(args)
 	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -523,11 +759,21 @@ func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string) (
 			format.BinarySize(info.RootFSSizeBytes),
 			info.Path,
 		)
+		if outFormat == outputFormatJSON {
+			return jsonResult(backupCreateResponseJSON{Action: "backup-created", Instance: name, Backup: backupPayload(info)})
+		}
 		return commandResult{stdout: stdout, exitCode: 0}, nil
 	case "list":
 		backups, err := a.provisioner.ListBackups(ctx, name)
 		if err != nil {
 			return commandResult{stderr: fmt.Sprintf("backup list %s: %v\n", name, err), exitCode: 1}, err
+		}
+		if outFormat == outputFormatJSON {
+			payload := backupListResponseJSON{Instance: name, Backups: make([]backupJSON, 0, len(backups))}
+			for _, backup := range backups {
+				payload.Backups = append(payload.Backups, backupPayload(backup))
+			}
+			return jsonResult(payload)
 		}
 		if len(backups) == 0 {
 			return commandResult{stdout: fmt.Sprintf("no backups for %s\n", name), exitCode: 0}, nil
@@ -562,12 +808,21 @@ func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string) (
 	}
 }
 
-func (a *App) cmdList(ctx context.Context, actor model.Actor) (commandResult, error) {
+func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFormat) (commandResult, error) {
 	instances, err := a.store.ListInstances(ctx, false)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("list instances: %v\n", err), exitCode: 1}, err
 	}
 	instances = a.visibleInstances(actor, instances)
+	if outFormat == outputFormatJSON {
+		payload := struct {
+			Instances []instanceSummaryJSON `json:"instances"`
+		}{Instances: make([]instanceSummaryJSON, 0, len(instances))}
+		for _, inst := range instances {
+			payload.Instances = append(payload.Instances, instanceSummaryPayload(a.cfg, inst, false))
+		}
+		return jsonResult(payload)
+	}
 	if len(instances) == 0 {
 		return commandResult{stdout: "no instances\n", exitCode: 0}, nil
 	}
@@ -609,7 +864,7 @@ func renderTextTable(headers []string, rows [][]string) (string, error) {
 	return b.String(), nil
 }
 
-func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: inspect <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -622,6 +877,9 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string) 
 	events, err := a.store.ListEvents(ctx, inst.ID, 10)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("load events: %v\n", err), exitCode: 1}, err
+	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(a.inspectPayload(inst, events))
 	}
 
 	var b strings.Builder
@@ -908,7 +1166,7 @@ func formatImportProgress(progress provision.ImportProgress) string {
 
 func helpResult() commandResult {
 	var b strings.Builder
-	b.WriteString("usage: ssh srv <command>\n\n")
+	b.WriteString("usage: ssh srv [--json] <command>\n\n")
 
 	type helpEntry struct {
 		command     string
@@ -973,6 +1231,15 @@ func helpResult() commandResult {
 		}
 		b.WriteString("\n")
 	}
+
+	b.WriteString("global options:\n")
+	globalOptionOutput, err := renderTextTable([]string{"flag", "description"}, [][]string{{"--json", "Return machine-readable JSON for supported non-streaming commands"}})
+	if err != nil {
+		b.WriteString("  --json               Return machine-readable JSON for supported non-streaming commands\n")
+	} else {
+		b.WriteString(globalOptionOutput)
+	}
+	b.WriteString("\n")
 
 	b.WriteString("new and resize options:\n")
 	optionRows := [][]string{
@@ -1282,7 +1549,7 @@ func (w *terminalSafeWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
 	name, backupID, err := parseRestoreArgs(args)
 	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -1315,10 +1582,13 @@ func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string) 
 		format.BinarySize(effectiveInstanceRootFSSizeBytes(inst)),
 		info.CreatedAt.Format(time.RFC3339),
 	)
+	if outFormat == outputFormatJSON {
+		return jsonResult(restoreResponseJSON{Action: "restored", Instance: instanceSummaryPayload(a.cfg, inst, false), Backup: backupPayload(info)})
+	}
 	return commandResult{stdout: stdout, exitCode: 0}, nil
 }
 
-func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: start <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -1342,10 +1612,13 @@ func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string) (c
 		}
 		return commandResult{stderr: stderr, exitCode: 1}, err
 	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(commandActionJSON{Action: "started", Instance: instanceSummaryPayload(a.cfg, inst, true)})
+	}
 	return lifecycleReadyResult("started", inst), nil
 }
 
-func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: stop <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -1368,10 +1641,13 @@ func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string) (co
 		}
 		return commandResult{stderr: fmt.Sprintf("stop %s: %v\n", args[1], err), exitCode: 1}, err
 	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(commandActionJSON{Action: "stopped", Instance: instanceSummaryPayload(a.cfg, inst, false)})
+	}
 	return commandResult{stdout: fmt.Sprintf("stopped: %s\nstate: %s\n", inst.Name, inst.State), exitCode: 0}, nil
 }
 
-func (a *App) cmdRestart(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+func (a *App) cmdRestart(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: restart <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -1401,10 +1677,13 @@ func (a *App) cmdRestart(ctx context.Context, actor model.Actor, args []string) 
 		}
 		return commandResult{stderr: stderr, exitCode: 1}, err
 	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(commandActionJSON{Action: "restarted", Instance: instanceSummaryPayload(a.cfg, inst, true)})
+	}
 	return lifecycleReadyResult("restarted", inst), nil
 }
 
-func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
 	if len(args) != 2 {
 		err := errors.New("usage: delete <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
@@ -1426,6 +1705,9 @@ func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string) (
 			err = fmt.Errorf("instance %q does not exist", args[1])
 		}
 		return commandResult{stderr: fmt.Sprintf("delete %s: %v\n", args[1], err), exitCode: 1}, err
+	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(commandActionJSON{Action: "deleted", Instance: instanceSummaryPayload(a.cfg, inst, false)})
 	}
 	return commandResult{stdout: fmt.Sprintf("deleted: %s\nstate: %s\n", inst.Name, inst.State), exitCode: 0}, nil
 }

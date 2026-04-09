@@ -27,6 +27,8 @@ ssh srv start demo
 The service treats SSH as command transport only. Caller identity comes from Tailscale `WhoIs` data resolved from the incoming tailnet connection.
 Control-plane examples omit a username because authorization is based on that Tailscale identity, not the SSH username.
 
+Most non-streaming instance and backup commands accept a global `--json` flag. With OpenSSH, terminate local ssh option parsing first, for example `ssh srv -- --json inspect demo` or `ssh srv -- --json list`.
+
 ## Use Cases
 
 - **Throwaway debug VMs** — spin up an isolated environment, break things, and delete it without affecting the host
@@ -76,6 +78,8 @@ ssh srv new demo --cpus 4 --ram 8G --rootfs-size 20G
 # inspect and logs
 ssh srv list
 ssh srv inspect demo
+ssh srv -- --json list
+ssh srv -- --json inspect demo
 ssh srv logs demo
 ssh srv logs demo serial
 ssh srv logs demo firecracker

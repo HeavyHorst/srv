@@ -13,6 +13,7 @@ ROOTFS_LABEL="${ROOTFS_LABEL:-srv-root}"
 # toolchain friction on modern distros such as Arch with GCC 15.
 KERNEL_VERSION="${KERNEL_VERSION:-6.12.79}"
 FIRECRACKER_CONFIG_VERSION="${FIRECRACKER_CONFIG_VERSION:-6.1}"
+PI_VERSION="${PI_VERSION:-0.66.1}"
 
 KERNEL_TARBALL="${WORK_DIR}/linux-${KERNEL_VERSION}.tar.xz"
 KERNEL_SOURCE_DIR="${WORK_DIR}/linux-${KERNEL_VERSION}"
@@ -291,6 +292,31 @@ install_kernel_modules() {
 	rm -f "${modules_dir}/build" "${modules_dir}/source"
 }
 
+install_pi() {
+	local release_arch tarball url
+	case "${ARCH}" in
+		x86_64)
+			release_arch="x64"
+			;;
+		aarch64 | arm64)
+			release_arch="arm64"
+			;;
+		*)
+			echo "unsupported architecture for Pi release tarball: ${ARCH}" >&2
+			exit 1
+			;;
+	esac
+
+	tarball="${WORK_DIR}/pi-linux-${release_arch}-${PI_VERSION}.tar.gz"
+	url="${PI_TARBALL_URL:-https://github.com/badlogic/pi-mono/releases/download/v${PI_VERSION}/pi-linux-${release_arch}.tar.gz}"
+	fetch "${url}" "${tarball}"
+
+	install -d -m 0755 "${ROOTFS_MOUNT_DIR}/opt" "${ROOTFS_MOUNT_DIR}/usr/local/bin"
+	rm -rf "${ROOTFS_MOUNT_DIR}/opt/pi"
+	tar -xzf "${tarball}" -C "${ROOTFS_MOUNT_DIR}/opt"
+	ln -sf /opt/pi/pi "${ROOTFS_MOUNT_DIR}/usr/local/bin/pi"
+}
+
 configure_rootfs() {
 	install -d "${ROOTFS_MOUNT_DIR}/var/lib/srv"
 	chmod 0755 "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/bootstrap.sh"
@@ -317,6 +343,7 @@ build_rootfs() {
 	install_kernel_modules
 
 	rsync -a "${SCRIPT_DIR}/overlay/" "${ROOTFS_MOUNT_DIR}/"
+	install_pi
 	bootstrap_lazyvim
 	configure_rootfs
 	detach_rootfs
@@ -329,6 +356,7 @@ arch=${ARCH}
 kernel_version=${KERNEL_VERSION}
 kernel_release=${KERNEL_RELEASE}
 firecracker_config_url=${FIRECRACKER_CONFIG_URL}
+pi_version=${PI_VERSION}
 rootfs_size=${ROOTFS_SIZE}
 packages=$(IFS=,; echo "${ROOTFS_PACKAGES[*]}")
 artifacts=$(basename -- "${VMLINUX_OUTPUT}"),$(basename -- "${ROOTFS_OUTPUT}")

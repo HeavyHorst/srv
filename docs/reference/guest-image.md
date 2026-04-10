@@ -20,7 +20,7 @@ The image is intentionally not minimal — it includes tooling for development a
 - Go, gopls
 - Odin, odinfmt, OLS
 - Neovim with prewarmed LazyVim (BMW heritage amber theme)
-- OpenCode CLI with per-VM Zen gateway bootstrap
+- OpenCode and Pi CLIs with per-VM Zen gateway bootstrap
 - Git, fd, ripgrep, tree-sitter-cli, gcc
 - iptables-nft with IPv4/IPv6 nftables support
 - Kernel module tree matching the custom kernel (overlay, br_netfilter, Docker-related modules)
@@ -35,7 +35,7 @@ The guest includes `srv-bootstrap.service`, which runs on every boot:
 4. Sets the hostname from `srv.hostname`
 5. Starts `tailscaled`
 6. Runs `tailscale up --auth-key=... --hostname=... --ssh` on the first authenticated boot (relies on persisted state on later boots)
-7. Writes `/root/.config/opencode/opencode.json` to the per-VM host Zen gateway when `SRV_ZEN_API_KEY` is configured, or removes that config when the gateway is disabled
+7. Writes `/root/.config/opencode/opencode.json` plus Pi config under `/root/.pi/agent/` to the per-VM host Zen gateway when `SRV_ZEN_API_KEY` is configured, or removes those managed defaults when the gateway is disabled
 8. Writes `/var/lib/srv/bootstrap.done` with the latest successful bootstrap timestamp
 
 The `--ssh` flag on `tailscale up` is intentional — it enables Tailscale SSH so the control plane's `connect: ssh root@<name>` output works through the tailnet without per-user OpenSSH keys.

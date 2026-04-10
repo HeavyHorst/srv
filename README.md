@@ -173,12 +173,12 @@ When debugging a failed host run, start with `ssh srv inspect <name>`, then comp
 - Reflinks clone the base rootfs for fast per-instance writable disks.
 - A root-only network helper owns TAP and iptables mutations, while a separate root-owned VM runner invokes Firecracker through the official jailer, drops the microVM process to `srv-vm:srv`, and places each VM into its own cgroup v2 leaf.
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
-- When `SRV_ZEN_API_KEY` is configured, `srv` also binds a per-instance HTTP proxy on that instance's host/gateway IP and forwards `/v1/...` requests to the upstream OpenCode Zen API with the host key injected. The proxy only serves requests from that instance's guest IP, and guest bootstrap writes `/root/.config/opencode/opencode.json` so the preinstalled `opencode` CLI targets that per-VM gateway by default without storing the real Zen key inside the guest.
+- When `SRV_ZEN_API_KEY` is configured, `srv` also binds a per-instance HTTP proxy on that instance's host/gateway IP and forwards `/v1/...` requests to the upstream OpenCode Zen API with the host key injected. The proxy only serves requests from that instance's guest IP, and guest bootstrap writes both `/root/.config/opencode/opencode.json` and Pi config under `/root/.pi/agent/` so the preinstalled `opencode` and `pi` CLIs target that per-VM gateway by default without storing the real Zen key inside the guest.
 - `snapshot create` is an admin-only global barrier; while it is active, all other SSH commands are rejected until the local readonly btrfs snapshot has been created.
 - Existing stopped guests pick up the currently configured `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` on their next `start` or `restart`.
 - Rootfs changes only affect newly created guests after you rebuild the base image artifacts and refresh `SRV_BASE_ROOTFS`.
 
-The current Arch guest image expects a boot-time service that reads MMDS, sets the hostname, starts `tailscaled`, manages the root account's default OpenCode config for the per-VM Zen gateway when enabled, and runs `tailscale up --auth-key=... --ssh` on the first authenticated boot only.
+The current Arch guest image expects a boot-time service that reads MMDS, sets the hostname, starts `tailscaled`, manages the root account's default OpenCode and Pi configs for the per-VM Zen gateway when enabled, and runs `tailscale up --auth-key=... --ssh` on the first authenticated boot only.
 
 ## Docs
 

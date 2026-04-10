@@ -22,9 +22,9 @@ When `SRV_ZEN_API_KEY` is configured on the host, `srv` binds a per-instance HTT
 
 - Only accepts requests from that VM's guest IP
 - Forwards `/v1/...` requests to the upstream OpenCode Zen API with the host key injected
-- The guest bootstrap writes `/root/.config/opencode/opencode.json` pointing at this gateway
+- The guest bootstrap writes `/root/.config/opencode/opencode.json` and Pi config under `/root/.pi/agent/` pointing at this gateway
 
-This means the agent inside the VM can use `opencode` or any OpenAI-compatible client against `http://<gateway-ip>:11434/v1` without ever seeing the real API key.
+This means the agent inside the VM can use `opencode`, `pi`, or any OpenAI-compatible client against `http://<gateway-ip>:11434/v1` without ever seeing the real API key.
 
 ## Connect the agent
 
@@ -32,7 +32,7 @@ This means the agent inside the VM can use `opencode` or any OpenAI-compatible c
 ssh root@agent-1
 ```
 
-The preinstalled `opencode` CLI is already configured to target the per-VM gateway. If you are using a different agent framework, point its API client at:
+The preinstalled `opencode` and `pi` CLIs are already configured to target the per-VM gateway. If you are using a different agent framework, point its API client at:
 
 ```
 http://<gateway-ip>:11434/v1

@@ -57,7 +57,20 @@ When the Zen gateway is enabled, the guest `srv-bootstrap.service` writes `/root
 
 The `apiKey` is a local placeholder only so OpenCode keeps Zen's paid model catalog visible — the real credential still lives only on the host and is injected by the proxy.
 
-When the gateway is disabled (no `SRV_ZEN_API_KEY`), bootstrap removes the default config file.
+Bootstrap also writes Pi config under `/root/.pi/agent/` so the preinstalled `pi` CLI uses the same gateway by default:
+
+```json
+{
+  "providers": {
+    "opencode": {
+      "baseUrl": "http://<gateway-ip>:11434/v1",
+      "apiKey": "srv-zen-gateway"
+    }
+  }
+}
+```
+
+When the gateway is disabled (no `SRV_ZEN_API_KEY`), bootstrap removes those managed default config files.
 
 ## Configuration
 
@@ -69,7 +82,7 @@ When the gateway is disabled (no `SRV_ZEN_API_KEY`), bootstrap removes the defau
 
 ## Using the gateway from the guest
 
-The preinstalled `opencode` CLI works out of the box. For other agents or HTTP clients:
+The preinstalled `opencode` and `pi` CLIs work out of the box. For other agents or HTTP clients:
 
 ```bash
 # Inside the VM
@@ -78,4 +91,4 @@ curl http://$(ip route show default | awk '{print $3}'):11434/v1/models
 
 ## Disabling the gateway
 
-Remove or leave `SRV_ZEN_API_KEY` unset. After the next guest boot, the bootstrap service will remove the OpenCode config file.
+Remove or leave `SRV_ZEN_API_KEY` unset. After the next guest boot, the bootstrap service will remove the managed OpenCode and Pi config files.

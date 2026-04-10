@@ -362,14 +362,14 @@ const css = `
 *, *::before, *::after { box-sizing: border-box; }
 
 html {
-	font-size: 12px;
+	font-size: 14px;
 	-webkit-text-size-adjust: 100%;
 	background: #f5f5f5;
 }
 
 body {
-	font-family: "Berkeley Mono", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
-	line-height: 1.4;
+	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+	line-height: 1.6;
 	color: #000;
 	max-width: 55rem;
 	margin: 2rem auto;
@@ -416,7 +416,7 @@ h1:first-child { margin-top: 0; }
 .section-divider {
 	border: none;
 	border-top: 2px solid #000;
-	margin: 1.5rem 0;
+	margin: 4rem 0 3rem;
 }
 
 .section-header {
@@ -438,7 +438,7 @@ a:hover { color: #333; }
 
 code {
 	font-family: "Berkeley Mono", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
-	font-size: 0.9em;
+	font-size: 0.85em;
 	background: transparent;
 	padding: 0;
 	border-radius: 0;
@@ -451,6 +451,8 @@ pre {
 	border-radius: 0;
 	border: 1px solid #ccc;
 	counter-reset: line;
+	overflow-x: auto;
+	white-space: pre;
 }
 
 pre code {
@@ -556,8 +558,6 @@ ul, ol { padding-left: 2rem; }
 li { margin-bottom: 0.15rem; }
 
 nav.toc {
-	border: 1px solid #000;
-	border-radius: 0;
 	padding: 0.75rem 1rem;
 	margin-bottom: 1rem;
 }
@@ -627,7 +627,30 @@ nav.toc a:hover { color: #333; }
 	body { max-width: none; padding: 0; border: none; box-shadow: none; }
 	html { background: #fff; }
 	nav.toc { display: none; }
+	.manual-section { page-break-before: always; }
+	.manual-section:first-child { page-break-before: auto; }
 }
+
+@media (max-width: 768px) {
+	body { padding: 1rem; margin: 0.5rem; min-height: auto; }
+	.section-header { position: sticky; top: 0; background: #fff; padding: 0.5rem 0; border-bottom: 1px solid #ddd; z-index: 100; }
+	.toc-toggle { display: block; }
+	nav.toc { display: none; margin-top: 0.5rem; }
+	nav.toc.expanded { display: block; }
+}
+
+.toc-toggle {
+	display: none;
+	width: 100%;
+	padding: 0.5rem;
+	background: #f5f5f5;
+	border: 1px solid #ddd;
+	font-family: inherit;
+	font-size: 1rem;
+	cursor: pointer;
+}
+
+.toc-toggle:hover { background: #eee; }
 `
 
 func buildTOC(sections []section, tocsBySection [][]tocEntry) string {
@@ -750,6 +773,7 @@ Sections: %d · Headings: %d · Words: %d
 	out.WriteString(css)
 	out.WriteString("\n</style>\n")
 	out.WriteString("</head>\n<body>\n")
+	out.WriteString("<button class=\"toc-toggle\" onclick=\"document.querySelector('nav.toc').classList.toggle('expanded')\">Table of Contents</button>\n")
 	out.WriteString(tocHTML)
 	out.WriteString("\n")
 	out.WriteString(body.String())

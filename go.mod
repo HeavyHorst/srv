@@ -8,6 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/klauspost/compress v1.18.2
 	github.com/olekukonko/tablewriter v1.1.4
+	github.com/yuin/goldmark v1.8.2
 	golang.org/x/crypto v0.46.0
 	golang.org/x/sync v0.19.0
 	golang.org/x/sys v0.42.0

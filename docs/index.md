@@ -26,20 +26,20 @@ All VMs get a full Linux system with systemd, a real kernel, and their own Tails
 
 ```
                     Tailscale tailnet
-                          │
-                    ┌─────┴─────┐
-                    │   tsnet    │  (joins tailnet as "srv")
-                    │  :22/tcp   │  (SSH API surface)
-                    └─────┬─────┘
-                          │
-            ┌─────────────┼─────────────┐
-            │             │             │
-      ┌─────┴─────┐ ┌────┴────┐ ┌─────┴─────┐
-      │  VM: demo │ │ VM: ci  │ │  VM: test  │
-      │  /30 net  │ │ /30 net │ │  /30 net   │
-      │  cgroup   │ │ cgroup  │ │  cgroup    │
-      │  TAP+NAT  │ │ TAP+NAT │ │  TAP+NAT   │
-      └───────────┘ └─────────┘ └────────────┘
+                           │
+                     ┌─────┴─────┐
+                     │   tsnet   │  (joins tailnet as "srv")
+                     │  :22/tcp  │  (SSH API surface)
+                     └─────┬─────┘
+                           │
+             ┌─────────────┼─────────────┐
+             │             │             │
+      ┌──────┴──────┐ ┌──────┴──────┐ ┌──────┴──────┐
+      │ VM: demo    │ │ VM: ci      │ │ VM: test    │
+      │ /30 net     │ │ /30 net     │ │ /30 net     │
+      │ cgroup      │ │ cgroup      │ │ cgroup      │
+      │ TAP + NAT   │ │ TAP + NAT   │ │ TAP + NAT   │
+      └─────────────┘ └─────────────┘ └─────────────┘
 ```
 
 Key components:

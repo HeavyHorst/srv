@@ -3,3 +3,5 @@ images/arch-base/out/
 /srv
 /srv-net-helper
 /srv-vm-runner
+/srv-manual
+/manual.html

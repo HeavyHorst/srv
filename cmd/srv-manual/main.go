@@ -89,11 +89,11 @@ func addHeadingAnchorsAndNumbers(html string, secNum int, entries []tocEntry) st
 					num += fmt.Sprintf(".%d", counters[j])
 				}
 				entryIdx++
-				return fmt.Sprintf(`<%s id="%s"><span class="heading-num">%s</span><a class="heading-anchor" href="#%s">#</a>%s`, tag, id, num, id, text)
+				return fmt.Sprintf(`<%s id="%s"><a class="heading-anchor" href="#%s">%s %s</a></%s>`, tag, id, id, num, text, tag)
 			}
 			entryIdx++
 		}
-		return fmt.Sprintf(`<%s id="%s"><a class="heading-anchor" href="#%s">#</a>%s`, tag, id, id, text)
+		return fmt.Sprintf(`<%s id="%s"><a class="heading-anchor" href="#%s">%s</a></%s>`, tag, id, id, text, tag)
 	})
 }
 
@@ -115,7 +115,7 @@ func preprocessAdmonitions(content string, md goldmark.Markdown) string {
 			bodyHTML.WriteString(htmlEscape(body))
 		}
 
-		return fmt.Sprintf("\n<div class=\"admonition %s\">\n<strong>%s</strong>\n%s\n</div>\n", kind, kind, bodyHTML.String())
+		return fmt.Sprintf("\n<div class=\"admonition %s\">\n%s\n</div>\n", kind, bodyHTML.String())
 	})
 }
 
@@ -362,18 +362,22 @@ const css = `
 *, *::before, *::after { box-sizing: border-box; }
 
 html {
-	font-size: 16px;
+	font-size: 12px;
 	-webkit-text-size-adjust: 100%;
+	background: #f5f5f5;
 }
 
 body {
 	font-family: "Berkeley Mono", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
 	line-height: 1.4;
 	color: #000;
-	max-width: 80rem;
-	margin: 0 auto;
-	padding: 0.5rem 1rem 2rem;
+	max-width: 55rem;
+	margin: 2rem auto;
+	padding: 3rem 4rem 4rem;
 	background: #fff;
+	border: 1px solid #ddd;
+	box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+	min-height: 80vh;
 }
 
 h1, h2, h3, h4, h5, h6 {
@@ -391,21 +395,11 @@ h4 { font-size: 1rem; }
 h1:first-child { margin-top: 0; }
 
 .heading-anchor {
-	color: #999;
+	color: inherit;
 	text-decoration: none;
-	font-weight: 400;
-	margin-left: 0.25rem;
-	font-size: 0.75em;
 }
 
-.heading-anchor:hover { color: #000; }
-
-.heading-num {
-	color: #666;
-	font-weight: 400;
-	margin-right: 0.5rem;
-	font-size: 0.85em;
-}
+.heading-anchor:hover { text-decoration: underline; }
 
 .section-meta {
 	font-size: 0.75rem;
@@ -444,14 +438,14 @@ a:hover { color: #333; }
 
 code {
 	font-family: "Berkeley Mono", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
-	font-size: 0.875em;
-	background: #e8e8e8;
-	padding: 0.1em 0.25em;
+	font-size: 0.9em;
+	background: transparent;
+	padding: 0;
 	border-radius: 0;
 }
 
 pre {
-	background: #f5f5f5;
+	background: transparent;
 	color: #000;
 	padding: 1rem 0.5rem;
 	border-radius: 0;
@@ -558,7 +552,7 @@ footer code {
 	padding: 0;
 }
 
-ul, ol { padding-left: 1.25rem; }
+ul, ol { padding-left: 2rem; }
 li { margin-bottom: 0.15rem; }
 
 nav.toc {
@@ -630,7 +624,8 @@ nav.toc a:hover { color: #333; }
 }
 
 @media print {
-	body { max-width: none; padding: 0; }
+	body { max-width: none; padding: 0; border: none; box-shadow: none; }
+	html { background: #fff; }
 	nav.toc { display: none; }
 }
 `
@@ -676,8 +671,7 @@ func buildTOC(sections []section, tocsBySection [][]tocEntry) string {
 				for j := 2; j <= e.level; j++ {
 					num += fmt.Sprintf(".%d", counters[j])
 				}
-				levelLabel := fmt.Sprintf("[H%d]", e.level)
-				buf.WriteString(fmt.Sprintf("<li><span class=\"toc-num\">%s</span><span class=\"toc-level\">%s</span><a href=\"#%s\">%s</a></li>\n", num, levelLabel, e.id, e.text))
+				buf.WriteString(fmt.Sprintf("<li><span class=\"toc-num\">%s</span><a href=\"#%s\">%s</a></li>\n", num, e.id, e.text))
 			}
 			for currentLevel > 2 {
 				buf.WriteString("</ul>\n")

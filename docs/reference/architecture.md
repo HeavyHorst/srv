@@ -4,6 +4,7 @@ srv is a single-host control plane that manages Firecracker microVMs through an 
 
 ## Control plane
 
+<!-- srv-manual:block=diagram -->
 ```
 ┌────────────────────────────────────────────────────────┐
 │                      srv process                       │
@@ -80,6 +81,7 @@ When `SRV_ZEN_API_KEY` is set, `srv` binds a per-instance HTTP proxy on each VM'
 
 ## Data paths
 
+<!-- srv-manual:block=diagram -->
 ```
 SRV_DATA_DIR/
 ├── state/

@@ -4,6 +4,7 @@ When `SRV_ZEN_API_KEY` is configured on the host, srv sets up a per-instance HTT
 
 ## How it works
 
+<!-- srv-manual:block=diagram -->
 ```
 ┌───────────────────────────────────────────────┐
 │                     Host                      │

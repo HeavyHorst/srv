@@ -188,6 +188,19 @@ The current Arch guest image expects a boot-time service that reads MMDS, sets t
 - [`images/arch-base/README.md`](images/arch-base/README.md): guest image builder and overlay details
 - [`contrib/systemd/install.sh`](contrib/systemd/install.sh): one-shot installer for the supported host path
 
+When regenerating the single-page manual with `go run ./cmd/srv-manual docs manual.html`, the generator classifies fenced blocks as `Command`, `Output`, `Diagram`, or `Example`. If a block needs an explicit manual label, place an override comment immediately before it:
+
+````md
+<!-- srv-manual:block=diagram -->
+```text
+┌──────────────────────────┐
+│        srv process       │
+└──────────────────────────┘
+```
+````
+
+Supported override values are `command`, `output`, `diagram`, and `example`.
+
 ## Non-Goals For Now
 
 - `srv` is intentionally a single-host control plane for this phase of the project.

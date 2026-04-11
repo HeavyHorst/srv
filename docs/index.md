@@ -24,6 +24,7 @@ All VMs get a full Linux system with systemd, a real kernel, and their own Tails
 
 ## Conceptual architecture
 
+<!-- srv-manual:block=diagram -->
 ```
                     Tailscale tailnet
                            │

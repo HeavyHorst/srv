@@ -4,6 +4,7 @@ Every srv VM gets its own isolated network stack: a dedicated `/30` subnet, TAP 
 
 ## How it works
 
+<!-- srv-manual:block=diagram -->
 ```
 Internet
     │

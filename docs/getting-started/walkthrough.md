@@ -8,6 +8,7 @@ This walkthrough assumes you have completed the [installation](install.md) and t
 ssh srv new demo
 ```
 
+<!-- srv-manual:block=output -->
 ```
 demo created — state: provisioning
 inspect:  ssh srv inspect demo
@@ -28,6 +29,7 @@ ssh srv new demo --cpus 4 --ram 8G --rootfs-size 20G
 ssh srv list
 ```
 
+<!-- srv-manual:block=output -->
 ```
 NAME     STATE   CPUS  MEMORY   DISK     TAILSCALE
 demo     ready   1     1.0 GiB  10.0 GiB 100.64.0.2

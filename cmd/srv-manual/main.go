@@ -36,7 +36,7 @@ func stripFirstH1(html string) string {
 	return firstH1Re.ReplaceAllString(html, "")
 }
 
-var headingIDRe = regexp.MustCompile(`<(h[1-6])\s+id="([^"]+)">([^<]*)`)
+var headingRe = regexp.MustCompile(`(?s)<(h[1-6])\s+id="([^"]+)">(.*?)</h[1-6]>`)
 
 var preCodeRe = regexp.MustCompile(`(?s)<pre><code[^>]*>(.*?)</code></pre>`)
 
@@ -65,11 +65,11 @@ func addLineNumbersToCodeBlocks(html string) string {
 func addHeadingAnchorsAndNumbers(html string, secNum int, entries []tocEntry) string {
 	counters := make([]int, 5)
 	entryIdx := 0
-	return headingIDRe.ReplaceAllStringFunc(html, func(match string) string {
-		submatch := headingIDRe.FindStringSubmatch(match)
+	return headingRe.ReplaceAllStringFunc(html, func(match string) string {
+		submatch := headingRe.FindStringSubmatch(match)
 		tag := submatch[1]
 		id := submatch[2]
-		text := submatch[3]
+		innerHTML := submatch[3]
 
 		// Skip h1 entries in our tracking (they were stripped from content)
 		for entryIdx < len(entries) && entries[entryIdx].level <= 1 {
@@ -89,11 +89,11 @@ func addHeadingAnchorsAndNumbers(html string, secNum int, entries []tocEntry) st
 					num += fmt.Sprintf(".%d", counters[j])
 				}
 				entryIdx++
-				return fmt.Sprintf(`<%s id="%s"><a class="heading-anchor" href="#%s">%s %s</a></%s>`, tag, id, id, num, text, tag)
+				return fmt.Sprintf(`<%s id="%s"><a class="heading-anchor" href="#%s">%s %s</a></%s>`, tag, id, id, num, innerHTML, tag)
 			}
 			entryIdx++
 		}
-		return fmt.Sprintf(`<%s id="%s"><a class="heading-anchor" href="#%s">%s</a></%s>`, tag, id, id, text, tag)
+		return fmt.Sprintf(`<%s id="%s"><a class="heading-anchor" href="#%s">%s</a></%s>`, tag, id, id, innerHTML, tag)
 	})
 }
 
@@ -760,7 +760,8 @@ func main() {
 	}
 
 	footerHTML := fmt.Sprintf(`<footer>
-Sections: %d · Headings: %d · Words: %d
+<div>Sections: %d · Headings: %d · Words: %d</div>
+<div>MIT License · Copyright (c) 2026 Rene Michaelis</div>
 </footer>
 `, len(sections), headingCount, totalWords)
 

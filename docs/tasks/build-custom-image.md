@@ -1,6 +1,6 @@
 # Build a custom guest image
 
-The default guest image is an Arch Linux rootfs with Docker, Go, Neovim, OpenCode, and common development tools. You can customize it by modifying the overlay or building a completely different rootfs.
+The default guest image is an Arch Linux rootfs with Docker, Go, Neovim, OpenCode, Pi, and common development tools. You can customize it by modifying the overlay or building a completely different rootfs.
 
 ## Default image builder
 
@@ -20,7 +20,7 @@ This produces two artifacts:
 - Docker, docker-compose
 - Go, gopls, Odin, odinfmt, OLS
 - Neovim with a prewarmed LazyVim config (BMW heritage amber theme)
-- OpenCode CLI with per-VM Zen gateway bootstrap
+- OpenCode and Pi CLIs with per-VM Zen gateway bootstrap
 - Git, fd, ripgrep, tree-sitter-cli, gcc
 - iptables-nft with IPv4/IPv6 nftables support
 - `srv-bootstrap.service` for Tailscale and MMDS setup

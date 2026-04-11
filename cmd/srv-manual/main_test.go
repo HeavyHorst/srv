@@ -20,6 +20,26 @@ second
 	}
 }
 
+func TestAddHeadingAnchorsAndNumbersReplacesWholeHeading(t *testing.T) {
+	html := `<h2 id="build">Build</h2><h3 id="with-code">Use <code>srv</code></h3>`
+	entries := []tocEntry{
+		{level: 2, text: "Build", id: "build"},
+		{level: 3, text: "Use srv", id: "with-code"},
+	}
+
+	got := addHeadingAnchorsAndNumbers(html, 13, entries)
+
+	if strings.Contains(got, `</h2></h2>`) || strings.Contains(got, `</h3></h3>`) {
+		t.Fatalf("expected headings to have a single closing tag, got %q", got)
+	}
+	if !strings.Contains(got, `<h2 id="build"><a class="heading-anchor" href="#build">13.1 Build</a></h2>`) {
+		t.Fatalf("expected numbered h2 heading, got %q", got)
+	}
+	if !strings.Contains(got, `<h3 id="with-code"><a class="heading-anchor" href="#with-code">13.1.1 Use <code>srv</code></a></h3>`) {
+		t.Fatalf("expected inline heading markup to be preserved, got %q", got)
+	}
+}
+
 func TestPreprocessAdmonitionsTrimsEachIndentedLine(t *testing.T) {
 	content := "!!! note\n    First line.\n    Second line.\n"
 

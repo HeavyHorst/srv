@@ -201,6 +201,8 @@ When regenerating the single-page manual with `go run ./cmd/srv-manual docs manu
 
 Supported override values are `command`, `output`, `diagram`, and `example`.
 
+For local manual generation, `make manual` writes `manual.html` in the repo root. For GitHub Pages, `make pages-build` writes the same self-contained handbook to `dist/index.html`, and [`.github/workflows/deploy-manual.yml`](.github/workflows/deploy-manual.yml) publishes that artifact through the native GitHub Pages workflow on pushes to `main`.
+
 ## Non-Goals For Now
 
 - `srv` is intentionally a single-host control plane for this phase of the project.

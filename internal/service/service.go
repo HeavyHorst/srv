@@ -975,10 +975,7 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		rows = append(rows, [2]string{"LOAD 15m", fmt.Sprintf("%s %.2f", loadBar15m, summary.CPU.Load15m)})
 	}
 
-	instSummary := fmt.Sprintf("%d total | %d running | %d stopped | %d failed",
-		summary.Instances.Total, summary.Instances.Running,
-		summary.Instances.Stopped, summary.Instances.Failed)
-	rows = append(rows, [2]string{"INSTANCES", instSummary})
+	rows = append(rows, [2]string{"INSTANCES", formatStatusInstanceSummary(summary.Instances)})
 
 	for _, resource := range summary.Capacity {
 		label := strings.ToUpper(resource.Resource)
@@ -999,33 +996,32 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		}
 	}
 
-	totalWidth := col1Width + valueWidth + 7
 	var b strings.Builder
 
-	b.WriteString(boxTop(totalWidth))
+	b.WriteString(boxTop(col1Width, valueWidth))
 	for i, row := range rows {
 		label := row[0]
 		value := row[1]
 		if label != "" && i > 0 && rows[i-1][0] != "" {
-			b.WriteString(boxSeparator(totalWidth))
+			b.WriteString(boxSeparator(col1Width, valueWidth))
 		}
 		b.WriteString(boxRow(label, value, col1Width, valueWidth))
 	}
-	b.WriteString(boxBottom(totalWidth))
+	b.WriteString(boxBottom(col1Width, valueWidth))
 
 	return commandResult{stdout: b.String(), exitCode: 0}, nil
 }
 
-func boxTop(width int) string {
-	return "┌" + strings.Repeat("─", width-2) + "┐\n"
+func boxTop(labelWidth, valueWidth int) string {
+	return "┌" + strings.Repeat("─", labelWidth+2) + "┬" + strings.Repeat("─", valueWidth+2) + "┐\n"
 }
 
-func boxBottom(width int) string {
-	return "└" + strings.Repeat("─", width-2) + "┘\n"
+func boxBottom(labelWidth, valueWidth int) string {
+	return "└" + strings.Repeat("─", labelWidth+2) + "┴" + strings.Repeat("─", valueWidth+2) + "┘\n"
 }
 
-func boxSeparator(width int) string {
-	return "├" + strings.Repeat("─", width-2) + "┤\n"
+func boxSeparator(labelWidth, valueWidth int) string {
+	return "├" + strings.Repeat("─", labelWidth+2) + "┼" + strings.Repeat("─", valueWidth+2) + "┤\n"
 }
 
 func boxRow(label, value string, labelWidth, valueWidth int) string {

@@ -263,8 +263,11 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 		"advisory only; overcommit allowed",
 		format.BinarySize(expectedDiskAllocated),
 		"┌",
+		"┬",
 		"┐",
+		"┼",
 		"└",
+		"┴",
 		"┘",
 		"│",
 	} {
@@ -274,6 +277,9 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	}
 	if strings.Contains(result.stdout, "\nready:") {
 		t.Fatalf("cmdStatus() included duplicated state block\nfull output:\n%s", result.stdout)
+	}
+	if strings.Contains(result.stdout, " | ") {
+		t.Fatalf("cmdStatus() mixed ASCII pipes into the table content\nfull output:\n%s", result.stdout)
 	}
 	lines := strings.Split(strings.TrimSuffix(result.stdout, "\n"), "\n")
 	wantWidth := utf8.RuneCountInString(lines[0])

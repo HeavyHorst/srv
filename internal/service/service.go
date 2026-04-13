@@ -949,8 +949,9 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		return jsonResult(summary)
 	}
 
-	const col1Width = 16
-	const barWidth = 44
+	const col1Width = 12
+	const barWidth = 32
+	const valueWidth = 52
 
 	var rows [][2]string
 
@@ -969,14 +970,12 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		loadBar1m := format.BarWide(barWidth, int64(summary.CPU.Load1m*100), 100)
 		loadBar5m := format.BarWide(barWidth, int64(summary.CPU.Load5m*100), 100)
 		loadBar15m := format.BarWide(barWidth, int64(summary.CPU.Load15m*100), 100)
-		loadInfo := fmt.Sprintf("1m %s %.2f  |  5m %s %.2f  |  15m %s %.2f",
-			loadBar1m, summary.CPU.Load1m,
-			loadBar5m, summary.CPU.Load5m,
-			loadBar15m, summary.CPU.Load15m)
-		rows = append(rows, [2]string{"LOAD", loadInfo})
+		rows = append(rows, [2]string{"LOAD 1m", fmt.Sprintf("%s %.2f", loadBar1m, summary.CPU.Load1m)})
+		rows = append(rows, [2]string{"LOAD 5m", fmt.Sprintf("%s %.2f", loadBar5m, summary.CPU.Load5m)})
+		rows = append(rows, [2]string{"LOAD 15m", fmt.Sprintf("%s %.2f", loadBar15m, summary.CPU.Load15m)})
 	}
 
-	instSummary := fmt.Sprintf("%d total  |  %d running  |  %d stopped  |  %d failed",
+	instSummary := fmt.Sprintf("%d total | %d running | %d stopped | %d failed",
 		summary.Instances.Total, summary.Instances.Running,
 		summary.Instances.Stopped, summary.Instances.Failed)
 	rows = append(rows, [2]string{"INSTANCES", instSummary})
@@ -989,7 +988,7 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		if resource.Budget > 0 {
 			pct = int(float64(resource.Allocated) / float64(resource.Budget) * 100)
 		}
-		valueLine := fmt.Sprintf("%s / %s  [%d%%]", allocatedStr, budgetStr, pct)
+		valueLine := fmt.Sprintf("%s / %s [%d%%]", allocatedStr, budgetStr, pct)
 		rows = append(rows, [2]string{label, valueLine})
 
 		bar := format.BarWide(barWidth, resource.Allocated, resource.Budget)
@@ -1000,7 +999,7 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		}
 	}
 
-	totalWidth := col1Width + 3 + 60
+	totalWidth := col1Width + 3 + valueWidth
 	var b strings.Builder
 
 	b.WriteString(boxTop(totalWidth))
@@ -1010,7 +1009,7 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		if label != "" && i > 0 && rows[i-1][0] != "" {
 			b.WriteString(boxSeparator(totalWidth))
 		}
-		b.WriteString(boxRow(label, value, col1Width))
+		b.WriteString(boxRow(label, value, col1Width, valueWidth))
 	}
 	b.WriteString(boxBottom(totalWidth))
 
@@ -1029,11 +1028,15 @@ func boxSeparator(width int) string {
 	return "├" + strings.Repeat("─", width-2) + "┤\n"
 }
 
-func boxRow(label, value string, labelWidth int) string {
-	if label == "" {
-		return fmt.Sprintf("│ %-*s│ %s │\n", labelWidth+1, "", value)
+func boxRow(label, value string, labelWidth, valueWidth int) string {
+	// Truncate or pad value to fit exactly
+	if len(value) > valueWidth {
+		value = value[:valueWidth-3] + "..."
 	}
-	return fmt.Sprintf("│ %-*s│ %s │\n", labelWidth+1, label, value)
+	if label == "" {
+		return fmt.Sprintf("│ %-*s│ %-*s │\n", labelWidth+1, "", valueWidth, value)
+	}
+	return fmt.Sprintf("│ %-*s│ %-*s │\n", labelWidth+1, label, valueWidth, value)
 }
 
 func (a *App) cmdLogsRequest(ctx context.Context, actor model.Actor, req logsRequest) (commandResult, error) {

@@ -459,6 +459,21 @@ func TestFormatStatusBarUsesRequestedWidth(t *testing.T) {
 	}
 }
 
+func TestSkipStatusSeparatorKeepsDiskStorageDetailsGrouped(t *testing.T) {
+	for _, tc := range []struct {
+		prev string
+		curr string
+	}{
+		{prev: "DISK", curr: "BTRFS"},
+		{prev: "DISK", curr: "MDADM"},
+		{prev: "BTRFS", curr: "MDADM"},
+	} {
+		if !skipStatusSeparator(tc.prev, tc.curr) {
+			t.Fatalf("skipStatusSeparator(%q, %q) = false, want true", tc.prev, tc.curr)
+		}
+	}
+}
+
 func TestFormatStatusUsageLineUsesSharedByteUnit(t *testing.T) {
 	got := formatStatusUsageLine("bytes", 0, 147*1024*1024/10, 0)
 	const want = "0/14.7 MiB [0%]"

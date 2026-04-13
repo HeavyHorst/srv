@@ -33,6 +33,7 @@ import (
 
 	"srv/internal/config"
 	"srv/internal/format"
+	"srv/internal/host"
 	"srv/internal/model"
 	"srv/internal/provision"
 	"srv/internal/store"
@@ -166,9 +167,9 @@ type restoreResponseJSON struct {
 	Backup   backupJSON          `json:"backup"`
 }
 
-type statusResponseJSON = provision.CapacitySummary
-type statusInstancesJSON = provision.CapacityInstances
-type statusResourceJSON = provision.CapacityResource
+type statusResponseJSON = host.CapacitySummary
+type statusInstancesJSON = host.CapacityInstances
+type statusResourceJSON = host.CapacityResource
 
 type logTarget string
 
@@ -987,6 +988,10 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 
 		bar := formatStatusBar(valueWidth, resource.Allocated, resource.Budget)
 		rows = append(rows, [2]string{"", bar})
+
+		for _, detail := range resource.Details {
+			rows = append(rows, [2]string{strings.ToUpper(detail.Label), detail.Value})
+		}
 	}
 
 	var b strings.Builder
@@ -1038,7 +1043,25 @@ func skipStatusSeparator(prevLabel, label string) bool {
 	if strings.HasPrefix(prevLabel, "LOAD ") && strings.HasPrefix(label, "LOAD ") {
 		return true
 	}
+	if prevRank := statusStorageLabelRank(prevLabel); prevRank >= 0 {
+		if labelRank := statusStorageLabelRank(label); labelRank > prevRank {
+			return true
+		}
+	}
 	return false
+}
+
+func statusStorageLabelRank(label string) int {
+	switch label {
+	case "DISK":
+		return 0
+	case "BTRFS":
+		return 1
+	case "MDADM":
+		return 2
+	default:
+		return -1
+	}
 }
 
 func boxRow(label, value string, labelWidth, valueWidth int) string {

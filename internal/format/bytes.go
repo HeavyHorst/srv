@@ -31,6 +31,14 @@ func repeatBar(n int, r rune) string {
 	return string(b)
 }
 
+const (
+	Byte = int64(1)
+	KiB  = 1024 * Byte
+	MiB  = 1024 * KiB
+	GiB  = 1024 * MiB
+	TiB  = 1024 * GiB
+)
+
 func BinarySize(sizeBytes int64) string {
 	if sizeBytes < 1024 {
 		return fmt.Sprintf("%d B", sizeBytes)

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -23,8 +24,11 @@ import (
 	"tailscale.com/client/tailscale/v2"
 
 	"srv/internal/config"
+	"srv/internal/format"
+	"srv/internal/host"
 	"srv/internal/model"
 	"srv/internal/nethelper"
+	"srv/internal/storage"
 	"srv/internal/store"
 	"srv/internal/vmrunner"
 )
@@ -97,7 +101,7 @@ func TestPrepareInstanceDirRejectsActiveOrOrphanedNames(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: defaultReadFilesystemBytes,
+		readFilesystemBytes: host.DefaultReadFilesystemBytes,
 	}
 
 	active := provisionTestInstance(cfg, "busy", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
@@ -242,7 +246,7 @@ func TestAllocateNetworkSkipsDeletedSubnetsAndDetectsExhaustion(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: defaultReadFilesystemBytes,
+		readFilesystemBytes: host.DefaultReadFilesystemBytes,
 	}
 
 	used := provisionTestInstance(cfg, "used", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
@@ -339,7 +343,7 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: defaultReadFilesystemBytes,
+		readFilesystemBytes: host.DefaultReadFilesystemBytes,
 	}
 
 	oldReflinkCloneFile := reflinkCloneFile
@@ -520,13 +524,13 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 		cfg:                 sourceCfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               sourceStore,
-		readFilesystemBytes: defaultReadFilesystemBytes,
+		readFilesystemBytes: host.DefaultReadFilesystemBytes,
 	}
 	dest := &Provisioner{
 		cfg:                 destCfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               destStore,
-		readFilesystemBytes: defaultReadFilesystemBytes,
+		readFilesystemBytes: host.DefaultReadFilesystemBytes,
 	}
 	for _, dir := range []string{sourceCfg.InstancesDir(), destCfg.InstancesDir()} {
 		if err := os.MkdirAll(dir, 0o770); err != nil {
@@ -782,7 +786,7 @@ func TestImportInstanceRejectsAliasedPortableArtifactEntries(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: defaultReadFilesystemBytes,
+		readFilesystemBytes: host.DefaultReadFilesystemBytes,
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
 		t.Fatalf("MkdirAll(instances dir): %v", err)
@@ -819,7 +823,7 @@ func TestImportInstanceRejectsOversizedPortableLogs(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: defaultReadFilesystemBytes,
+		readFilesystemBytes: host.DefaultReadFilesystemBytes,
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
 		t.Fatalf("MkdirAll(instances dir): %v", err)
@@ -927,7 +931,7 @@ func TestImportInstanceReleasesAdmissionLockDuringStreaming(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: defaultReadFilesystemBytes,
+		readFilesystemBytes: host.DefaultReadFilesystemBytes,
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
 		t.Fatalf("MkdirAll(instances dir): %v", err)
@@ -1148,7 +1152,7 @@ func TestBackupRequiresStoppedInstance(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: defaultReadFilesystemBytes,
+		readFilesystemBytes: host.DefaultReadFilesystemBytes,
 	}
 
 	inst := provisionTestInstance(cfg, "demo", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
@@ -1586,10 +1590,10 @@ func TestCreateRejectsWhenHostDiskSpaceIsLow(t *testing.T) {
 		store:    st,
 		tsClient: &tailscale.Client{},
 		readHostMemoryBytes: func() (int64, error) {
-			return 8 * 1024 * miB, nil
+			return 8 * 1024 * format.MiB, nil
 		},
 		readFilesystemBytes: func(string) (int64, error) {
-			return 512 * miB, nil
+			return 512 * format.MiB, nil
 		},
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
@@ -1604,7 +1608,7 @@ func TestCreateRejectsWhenHostDiskSpaceIsLow(t *testing.T) {
 			t.Fatalf("WriteFile(%q): %v", path, err)
 		}
 	}
-	if err := os.Truncate(baseRootFS, 4*miB); err != nil {
+	if err := os.Truncate(baseRootFS, 4*format.MiB); err != nil {
 		t.Fatalf("Truncate(baseRootFS): %v", err)
 	}
 
@@ -1737,7 +1741,7 @@ func TestStartRejectsWhenHostMemoryIsLow(t *testing.T) {
 		networkHelper: panicNetworkHelper{t: t},
 		vmRunner:      panicVMRunner{t: t},
 		readHostMemoryBytes: func() (int64, error) {
-			return 1024 * miB, nil
+			return 1024 * format.MiB, nil
 		},
 	}
 	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
@@ -1962,7 +1966,7 @@ func TestResizeRejectsGrowingRootFSWhenHostDiskSpaceIsLow(t *testing.T) {
 		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store: st,
 		readFilesystemBytes: func(string) (int64, error) {
-			return 256 * miB, nil
+			return 256 * format.MiB, nil
 		},
 	}
 
@@ -1996,12 +2000,82 @@ func TestResizeRejectsGrowingRootFSWhenHostDiskSpaceIsLow(t *testing.T) {
 	}
 }
 
+func TestCapacitySummaryIncludesDiskStorageDetails(t *testing.T) {
+	oldReadProcMountInfo := storage.ReadProcMountInfo
+	oldReadTrimmedFile := storage.ReadTrimmedFile
+	oldRunBtrfsCommand := storage.RunBtrfsCommand
+	oldPathExists := storage.PathExists
+	t.Cleanup(func() {
+		storage.ReadProcMountInfo = oldReadProcMountInfo
+		storage.ReadTrimmedFile = oldReadTrimmedFile
+		storage.RunBtrfsCommand = oldRunBtrfsCommand
+		storage.PathExists = oldPathExists
+	})
+
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:   cfg,
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+		readHostMemoryBytes: func() (int64, error) {
+			return 8 * 1024 * format.MiB, nil
+		},
+		readFilesystemBytes: func(string) (int64, error) {
+			return 128 * 1024 * format.MiB, nil
+		},
+	}
+	if err := os.MkdirAll(cfg.InstancesDir(), 0o755); err != nil {
+		t.Fatalf("MkdirAll(instances dir): %v", err)
+	}
+
+	storage.ReadProcMountInfo = func() ([]byte, error) {
+		line := fmt.Sprintf("36 25 0:32 / %s rw,relatime - btrfs /dev/md0 rw\n", cfg.InstancesDir())
+		return []byte(line), nil
+	}
+	storage.ReadTrimmedFile = func(path string) (string, error) {
+		switch path {
+		case "/sys/class/block/md0/md/array_state":
+			return "clean", nil
+		case "/sys/class/block/md0/md/degraded":
+			return "0", nil
+		case "/sys/class/block/md0/md/sync_action":
+			return "idle", nil
+		default:
+			return "", os.ErrNotExist
+		}
+	}
+	storage.RunBtrfsCommand = func(context.Context, ...string) (string, error) {
+		return "", nil
+	}
+	storage.PathExists = func(string) bool { return false }
+
+	summary, err := p.CapacitySummary(ctx)
+	if err != nil {
+		t.Fatalf("CapacitySummary(): %v", err)
+	}
+
+	resources := make(map[string]host.CapacityResource, len(summary.Capacity))
+	for _, resource := range summary.Capacity {
+		resources[resource.Resource] = resource
+	}
+	disk := resources["disk"]
+	want := []host.CapacityDetail{
+		{Label: "BTRFS", Value: "DEVICE STATS CLEAN"},
+		{Label: "MDADM", Value: "HEALTH O.K."},
+	}
+	if !reflect.DeepEqual(disk.Details, want) {
+		t.Fatalf("disk details = %#v, want %#v", disk.Details, want)
+	}
+}
+
 func TestReservedInstanceRootFSBytesUsesAllocatedBytesForDeletedAndDeletingInstances(t *testing.T) {
 	rootfsPath := filepath.Join(t.TempDir(), "rootfs.img")
 	if err := os.WriteFile(rootfsPath, []byte("payload"), 0o644); err != nil {
 		t.Fatalf("WriteFile(rootfs): %v", err)
 	}
-	if err := os.Truncate(rootfsPath, 64*miB); err != nil {
+	if err := os.Truncate(rootfsPath, 64*format.MiB); err != nil {
 		t.Fatalf("Truncate(rootfs): %v", err)
 	}
 
@@ -2018,7 +2092,7 @@ func TestReservedInstanceRootFSBytesUsesAllocatedBytesForDeletedAndDeletingInsta
 		inst := model.Instance{
 			State:           state,
 			RootFSPath:      rootfsPath,
-			RootFSSizeBytes: 64 * miB,
+			RootFSSizeBytes: 64 * format.MiB,
 		}
 		if got, want := reservedInstanceRootFSBytes(inst), st.Blocks*512; got != want {
 			t.Fatalf("reservedInstanceRootFSBytes(%q) = %d, want %d", state, got, want)
@@ -2037,7 +2111,7 @@ func TestEnsureHostDiskCapacityCountsDeletedInstancesStillPresentInStore(t *test
 	if err := os.WriteFile(rootfsPath, []byte("payload"), 0o644); err != nil {
 		t.Fatalf("WriteFile(rootfs): %v", err)
 	}
-	if err := os.Truncate(rootfsPath, 64*miB); err != nil {
+	if err := os.Truncate(rootfsPath, 64*format.MiB); err != nil {
 		t.Fatalf("Truncate(rootfs): %v", err)
 	}
 
@@ -2053,14 +2127,14 @@ func TestEnsureHostDiskCapacityCountsDeletedInstancesStillPresentInStore(t *test
 
 	deleted := provisionTestInstance(cfg, "deleted", model.StateDeleted, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 	deleted.RootFSPath = rootfsPath
-	deleted.RootFSSizeBytes = 64 * miB
+	deleted.RootFSSizeBytes = 64 * format.MiB
 	deletedAt := deleted.CreatedAt.Add(time.Minute)
 	deleted.DeletedAt = &deletedAt
 	if err := st.CreateInstance(ctx, deleted); err != nil {
 		t.Fatalf("CreateInstance(deleted): %v", err)
 	}
 
-	requestedBytes := int64(8 * miB)
+	requestedBytes := int64(8 * format.MiB)
 	p := &Provisioner{
 		cfg:   cfg,
 		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),

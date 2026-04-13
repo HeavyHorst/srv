@@ -999,7 +999,7 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		}
 	}
 
-	totalWidth := col1Width + 3 + valueWidth
+	totalWidth := col1Width + valueWidth + 7
 	var b strings.Builder
 
 	b.WriteString(boxTop(totalWidth))
@@ -1029,9 +1029,14 @@ func boxSeparator(width int) string {
 }
 
 func boxRow(label, value string, labelWidth, valueWidth int) string {
-	// Truncate or pad value to fit exactly
-	if len(value) > valueWidth {
-		value = value[:valueWidth-3] + "..."
+	// Truncate by rune count so UTF-8 bar glyphs don't get cut off early.
+	valueRunes := []rune(value)
+	if len(valueRunes) > valueWidth {
+		if valueWidth <= 3 {
+			value = string([]rune("...")[:valueWidth])
+		} else {
+			value = string(valueRunes[:valueWidth-3]) + "..."
+		}
 	}
 	if label == "" {
 		return fmt.Sprintf("│ %-*s│ %-*s │\n", labelWidth+1, "", valueWidth, value)

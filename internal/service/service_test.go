@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"srv/internal/config"
 	"srv/internal/format"
@@ -274,6 +275,13 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	if strings.Contains(result.stdout, "\nready:") {
 		t.Fatalf("cmdStatus() included duplicated state block\nfull output:\n%s", result.stdout)
 	}
+	lines := strings.Split(strings.TrimSuffix(result.stdout, "\n"), "\n")
+	wantWidth := utf8.RuneCountInString(lines[0])
+	for _, line := range lines {
+		if got := utf8.RuneCountInString(line); got != wantWidth {
+			t.Fatalf("cmdStatus() produced uneven box width: line %q has width %d, want %d\nfull output:\n%s", line, got, wantWidth, result.stdout)
+		}
+	}
 }
 
 func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
@@ -355,6 +363,14 @@ func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
 	disk := resources["disk"]
 	if disk.Allocated != expectedDiskAllocated || disk.Reserve != 1<<30 || disk.Budget != max(disk.Total-disk.Reserve, int64(0)) || disk.Left != disk.Budget-disk.Allocated {
 		t.Fatalf("disk status = %#v", disk)
+	}
+}
+
+func TestBoxRowKeepsUTF8BarsWhenTheyFit(t *testing.T) {
+	value := "[████░░░░░░░░░░░░░░]"
+	got := boxRow("LOAD", value, 12, 24)
+	if !strings.Contains(got, value) {
+		t.Fatalf("boxRow() cut off UTF-8 bar that fits the column\nwant substring: %q\ngot: %q", value, got)
 	}
 }
 

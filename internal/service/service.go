@@ -956,10 +956,11 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 			formatStatusValue(resource.Unit, resource.Allocated),
 			formatStatusValue(resource.Unit, resource.Budget),
 			formatStatusValue(resource.Unit, resource.Left),
+			format.Bar(resource.Allocated, resource.Budget),
 			resource.Note,
 		})
 	}
-	tableOutput, err := renderTextTable([]string{"Resource", "Allocated", "Budget", "Left", "Notes"}, tableRows)
+	tableOutput, err := renderTextTable([]string{"Resource", "Allocated", "Budget", "Left", "Used", "Notes"}, tableRows)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("render status: %v\n", err), exitCode: 1}, err
 	}

@@ -258,6 +258,7 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 		"ALLOCATED",
 		"BUDGET",
 		"LEFT",
+		"USED",
 		"cpu",
 		"memory",
 		"disk",

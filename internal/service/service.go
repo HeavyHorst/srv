@@ -950,7 +950,6 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 	}
 
 	const col1Width = 12
-	const barWidth = 32
 	const valueWidth = 52
 
 	var rows [][2]string
@@ -967,33 +966,27 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		}
 		rows = append(rows, [2]string{"", coreInfo})
 
-		loadBar1m := format.BarWide(barWidth, int64(summary.CPU.Load1m*100), 100)
-		loadBar5m := format.BarWide(barWidth, int64(summary.CPU.Load5m*100), 100)
-		loadBar15m := format.BarWide(barWidth, int64(summary.CPU.Load15m*100), 100)
-		rows = append(rows, [2]string{"LOAD 1m", fmt.Sprintf("%s %.2f", loadBar1m, summary.CPU.Load1m)})
-		rows = append(rows, [2]string{"LOAD 5m", fmt.Sprintf("%s %.2f", loadBar5m, summary.CPU.Load5m)})
-		rows = append(rows, [2]string{"LOAD 15m", fmt.Sprintf("%s %.2f", loadBar15m, summary.CPU.Load15m)})
+		loadBar1m := formatStatusLoadBar(valueWidth, summary.CPU.LogicalCores, summary.CPU.Load1m)
+		loadBar5m := formatStatusLoadBar(valueWidth, summary.CPU.LogicalCores, summary.CPU.Load5m)
+		loadBar15m := formatStatusLoadBar(valueWidth, summary.CPU.LogicalCores, summary.CPU.Load15m)
+		rows = append(rows, [2]string{"LOAD 1m", loadBar1m})
+		rows = append(rows, [2]string{"LOAD 5m", loadBar5m})
+		rows = append(rows, [2]string{"LOAD 15m", loadBar15m})
 	}
 
 	rows = append(rows, [2]string{"INSTANCES", formatStatusInstanceSummary(summary.Instances)})
 
 	for _, resource := range summary.Capacity {
 		label := strings.ToUpper(resource.Resource)
-		allocatedStr := formatStatusValue(resource.Unit, resource.Allocated)
-		budgetStr := formatStatusValue(resource.Unit, resource.Budget)
 		pct := 0
 		if resource.Budget > 0 {
 			pct = int(float64(resource.Allocated) / float64(resource.Budget) * 100)
 		}
-		valueLine := fmt.Sprintf("%s / %s [%d%%]", allocatedStr, budgetStr, pct)
+		valueLine := formatStatusResourceLine(resource, pct)
 		rows = append(rows, [2]string{label, valueLine})
 
-		bar := format.BarWide(barWidth, resource.Allocated, resource.Budget)
+		bar := formatStatusBar(valueWidth, resource.Allocated, resource.Budget)
 		rows = append(rows, [2]string{"", bar})
-
-		if resource.Note != "" {
-			rows = append(rows, [2]string{"", resource.Note})
-		}
 	}
 
 	var b strings.Builder
@@ -1002,8 +995,10 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 	for i, row := range rows {
 		label := row[0]
 		value := row[1]
-		if label != "" && i > 0 && rows[i-1][0] != "" {
-			b.WriteString(boxSeparator(col1Width, valueWidth))
+		if label != "" && i > 0 {
+			if prevLabel := previousStatusLabel(rows, i-1); prevLabel != "" && !skipStatusSeparator(prevLabel, label) {
+				b.WriteString(boxSeparator(col1Width, valueWidth))
+			}
 		}
 		b.WriteString(boxRow(label, value, col1Width, valueWidth))
 	}
@@ -1022,6 +1017,28 @@ func boxBottom(labelWidth, valueWidth int) string {
 
 func boxSeparator(labelWidth, valueWidth int) string {
 	return "├" + strings.Repeat("─", labelWidth+2) + "┼" + strings.Repeat("─", valueWidth+2) + "┤\n"
+}
+
+func previousStatusLabel(rows [][2]string, i int) string {
+	for ; i >= 0; i-- {
+		if rows[i][0] != "" {
+			return rows[i][0]
+		}
+	}
+	return ""
+}
+
+func skipStatusSeparator(prevLabel, label string) bool {
+	if prevLabel == "OS" && label == "KERNEL" {
+		return true
+	}
+	if prevLabel == "CPU" && label == "LOAD 1m" {
+		return true
+	}
+	if strings.HasPrefix(prevLabel, "LOAD ") && strings.HasPrefix(label, "LOAD ") {
+		return true
+	}
+	return false
 }
 
 func boxRow(label, value string, labelWidth, valueWidth int) string {
@@ -2154,18 +2171,93 @@ func formatStatusInstanceSummary(instances statusInstancesJSON) string {
 	return strings.Join(parts, ", ")
 }
 
-func formatStatusValue(unit string, value int64) string {
+func formatStatusUsageLine(unit string, allocated, budget int64, pct int) string {
 	switch unit {
 	case "vcpu":
-		return fmt.Sprintf("%d vCPU", value)
+		return fmt.Sprintf("%d/%d vCPU [%d%%]", allocated, budget, pct)
 	case "bytes":
-		if value < 0 {
-			return "-" + format.BinarySize(-value)
-		}
-		return format.BinarySize(value)
+		return formatStatusByteUsageLine(allocated, budget, pct)
 	default:
-		return strconv.FormatInt(value, 10)
+		return fmt.Sprintf("%d/%d [%d%%]", allocated, budget, pct)
 	}
+}
+
+func formatStatusResourceLine(resource statusResourceJSON, pct int) string {
+	valueLine := formatStatusUsageLine(resource.Unit, resource.Allocated, resource.Budget, pct)
+	if note := formatStatusInlineNote(resource); note != "" {
+		return valueLine + " - " + note
+	}
+	return valueLine
+}
+
+func formatStatusInlineNote(resource statusResourceJSON) string {
+	if resource.Advisory {
+		return "overcommit allowed"
+	}
+	if resource.Reserve > 0 && resource.Unit == "bytes" {
+		return format.BinarySize(resource.Reserve) + " host reserve"
+	}
+	return ""
+}
+
+func formatStatusByteUsageLine(allocated, budget int64, pct int) string {
+	unit, divisor := statusByteUnit(maxInt64(absInt64(allocated), absInt64(budget)))
+	return fmt.Sprintf("%s/%s %s [%d%%]",
+		formatStatusUsageNumber(float64(allocated)/divisor),
+		formatStatusUsageNumber(float64(budget)/divisor),
+		unit,
+		pct,
+	)
+}
+
+func statusByteUnit(sizeBytes int64) (string, float64) {
+	for _, unit := range []struct {
+		name    string
+		divisor float64
+	}{
+		{"TiB", 1024 * 1024 * 1024 * 1024},
+		{"GiB", 1024 * 1024 * 1024},
+		{"MiB", 1024 * 1024},
+		{"KiB", 1024},
+	} {
+		if sizeBytes >= int64(unit.divisor) {
+			return unit.name, unit.divisor
+		}
+	}
+	return "B", 1
+}
+
+func formatStatusUsageNumber(value float64) string {
+	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(value, 'f', 2, 64), "0"), ".")
+}
+
+func absInt64(value int64) int64 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func formatStatusLoadBar(width, logicalCores int, load float64) string {
+	total := int64(logicalCores) * 100
+	if total <= 0 {
+		total = 100
+	}
+	return formatStatusBar(width, int64(math.Round(load*100)), total)
+}
+
+func formatStatusBar(width int, used, total int64) string {
+	bar := format.BarWide(width, used, total)
+	bar = strings.TrimPrefix(bar, "[")
+	bar = strings.TrimSuffix(bar, "]")
+	return bar
 }
 
 func missingInstanceResult(command, name string, err error) (commandResult, error) {

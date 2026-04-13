@@ -20,7 +20,6 @@ import (
 	"unicode/utf8"
 
 	"srv/internal/config"
-	"srv/internal/format"
 	"srv/internal/model"
 	"srv/internal/provision"
 	"srv/internal/store"
@@ -251,6 +250,33 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	if result.exitCode != 0 {
 		t.Fatalf("cmdStatus() exitCode = %d, want 0", result.exitCode)
 	}
+	summary, err := prov.CapacitySummary(ctx)
+	if err != nil {
+		t.Fatalf("CapacitySummary(): %v", err)
+	}
+	expectedCPUUsage := ""
+	expectedMemoryUsage := ""
+	expectedDiskUsage := ""
+	for _, resource := range summary.Capacity {
+		pct := 0
+		if resource.Budget > 0 {
+			pct = int(float64(resource.Allocated) / float64(resource.Budget) * 100)
+		}
+		switch resource.Resource {
+		case "cpu":
+			expectedCPUUsage = formatStatusResourceLine(resource, pct)
+		case "memory":
+			expectedMemoryUsage = formatStatusResourceLine(resource, pct)
+		case "disk":
+			if resource.Allocated != expectedDiskAllocated {
+				t.Fatalf("disk allocated = %d, want %d", resource.Allocated, expectedDiskAllocated)
+			}
+			expectedDiskUsage = formatStatusResourceLine(resource, pct)
+		}
+	}
+	if expectedCPUUsage == "" || expectedMemoryUsage == "" || expectedDiskUsage == "" {
+		t.Fatal("expected cpu, memory, and disk resources in CapacitySummary")
+	}
 	for _, want := range []string{
 		"srv",
 		"total",
@@ -260,8 +286,9 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 		"CPU",
 		"MEMORY",
 		"DISK",
-		"advisory only; overcommit allowed",
-		format.BinarySize(expectedDiskAllocated),
+		expectedCPUUsage,
+		expectedMemoryUsage,
+		expectedDiskUsage,
 		"┌",
 		"┬",
 		"┐",
@@ -281,7 +308,44 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	if strings.Contains(result.stdout, " | ") {
 		t.Fatalf("cmdStatus() mixed ASCII pipes into the table content\nfull output:\n%s", result.stdout)
 	}
+	for _, unwanted := range []string{
+		"advisory only; overcommit allowed",
+		" total - ",
+	} {
+		if strings.Contains(result.stdout, unwanted) {
+			t.Fatalf("cmdStatus() still included old standalone note content %q\nfull output:\n%s", unwanted, result.stdout)
+		}
+	}
 	lines := strings.Split(strings.TrimSuffix(result.stdout, "\n"), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "│ LOAD ") && strings.Contains(line, ".") {
+			t.Fatalf("cmdStatus() still included numeric load values\nline: %q\nfull output:\n%s", line, result.stdout)
+		}
+	}
+	for i := 0; i < len(lines)-1; i++ {
+		if strings.HasPrefix(lines[i], "│ OS") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
+			if i+2 < len(lines) && strings.HasPrefix(lines[i+2], "│ KERNEL") {
+				t.Fatalf("cmdStatus() included a separator between OS and KERNEL\nfull output:\n%s", result.stdout)
+			}
+		}
+		if strings.HasPrefix(lines[i], "│ LOAD 1m") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
+			if i+2 < len(lines) && strings.HasPrefix(lines[i+2], "│ LOAD 5m") {
+				t.Fatalf("cmdStatus() included a separator between LOAD 1m and LOAD 5m\nfull output:\n%s", result.stdout)
+			}
+		}
+		if strings.HasPrefix(lines[i], "│ LOAD 5m") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
+			if i+2 < len(lines) && strings.HasPrefix(lines[i+2], "│ LOAD 15m") {
+				t.Fatalf("cmdStatus() included a separator between LOAD 5m and LOAD 15m\nfull output:\n%s", result.stdout)
+			}
+		}
+	}
+	for i, line := range lines {
+		if strings.HasPrefix(line, "│ MEMORY") || strings.HasPrefix(line, "│ DISK") {
+			if i == 0 || !strings.Contains(lines[i-1], "├") {
+				t.Fatalf("cmdStatus() missing a separator before %q\nfull output:\n%s", strings.TrimSpace(line), result.stdout)
+			}
+		}
+	}
 	wantWidth := utf8.RuneCountInString(lines[0])
 	for _, line := range lines {
 		if got := utf8.RuneCountInString(line); got != wantWidth {
@@ -373,10 +437,57 @@ func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
 }
 
 func TestBoxRowKeepsUTF8BarsWhenTheyFit(t *testing.T) {
-	value := "[████░░░░░░░░░░░░░░]"
+	value := "████░░░░░░░░░░░░░░"
 	got := boxRow("LOAD", value, 12, 24)
 	if !strings.Contains(got, value) {
 		t.Fatalf("boxRow() cut off UTF-8 bar that fits the column\nwant substring: %q\ngot: %q", value, got)
+	}
+}
+
+func TestFormatStatusLoadBarNormalizesByLogicalCores(t *testing.T) {
+	got := formatStatusLoadBar(52, 12, 1.08)
+	want := strings.Repeat("█", 4) + strings.Repeat("░", 48)
+	if got != want {
+		t.Fatalf("formatStatusLoadBar() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatStatusBarUsesRequestedWidth(t *testing.T) {
+	got := formatStatusBar(52, 0, 100)
+	if utf8.RuneCountInString(got) != 52 {
+		t.Fatalf("formatStatusBar() width = %d, want 52", utf8.RuneCountInString(got))
+	}
+}
+
+func TestFormatStatusUsageLineUsesSharedByteUnit(t *testing.T) {
+	got := formatStatusUsageLine("bytes", 0, 147*1024*1024/10, 0)
+	const want = "0/14.7 MiB [0%]"
+	if got != want {
+		t.Fatalf("formatStatusUsageLine(bytes) = %q, want %q", got, want)
+	}
+}
+
+func TestFormatStatusUsageLineUsesCompactVCPUFormat(t *testing.T) {
+	got := formatStatusUsageLine("vcpu", 2, 12, 16)
+	const want = "2/12 vCPU [16%]"
+	if got != want {
+		t.Fatalf("formatStatusUsageLine(vcpu) = %q, want %q", got, want)
+	}
+}
+
+func TestFormatStatusResourceLineUsesInlineAdvisoryNote(t *testing.T) {
+	got := formatStatusResourceLine(statusResourceJSON{Unit: "vcpu", Allocated: 0, Budget: 12, Advisory: true}, 0)
+	const want = "0/12 vCPU [0%] - overcommit allowed"
+	if got != want {
+		t.Fatalf("formatStatusResourceLine(cpu) = %q, want %q", got, want)
+	}
+}
+
+func TestFormatStatusResourceLineUsesInlineReserveNote(t *testing.T) {
+	got := formatStatusResourceLine(statusResourceJSON{Unit: "bytes", Allocated: 0, Budget: 1473 * 1024 * 1024 / 100, Reserve: 512 * 1024 * 1024}, 0)
+	const want = "0/14.73 MiB [0%] - 512.0 MiB host reserve"
+	if got != want {
+		t.Fatalf("formatStatusResourceLine(memory) = %q, want %q", got, want)
 	}
 }
 

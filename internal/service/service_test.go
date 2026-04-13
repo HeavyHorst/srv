@@ -251,19 +251,21 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 		t.Fatalf("cmdStatus() exitCode = %d, want 0", result.exitCode)
 	}
 	for _, want := range []string{
-		"server: srv\n",
-		"instances: 4 total, 1 running, 1 stopped, 1 failed, 1 deleting\n",
-		"capacity\n",
-		"RESOURCE",
-		"ALLOCATED",
-		"BUDGET",
-		"LEFT",
-		"USED",
-		"cpu",
-		"memory",
-		"disk",
+		"srv",
+		"total",
+		"running",
+		"stopped",
+		"failed",
+		"CPU",
+		"MEMORY",
+		"DISK",
 		"advisory only; overcommit allowed",
 		format.BinarySize(expectedDiskAllocated),
+		"┌",
+		"┐",
+		"└",
+		"┘",
+		"│",
 	} {
 		if !strings.Contains(result.stdout, want) {
 			t.Fatalf("cmdStatus() stdout missing %q\nfull output:\n%s", want, result.stdout)

@@ -949,28 +949,91 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 		return jsonResult(summary)
 	}
 
-	tableRows := make([][]string, 0, len(summary.Capacity))
-	for _, resource := range summary.Capacity {
-		tableRows = append(tableRows, []string{
-			resource.Resource,
-			formatStatusValue(resource.Unit, resource.Allocated),
-			formatStatusValue(resource.Unit, resource.Budget),
-			formatStatusValue(resource.Unit, resource.Left),
-			format.Bar(resource.Allocated, resource.Budget),
-			resource.Note,
-		})
-	}
-	tableOutput, err := renderTextTable([]string{"Resource", "Allocated", "Budget", "Left", "Used", "Notes"}, tableRows)
-	if err != nil {
-		return commandResult{stderr: fmt.Sprintf("render status: %v\n", err), exitCode: 1}, err
+	const col1Width = 16
+	const barWidth = 44
+
+	var rows [][2]string
+
+	rows = append(rows, [2]string{"SERVER", summary.Hostname})
+	rows = append(rows, [2]string{"OS", summary.OS.Name})
+	rows = append(rows, [2]string{"KERNEL", fmt.Sprintf("%s (%s)", summary.OS.Kernel, summary.OS.Arch)})
+
+	if summary.CPU.Model != "" {
+		rows = append(rows, [2]string{"CPU", summary.CPU.Model})
+		coreInfo := fmt.Sprintf("%d vCPU", summary.CPU.LogicalCores)
+		if summary.CPU.PhysicalCores > 0 && summary.CPU.PhysicalCores != summary.CPU.LogicalCores {
+			coreInfo = fmt.Sprintf("%d vCPU / %d cores", summary.CPU.LogicalCores, summary.CPU.PhysicalCores)
+		}
+		rows = append(rows, [2]string{"", coreInfo})
+
+		loadBar1m := format.BarWide(barWidth, int64(summary.CPU.Load1m*100), 100)
+		loadBar5m := format.BarWide(barWidth, int64(summary.CPU.Load5m*100), 100)
+		loadBar15m := format.BarWide(barWidth, int64(summary.CPU.Load15m*100), 100)
+		loadInfo := fmt.Sprintf("1m %s %.2f  |  5m %s %.2f  |  15m %s %.2f",
+			loadBar1m, summary.CPU.Load1m,
+			loadBar5m, summary.CPU.Load5m,
+			loadBar15m, summary.CPU.Load15m)
+		rows = append(rows, [2]string{"LOAD", loadInfo})
 	}
 
+	instSummary := fmt.Sprintf("%d total  |  %d running  |  %d stopped  |  %d failed",
+		summary.Instances.Total, summary.Instances.Running,
+		summary.Instances.Stopped, summary.Instances.Failed)
+	rows = append(rows, [2]string{"INSTANCES", instSummary})
+
+	for _, resource := range summary.Capacity {
+		label := strings.ToUpper(resource.Resource)
+		allocatedStr := formatStatusValue(resource.Unit, resource.Allocated)
+		budgetStr := formatStatusValue(resource.Unit, resource.Budget)
+		pct := 0
+		if resource.Budget > 0 {
+			pct = int(float64(resource.Allocated) / float64(resource.Budget) * 100)
+		}
+		valueLine := fmt.Sprintf("%s / %s  [%d%%]", allocatedStr, budgetStr, pct)
+		rows = append(rows, [2]string{label, valueLine})
+
+		bar := format.BarWide(barWidth, resource.Allocated, resource.Budget)
+		rows = append(rows, [2]string{"", bar})
+
+		if resource.Note != "" {
+			rows = append(rows, [2]string{"", resource.Note})
+		}
+	}
+
+	totalWidth := col1Width + 3 + 60
 	var b strings.Builder
-	fmt.Fprintf(&b, "server: %s\n", summary.Hostname)
-	fmt.Fprintf(&b, "instances: %s\n\n", formatStatusInstanceSummary(summary.Instances))
-	b.WriteString("capacity\n")
-	b.WriteString(tableOutput)
+
+	b.WriteString(boxTop(totalWidth))
+	for i, row := range rows {
+		label := row[0]
+		value := row[1]
+		if label != "" && i > 0 && rows[i-1][0] != "" {
+			b.WriteString(boxSeparator(totalWidth))
+		}
+		b.WriteString(boxRow(label, value, col1Width))
+	}
+	b.WriteString(boxBottom(totalWidth))
+
 	return commandResult{stdout: b.String(), exitCode: 0}, nil
+}
+
+func boxTop(width int) string {
+	return "┌" + strings.Repeat("─", width-2) + "┐\n"
+}
+
+func boxBottom(width int) string {
+	return "└" + strings.Repeat("─", width-2) + "┘\n"
+}
+
+func boxSeparator(width int) string {
+	return "├" + strings.Repeat("─", width-2) + "┤\n"
+}
+
+func boxRow(label, value string, labelWidth int) string {
+	if label == "" {
+		return fmt.Sprintf("│ %-*s│ %s │\n", labelWidth+1, "", value)
+	}
+	return fmt.Sprintf("│ %-*s│ %s │\n", labelWidth+1, label, value)
 }
 
 func (a *App) cmdLogsRequest(ctx context.Context, actor model.Actor, req logsRequest) (commandResult, error) {

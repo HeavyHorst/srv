@@ -37,7 +37,7 @@ By default this currently builds Linux `6.12.79` while reusing Firecracker's `mi
 
 The default guest rootfs size is `10G`. Override it with `ROOTFS_SIZE` if you want a different image size.
 
-The default guest image is now intentionally less minimal: it includes `docker`, `docker-compose`, `go`, `gopls`, `lua-language-server`, `neovim`, `opencode`, `pi`, `odin`, `odinfmt`, `ols`, `shfmt`, `stylua`, `git`, `fd`, `ripgrep`, `tree-sitter-cli`, `gcc`, a root LazyVim starter config with the BMW heritage amber theme preselected, boot-time module loading for `overlay` and `br_netfilter`, Docker-friendly sysctls, nftables IPv4/IPv6 family support for Arch's `iptables-nft` userspace, and a matching kernel module tree with real Docker-related `.ko` files installed from the custom Firecracker kernel build.
+The default guest image is now intentionally less minimal: it includes `docker`, `docker-compose`, `go`, `gopls`, `lua-language-server`, `neovim`, `opencode`, `pi`, `odin`, `odinfmt`, `ols`, `perf`, `shfmt`, `stylua`, `valgrind`, `git`, `fd`, `ripgrep`, `tree-sitter-cli`, `gcc`, a root LazyVim starter config with the BMW heritage amber theme preselected, boot-time module loading for `overlay` and `br_netfilter`, Docker-friendly sysctls, nftables IPv4/IPv6 family support for Arch's `iptables-nft` userspace, and a matching kernel module tree with real Docker-related `.ko` files installed from the custom Firecracker kernel build.
 
 The LazyVim config lives under `/root/.config/nvim`. The image overlay now includes the shared BMW LazyVim colorscheme files, a managed `lua/plugins/bootstrap-theme.lua`, and overrides that point `lua_ls`, `gopls`, and `ols` at system binaries already installed in the image while clearing Mason's default `ensure_installed` list. That keeps the build-time `nvim --headless "+Lazy! sync"` prewarm deterministic instead of racing Mason's background installers, so fresh guests inherit the downloaded plugin set and do not need to bootstrap LazyVim on first launch.
 
@@ -46,7 +46,7 @@ OpenCode is installed from Arch's `extra` repository, while Pi is fetched from t
 If you want to pin a different Pi release, override `PI_VERSION`:
 
 ```bash
-sudo PI_VERSION=0.66.1 ./images/arch-base/build.sh
+sudo PI_VERSION=0.67.1 ./images/arch-base/build.sh
 ```
 
 The kernel build parallelism is conservative by default. Override it if needed:
@@ -138,7 +138,7 @@ You can then point the service at those paths with `-base-kernel` and `-base-roo
 - The kernel fragment also enables Landlock and adds it to `CONFIG_LSM`, which keeps pacman's default download sandbox working inside the guest on current Arch releases. Without that, package installs can fail with `landlock is not supported by the kernel` unless you disable pacman's sandbox manually.
 - If the kernel build still fails with a generic top-level `Makefile:... Error 2`, retry with `KERNEL_JOBS=1` to surface the first real error line.
 - The rootfs intentionally still omits the Arch `linux` package. The custom kernel is supplied separately as `vmlinux`, which matches how Firecracker boots guests, and the builder disables `90-mkinitcpio-install.hook` during `pacstrap` because no guest initramfs is needed.
-- The rootfs package set now includes `docker`, `docker-compose`, `go`, `gopls`, `lua-language-server`, `neovim`, `opencode`, `odin`, `odinfmt`, `ols`, `shfmt`, `stylua`, `git`, `fd`, `ripgrep`, `tree-sitter-cli`, `gcc`, `iptables-nft`, and `kmod`, while the image build also installs the upstream Pi release tarball under `/opt/pi`, which makes fresh guests ready for Docker-based workloads, Go or Odin development, and both OpenCode and Pi agent workflows without additional package installs.
+- The rootfs package set now includes `docker`, `docker-compose`, `go`, `gopls`, `lua-language-server`, `neovim`, `opencode`, `odin`, `odinfmt`, `ols`, `perf`, `shfmt`, `stylua`, `valgrind`, `git`, `fd`, `ripgrep`, `tree-sitter-cli`, `gcc`, `iptables-nft`, and `kmod`, while the image build also installs the upstream Pi release tarball under `/opt/pi`, which makes fresh guests ready for Docker-based workloads, Go or Odin development, low-level profiling/debugging, and both OpenCode and Pi agent workflows without additional package installs.
 - Guest bootstrap now also manages `/root/.config/opencode/opencode.json` and Pi config under `/root/.pi/agent/` from MMDS/bootstrap metadata so the root account automatically targets the per-VM host Zen gateway when `SRV_ZEN_API_KEY` is configured, without ever storing the real Zen API key inside the guest.
 - The overlay now adds the repo-managed BMW LazyVim theme files and a default `bootstrap-theme.lua`, so new guests start on the same heritage amber colorscheme used by the `config` repo's LazyVim tooling.
 - The builder also prewarms LazyVim inside the guest with `nvim --headless "+Lazy! sync"`, and the shipped config clears Mason's default auto-installs so that bootstrap work finishes before Neovim exits instead of leaving background package installs running.

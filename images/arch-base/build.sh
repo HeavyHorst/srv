@@ -13,7 +13,7 @@ ROOTFS_LABEL="${ROOTFS_LABEL:-srv-root}"
 # toolchain friction on modern distros such as Arch with GCC 15.
 KERNEL_VERSION="${KERNEL_VERSION:-6.12.79}"
 FIRECRACKER_CONFIG_VERSION="${FIRECRACKER_CONFIG_VERSION:-6.1}"
-PI_VERSION="${PI_VERSION:-0.66.1}"
+PI_VERSION="${PI_VERSION:-0.67.1}"
 
 KERNEL_TARBALL="${WORK_DIR}/linux-${KERNEL_VERSION}.tar.xz"
 KERNEL_SOURCE_DIR="${WORK_DIR}/linux-${KERNEL_VERSION}"
@@ -49,11 +49,13 @@ ROOTFS_PACKAGES=(
 	odin
 	odinfmt
 	ols
+	perf
 	ripgrep
 	shfmt
 	stylua
 	tailscale
 	tree-sitter-cli
+	valgrind
 )
 
 LOOP_DEVICE=""

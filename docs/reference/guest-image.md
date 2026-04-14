@@ -21,7 +21,7 @@ The image is intentionally not minimal — it includes tooling for development a
 - Odin, odinfmt, OLS
 - Neovim with prewarmed LazyVim (BMW heritage amber theme)
 - OpenCode and Pi CLIs with per-VM Zen gateway bootstrap
-- Git, fd, ripgrep, tree-sitter-cli, gcc
+- Git, fd, ripgrep, tree-sitter-cli, gcc, perf, valgrind
 - iptables-nft with IPv4/IPv6 nftables support
 - Kernel module tree matching the custom kernel (overlay, br_netfilter, Docker-related modules)
 

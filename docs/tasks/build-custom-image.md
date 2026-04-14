@@ -21,7 +21,7 @@ This produces two artifacts:
 - Go, gopls, Odin, odinfmt, OLS
 - Neovim with a prewarmed LazyVim config (BMW heritage amber theme)
 - OpenCode and Pi CLIs with per-VM Zen gateway bootstrap
-- Git, fd, ripgrep, tree-sitter-cli, gcc
+- Git, fd, ripgrep, tree-sitter-cli, gcc, perf, valgrind
 - iptables-nft with IPv4/IPv6 nftables support
 - `srv-bootstrap.service` for Tailscale and MMDS setup
 

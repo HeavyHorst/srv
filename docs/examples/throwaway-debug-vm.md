@@ -34,7 +34,7 @@ Look for the `tailscale-name` and `tailscale-ip` fields.
 ssh root@debug-vm
 ```
 
-The guest image comes with Docker, Go, Neovim, Git, and common development tools preinstalled. Install anything else with `pacman -S`.
+The guest image comes with Docker, Go, Neovim, Git, `perf`, `valgrind`, and common development tools preinstalled. Install anything else with `pacman -S`.
 
 ## Clean up
 

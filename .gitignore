@@ -1,5 +1,6 @@
 images/arch-base/out/
 /.config
+/.opencode
 /srv
 /srv-net-helper
 /srv-vm-runner

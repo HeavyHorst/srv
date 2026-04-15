@@ -18,9 +18,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	gssh "github.com/gliderlabs/ssh"
@@ -179,6 +181,42 @@ type logsRequest struct {
 	follow bool
 }
 
+type topRequest struct {
+	interval time.Duration
+}
+
+type topSnapshot struct {
+	capturedAt time.Time
+	instances  []topInstanceSnapshot
+}
+
+type topInstanceSnapshot struct {
+	Name               string
+	State              string
+	VCPUCount          int64
+	CPUUsageUsec       uint64
+	MemoryCurrentBytes int64
+	MemoryLimitBytes   int64
+	DiskAllocatedBytes int64
+	DiskLimitBytes     int64
+	NetRXBytes         uint64
+	NetTXBytes         uint64
+	Uptime             time.Duration
+	HasLiveMetrics     bool
+	HasNetStats        bool
+	HasUptime          bool
+}
+
+type topRenderedRow struct {
+	Values  []string
+	Styles  []topCellStyle
+	SortCPU float64
+	HasCPU  bool
+	Name    string
+}
+
+type topCellStyle uint8
+
 const (
 	logTargetAll         logTarget = "all"
 	logTargetSerial      logTarget = "serial"
@@ -186,6 +224,16 @@ const (
 	defaultLogTailLines            = 40
 	maxLogChunkBytes               = 1024 * 1024
 	mib                            = int64(1024 * 1024)
+	defaultTopInterval             = time.Second
+)
+
+const (
+	topCellStyleNone topCellStyle = iota
+	topCellStyleOK
+	topCellStyleWarning
+	topCellStyleCritical
+	topCellStyleMuted
+	topCellStyleHeader
 )
 
 var (
@@ -241,7 +289,7 @@ func maybeUnsupportedJSONCommand(command string, format outputFormat) (commandRe
 		return commandResult{}, nil, false
 	}
 	switch command {
-	case "logs", "export", "import", "snapshot", "help":
+	case "logs", "export", "import", "snapshot", "help", "top":
 		result, err := unsupportedJSONResult(command)
 		return result, err, true
 	default:
@@ -423,7 +471,7 @@ func (a *App) Run(ctx context.Context) error {
 		Handler:     a.handleSession,
 		HostSigners: []gssh.Signer{hostSigner},
 		IdleTimeout: 5 * time.Minute,
-		PtyCallback: func(ctx gssh.Context, pty gssh.Pty) bool { return false },
+		PtyCallback: func(ctx gssh.Context, pty gssh.Pty) bool { return true },
 		SessionRequestCallback: func(sess gssh.Session, requestType string) bool {
 			return requestType != "shell" && requestType != "subsystem"
 		},
@@ -581,6 +629,16 @@ func (a *App) handleSession(sess gssh.Session) {
 			lease.Release()
 		}
 		exitCode, err := a.handleLogsSession(sess, actor, logsReq)
+		finalize(actor, true, reason, err)
+		if exitCode == 0 && err != nil {
+			exitCode = 1
+		}
+		_ = sess.Exit(exitCode)
+		return
+	}
+	if req.args[0] == "top" {
+		lease.Release()
+		exitCode, err := a.handleTopSession(sess, actor, req.args)
 		finalize(actor, true, reason, err)
 		if exitCode == 0 && err != nil {
 			exitCode = 1
@@ -1129,11 +1187,711 @@ func (a *App) handleLogsSession(sess gssh.Session, actor model.Actor, req logsRe
 	return 1, wrapped
 }
 
+func (a *App) handleTopSession(sess gssh.Session, actor model.Actor, args []string) (int, error) {
+	req, err := parseTopArgs(args)
+	if err != nil {
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		return 2, err
+	}
+	if err := requirePTY(sess, "top"); err != nil {
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		return 1, err
+	}
+	if a.provisioner == nil {
+		err := errors.New("top is unavailable: provisioner is unavailable")
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		return 1, err
+	}
+
+	quitCh := make(chan struct{}, 1)
+	go watchTopExitKey(sess, quitCh)
+
+	_, _ = io.WriteString(sess, "\x1b[?1049h\x1b[?25l")
+	defer func() {
+		_, _ = io.WriteString(sess, "\x1b[?25h\x1b[?1049l")
+	}()
+
+	startedAt := time.Now()
+	var prev *topSnapshot
+	for {
+		snapshot, err := a.readTopSnapshot(sess.Context(), actor)
+		if err != nil {
+			wrapped := fmt.Errorf("top: %w", err)
+			_, _ = io.WriteString(sess.Stderr(), wrapped.Error()+"\n")
+			return 1, wrapped
+		}
+		screen := renderTopScreen(snapshot, prev, time.Since(startedAt), req.interval)
+		if _, err := io.WriteString(sess, "\x1b[H\x1b[J"+screen); err != nil {
+			if sess.Context().Err() != nil {
+				return 0, nil
+			}
+			return 1, err
+		}
+		prev = &snapshot
+		if _, err := sess.SendRequest("keepalive@openssh.com", true, nil); err != nil && sess.Context().Err() == nil {
+			return 1, err
+		}
+
+		select {
+		case <-sess.Context().Done():
+			return 0, nil
+		case <-quitCh:
+			return 0, nil
+		case <-time.After(req.interval):
+		}
+	}
+}
+
+func watchTopExitKey(r io.Reader, quitCh chan<- struct{}) {
+	buf := make([]byte, 1)
+	for {
+		if _, err := r.Read(buf); err != nil {
+			return
+		}
+		if buf[0] != 'q' && buf[0] != 'Q' && buf[0] != 0x03 {
+			continue
+		}
+		select {
+		case quitCh <- struct{}{}:
+		default:
+		}
+		return
+	}
+}
+
+func requirePTY(sess gssh.Session, command string) error {
+	if _, _, ok := sess.Pty(); ok {
+		return nil
+	}
+	return fmt.Errorf("%s requires a PTY (run with ssh -t)", command)
+}
+
+func rejectPTY(sess gssh.Session, command string) error {
+	if _, _, ok := sess.Pty(); !ok {
+		return nil
+	}
+	return fmt.Errorf("%s does not support PTY sessions", command)
+}
+
+func (a *App) readTopSnapshot(ctx context.Context, actor model.Actor) (topSnapshot, error) {
+	instances, err := a.store.ListInstances(ctx, false)
+	if err != nil {
+		return topSnapshot{}, fmt.Errorf("list instances: %w", err)
+	}
+	instances = a.visibleInstances(actor, instances)
+	snapshot := topSnapshot{
+		capturedAt: time.Now(),
+		instances:  make([]topInstanceSnapshot, len(instances)),
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	for i, inst := range instances {
+		i, inst := i, inst
+		g.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			sample := topInstanceSnapshot{
+				Name:               inst.Name,
+				State:              inst.State,
+				VCPUCount:          effectiveInstanceVCPUCount(inst, a.cfg),
+				DiskAllocatedBytes: topAllocatedFileBytes(inst.RootFSPath),
+				DiskLimitBytes:     effectiveInstanceRootFSSizeBytes(inst),
+			}
+			if rx, tx, ok := readInterfaceByteCounters(inst.TapDevice); ok {
+				// Host TAP rx is guest transmit, and host TAP tx is guest receive.
+				sample.NetRXBytes = tx
+				sample.NetTXBytes = rx
+				sample.HasNetStats = true
+			}
+			if inst.FirecrackerPID > 0 {
+				if uptime, ok := topInstanceUptime(inst, snapshot.capturedAt); ok {
+					sample.Uptime = uptime
+					sample.HasUptime = true
+				}
+				metrics, err := a.provisioner.ReadInstanceMetrics(ctx, inst.Name)
+				if err == nil {
+					sample.CPUUsageUsec = metrics.CPUUsageUsec
+					sample.MemoryCurrentBytes = metrics.MemoryCurrentBytes
+					sample.MemoryLimitBytes = metrics.MemoryLimitBytes
+					sample.HasLiveMetrics = true
+				}
+			}
+			if sample.MemoryLimitBytes == 0 {
+				sample.MemoryLimitBytes = effectiveInstanceMemoryMiB(inst, a.cfg) * mib
+			}
+			snapshot.instances[i] = sample
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return topSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+func renderTopScreen(snapshot topSnapshot, prev *topSnapshot, sessionAge, interval time.Duration) string {
+	headers := []string{"VM", "STATUS", "CPU%", "MEM", "DISK", "NET RX", "NET TX", "UPTIME"}
+	rows := buildTopRenderedRows(snapshot, prev)
+	if len(rows) == 0 {
+		rows = append(rows, topRenderedRow{
+			Values: []string{"no visible instances", "-", "-", "-", "-", "-", "-", "-"},
+			Styles: []topCellStyle{topCellStyleMuted, topCellStyleMuted, topCellStyleMuted, topCellStyleMuted, topCellStyleMuted, topCellStyleMuted, topCellStyleMuted, topCellStyleMuted},
+			Name:   "no visible instances",
+		})
+	}
+	widths := []int{18, 16, 7, 24, 25, 12, 12, 8}
+
+	var b strings.Builder
+	fmt.Fprintf(
+		&b,
+		"%s  %s %s  %s %s  %s %d  %s\n",
+		topEmphasize("srv top"),
+		topMuted("uptime"),
+		formatTopDuration(sessionAge),
+		topMuted("refresh"),
+		interval.Round(time.Millisecond),
+		topMuted("visible"),
+		len(snapshot.instances),
+		topMuted("press q to exit"),
+	)
+	b.WriteString(buildTopSummary(snapshot, prev))
+	b.WriteString("\n\n")
+	b.WriteString(topChrome(topBoxLine("┌", "┬", "┐", widths)))
+	b.WriteString(topBoxRow(headers, []topCellStyle{topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader}, widths))
+	b.WriteString(topChrome(topBoxLine("├", "┼", "┤", widths)))
+	for _, row := range rows {
+		b.WriteString(topBoxRow(row.Values, row.Styles, widths))
+	}
+	b.WriteString(topChrome(topBoxLine("└", "┴", "┘", widths)))
+	b.WriteString(topMuted("MEM = live/configured RAM. DISK = host allocated/configured rootfs.\n"))
+	return b.String()
+}
+
+func buildTopRenderedRows(snapshot topSnapshot, prev *topSnapshot) []topRenderedRow {
+	rows := make([]topRenderedRow, 0, len(snapshot.instances))
+	var prevByName map[string]topInstanceSnapshot
+	prevElapsed := 0.0
+	if prev != nil {
+		prevElapsed = snapshot.capturedAt.Sub(prev.capturedAt).Seconds()
+		if prevElapsed > 0 {
+			prevByName = make(map[string]topInstanceSnapshot, len(prev.instances))
+			for _, inst := range prev.instances {
+				prevByName[inst.Name] = inst
+			}
+		}
+	}
+	for _, inst := range snapshot.instances {
+		statusValue, statusStyle := formatTopStatus(inst)
+		row := topRenderedRow{
+			Values: []string{
+				inst.Name,
+				statusValue,
+				"-",
+				formatTopMemory(inst),
+				formatTopDisk(inst),
+				"-",
+				"-",
+				formatTopUptime(inst),
+			},
+			Styles: []topCellStyle{
+				topCellStyleNone,
+				statusStyle,
+				topCellStyleMuted,
+				topMemorySeverity(inst),
+				topDiskSeverity(inst),
+				topCellStyleMuted,
+				topCellStyleMuted,
+				topUptimeStyle(inst),
+			},
+			Name: inst.Name,
+		}
+		if prevInst, ok := prevByName[inst.Name]; ok {
+			if cpuPct, ok := topCPUPercent(prevInst, inst, prevElapsed); ok {
+				row.Values[2] = formatTopCPU(cpuPct)
+				row.Styles[2] = topCPUSeverity(inst, cpuPct)
+				row.SortCPU = cpuPct
+				row.HasCPU = true
+			}
+			if rxRate, ok := topByteRate(prevInst.NetRXBytes, inst.NetRXBytes, prevElapsed, inst.HasNetStats && prevInst.HasNetStats); ok {
+				row.Values[5] = formatTopRate(rxRate)
+				row.Styles[5] = topCellStyleNone
+			}
+			if txRate, ok := topByteRate(prevInst.NetTXBytes, inst.NetTXBytes, prevElapsed, inst.HasNetStats && prevInst.HasNetStats); ok {
+				row.Values[6] = formatTopRate(txRate)
+				row.Styles[6] = topCellStyleNone
+			}
+		}
+		rows = append(rows, row)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		left, right := rows[i], rows[j]
+		if left.HasCPU != right.HasCPU {
+			return left.HasCPU
+		}
+		if left.HasCPU && right.HasCPU && left.SortCPU != right.SortCPU {
+			return left.SortCPU > right.SortCPU
+		}
+		if left.Values[1] != right.Values[1] {
+			return left.Values[1] < right.Values[1]
+		}
+		return left.Name < right.Name
+	})
+	return rows
+}
+
+func buildTopSummary(snapshot topSnapshot, prev *topSnapshot) string {
+	running := 0
+	stopped := 0
+	transition := 0
+	failed := 0
+
+	hotCPUName := "-"
+	hotCPUPct := 0.0
+	hotCPUStyle := topCellStyleMuted
+	hotCPUOK := false
+
+	hotMemName := "-"
+	hotMemRatio := 0.0
+	hotMemStyle := topCellStyleMuted
+	hotMemOK := false
+
+	hotDiskName := "-"
+	hotDiskRatio := 0.0
+	hotDiskStyle := topCellStyleMuted
+	hotDiskOK := false
+
+	var prevByName map[string]topInstanceSnapshot
+	prevElapsed := 0.0
+	if prev != nil {
+		prevElapsed = snapshot.capturedAt.Sub(prev.capturedAt).Seconds()
+		if prevElapsed > 0 {
+			prevByName = make(map[string]topInstanceSnapshot, len(prev.instances))
+			for _, inst := range prev.instances {
+				prevByName[inst.Name] = inst
+			}
+		}
+	}
+
+	totalRXRate := 0.0
+	totalTXRate := 0.0
+	hasRXRate := false
+	hasTXRate := false
+
+	for _, inst := range snapshot.instances {
+		switch inst.State {
+		case model.StateReady:
+			running++
+		case model.StateStopped:
+			stopped++
+		case model.StateProvisioning, model.StateAwaitingTailnet, model.StateDeleting:
+			transition++
+		case model.StateFailed:
+			failed++
+		}
+
+		if ratio, ok := topUsageRatio(inst.MemoryCurrentBytes, inst.MemoryLimitBytes, inst.HasLiveMetrics); ok && (!hotMemOK || ratio > hotMemRatio) {
+			hotMemName = inst.Name
+			hotMemRatio = ratio
+			hotMemStyle = topMemorySeverity(inst)
+			hotMemOK = true
+		}
+		if ratio, ok := topUsageRatio(inst.DiskAllocatedBytes, inst.DiskLimitBytes, true); ok && (!hotDiskOK || ratio > hotDiskRatio) {
+			hotDiskName = inst.Name
+			hotDiskRatio = ratio
+			hotDiskStyle = topDiskSeverity(inst)
+			hotDiskOK = true
+		}
+
+		prevInst, ok := prevByName[inst.Name]
+		if !ok {
+			continue
+		}
+		if cpuPct, ok := topCPUPercent(prevInst, inst, prevElapsed); ok && (!hotCPUOK || cpuPct > hotCPUPct) {
+			hotCPUName = inst.Name
+			hotCPUPct = cpuPct
+			hotCPUStyle = topCPUSeverity(inst, cpuPct)
+			hotCPUOK = true
+		}
+		if rxRate, ok := topByteRate(prevInst.NetRXBytes, inst.NetRXBytes, prevElapsed, inst.HasNetStats && prevInst.HasNetStats); ok {
+			totalRXRate += rxRate
+			hasRXRate = true
+		}
+		if txRate, ok := topByteRate(prevInst.NetTXBytes, inst.NetTXBytes, prevElapsed, inst.HasNetStats && prevInst.HasNetStats); ok {
+			totalTXRate += txRate
+			hasTXRate = true
+		}
+	}
+
+	countsLine := fmt.Sprintf(
+		"%s %d  %s %d  %s %d  %s %d",
+		topMuted("running"),
+		running,
+		topMuted("stopped"),
+		stopped,
+		topMuted("transition"),
+		transition,
+		topMuted("failed"),
+		failed,
+	)
+
+	details := []string{
+		fmt.Sprintf("%s %s %s", topMuted("hot cpu"), hotCPUName, topSummaryMetricValue(hotCPUOK, formatTopCPU(hotCPUPct), hotCPUStyle)),
+		fmt.Sprintf("%s %s %s", topMuted("hot mem"), hotMemName, topSummaryMetricValue(hotMemOK, formatTopPercent(hotMemRatio), hotMemStyle)),
+		fmt.Sprintf("%s %s %s", topMuted("hot disk"), hotDiskName, topSummaryMetricValue(hotDiskOK, formatTopPercent(hotDiskRatio), hotDiskStyle)),
+	}
+	if hasRXRate {
+		details = append(details, fmt.Sprintf("%s %s", topMuted("rx"), formatTopRate(totalRXRate)))
+	}
+	if hasTXRate {
+		details = append(details, fmt.Sprintf("%s %s", topMuted("tx"), formatTopRate(totalTXRate)))
+	}
+
+	return countsLine + "\n" + strings.Join(details, "  ")
+}
+
+func topBoxLine(left, middle, right string, widths []int) string {
+	parts := make([]string, 0, len(widths))
+	for _, width := range widths {
+		parts = append(parts, strings.Repeat("─", width+2))
+	}
+	return left + strings.Join(parts, middle) + right + "\n"
+}
+
+func topBoxRow(values []string, styles []topCellStyle, widths []int) string {
+	var b strings.Builder
+	b.WriteString(topChrome("│"))
+	for i, value := range values {
+		clamped := topClampCell(value, widths[i])
+		padding := strings.Repeat(" ", widths[i]-len([]rune(clamped)))
+		b.WriteByte(' ')
+		b.WriteString(topColorize(clamped, topRowStyle(styles, i)))
+		b.WriteString(padding)
+		b.WriteByte(' ')
+		b.WriteString(topChrome("│"))
+	}
+	b.WriteByte('\n')
+	return b.String()
+}
+
+func topClampCell(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width <= 3 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-3]) + "..."
+}
+
+func topRowStyle(styles []topCellStyle, i int) topCellStyle {
+	if i < 0 || i >= len(styles) {
+		return topCellStyleNone
+	}
+	return styles[i]
+}
+
+func topColorize(value string, style topCellStyle) string {
+	if value == "" {
+		return value
+	}
+	code := ""
+	switch style {
+	case topCellStyleOK:
+		code = "\x1b[38;2;0;121;76m"
+	case topCellStyleWarning:
+		code = "\x1b[38;2;255;183;0m"
+	case topCellStyleCritical:
+		code = "\x1b[38;2;255;65;54m"
+	case topCellStyleMuted:
+		code = "\x1b[38;2;128;128;128m"
+	case topCellStyleHeader:
+		code = "\x1b[1;38;2;176;176;176m"
+	default:
+		return value
+	}
+	return code + value + "\x1b[0m"
+}
+
+func topChrome(value string) string {
+	return topWrapStyle(value, "\x1b[38;2;92;92;92m")
+}
+
+func topSummaryMetricValue(ok bool, value string, style topCellStyle) string {
+	if !ok {
+		return topColorize("-", topCellStyleMuted)
+	}
+	return topColorize(value, style)
+}
+
+func topMuted(value string) string {
+	return topWrapStyle(value, "\x1b[38;2;128;128;128m")
+}
+
+func topEmphasize(value string) string {
+	return topWrapStyle(value, "\x1b[1m")
+}
+
+func topWrapStyle(value, code string) string {
+	if value == "" {
+		return value
+	}
+	return code + value + "\x1b[0m"
+}
+
+func formatTopCPU(pct float64) string {
+	return strconv.FormatFloat(pct, 'f', 1, 64) + "%"
+}
+
+func formatTopMemory(inst topInstanceSnapshot) string {
+	if !inst.HasLiveMetrics || inst.MemoryLimitBytes <= 0 {
+		return "-"
+	}
+	return formatTopUsage(inst.MemoryCurrentBytes, inst.MemoryLimitBytes)
+}
+
+func formatTopDisk(inst topInstanceSnapshot) string {
+	if inst.DiskLimitBytes <= 0 {
+		return "-"
+	}
+	return formatTopUsage(inst.DiskAllocatedBytes, inst.DiskLimitBytes)
+}
+
+func formatTopUsage(current, limit int64) string {
+	ratio, ok := topUsageRatio(current, limit, true)
+	if !ok {
+		return format.BinarySize(current) + "/" + format.BinarySize(limit)
+	}
+	return fmt.Sprintf("%s/%s %s", format.BinarySize(current), format.BinarySize(limit), formatTopPercentPadded(ratio))
+}
+
+func formatTopRate(rate float64) string {
+	if rate < 0 {
+		return "-"
+	}
+	return format.BinarySize(int64(math.Round(rate))) + "/s"
+}
+
+func formatTopUptime(inst topInstanceSnapshot) string {
+	if !inst.HasUptime {
+		return "-"
+	}
+	return formatTopDuration(inst.Uptime)
+}
+
+func formatTopStatus(inst topInstanceSnapshot) (string, topCellStyle) {
+	switch inst.State {
+	case model.StateReady:
+		return "running", topCellStyleOK
+	case model.StateProvisioning, model.StateAwaitingTailnet:
+		return inst.State, topCellStyleWarning
+	case model.StateFailed, model.StateDeleting:
+		return inst.State, topCellStyleCritical
+	case model.StateStopped:
+		return inst.State, topCellStyleWarning
+	default:
+		return inst.State, topCellStyleNone
+	}
+}
+
+func topCPUSeverity(inst topInstanceSnapshot, pct float64) topCellStyle {
+	if inst.VCPUCount <= 0 {
+		return topCellStyleNone
+	}
+	return topRatioSeverity(pct/float64(inst.VCPUCount*100), 0.90, 0.98)
+}
+
+func topMemorySeverity(inst topInstanceSnapshot) topCellStyle {
+	if !inst.HasLiveMetrics || inst.MemoryLimitBytes <= 0 {
+		return topCellStyleMuted
+	}
+	return topRatioSeverity(float64(inst.MemoryCurrentBytes)/float64(inst.MemoryLimitBytes), 0.75, 0.90)
+}
+
+func topDiskSeverity(inst topInstanceSnapshot) topCellStyle {
+	if inst.DiskLimitBytes <= 0 {
+		return topCellStyleMuted
+	}
+	return topRatioSeverity(float64(inst.DiskAllocatedBytes)/float64(inst.DiskLimitBytes), 0.80, 0.95)
+}
+
+func topUptimeStyle(inst topInstanceSnapshot) topCellStyle {
+	if !inst.HasUptime {
+		return topCellStyleMuted
+	}
+	return topCellStyleNone
+}
+
+func topRatioSeverity(ratio, warning, critical float64) topCellStyle {
+	switch {
+	case ratio >= critical:
+		return topCellStyleCritical
+	case ratio >= warning:
+		return topCellStyleWarning
+	case ratio >= 0:
+		return topCellStyleOK
+	default:
+		return topCellStyleNone
+	}
+}
+
+func topUsageRatio(current, limit int64, ok bool) (float64, bool) {
+	if !ok || limit <= 0 || current < 0 {
+		return 0, false
+	}
+	return float64(current) / float64(limit), true
+}
+
+func formatTopPercent(ratio float64) string {
+	if ratio < 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.0f%%", ratio*100)
+}
+
+func formatTopPercentPadded(ratio float64) string {
+	if ratio < 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%3.0f%%", ratio*100)
+}
+
+func formatTopDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return d.String()
+	}
+	hours := d / time.Hour
+	minutes := (d % time.Hour) / time.Minute
+	seconds := (d % time.Minute) / time.Second
+	if hours > 0 {
+		return fmt.Sprintf("%dh%02dm", hours, minutes)
+	}
+	return fmt.Sprintf("%dm%02ds", minutes, seconds)
+}
+
+func topCPUPercent(prev, curr topInstanceSnapshot, elapsedSeconds float64) (float64, bool) {
+	if !prev.HasLiveMetrics || !curr.HasLiveMetrics || elapsedSeconds <= 0 || curr.CPUUsageUsec < prev.CPUUsageUsec {
+		return 0, false
+	}
+	return float64(curr.CPUUsageUsec-prev.CPUUsageUsec) / elapsedSeconds / 10000.0, true
+}
+
+func topByteRate(prev, curr uint64, elapsedSeconds float64, ok bool) (float64, bool) {
+	if !ok || elapsedSeconds <= 0 || curr < prev {
+		return 0, false
+	}
+	return float64(curr-prev) / elapsedSeconds, true
+}
+
+func parseTopArgs(args []string) (topRequest, error) {
+	req := topRequest{interval: defaultTopInterval}
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--interval":
+			i++
+			if i >= len(args) {
+				return topRequest{}, errors.New(topUsage())
+			}
+			interval, err := parseTopInterval(args[i])
+			if err != nil {
+				return topRequest{}, fmt.Errorf("invalid interval %q\n%s", args[i], topUsage())
+			}
+			req.interval = interval
+		default:
+			return topRequest{}, fmt.Errorf("unexpected argument %q\n%s", args[i], topUsage())
+		}
+	}
+	if req.interval < 200*time.Millisecond {
+		return topRequest{}, fmt.Errorf("interval must be at least 200ms\n%s", topUsage())
+	}
+	return req, nil
+}
+
+func parseTopInterval(raw string) (time.Duration, error) {
+	if strings.IndexFunc(raw, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(seconds) * time.Second, nil
+	}
+	return time.ParseDuration(raw)
+}
+
+func topUsage() string {
+	return "usage: top [--interval DURATION]"
+}
+
+func topInstanceUptime(inst model.Instance, now time.Time) (time.Duration, bool) {
+	if inst.FirecrackerPID <= 0 {
+		return 0, false
+	}
+	info, err := os.Stat(filepath.Join("/proc", strconv.Itoa(inst.FirecrackerPID)))
+	if err != nil {
+		return 0, false
+	}
+	startedAt := info.ModTime()
+	if startedAt.After(now) {
+		return 0, true
+	}
+	return now.Sub(startedAt), true
+}
+
+func topAllocatedFileBytes(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return info.Size()
+	}
+	return st.Blocks * 512
+}
+
+func readInterfaceByteCounters(name string) (uint64, uint64, bool) {
+	if strings.TrimSpace(name) == "" {
+		return 0, 0, false
+	}
+	rx, err := readUint64File(filepath.Join("/sys/class/net", name, "statistics", "rx_bytes"))
+	if err != nil {
+		return 0, 0, false
+	}
+	tx, err := readUint64File(filepath.Join("/sys/class/net", name, "statistics", "tx_bytes"))
+	if err != nil {
+		return 0, 0, false
+	}
+	return rx, tx, true
+}
+
+func readUint64File(path string) (uint64, error) {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(strings.TrimSpace(string(payload)), 10, 64)
+}
+
 func (a *App) handleExportSession(sess gssh.Session, actor model.Actor, args []string) (int, error) {
 	name, err := parseExportArgs(args)
 	if err != nil {
 		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
 		return 2, err
+	}
+	if err := rejectPTY(sess, "export"); err != nil {
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		return 1, err
 	}
 
 	unlock := a.lockInstance(name)
@@ -1159,6 +1917,10 @@ func (a *App) handleImportSession(sess gssh.Session, actor model.Actor, args []s
 	if err := parseImportArgs(args); err != nil {
 		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
 		return 2, err
+	}
+	if err := rejectPTY(sess, "import"); err != nil {
+		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		return 1, err
 	}
 
 	artifactInfo, stream, err := provision.PeekPortableArtifactInfo(sess)
@@ -1364,6 +2126,7 @@ func helpResult() commandResult {
 			entries: []helpEntry{
 				{"logs <name> [serial|firecracker]", "View instance logs."},
 				{"logs -f <name> <target>", "Follow logs in real time."},
+				{"top [--interval DURATION]", "Watch live CPU, memory, disk, and network usage."},
 			},
 		},
 		{

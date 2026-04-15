@@ -85,6 +85,7 @@ type networkHelper interface {
 type vmRunner interface {
 	StartInstanceVM(ctx context.Context, req vmrunner.StartRequest) (vmrunner.StartResponse, error)
 	StopInstanceVM(ctx context.Context, req vmrunner.StopRequest) error
+	ReadInstanceMetrics(ctx context.Context, req vmrunner.MetricsRequest) (vmrunner.MetricsResponse, error)
 }
 
 type guestBootstrap = vmrunner.Bootstrap
@@ -1397,6 +1398,17 @@ func (p *Provisioner) stopFirecracker(name string, pid int) error {
 		return fmt.Errorf("stop firecracker for %q: %w", name, err)
 	}
 	return nil
+}
+
+func (p *Provisioner) ReadInstanceMetrics(ctx context.Context, name string) (vmrunner.MetricsResponse, error) {
+	if p.vmRunner == nil {
+		return vmrunner.MetricsResponse{}, errors.New("vm runner client is unavailable")
+	}
+	resp, err := p.vmRunner.ReadInstanceMetrics(ctx, vmrunner.MetricsRequest{Name: name})
+	if err != nil {
+		return vmrunner.MetricsResponse{}, fmt.Errorf("read firecracker metrics for %q: %w", name, err)
+	}
+	return resp, nil
 }
 
 func (p *Provisioner) outboundInterface(ctx context.Context) (string, error) {

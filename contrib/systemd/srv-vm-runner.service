@@ -25,6 +25,9 @@ SystemCallArchitectures=native
 RestrictRealtime=yes
 # Delegate only the controllers the runner manages under its per-VM subtree.
 Delegate=cpu memory pids
+# Start the service inside the same delegated subgroup it later manages to avoid
+# cgroup v2 restart races where systemd re-enters the now-internal parent node.
+DelegateSubgroup=supervisor
 Restart=on-failure
 RestartSec=5s
 

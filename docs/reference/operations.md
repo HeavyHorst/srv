@@ -130,7 +130,9 @@ That smoke pass is part of the supported restore workflow now, not an optional e
 4. Restart the services.
 
 ```bash
-sudo systemctl restart srv-vm-runner srv-net-helper srv
+sudo systemctl stop srv srv-net-helper srv-vm-runner
+sleep 5
+sudo systemctl start srv-vm-runner srv-net-helper srv
 ```
 
 5. Run the host smoke test.
@@ -175,7 +177,7 @@ Important caveat: existing guests keep their own writable `rootfs.img`. There is
 
 - cgroup v2 is required. The runner now depends on a delegated cgroup v2 subtree to place each VM into its own `firecracker-vms/<name>` leaf with enforced `cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`.
 - IPv4 forwarding must stay enabled on the host. Guest egress depends on forwarding packets from each TAP device through the host's outbound interface after the helper installs MASQUERADE and `FORWARD` rules.
-- `srv-vm-runner.service` must keep `User=root`, `Group=srv`, `Delegate=cpu memory pids`, and a group-accessible socket under `/run/srv-vm-runner/`.
+- `srv-vm-runner.service` must keep `User=root`, `Group=srv`, `Delegate=cpu memory pids`, `DelegateSubgroup=supervisor`, and a group-accessible socket under `/run/srv-vm-runner/`.
 - Do not add `NoNewPrivileges=yes` to `srv-vm-runner.service`; the jailer must drop privileges and `exec` Firecracker on real hosts.
 - Keep using the official static Firecracker and jailer release pairing. Distro-provided dynamically linked binaries can fail after chroot before the API socket appears.
 - Preserve `/etc/srv/srv.env` across reinstall or upgrade unless you are intentionally changing configuration and have accounted for the stored absolute paths.

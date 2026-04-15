@@ -98,7 +98,7 @@ sudo journalctl -u srv-vm-runner -f
 Common issues:
 
 - Jailer chroot setup failures — check that `SRV_JAILER_BASE_DIR` is on the same filesystem as `SRV_DATA_DIR`
-- Permission errors — verify `srv-vm-runner.service` keeps `User=root`, `Group=srv`, `Delegate=cpu memory pids`, and no `NoNewPrivileges=yes`
+- Permission errors — verify `srv-vm-runner.service` keeps `User=root`, `Group=srv`, `Delegate=cpu memory pids`, `DelegateSubgroup=supervisor`, and no `NoNewPrivileges=yes`
 - `/dev/kvm` not available — check permissions and that KVM is loaded
 
 ## Smoke test

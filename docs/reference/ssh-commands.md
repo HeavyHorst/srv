@@ -30,6 +30,7 @@ ssh srv -- --json status
 | `logs <name> serial` | View serial log |
 | `logs <name> firecracker` | View Firecracker VMM log |
 | `logs -f <name> [serial\|firecracker]` | Follow log output |
+| `top [--interval <duration>]` | Watch live per-VM CPU, memory, disk, and network usage; run with `ssh -t` and press `q` to exit |
 
 ## Lifecycle commands
 
@@ -82,3 +83,4 @@ Usage: `ssh srv-a export demo | ssh srv-b import`
 - Backups are tied to the original VM record — they cannot be restored onto a different VM
 - Export requires the source VM to be stopped
 - Import recreates the VM under the same name and leaves it stopped
+- `top` refreshes continuously by default; use `ssh -t srv top --interval 2s` or similar to slow the redraw rate

@@ -335,17 +335,26 @@ reload_systemd() {
 	systemctl daemon-reload
 }
 
+restart_service_stack() {
+	systemctl stop srv srv-net-helper srv-vm-runner
+	# systemd 260 can trip over delegated cgroup reuse when srv-vm-runner is
+	# started immediately after stop; give the subtree time to disappear even if
+	# the previous unit state was failed instead of active.
+	sleep 5
+	systemctl start srv-vm-runner srv-net-helper srv
+}
+
 manage_service() {
 	if (( ENABLE_SERVICE )) && (( START_SERVICE )); then
 		systemctl enable srv
-		systemctl restart srv-net-helper srv-vm-runner srv
+		restart_service_stack
 		return
 	fi
 	if (( ENABLE_SERVICE )); then
 		systemctl enable srv
 	fi
 	if (( START_SERVICE )); then
-		systemctl restart srv-net-helper srv-vm-runner srv
+		restart_service_stack
 	fi
 }
 

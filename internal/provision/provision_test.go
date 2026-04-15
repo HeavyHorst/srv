@@ -2380,6 +2380,11 @@ func (r panicVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) err
 	return nil
 }
 
+func (r panicVMRunner) ReadInstanceMetrics(context.Context, vmrunner.MetricsRequest) (vmrunner.MetricsResponse, error) {
+	r.t.Fatalf("ReadInstanceMetrics() should not be called")
+	return vmrunner.MetricsResponse{}, nil
+}
+
 type noopVMRunner struct{}
 
 func (noopVMRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (vmrunner.StartResponse, error) {
@@ -2388,4 +2393,8 @@ func (noopVMRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (vmr
 
 func (noopVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {
 	return nil
+}
+
+func (noopVMRunner) ReadInstanceMetrics(context.Context, vmrunner.MetricsRequest) (vmrunner.MetricsResponse, error) {
+	return vmrunner.MetricsResponse{}, nil
 }

@@ -14,6 +14,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 |---------|-------------|
 | `new <name>` | Create new VM with optional `--cpus`, `--ram`, `--rootfs-size` |
 | `list` | Show visible VMs (all for admins, own for regular users) |
+| `top [--interval DURATION]` | Live per-VM CPU, memory, disk, and network view; press `q` to exit |
 | `status` | Admin-only host capacity and allocation summary |
 | `inspect <name>` | Show VM details and status |
 | `logs <name>` | View serial or firecracker logs |
@@ -54,6 +55,10 @@ ssh srv logs demo serial
 ssh srv logs demo firecracker
 ssh srv logs -f demo serial
 ssh srv logs -f demo firecracker
+
+# Live VM usage
+ssh -t srv top
+ssh -t srv top --interval 2s
 ```
 
 ## Systemd Management
@@ -63,7 +68,9 @@ ssh srv logs -f demo firecracker
 sudo systemctl status srv srv-net-helper srv-vm-runner
 
 # Restart
-sudo systemctl restart srv srv-net-helper srv-vm-runner
+sudo systemctl stop srv srv-net-helper srv-vm-runner
+sleep 5
+sudo systemctl start srv-vm-runner srv-net-helper srv
 
 # View logs
 sudo journalctl -u srv -f

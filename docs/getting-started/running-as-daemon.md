@@ -21,11 +21,13 @@ sudo journalctl -u srv -f
 sudo journalctl -u srv-vm-runner -f
 
 # Restart all services
-sudo systemctl restart srv-vm-runner srv-net-helper srv
+sudo systemctl stop srv srv-net-helper srv-vm-runner
+sleep 5
+sudo systemctl start srv-vm-runner srv-net-helper srv
 ```
 
 !!! warning
-    `srv-vm-runner.service` must keep `User=root`, `Group=srv`, `Delegate=cpu memory pids`, and a group-accessible socket under `/run/srv-vm-runner/`. Do not add `NoNewPrivileges=yes` — the jailer must drop privileges and `exec` Firecracker on real hosts.
+    `srv-vm-runner.service` must keep `User=root`, `Group=srv`, `Delegate=cpu memory pids`, `DelegateSubgroup=supervisor`, and a group-accessible socket under `/run/srv-vm-runner/`. Do not add `NoNewPrivileges=yes` — the jailer must drop privileges and `exec` Firecracker on real hosts.
 
 ## Host reboot recovery
 
@@ -47,7 +49,9 @@ If `/etc/srv/srv.env` already exists before an upgrade, the installer keeps it b
 4. Restart:
 
     ```bash
-    sudo systemctl restart srv-vm-runner srv-net-helper srv
+    sudo systemctl stop srv srv-net-helper srv-vm-runner
+    sleep 5
+    sudo systemctl start srv-vm-runner srv-net-helper srv
     ```
 
 5. Run the smoke test:

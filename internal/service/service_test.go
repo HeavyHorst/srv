@@ -8,6 +8,8 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,10 +21,14 @@ import (
 	"time"
 	"unicode/utf8"
 
+	gssh "github.com/gliderlabs/ssh"
+	gossh "golang.org/x/crypto/ssh"
+
 	"srv/internal/config"
 	"srv/internal/model"
 	"srv/internal/provision"
 	"srv/internal/store"
+	"srv/internal/vmrunner"
 )
 
 func TestAuthorize(t *testing.T) {
@@ -894,6 +900,7 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 		"import",
 		"logs <name> [serial|firecracker]",
 		"logs -f <name> <target>",
+		"top [--interval DURATION]",
 		"status",
 		"restore <name> <backup-id>",
 		"start <name>",
@@ -938,6 +945,7 @@ func TestMaybeUnsupportedJSONCommand(t *testing.T) {
 		{name: "import json rejected", command: "import", format: outputFormatJSON, wantRejected: true, wantStderr: "import does not support --json\n"},
 		{name: "snapshot json rejected", command: "snapshot", format: outputFormatJSON, wantRejected: true, wantStderr: "snapshot does not support --json\n"},
 		{name: "help json rejected", command: "help", format: outputFormatJSON, wantRejected: true, wantStderr: "help does not support --json\n"},
+		{name: "top json rejected", command: "top", format: outputFormatJSON, wantRejected: true, wantStderr: "top does not support --json\n"},
 		{name: "list json allowed", command: "list", format: outputFormatJSON, wantRejected: false},
 		{name: "logs text allowed", command: "logs", format: outputFormatText, wantRejected: false},
 	}
@@ -979,6 +987,365 @@ func TestDispatchRejectsJSONHelp(t *testing.T) {
 	if result.stderr != "help does not support --json\n" {
 		t.Fatalf("dispatch(help json) stderr = %q", result.stderr)
 	}
+}
+
+func TestParseTopArgsSupportsDurationAndSeconds(t *testing.T) {
+	req, err := parseTopArgs([]string{"top", "--interval", "1500ms"})
+	if err != nil {
+		t.Fatalf("parseTopArgs(duration): %v", err)
+	}
+	if req.interval != 1500*time.Millisecond {
+		t.Fatalf("parseTopArgs(duration) interval = %s, want 1.5s", req.interval)
+	}
+
+	req, err = parseTopArgs([]string{"top", "--interval", "2"})
+	if err != nil {
+		t.Fatalf("parseTopArgs(seconds): %v", err)
+	}
+	if req.interval != 2*time.Second {
+		t.Fatalf("parseTopArgs(seconds) interval = %s, want 2s", req.interval)
+	}
+}
+
+func TestParseTopArgsRejectsUnexpectedArguments(t *testing.T) {
+	if _, err := parseTopArgs([]string{"top", "--interval", "100ms"}); err == nil || !strings.Contains(err.Error(), "interval must be at least 200ms") {
+		t.Fatalf("parseTopArgs(short interval) error = %v", err)
+	}
+	if _, err := parseTopArgs([]string{"top", "--wat"}); err == nil || !strings.Contains(err.Error(), topUsage()) {
+		t.Fatalf("parseTopArgs(unexpected) error = %v", err)
+	}
+}
+
+func TestWatchTopExitKeyAcceptsCtrlC(t *testing.T) {
+	quitCh := make(chan struct{}, 1)
+	watchTopExitKey(bytes.NewBuffer([]byte{0x03}), quitCh)
+	select {
+	case <-quitCh:
+	default:
+		t.Fatal("watchTopExitKey() did not signal quit on Ctrl+C")
+	}
+}
+
+func TestHandleTopSessionRequiresPTY(t *testing.T) {
+	app := &App{}
+	sess := newServiceTestSession(context.Background(), "", false, []string{"top"})
+
+	exitCode, err := app.handleTopSession(sess, model.Actor{UserLogin: "alice@example.com"}, []string{"top"})
+	if err == nil || err.Error() != "top requires a PTY (run with ssh -t)" {
+		t.Fatalf("handleTopSession() error = %v", err)
+	}
+	if exitCode != 1 {
+		t.Fatalf("handleTopSession() exitCode = %d, want 1", exitCode)
+	}
+	if got := sess.stderr.String(); got != "top requires a PTY (run with ssh -t)\n" {
+		t.Fatalf("handleTopSession() stderr = %q", got)
+	}
+}
+
+func TestHandleExportSessionRejectsPTY(t *testing.T) {
+	app := &App{}
+	sess := newServiceTestSession(context.Background(), "", true, []string{"export", "alpha"})
+
+	exitCode, err := app.handleExportSession(sess, model.Actor{UserLogin: "alice@example.com"}, []string{"export", "alpha"})
+	if err == nil || err.Error() != "export does not support PTY sessions" {
+		t.Fatalf("handleExportSession() error = %v", err)
+	}
+	if exitCode != 1 {
+		t.Fatalf("handleExportSession() exitCode = %d, want 1", exitCode)
+	}
+	if got := sess.stderr.String(); got != "export does not support PTY sessions\n" {
+		t.Fatalf("handleExportSession() stderr = %q", got)
+	}
+}
+
+func TestHandleImportSessionRejectsPTY(t *testing.T) {
+	app := &App{}
+	sess := newServiceTestSession(context.Background(), "", true, []string{"import"})
+
+	exitCode, err := app.handleImportSession(sess, model.Actor{UserLogin: "alice@example.com"}, []string{"import"})
+	if err == nil || err.Error() != "import does not support PTY sessions" {
+		t.Fatalf("handleImportSession() error = %v", err)
+	}
+	if exitCode != 1 {
+		t.Fatalf("handleImportSession() exitCode = %d, want 1", exitCode)
+	}
+	if got := sess.stderr.String(); got != "import does not support PTY sessions\n" {
+		t.Fatalf("handleImportSession() stderr = %q", got)
+	}
+}
+
+func TestHandleTopSessionRendersAndExitsOnQ(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:         config.Config{MemoryMiB: 1024},
+		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:       st,
+		provisioner: &provision.Provisioner{},
+	}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.April, 15, 12, 0, 0, 0, time.UTC))
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	sess := newServiceTestSession(ctx, "q", true, []string{"top", "--interval", "200ms"})
+	exitCode, err := app.handleTopSession(sess, model.Actor{UserLogin: "alice@example.com"}, []string{"top", "--interval", "200ms"})
+	if err != nil {
+		t.Fatalf("handleTopSession(): %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("handleTopSession() exitCode = %d, want 0", exitCode)
+	}
+	out := sess.stdout.String()
+	for _, want := range []string{"\x1b[?1049h\x1b[?25l", "\x1b[H\x1b[J", "srv top", "alpha", "press q to exit", "\x1b[?25h\x1b[?1049l"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("handleTopSession() output missing %q\nfull output:\n%s", want, out)
+		}
+	}
+	if !reflect.DeepEqual(sess.sentRequests, []string{"keepalive@openssh.com"}) {
+		t.Fatalf("handleTopSession() sentRequests = %#v", sess.sentRequests)
+	}
+}
+
+func TestReadTopSnapshotUsesMetricsAndConfiguredMemoryFallback(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "vm-runner.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("net.Listen(unix): %v", err)
+	}
+	defer listener.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vm/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("metrics method = %s, want POST", r.Method)
+		}
+		var req vmrunner.MetricsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(metrics request): %v", err)
+		}
+		if req.Name != "alpha" {
+			t.Fatalf("metrics name = %q, want alpha", req.Name)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(vmrunner.MetricsResponse{
+			CPUUsageUsec:       12345,
+			MemoryCurrentBytes: 256 << 20,
+			MemoryLimitBytes:   0,
+		}); err != nil {
+			t.Fatalf("Encode(metrics response): %v", err)
+		}
+	})
+
+	httpServer := &http.Server{Handler: mux}
+	go func() {
+		_ = httpServer.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(ctx)
+	})
+
+	ctx := context.Background()
+	cfg := loadServiceTestConfig(t, map[string]string{"SRV_VM_RUNNER_SOCKET": socketPath})
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatalf("provision.New(): %v", err)
+	}
+	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Now().UTC().Add(-10*time.Minute))
+	inst.FirecrackerPID = os.Getpid()
+	inst.MemoryMiB = 4096
+	inst.RootFSPath = filepath.Join(cfg.InstancesDir(), inst.Name, "rootfs.img")
+	allocated := writeSparseServiceTestFile(t, inst.RootFSPath, inst.RootFSSizeBytes)
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	snapshot, err := app.readTopSnapshot(ctx, model.Actor{UserLogin: "alice@example.com"})
+	if err != nil {
+		t.Fatalf("readTopSnapshot(): %v", err)
+	}
+	if len(snapshot.instances) != 1 {
+		t.Fatalf("readTopSnapshot() instances = %#v", snapshot.instances)
+	}
+	got := snapshot.instances[0]
+	if got.Name != inst.Name || got.State != model.StateReady || got.CPUUsageUsec != 12345 {
+		t.Fatalf("readTopSnapshot() basic metrics = %#v", got)
+	}
+	if !got.HasLiveMetrics || got.MemoryCurrentBytes != 256<<20 || got.MemoryLimitBytes != inst.MemoryMiB*mib {
+		t.Fatalf("readTopSnapshot() memory metrics = %#v", got)
+	}
+	if got.DiskAllocatedBytes != allocated || got.DiskLimitBytes != inst.RootFSSizeBytes {
+		t.Fatalf("readTopSnapshot() disk metrics = %#v, allocated=%d", got, allocated)
+	}
+	if !got.HasUptime || got.Uptime <= 0 {
+		t.Fatalf("readTopSnapshot() uptime = %#v", got)
+	}
+}
+
+func TestTopInstanceUptimeUsesProcessStartTime(t *testing.T) {
+	now := time.Now()
+	inst := model.Instance{
+		FirecrackerPID: os.Getpid(),
+		UpdatedAt:      now.Add(time.Hour),
+	}
+
+	uptime, ok := topInstanceUptime(inst, now)
+	if !ok {
+		t.Fatal("topInstanceUptime() reported no uptime for current process")
+	}
+	if uptime < 0 {
+		t.Fatalf("topInstanceUptime() = %s, want non-negative", uptime)
+	}
+	if uptime > 10*time.Minute {
+		t.Fatalf("topInstanceUptime() = %s, unexpectedly large for test process", uptime)
+	}
+}
+
+func TestRenderTopScreenFormatsLiveMetrics(t *testing.T) {
+	prev := &topSnapshot{
+		capturedAt: time.Date(2026, time.April, 15, 12, 0, 0, 0, time.UTC),
+		instances: []topInstanceSnapshot{
+			{Name: "alpha", State: model.StateReady, VCPUCount: 4, CPUUsageUsec: 1_000_000, NetRXBytes: 1024, NetTXBytes: 2048, HasLiveMetrics: true, HasNetStats: true, HasUptime: true, Uptime: 2*time.Hour + 12*time.Minute},
+			{Name: "beta", State: model.StateStopped, DiskAllocatedBytes: 64 << 20, DiskLimitBytes: 4 << 30},
+		},
+	}
+	snapshot := topSnapshot{
+		capturedAt: prev.capturedAt.Add(time.Second),
+		instances: []topInstanceSnapshot{
+			{
+				Name:               "alpha",
+				State:              model.StateReady,
+				VCPUCount:          4,
+				CPUUsageUsec:       1_133_000,
+				MemoryCurrentBytes: 811 << 20,
+				MemoryLimitBytes:   8 << 30,
+				DiskAllocatedBytes: 396 << 20,
+				DiskLimitBytes:     20 << 30,
+				NetRXBytes:         1024 + 1536,
+				NetTXBytes:         2048 + 512,
+				HasLiveMetrics:     true,
+				HasNetStats:        true,
+				HasUptime:          true,
+				Uptime:             2*time.Hour + 13*time.Minute,
+			},
+			{Name: "beta", State: model.StateStopped, DiskAllocatedBytes: 64 << 20, DiskLimitBytes: 4 << 30},
+		},
+	}
+
+	out := renderTopScreen(snapshot, prev, 12*time.Second, time.Second)
+	for _, want := range []string{
+		topEmphasize("srv top"),
+		topMuted("uptime") + " 12s",
+		topMuted("refresh") + " 1s",
+		topMuted("visible") + " 2",
+		topMuted("press q to exit"),
+		topMuted("running") + " 1",
+		topMuted("stopped") + " 1",
+		topMuted("transition") + " 0",
+		topMuted("failed") + " 0",
+		topMuted("hot cpu") + " alpha",
+		topMuted("hot mem") + " alpha",
+		topMuted("hot disk") + " alpha",
+		"VM",
+		"STATUS",
+		"CPU%",
+		"MEM",
+		"DISK",
+		"NET RX",
+		"NET TX",
+		"UPTIME",
+		"alpha",
+		"running",
+		"13.3%",
+		formatTopUsage(811<<20, 8<<30),
+		formatTopUsage(396<<20, 20<<30),
+		"1.5 KiB/s",
+		"512 B/s",
+		"2h13m",
+		"\x1b[38;2;0;121;76mrunning\x1b[0m",
+		"\x1b[38;2;0;121;76m13.3%\x1b[0m",
+		topMuted("MEM = live/configured RAM. DISK = host allocated/configured rootfs.\n"),
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("renderTopScreen() missing %q\nfull output:\n%s", want, out)
+		}
+	}
+	if strings.Index(out, "alpha") > strings.Index(out, "beta") {
+		t.Fatalf("renderTopScreen() rows were not sorted by CPU usage\nfull output:\n%s", out)
+	}
+}
+
+func TestRenderTopScreenKeepsStableWidthAcrossRateChanges(t *testing.T) {
+	prev := &topSnapshot{
+		capturedAt: time.Date(2026, time.April, 15, 12, 0, 0, 0, time.UTC),
+		instances: []topInstanceSnapshot{{
+			Name:           "alpha",
+			State:          model.StateReady,
+			VCPUCount:      4,
+			CPUUsageUsec:   1_000_000,
+			NetRXBytes:     100,
+			NetTXBytes:     100,
+			HasLiveMetrics: true,
+			HasNetStats:    true,
+		}},
+	}
+	first := topSnapshot{
+		capturedAt: prev.capturedAt.Add(time.Second),
+		instances: []topInstanceSnapshot{{
+			Name:               "alpha",
+			State:              model.StateReady,
+			VCPUCount:          4,
+			CPUUsageUsec:       1_010_000,
+			MemoryCurrentBytes: 256 << 20,
+			MemoryLimitBytes:   8 << 30,
+			DiskAllocatedBytes: 396 << 20,
+			DiskLimitBytes:     20 << 30,
+			NetRXBytes:         999,
+			NetTXBytes:         999,
+			HasLiveMetrics:     true,
+			HasNetStats:        true,
+		}},
+	}
+	second := topSnapshot{
+		capturedAt: first.capturedAt.Add(time.Second),
+		instances: []topInstanceSnapshot{{
+			Name:               "alpha",
+			State:              model.StateReady,
+			VCPUCount:          4,
+			CPUUsageUsec:       1_020_000,
+			MemoryCurrentBytes: 256 << 20,
+			MemoryLimitBytes:   8 << 30,
+			DiskAllocatedBytes: 396 << 20,
+			DiskLimitBytes:     20 << 30,
+			NetRXBytes:         2 * 1024,
+			NetTXBytes:         2 * 1024,
+			HasLiveMetrics:     true,
+			HasNetStats:        true,
+		}},
+	}
+	firstOut := renderTopScreen(first, prev, 5*time.Second, time.Second)
+	secondOut := renderTopScreen(second, &first, 6*time.Second, time.Second)
+	firstLine := topTestFirstBoxLine(firstOut)
+	secondLine := topTestFirstBoxLine(secondOut)
+	if utf8.RuneCountInString(firstLine) != utf8.RuneCountInString(secondLine) {
+		t.Fatalf("top width changed across rate updates\nfirst:  %q\nsecond: %q", firstLine, secondLine)
+	}
+}
+
+func topTestFirstBoxLine(out string) string {
+	for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+		if strings.Contains(line, "┌") {
+			return line
+		}
+	}
+	return ""
 }
 
 func TestCmdResizeUpdatesStoppedInstance(t *testing.T) {
@@ -1644,6 +2011,156 @@ func waitForOutput(t *testing.T, output *lockedBuffer, want string) {
 	}
 	t.Fatalf("timed out waiting for %q in output:\n%s", want, output.String())
 }
+
+type serviceTestAddr string
+
+func (a serviceTestAddr) Network() string { return "test" }
+
+func (a serviceTestAddr) String() string { return string(a) }
+
+type serviceTestContext struct {
+	context.Context
+	mu            sync.Mutex
+	user          string
+	sessionID     string
+	clientVersion string
+	serverVersion string
+	remoteAddr    net.Addr
+	localAddr     net.Addr
+	permissions   *gssh.Permissions
+	values        map[any]any
+}
+
+func newServiceTestContext(ctx context.Context) *serviceTestContext {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &serviceTestContext{
+		Context:       ctx,
+		user:          "alice",
+		sessionID:     "session-id",
+		clientVersion: "SSH-2.0-test-client",
+		serverVersion: "SSH-2.0-test-server",
+		remoteAddr:    serviceTestAddr("remote"),
+		localAddr:     serviceTestAddr("local"),
+		permissions:   &gssh.Permissions{},
+		values:        make(map[any]any),
+	}
+}
+
+func (c *serviceTestContext) Lock() { c.mu.Lock() }
+
+func (c *serviceTestContext) Unlock() { c.mu.Unlock() }
+
+func (c *serviceTestContext) User() string { return c.user }
+
+func (c *serviceTestContext) SessionID() string { return c.sessionID }
+
+func (c *serviceTestContext) ClientVersion() string { return c.clientVersion }
+
+func (c *serviceTestContext) ServerVersion() string { return c.serverVersion }
+
+func (c *serviceTestContext) RemoteAddr() net.Addr { return c.remoteAddr }
+
+func (c *serviceTestContext) LocalAddr() net.Addr { return c.localAddr }
+
+func (c *serviceTestContext) Permissions() *gssh.Permissions { return c.permissions }
+
+func (c *serviceTestContext) Value(key any) any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if value, ok := c.values[key]; ok {
+		return value
+	}
+	return c.Context.Value(key)
+}
+
+func (c *serviceTestContext) SetValue(key, value any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.values[key] = value
+}
+
+type serviceTestSession struct {
+	ctx          *serviceTestContext
+	stdin        io.Reader
+	stdout       bytes.Buffer
+	stderr       bytes.Buffer
+	command      []string
+	hasPty       bool
+	pty          gssh.Pty
+	sentRequests []string
+	exitCode     int
+}
+
+func newServiceTestSession(ctx context.Context, stdin string, hasPty bool, command []string) *serviceTestSession {
+	return &serviceTestSession{
+		ctx:     newServiceTestContext(ctx),
+		stdin:   strings.NewReader(stdin),
+		command: append([]string(nil), command...),
+		hasPty:  hasPty,
+		pty: gssh.Pty{
+			Term:   "xterm-256color",
+			Window: gssh.Window{Width: 120, Height: 40},
+		},
+		exitCode: -1,
+	}
+}
+
+func (s *serviceTestSession) Read(p []byte) (int, error) { return s.stdin.Read(p) }
+
+func (s *serviceTestSession) Write(p []byte) (int, error) { return s.stdout.Write(p) }
+
+func (s *serviceTestSession) Close() error { return nil }
+
+func (s *serviceTestSession) CloseWrite() error { return nil }
+
+func (s *serviceTestSession) SendRequest(name string, _ bool, _ []byte) (bool, error) {
+	s.sentRequests = append(s.sentRequests, name)
+	return true, nil
+}
+
+func (s *serviceTestSession) Stderr() io.ReadWriter { return &s.stderr }
+
+func (s *serviceTestSession) User() string { return s.ctx.User() }
+
+func (s *serviceTestSession) RemoteAddr() net.Addr { return s.ctx.RemoteAddr() }
+
+func (s *serviceTestSession) LocalAddr() net.Addr { return s.ctx.LocalAddr() }
+
+func (s *serviceTestSession) Environ() []string { return nil }
+
+func (s *serviceTestSession) Exit(code int) error {
+	s.exitCode = code
+	return nil
+}
+
+func (s *serviceTestSession) Command() []string { return append([]string(nil), s.command...) }
+
+func (s *serviceTestSession) RawCommand() string { return strings.Join(s.command, " ") }
+
+func (s *serviceTestSession) Subsystem() string { return "" }
+
+func (s *serviceTestSession) PublicKey() gssh.PublicKey { return nil }
+
+func (s *serviceTestSession) Context() gssh.Context { return s.ctx }
+
+func (s *serviceTestSession) Permissions() gssh.Permissions {
+	if s.ctx.permissions == nil {
+		return gssh.Permissions{}
+	}
+	return *s.ctx.permissions
+}
+
+func (s *serviceTestSession) Pty() (gssh.Pty, <-chan gssh.Window, bool) { return s.pty, nil, s.hasPty }
+
+func (s *serviceTestSession) Signals(chan<- gssh.Signal) {}
+
+func (s *serviceTestSession) Break(chan<- bool) {}
+
+var _ gssh.Session = (*serviceTestSession)(nil)
+var _ gssh.Context = (*serviceTestContext)(nil)
+var _ gossh.Channel = (*serviceTestSession)(nil)
 
 func newServiceTestStore(t *testing.T) *store.Store {
 	t.Helper()

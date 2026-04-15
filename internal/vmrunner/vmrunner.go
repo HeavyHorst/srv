@@ -106,6 +106,16 @@ type StopRequest struct {
 	PID  int    `json:"pid"`
 }
 
+type MetricsRequest struct {
+	Name string `json:"name"`
+}
+
+type MetricsResponse struct {
+	CPUUsageUsec       uint64 `json:"cpu_usage_usec"`
+	MemoryCurrentBytes int64  `json:"memory_current_bytes"`
+	MemoryLimitBytes   int64  `json:"memory_limit_bytes"`
+}
+
 type errorResponse struct {
 	Error string `json:"error"`
 }
@@ -151,6 +161,17 @@ func (c *Client) StopInstanceVM(ctx context.Context, req StopRequest) error {
 	return c.post(ctx, "/vm/stop", req, nil)
 }
 
+func (c *Client) ReadInstanceMetrics(ctx context.Context, req MetricsRequest) (MetricsResponse, error) {
+	if err := req.Validate(); err != nil {
+		return MetricsResponse{}, err
+	}
+	var resp MetricsResponse
+	if err := c.post(ctx, "/vm/metrics", req, &resp); err != nil {
+		return MetricsResponse{}, err
+	}
+	return resp, nil
+}
+
 func (c *Client) post(ctx context.Context, path string, payload any, out any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -193,6 +214,7 @@ func (c *Client) post(ctx context.Context, path string, payload any, out any) er
 
 type StartFunc func(context.Context, StartRequest) (StartResponse, error)
 type StopFunc func(context.Context, StopRequest) error
+type MetricsFunc func(context.Context, MetricsRequest) (MetricsResponse, error)
 
 type ServerConfig struct {
 	FirecrackerBinary string
@@ -221,10 +243,11 @@ type jailerRuntimePaths struct {
 }
 
 type Server struct {
-	log    *slog.Logger
-	config ServerConfig
-	start  StartFunc
-	stop   StopFunc
+	log     *slog.Logger
+	config  ServerConfig
+	start   StartFunc
+	stop    StopFunc
+	metrics MetricsFunc
 
 	cgroupMu           sync.Mutex
 	delegatedCgroupRel string
@@ -249,6 +272,7 @@ func NewServerWithHandlers(logger *slog.Logger, cfg ServerConfig, start StartFun
 	} else {
 		s.stop = s.stopVM
 	}
+	s.metrics = s.readInstanceMetrics
 	return s
 }
 
@@ -256,6 +280,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vm/start", s.handleStart)
 	mux.HandleFunc("/vm/stop", s.handleStop)
+	mux.HandleFunc("/vm/metrics", s.handleMetrics)
 	return mux
 }
 
@@ -334,6 +359,36 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s is not allowed", r.Method))
+		return
+	}
+	var req MetricsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Errorf("decode metrics request: %w", err))
+		return
+	}
+	if err := req.Validate(); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	resp, err := s.metrics(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			respondError(w, http.StatusNotFound, err)
+			return
+		}
+		s.log.Error("read vm metrics", "name", req.Name, "err", err)
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		s.log.Error("encode metrics response", "name", req.Name, "err", err)
+	}
 }
 
 func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, error) {
@@ -532,6 +587,13 @@ func (r StartRequest) Validate() error {
 	}
 	if strings.TrimSpace(r.Bootstrap.Hostname) == "" {
 		return errors.New("bootstrap hostname is required")
+	}
+	return nil
+}
+
+func (r MetricsRequest) Validate() error {
+	if !validName.MatchString(strings.TrimSpace(r.Name)) {
+		return fmt.Errorf("invalid instance name %q", r.Name)
 	}
 	return nil
 }
@@ -1012,6 +1074,34 @@ func (s *Server) delegatedCgroupRoot() (string, error) {
 	return s.delegatedCgroupRel, nil
 }
 
+func (s *Server) readInstanceMetrics(_ context.Context, req MetricsRequest) (MetricsResponse, error) {
+	rootRel, err := s.delegatedCgroupRoot()
+	if err != nil {
+		return MetricsResponse{}, err
+	}
+	cgroupPath, err := firecrackerCgroupPathUnder(rootRel, req.Name)
+	if err != nil {
+		return MetricsResponse{}, err
+	}
+	cpuUsageUsec, err := readCPUUsageUsec(filepath.Join(cgroupPath, "cpu.stat"))
+	if err != nil {
+		return MetricsResponse{}, err
+	}
+	memoryCurrentBytes, err := readInt64File(filepath.Join(cgroupPath, "memory.current"))
+	if err != nil {
+		return MetricsResponse{}, err
+	}
+	memoryLimitBytes, err := readInt64File(filepath.Join(cgroupPath, "memory.max"))
+	if err != nil {
+		return MetricsResponse{}, err
+	}
+	return MetricsResponse{
+		CPUUsageUsec:       cpuUsageUsec,
+		MemoryCurrentBytes: memoryCurrentBytes,
+		MemoryLimitBytes:   memoryLimitBytes,
+	}, nil
+}
+
 func moveProcessToCgroup(pid int, cgroupPath string) error {
 	if pid <= 0 {
 		return fmt.Errorf("move process to cgroup %s: invalid pid %d", cgroupPath, pid)
@@ -1060,6 +1150,41 @@ func readCgroupControllerFile(path string) (map[string]struct{}, error) {
 		values[strings.TrimPrefix(controller, "+")] = struct{}{}
 	}
 	return values, nil
+}
+
+func readCPUUsageUsec(path string) (uint64, error) {
+	payload, err := readTextFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read cpu stat %s: %w", path, err)
+	}
+	for _, line := range strings.Split(string(payload), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "usage_usec" {
+			continue
+		}
+		value, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse cpu usage from %s: %w", path, err)
+		}
+		return value, nil
+	}
+	return 0, fmt.Errorf("usage_usec missing from %s", path)
+}
+
+func readInt64File(path string) (int64, error) {
+	payload, err := readTextFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", path, err)
+	}
+	trimmed := strings.TrimSpace(string(payload))
+	if trimmed == "max" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return value, nil
 }
 
 func cgroupPathOnHost(rel string) string {

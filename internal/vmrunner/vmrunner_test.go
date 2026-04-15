@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,6 +43,9 @@ func TestRequestsValidate(t *testing.T) {
 	if err := (StopRequest{Name: "demo", PID: 1234}).Validate(); err != nil {
 		t.Fatalf("StopRequest.Validate(): %v", err)
 	}
+	if err := (MetricsRequest{Name: "demo"}).Validate(); err != nil {
+		t.Fatalf("MetricsRequest.Validate(): %v", err)
+	}
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -50,6 +54,7 @@ func TestRequestsValidate(t *testing.T) {
 		{name: "bad tap", err: func() error { req := valid; req.TapDevice = "nested/demo"; return req.Validate() }()},
 		{name: "bad guest ip", err: func() error { req := valid; req.GuestAddr = "10.0.0.2"; return req.Validate() }()},
 		{name: "bad stop pid", err: (StopRequest{Name: "demo", PID: -1}).Validate()},
+		{name: "bad metrics name", err: (MetricsRequest{Name: "nested/demo"}).Validate()},
 	} {
 		if tc.err == nil {
 			t.Fatalf("%s unexpectedly passed validation", tc.name)
@@ -115,6 +120,12 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 			return nil
 		},
 	)
+	server.metrics = func(_ context.Context, req MetricsRequest) (MetricsResponse, error) {
+		if req.Name != "demo" {
+			t.Fatalf("metrics request name = %q, want demo", req.Name)
+		}
+		return MetricsResponse{CPUUsageUsec: 12345, MemoryCurrentBytes: 256 << 20, MemoryLimitBytes: 1024 << 20}, nil
+	}
 
 	socketPath := filepath.Join(t.TempDir(), "vm-runner.sock")
 	listener, err := net.Listen("unix", socketPath)
@@ -146,6 +157,13 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 	}
 	if err := client.StopInstanceVM(ctx, StopRequest{Name: "demo", PID: 4321}); err != nil {
 		t.Fatalf("StopInstanceVM(): %v", err)
+	}
+	metrics, err := client.ReadInstanceMetrics(ctx, MetricsRequest{Name: "demo"})
+	if err != nil {
+		t.Fatalf("ReadInstanceMetrics(): %v", err)
+	}
+	if metrics.CPUUsageUsec != 12345 || metrics.MemoryCurrentBytes != 256<<20 || metrics.MemoryLimitBytes != 1024<<20 {
+		t.Fatalf("ReadInstanceMetrics() = %#v", metrics)
 	}
 
 	mu.Lock()
@@ -512,6 +530,81 @@ func TestPrepareFirecrackerCgroupParentMovesRunnerAndEnablesControllers(t *testi
 		if got := strings.Fields(string(payload)); !reflect.DeepEqual(got, []string{"+cpu", "+memory", "+pids"}) {
 			t.Fatalf("%s = %#v, want [+cpu +memory +pids]", path, got)
 		}
+	}
+}
+
+func TestReadInstanceMetricsReadsVMResourcesFromCgroup(t *testing.T) {
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	oldReadTextFile := readTextFile
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+		readTextFile = oldReadTextFile
+	})
+
+	cgroupFSRoot = t.TempDir()
+	currentCgroupPath = func() (string, error) {
+		return "/system.slice/srv-vm-runner.service", nil
+	}
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		InstancesDir:      "/var/lib/srv/instances",
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	})
+	cgroupPath := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service", firecrackerVMRootCgroupName, "demo")
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(cgroupPath): %v", err)
+	}
+	for path, payload := range map[string]string{
+		filepath.Join(cgroupPath, "cpu.stat"):       "usage_usec 12345\nuser_usec 10000\nsystem_usec 2345\n",
+		filepath.Join(cgroupPath, "memory.current"): "268435456\n",
+		filepath.Join(cgroupPath, "memory.max"):     "1073741824\n",
+	} {
+		if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", path, err)
+		}
+	}
+
+	metrics, err := server.readInstanceMetrics(context.Background(), MetricsRequest{Name: "demo"})
+	if err != nil {
+		t.Fatalf("readInstanceMetrics(): %v", err)
+	}
+	if metrics.CPUUsageUsec != 12345 || metrics.MemoryCurrentBytes != 256<<20 || metrics.MemoryLimitBytes != 1024<<20 {
+		t.Fatalf("readInstanceMetrics() = %#v", metrics)
+	}
+}
+
+func TestHandleMetricsReturnsNotFoundForMissingCgroup(t *testing.T) {
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		InstancesDir:      "/var/lib/srv/instances",
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	})
+	server.metrics = func(context.Context, MetricsRequest) (MetricsResponse, error) {
+		return MetricsResponse{}, os.ErrNotExist
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/vm/metrics", strings.NewReader(`{"name":"demo"}`))
+	w := httptest.NewRecorder()
+	server.handleMetrics(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("handleMetrics() status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestReadInt64FileAcceptsMax(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.max")
+	if err := os.WriteFile(path, []byte("max\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(memory.max): %v", err)
+	}
+	got, err := readInt64File(path)
+	if err != nil {
+		t.Fatalf("readInt64File(): %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("readInt64File(max) = %d, want 0", got)
 	}
 }
 

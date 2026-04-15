@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -42,13 +41,8 @@ var (
 		}
 		return names, nil
 	}
-	PathExists      = func(path string) bool { _, err := os.Stat(path); return err == nil }
-	EvalSymlinks    = filepath.EvalSymlinks
-	RunBtrfsCommand = func(ctx context.Context, args ...string) (string, error) {
-		cmd := exec.CommandContext(ctx, "btrfs", args...)
-		output, err := cmd.CombinedOutput()
-		return strings.TrimSpace(string(output)), err
-	}
+	PathExists   = func(path string) bool { _, err := os.Stat(path); return err == nil }
+	EvalSymlinks = filepath.EvalSymlinks
 )
 
 func StorageDetails(ctx context.Context, path string) []Detail {
@@ -59,7 +53,7 @@ func StorageDetails(ctx context.Context, path string) []Detail {
 
 	details := make([]Detail, 0, 2)
 	if mount.FSType == "btrfs" {
-		if value, ok := btrfsHealthStatus(ctx, path); ok {
+		if value, ok := btrfsHealthStatus(mount.Source); ok {
 			details = append(details, Detail{Label: "BTRFS", Value: value})
 		}
 	}
@@ -144,29 +138,77 @@ func unescapeMountInfoValue(value string) string {
 	return b.String()
 }
 
-func btrfsHealthStatus(ctx context.Context, path string) (string, bool) {
-	showOutput, showErr := RunBtrfsCommand(ctx, "filesystem", "show", path)
-	if showErr == nil && btrfsFilesystemShowHasMissingDevices(showOutput) {
-		return "DEGRADED", true
+func btrfsHealthStatus(source string) (string, bool) {
+	fsid, err := btrfsFSIDForMountSource(source)
+	if err != nil || fsid == "" {
+		return "", false
 	}
-	statsOutput, statsErr := RunBtrfsCommand(ctx, "device", "stats", "-c", path)
-	if hasStats, hasErrors := parseBtrfsDeviceStatsOutput(statsOutput); hasStats && hasErrors {
+	deviceIDs, err := ReadDirNames(filepath.Join("/sys/fs/btrfs", fsid, "devinfo"))
+	if err != nil {
+		return "", false
+	}
+
+	hasStats := false
+	hasErrors := false
+	for _, deviceID := range deviceIDs {
+		base := filepath.Join("/sys/fs/btrfs", fsid, "devinfo", deviceID)
+		missing, err := ReadTrimmedFile(filepath.Join(base, "missing"))
+		if err == nil && missing == "1" {
+			return "DEGRADED", true
+		}
+		stats, err := ReadTrimmedFile(filepath.Join(base, "error_stats"))
+		if err != nil {
+			continue
+		}
+		deviceHasStats, deviceHasErrors := parseBtrfsDeviceStatsOutput(stats)
+		hasStats = hasStats || deviceHasStats
+		hasErrors = hasErrors || deviceHasErrors
+	}
+	if hasErrors {
 		return "DEVICE ERRORS", true
 	}
-	if statsErr == nil {
+	if hasStats {
 		return "DEVICE STATS CLEAN", true
 	}
 	return "", false
 }
 
-func btrfsFilesystemShowHasMissingDevices(output string) bool {
-	for _, line := range strings.Split(strings.ToLower(output), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "some devices missing") || strings.Contains(line, "path missing") {
-			return true
+func btrfsFSIDForMountSource(source string) (string, error) {
+	deviceID, err := blockDeviceID(source)
+	if err != nil || deviceID == "" {
+		return "", err
+	}
+	fsids, err := ReadDirNames("/sys/fs/btrfs")
+	if err != nil {
+		return "", err
+	}
+	for _, fsid := range fsids {
+		if fsid == "features" || fsid == "btrfs-control" {
+			continue
+		}
+		devices, err := ReadDirNames(filepath.Join("/sys/fs/btrfs", fsid, "devices"))
+		if err != nil {
+			continue
+		}
+		for _, device := range devices {
+			candidateID, err := ReadTrimmedFile(filepath.Join("/sys/class/block", device, "dev"))
+			if err != nil || candidateID == "" {
+				continue
+			}
+			if candidateID == deviceID {
+				return fsid, nil
+			}
 		}
 	}
-	return false
+	return "", nil
+}
+
+func blockDeviceID(source string) (string, error) {
+	deviceName, err := blockDeviceName(source)
+	if err != nil || deviceName == "" {
+		return "", err
+	}
+	return ReadTrimmedFile(filepath.Join("/sys/class/block", deviceName, "dev"))
 }
 
 func parseBtrfsDeviceStatsOutput(output string) (bool, bool) {

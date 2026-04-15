@@ -2002,13 +2002,13 @@ func TestResizeRejectsGrowingRootFSWhenHostDiskSpaceIsLow(t *testing.T) {
 
 func TestCapacitySummaryIncludesDiskStorageDetails(t *testing.T) {
 	oldReadProcMountInfo := storage.ReadProcMountInfo
+	oldReadDirNames := storage.ReadDirNames
 	oldReadTrimmedFile := storage.ReadTrimmedFile
-	oldRunBtrfsCommand := storage.RunBtrfsCommand
 	oldPathExists := storage.PathExists
 	t.Cleanup(func() {
 		storage.ReadProcMountInfo = oldReadProcMountInfo
+		storage.ReadDirNames = oldReadDirNames
 		storage.ReadTrimmedFile = oldReadTrimmedFile
-		storage.RunBtrfsCommand = oldRunBtrfsCommand
 		storage.PathExists = oldPathExists
 	})
 
@@ -2034,8 +2034,26 @@ func TestCapacitySummaryIncludesDiskStorageDetails(t *testing.T) {
 		line := fmt.Sprintf("36 25 0:32 / %s rw,relatime - btrfs /dev/md0 rw\n", cfg.InstancesDir())
 		return []byte(line), nil
 	}
+	storage.ReadDirNames = func(path string) ([]string, error) {
+		switch path {
+		case "/sys/fs/btrfs":
+			return []string{"fsid-1"}, nil
+		case "/sys/fs/btrfs/fsid-1/devices":
+			return []string{"md0"}, nil
+		case "/sys/fs/btrfs/fsid-1/devinfo":
+			return []string{"1"}, nil
+		default:
+			return nil, os.ErrNotExist
+		}
+	}
 	storage.ReadTrimmedFile = func(path string) (string, error) {
 		switch path {
+		case "/sys/class/block/md0/dev":
+			return "9:0", nil
+		case "/sys/fs/btrfs/fsid-1/devinfo/1/missing":
+			return "0", nil
+		case "/sys/fs/btrfs/fsid-1/devinfo/1/error_stats":
+			return "write_errs 0\nread_errs 0\nflush_errs 0\ncorruption_errs 0\ngeneration_errs 0", nil
 		case "/sys/class/block/md0/md/array_state":
 			return "clean", nil
 		case "/sys/class/block/md0/md/degraded":
@@ -2045,9 +2063,6 @@ func TestCapacitySummaryIncludesDiskStorageDetails(t *testing.T) {
 		default:
 			return "", os.ErrNotExist
 		}
-	}
-	storage.RunBtrfsCommand = func(context.Context, ...string) (string, error) {
-		return "", nil
 	}
 	storage.PathExists = func(string) bool { return false }
 

@@ -1,46 +1,179 @@
 package storage
 
 import (
-	"context"
-	"errors"
 	"os"
 	"reflect"
 	"testing"
 )
 
-func TestBtrfsHealthStatusIgnoresUnrelatedMissingText(t *testing.T) {
-	oldRunBtrfsCommand := RunBtrfsCommand
+func TestBtrfsHealthStatusReportsCleanFromSysfs(t *testing.T) {
+	oldReadDirNames := ReadDirNames
+	oldReadTrimmedFile := ReadTrimmedFile
+	oldEvalSymlinks := EvalSymlinks
 	t.Cleanup(func() {
-		RunBtrfsCommand = oldRunBtrfsCommand
+		ReadDirNames = oldReadDirNames
+		ReadTrimmedFile = oldReadTrimmedFile
+		EvalSymlinks = oldEvalSymlinks
 	})
 
-	RunBtrfsCommand = func(_ context.Context, args ...string) (string, error) {
-		if len(args) >= 2 && args[0] == "filesystem" && args[1] == "show" {
-			return "Label: Missing_Data\n", nil
+	EvalSymlinks = func(path string) (string, error) {
+		if path == "/dev/mapper/cryptroot" {
+			return "/dev/dm-0", nil
 		}
-		return "[/dev/md0].write_io_errs 0\n[/dev/md0].read_io_errs 0\n", nil
+		return path, nil
+	}
+	ReadDirNames = func(path string) ([]string, error) {
+		switch path {
+		case "/sys/fs/btrfs":
+			return []string{"features", "btrfs-control", "fsid-1"}, nil
+		case "/sys/fs/btrfs/fsid-1/devices":
+			return []string{"dm-7", "dm-0"}, nil
+		case "/sys/fs/btrfs/fsid-1/devinfo":
+			return []string{"1"}, nil
+		default:
+			return nil, os.ErrNotExist
+		}
+	}
+	ReadTrimmedFile = func(path string) (string, error) {
+		switch path {
+		case "/sys/class/block/dm-0/dev":
+			return "253:0", nil
+		case "/sys/class/block/dm-7/dev":
+			return "253:7", nil
+		case "/sys/fs/btrfs/fsid-1/devinfo/1/missing":
+			return "0", nil
+		case "/sys/fs/btrfs/fsid-1/devinfo/1/error_stats":
+			return "write_errs 0\nread_errs 0\nflush_errs 0\ncorruption_errs 0\ngeneration_errs 0", nil
+		default:
+			return "", os.ErrNotExist
+		}
 	}
 
-	got, ok := btrfsHealthStatus(context.Background(), "/srv")
+	got, ok := btrfsHealthStatus("/dev/mapper/cryptroot")
 	if !ok || got != "DEVICE STATS CLEAN" {
 		t.Fatalf("btrfsHealthStatus() = %q, %v, want %q, true", got, ok, "DEVICE STATS CLEAN")
 	}
 }
 
-func TestBtrfsHealthStatusDoesNotTreatCommandFailureAsDeviceErrors(t *testing.T) {
-	oldRunBtrfsCommand := RunBtrfsCommand
+func TestBtrfsHealthStatusReportsDeviceErrorsFromSysfs(t *testing.T) {
+	oldReadDirNames := ReadDirNames
+	oldReadTrimmedFile := ReadTrimmedFile
+	oldEvalSymlinks := EvalSymlinks
 	t.Cleanup(func() {
-		RunBtrfsCommand = oldRunBtrfsCommand
+		ReadDirNames = oldReadDirNames
+		ReadTrimmedFile = oldReadTrimmedFile
+		EvalSymlinks = oldEvalSymlinks
 	})
 
-	RunBtrfsCommand = func(_ context.Context, args ...string) (string, error) {
-		if len(args) >= 2 && args[0] == "filesystem" && args[1] == "show" {
-			return "Label: srv\n", nil
+	EvalSymlinks = func(path string) (string, error) { return path, nil }
+	ReadDirNames = func(path string) ([]string, error) {
+		switch path {
+		case "/sys/fs/btrfs":
+			return []string{"fsid-1"}, nil
+		case "/sys/fs/btrfs/fsid-1/devices":
+			return []string{"md0"}, nil
+		case "/sys/fs/btrfs/fsid-1/devinfo":
+			return []string{"1"}, nil
+		default:
+			return nil, os.ErrNotExist
 		}
-		return "ERROR: not a mounted btrfs device", errors.New("exit status 1")
+	}
+	ReadTrimmedFile = func(path string) (string, error) {
+		switch path {
+		case "/sys/class/block/md0/dev":
+			return "9:0", nil
+		case "/sys/fs/btrfs/fsid-1/devinfo/1/missing":
+			return "0", nil
+		case "/sys/fs/btrfs/fsid-1/devinfo/1/error_stats":
+			return "write_errs 0\nread_errs 1\nflush_errs 0\ncorruption_errs 0\ngeneration_errs 0", nil
+		default:
+			return "", os.ErrNotExist
+		}
 	}
 
-	got, ok := btrfsHealthStatus(context.Background(), "/srv")
+	got, ok := btrfsHealthStatus("/dev/md0")
+	if !ok || got != "DEVICE ERRORS" {
+		t.Fatalf("btrfsHealthStatus() = %q, %v, want %q, true", got, ok, "DEVICE ERRORS")
+	}
+}
+
+func TestBtrfsHealthStatusReportsDegradedFromSysfs(t *testing.T) {
+	oldReadDirNames := ReadDirNames
+	oldReadTrimmedFile := ReadTrimmedFile
+	oldEvalSymlinks := EvalSymlinks
+	t.Cleanup(func() {
+		ReadDirNames = oldReadDirNames
+		ReadTrimmedFile = oldReadTrimmedFile
+		EvalSymlinks = oldEvalSymlinks
+	})
+
+	EvalSymlinks = func(path string) (string, error) { return path, nil }
+	ReadDirNames = func(path string) ([]string, error) {
+		switch path {
+		case "/sys/fs/btrfs":
+			return []string{"fsid-1"}, nil
+		case "/sys/fs/btrfs/fsid-1/devices":
+			return []string{"md0"}, nil
+		case "/sys/fs/btrfs/fsid-1/devinfo":
+			return []string{"1", "2"}, nil
+		default:
+			return nil, os.ErrNotExist
+		}
+	}
+	ReadTrimmedFile = func(path string) (string, error) {
+		switch path {
+		case "/sys/class/block/md0/dev":
+			return "9:0", nil
+		case "/sys/fs/btrfs/fsid-1/devinfo/1/missing":
+			return "0", nil
+		case "/sys/fs/btrfs/fsid-1/devinfo/1/error_stats":
+			return "write_errs 0\nread_errs 0\nflush_errs 0\ncorruption_errs 0\ngeneration_errs 0", nil
+		case "/sys/fs/btrfs/fsid-1/devinfo/2/missing":
+			return "1", nil
+		default:
+			return "", os.ErrNotExist
+		}
+	}
+
+	got, ok := btrfsHealthStatus("/dev/md0")
+	if !ok || got != "DEGRADED" {
+		t.Fatalf("btrfsHealthStatus() = %q, %v, want %q, true", got, ok, "DEGRADED")
+	}
+}
+
+func TestBtrfsHealthStatusReturnsUnavailableWhenSourceDeviceDoesNotMatchFSID(t *testing.T) {
+	oldReadDirNames := ReadDirNames
+	oldReadTrimmedFile := ReadTrimmedFile
+	oldEvalSymlinks := EvalSymlinks
+	t.Cleanup(func() {
+		ReadDirNames = oldReadDirNames
+		ReadTrimmedFile = oldReadTrimmedFile
+		EvalSymlinks = oldEvalSymlinks
+	})
+
+	EvalSymlinks = func(path string) (string, error) { return path, nil }
+	ReadDirNames = func(path string) ([]string, error) {
+		switch path {
+		case "/sys/fs/btrfs":
+			return []string{"features", "fsid-1"}, nil
+		case "/sys/fs/btrfs/fsid-1/devices":
+			return []string{"md1"}, nil
+		default:
+			return nil, os.ErrNotExist
+		}
+	}
+	ReadTrimmedFile = func(path string) (string, error) {
+		switch path {
+		case "/sys/class/block/md0/dev":
+			return "9:0", nil
+		case "/sys/class/block/md1/dev":
+			return "9:1", nil
+		default:
+			return "", os.ErrNotExist
+		}
+	}
+
+	got, ok := btrfsHealthStatus("/dev/md0")
 	if ok || got != "" {
 		t.Fatalf("btrfsHealthStatus() = %q, %v, want empty/false", got, ok)
 	}

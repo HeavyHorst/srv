@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -30,6 +31,16 @@ import (
 	"srv/internal/store"
 	"srv/internal/vmrunner"
 )
+
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripAnsi(s string) string {
+	return ansiRe.ReplaceAllString(s, "")
+}
+
+func bold(s string) string {
+	return "\x1b[1m" + s + "\x1b[0m"
+}
 
 func TestAuthorize(t *testing.T) {
 	actor := model.Actor{UserLogin: "alice@example.com"}
@@ -311,7 +322,7 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	if strings.Contains(result.stdout, "\nready:") {
 		t.Fatalf("cmdStatus() included duplicated state block\nfull output:\n%s", result.stdout)
 	}
-	if strings.Contains(result.stdout, " | ") {
+	if strings.Contains(stripAnsi(result.stdout), " | ") {
 		t.Fatalf("cmdStatus() mixed ASCII pipes into the table content\nfull output:\n%s", result.stdout)
 	}
 	for _, unwanted := range []string{
@@ -324,37 +335,40 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	}
 	lines := strings.Split(strings.TrimSuffix(result.stdout, "\n"), "\n")
 	for _, line := range lines {
-		if strings.HasPrefix(line, "│ LOAD ") && strings.Contains(line, ".") {
+		plain := stripAnsi(line)
+		if strings.HasPrefix(plain, "│ LOAD ") && strings.Contains(plain, ".") {
 			t.Fatalf("cmdStatus() still included numeric load values\nline: %q\nfull output:\n%s", line, result.stdout)
 		}
 	}
 	for i := 0; i < len(lines)-1; i++ {
-		if strings.HasPrefix(lines[i], "│ OS") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
-			if i+2 < len(lines) && strings.HasPrefix(lines[i+2], "│ KERNEL") {
+		plain := stripAnsi(lines[i])
+		if strings.HasPrefix(plain, "│ OS") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
+			if i+2 < len(lines) && strings.HasPrefix(stripAnsi(lines[i+2]), "│ KERNEL") {
 				t.Fatalf("cmdStatus() included a separator between OS and KERNEL\nfull output:\n%s", result.stdout)
 			}
 		}
-		if strings.HasPrefix(lines[i], "│ LOAD 1m") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
-			if i+2 < len(lines) && strings.HasPrefix(lines[i+2], "│ LOAD 5m") {
+		if strings.HasPrefix(plain, "│ LOAD 1m") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
+			if i+2 < len(lines) && strings.HasPrefix(stripAnsi(lines[i+2]), "│ LOAD 5m") {
 				t.Fatalf("cmdStatus() included a separator between LOAD 1m and LOAD 5m\nfull output:\n%s", result.stdout)
 			}
 		}
-		if strings.HasPrefix(lines[i], "│ LOAD 5m") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
-			if i+2 < len(lines) && strings.HasPrefix(lines[i+2], "│ LOAD 15m") {
+		if strings.HasPrefix(plain, "│ LOAD 5m") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
+			if i+2 < len(lines) && strings.HasPrefix(stripAnsi(lines[i+2]), "│ LOAD 15m") {
 				t.Fatalf("cmdStatus() included a separator between LOAD 5m and LOAD 15m\nfull output:\n%s", result.stdout)
 			}
 		}
 	}
 	for i, line := range lines {
-		if strings.HasPrefix(line, "│ MEMORY") || strings.HasPrefix(line, "│ DISK") {
+		plain := stripAnsi(line)
+		if strings.HasPrefix(plain, "│ MEMORY") || strings.HasPrefix(plain, "│ DISK") {
 			if i == 0 || !strings.Contains(lines[i-1], "├") {
-				t.Fatalf("cmdStatus() missing a separator before %q\nfull output:\n%s", strings.TrimSpace(line), result.stdout)
+				t.Fatalf("cmdStatus() missing a separator before %q\nfull output:\n%s", strings.TrimSpace(plain), result.stdout)
 			}
 		}
 	}
-	wantWidth := utf8.RuneCountInString(lines[0])
+	wantWidth := utf8.RuneCountInString(stripAnsi(lines[0]))
 	for _, line := range lines {
-		if got := utf8.RuneCountInString(line); got != wantWidth {
+		if got := utf8.RuneCountInString(stripAnsi(line)); got != wantWidth {
 			t.Fatalf("cmdStatus() produced uneven box width: line %q has width %d, want %d\nfull output:\n%s", line, got, wantWidth, result.stdout)
 		}
 	}

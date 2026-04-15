@@ -24,6 +24,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	gssh "github.com/gliderlabs/ssh"
 	"github.com/olekukonko/tablewriter"
@@ -916,7 +917,7 @@ func renderTextTable(headers []string, rows [][]string) (string, error) {
 	var b bytes.Buffer
 	displayHeaders := make([]string, len(headers))
 	for i, header := range headers {
-		displayHeaders[i] = strings.ToUpper(header)
+		displayHeaders[i] = "\x1b[1m" + strings.ToUpper(header) + "\x1b[0m"
 	}
 	table := tablewriter.NewTable(&b, tablewriter.WithHeaderAutoFormat(tw.Off))
 	table.Header(displayHeaders)
@@ -1123,7 +1124,6 @@ func statusStorageLabelRank(label string) int {
 }
 
 func boxRow(label, value string, labelWidth, valueWidth int) string {
-	// Truncate by rune count so UTF-8 bar glyphs don't get cut off early.
 	valueRunes := []rune(value)
 	if len(valueRunes) > valueWidth {
 		if valueWidth <= 3 {
@@ -1135,7 +1135,9 @@ func boxRow(label, value string, labelWidth, valueWidth int) string {
 	if label == "" {
 		return fmt.Sprintf("│ %-*s│ %-*s │\n", labelWidth+1, "", valueWidth, value)
 	}
-	return fmt.Sprintf("│ %-*s│ %-*s │\n", labelWidth+1, label, valueWidth, value)
+	boldLabel := "\x1b[1m" + label + "\x1b[0m"
+	labelPad := strings.Repeat(" ", labelWidth-utf8.RuneCountInString(label)+1)
+	return fmt.Sprintf("│ %s%s│ %-*s │\n", boldLabel, labelPad, valueWidth, value)
 }
 
 func (a *App) cmdLogsRequest(ctx context.Context, actor model.Actor, req logsRequest) (commandResult, error) {
@@ -1357,13 +1359,13 @@ func renderTopScreen(snapshot topSnapshot, prev *topSnapshot, sessionAge, interv
 	)
 	b.WriteString(buildTopSummary(snapshot, prev))
 	b.WriteString("\n\n")
-	b.WriteString(topChrome(topBoxLine("┌", "┬", "┐", widths)))
+	b.WriteString(topBoxLine("┌", "┬", "┐", widths))
 	b.WriteString(topBoxRow(headers, []topCellStyle{topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader, topCellStyleHeader}, widths))
-	b.WriteString(topChrome(topBoxLine("├", "┼", "┤", widths)))
+	b.WriteString(topBoxLine("├", "┼", "┤", widths))
 	for _, row := range rows {
 		b.WriteString(topBoxRow(row.Values, row.Styles, widths))
 	}
-	b.WriteString(topChrome(topBoxLine("└", "┴", "┘", widths)))
+	b.WriteString(topBoxLine("└", "┴", "┘", widths))
 	b.WriteString(topMuted("MEM = live/configured RAM. DISK = host allocated/configured rootfs.\n"))
 	return b.String()
 }
@@ -1560,7 +1562,7 @@ func topBoxLine(left, middle, right string, widths []int) string {
 
 func topBoxRow(values []string, styles []topCellStyle, widths []int) string {
 	var b strings.Builder
-	b.WriteString(topChrome("│"))
+	b.WriteString("│")
 	for i, value := range values {
 		clamped := topClampCell(value, widths[i])
 		padding := strings.Repeat(" ", widths[i]-len([]rune(clamped)))
@@ -1568,7 +1570,7 @@ func topBoxRow(values []string, styles []topCellStyle, widths []int) string {
 		b.WriteString(topColorize(clamped, topRowStyle(styles, i)))
 		b.WriteString(padding)
 		b.WriteByte(' ')
-		b.WriteString(topChrome("│"))
+		b.WriteString("│")
 	}
 	b.WriteByte('\n')
 	return b.String()
@@ -1610,15 +1612,11 @@ func topColorize(value string, style topCellStyle) string {
 	case topCellStyleMuted:
 		code = "\x1b[38;2;128;128;128m"
 	case topCellStyleHeader:
-		code = "\x1b[1;38;2;176;176;176m"
+		code = "\x1b[1m"
 	default:
 		return value
 	}
 	return code + value + "\x1b[0m"
-}
-
-func topChrome(value string) string {
-	return topWrapStyle(value, "\x1b[38;2;92;92;92m")
 }
 
 func topSummaryMetricValue(ok bool, value string, style topCellStyle) string {

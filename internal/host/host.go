@@ -12,6 +12,7 @@ import (
 )
 
 type CapacitySummary struct {
+	Version   string             `json:"version"`
 	Hostname  string             `json:"hostname"`
 	OS        OSInfo             `json:"os"`
 	CPU       CPUInfo            `json:"cpu"`

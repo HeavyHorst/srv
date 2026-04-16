@@ -296,6 +296,7 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	}
 	for _, want := range []string{
 		"srv",
+		"VERSION",
 		"total",
 		"running",
 		"stopped",
@@ -342,6 +343,11 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	}
 	for i := 0; i < len(lines)-1; i++ {
 		plain := stripAnsi(lines[i])
+		if strings.HasPrefix(plain, "│ SERVER") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
+			if i+2 < len(lines) && strings.HasPrefix(stripAnsi(lines[i+2]), "│ VERSION") {
+				t.Fatalf("cmdStatus() included a separator between SERVER and VERSION\nfull output:\n%s", result.stdout)
+			}
+		}
 		if strings.HasPrefix(plain, "│ OS") && i+1 < len(lines) && strings.Contains(lines[i+1], "├") {
 			if i+2 < len(lines) && strings.HasPrefix(stripAnsi(lines[i+2]), "│ KERNEL") {
 				t.Fatalf("cmdStatus() included a separator between OS and KERNEL\nfull output:\n%s", result.stdout)
@@ -427,6 +433,9 @@ func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
 	}
 	if payload.Hostname != "srv" {
 		t.Fatalf("status hostname = %q, want %q", payload.Hostname, "srv")
+	}
+	if payload.Version == "" {
+		t.Fatalf("status version is empty")
 	}
 	if payload.Instances.Total != 4 || payload.Instances.Running != 1 || payload.Instances.Stopped != 1 || payload.Instances.Failed != 1 {
 		t.Fatalf("status instances = %#v", payload.Instances)

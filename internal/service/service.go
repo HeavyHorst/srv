@@ -1015,6 +1015,7 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 	var rows [][2]string
 
 	rows = append(rows, [2]string{"SERVER", summary.Hostname})
+	rows = append(rows, [2]string{"VERSION", summary.Version})
 	rows = append(rows, [2]string{"OS", summary.OS.Name})
 	rows = append(rows, [2]string{"KERNEL", fmt.Sprintf("%s (%s)", summary.OS.Kernel, summary.OS.Arch)})
 
@@ -1093,6 +1094,9 @@ func previousStatusLabel(rows [][2]string, i int) string {
 }
 
 func skipStatusSeparator(prevLabel, label string) bool {
+	if prevLabel == "SERVER" && label == "VERSION" {
+		return true
+	}
 	if prevLabel == "OS" && label == "KERNEL" {
 		return true
 	}

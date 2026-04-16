@@ -21,6 +21,8 @@ SERVICE_USER="${SERVICE_USER:-srv}"
 SERVICE_GROUP="${SERVICE_GROUP:-srv}"
 VM_RUNNER_USER="${VM_RUNNER_USER:-srv-vm}"
 
+SRV_VERSION="${SRV_VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+
 OVERWRITE_ENV=0
 ENABLE_SERVICE=0
 START_SERVICE=0
@@ -56,6 +58,7 @@ Environment overrides:
   SERVICE_USER        default: ${SERVICE_USER}
   SERVICE_GROUP       default: ${SERVICE_GROUP}
   VM_RUNNER_USER      default: ${VM_RUNNER_USER}
+  SRV_VERSION         default: git describe or "dev"
 EOF
 }
 
@@ -127,7 +130,7 @@ build_binary() {
 	local output_path="$2"
 	local tmp_bin
 	tmp_bin="$(mktemp)"
-	go build -o "${tmp_bin}" "${target}"
+	go build -ldflags "-X srv/internal/version.Version=${SRV_VERSION}" -o "${tmp_bin}" "${target}"
 	install -D -m 0755 "${tmp_bin}" "${output_path}"
 	rm -f "${tmp_bin}"
 }

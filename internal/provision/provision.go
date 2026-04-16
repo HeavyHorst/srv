@@ -31,6 +31,7 @@ import (
 	"srv/internal/nethelper"
 	"srv/internal/storage"
 	"srv/internal/store"
+	"srv/internal/version"
 	"srv/internal/vmrunner"
 )
 
@@ -915,6 +916,7 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 	cpuInfo.Load1m, cpuInfo.Load5m, cpuInfo.Load15m = host.ReadLoadAvg()
 
 	return host.CapacitySummary{
+		Version:  version.Version,
 		Hostname: p.cfg.Hostname,
 		OS:       host.ReadOSInfo(),
 		CPU:      cpuInfo,

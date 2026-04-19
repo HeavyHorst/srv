@@ -177,6 +177,105 @@ func TestStoreDeleteInstanceRemovesEvents(t *testing.T) {
 	}
 }
 
+func TestStoreIntegrationLifecycleAndBindings(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	inst := testInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := s.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	integration := model.Integration{
+		ID:          "openai-id",
+		Name:        "openai",
+		Kind:        model.IntegrationKindHTTP,
+		TargetURL:   "https://api.openai.com/v1",
+		AuthMode:    model.IntegrationAuthBearerEnv,
+		BearerEnv:   "SRV_SECRET_OPENAI_PROD",
+		HeadersJSON: `[{"name":"X-App","value":"srv"}]`,
+		CreatedAt:   inst.CreatedAt,
+		UpdatedAt:   inst.UpdatedAt,
+	}
+	if err := s.CreateIntegration(ctx, integration); err != nil {
+		t.Fatalf("CreateIntegration: %v", err)
+	}
+
+	gotIntegration, err := s.GetIntegrationByName(ctx, integration.Name)
+	if err != nil {
+		t.Fatalf("GetIntegrationByName: %v", err)
+	}
+	if !reflect.DeepEqual(gotIntegration, integration) {
+		t.Fatalf("GetIntegrationByName mismatch\nwant: %#v\n got: %#v", integration, gotIntegration)
+	}
+
+	list, err := s.ListIntegrations(ctx)
+	if err != nil {
+		t.Fatalf("ListIntegrations: %v", err)
+	}
+	if len(list) != 1 || !reflect.DeepEqual(list[0], integration) {
+		t.Fatalf("ListIntegrations = %#v, want %#v", list, []model.Integration{integration})
+	}
+
+	binding := model.InstanceIntegrationBinding{
+		InstanceID:    inst.ID,
+		IntegrationID: integration.ID,
+		CreatedAt:     inst.CreatedAt.Add(time.Minute),
+		CreatedByUser: inst.CreatedByUser,
+		CreatedByNode: inst.CreatedByNode,
+	}
+	if err := s.BindIntegrationToInstance(ctx, binding); err != nil {
+		t.Fatalf("BindIntegrationToInstance: %v", err)
+	}
+
+	bound, err := s.ListInstanceIntegrations(ctx, inst.ID)
+	if err != nil {
+		t.Fatalf("ListInstanceIntegrations: %v", err)
+	}
+	if len(bound) != 1 || !reflect.DeepEqual(bound[0], integration) {
+		t.Fatalf("ListInstanceIntegrations = %#v, want [%#v]", bound, integration)
+	}
+
+	count, err := s.CountIntegrationBindings(ctx, integration.ID)
+	if err != nil {
+		t.Fatalf("CountIntegrationBindings: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("CountIntegrationBindings = %d, want 1", count)
+	}
+
+	if err := s.UnbindIntegrationFromInstance(ctx, inst.ID, integration.ID); err != nil {
+		t.Fatalf("UnbindIntegrationFromInstance: %v", err)
+	}
+	count, err = s.CountIntegrationBindings(ctx, integration.ID)
+	if err != nil {
+		t.Fatalf("CountIntegrationBindings after unbind: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("CountIntegrationBindings after unbind = %d, want 0", count)
+	}
+
+	if err := s.BindIntegrationToInstance(ctx, binding); err != nil {
+		t.Fatalf("BindIntegrationToInstance second time: %v", err)
+	}
+	if err := s.DeleteInstance(ctx, inst.Name); err != nil {
+		t.Fatalf("DeleteInstance: %v", err)
+	}
+	count, err = s.CountIntegrationBindings(ctx, integration.ID)
+	if err != nil {
+		t.Fatalf("CountIntegrationBindings after instance delete: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("CountIntegrationBindings after instance delete = %d, want 0", count)
+	}
+
+	if err := s.DeleteIntegration(ctx, integration.Name); err != nil {
+		t.Fatalf("DeleteIntegration: %v", err)
+	}
+	if _, err := s.GetIntegrationByName(ctx, integration.Name); err != sql.ErrNoRows {
+		t.Fatalf("GetIntegrationByName after delete error = %v, want %v", err, sql.ErrNoRows)
+	}
+}
+
 func TestStoreRecordAuditRows(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

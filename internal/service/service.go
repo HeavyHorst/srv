@@ -43,22 +43,23 @@ import (
 )
 
 type App struct {
-	cfg         config.Config
-	log         *slog.Logger
-	store       *store.Store
-	provisioner *provision.Provisioner
-	tailscale   *tsnet.Server
-	localAPI    *local.Client
-	sshServer   *gssh.Server
-	zenGateway  *zenGatewayManager
-	commandMu   sync.Mutex
-	commandCond *sync.Cond
-	commandOnce sync.Once
-	snapshotOn  bool
-	inFlight    int
-	mu          sync.Mutex
-	lockMu      sync.Mutex
-	locks       map[string]*instanceLockEntry
+	cfg                config.Config
+	log                *slog.Logger
+	store              *store.Store
+	provisioner        *provision.Provisioner
+	tailscale          *tsnet.Server
+	localAPI           *local.Client
+	sshServer          *gssh.Server
+	zenGateway         *zenGatewayManager
+	integrationGateway *integrationGatewayManager
+	commandMu          sync.Mutex
+	commandCond        *sync.Cond
+	commandOnce        sync.Once
+	snapshotOn         bool
+	inFlight           int
+	mu                 sync.Mutex
+	lockMu             sync.Mutex
+	locks              map[string]*instanceLockEntry
 }
 
 type instanceLockEntry struct {
@@ -101,8 +102,9 @@ type instanceSummaryJSON struct {
 }
 
 type inspectResponseJSON struct {
-	Instance inspectInstanceJSON `json:"instance"`
-	Events   []inspectEventJSON  `json:"events"`
+	Instance     inspectInstanceJSON      `json:"instance"`
+	Integrations []inspectIntegrationJSON `json:"integrations,omitempty"`
+	Events       []inspectEventJSON       `json:"events"`
 }
 
 type inspectInstanceJSON struct {
@@ -139,6 +141,12 @@ type inspectEventJSON struct {
 	CreatedAt time.Time `json:"created_at"`
 	Type      string    `json:"type"`
 	Message   string    `json:"message"`
+}
+
+type inspectIntegrationJSON struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	URL  string `json:"url"`
 }
 
 type backupJSON struct {
@@ -328,7 +336,7 @@ func backupPayload(info provision.BackupInfo) backupJSON {
 	}
 }
 
-func (a *App) inspectPayload(inst model.Instance, events []model.InstanceEvent) inspectResponseJSON {
+func (a *App) inspectPayload(inst model.Instance, integrations []inspectIntegrationJSON, events []model.InstanceEvent) inspectResponseJSON {
 	debugHint := inspectDebugHint(inst)
 	payload := inspectResponseJSON{
 		Instance: inspectInstanceJSON{
@@ -358,7 +366,8 @@ func (a *App) inspectPayload(inst model.Instance, events []model.InstanceEvent) 
 			},
 			DebugHint: debugHint,
 		},
-		Events: make([]inspectEventJSON, 0, len(events)),
+		Integrations: integrations,
+		Events:       make([]inspectEventJSON, 0, len(events)),
 	}
 	for _, evt := range events {
 		payload.Events = append(payload.Events, inspectEventJSON{
@@ -387,6 +396,10 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	integrationGateway, err := newIntegrationGatewayManager(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
 
 	st, err := store.Open(cfg.DatabasePath())
 	if err != nil {
@@ -399,7 +412,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 
-	return &App{cfg: cfg, log: logger, store: st, provisioner: prov, zenGateway: zenGateway}, nil
+	return &App{cfg: cfg, log: logger, store: st, provisioner: prov, zenGateway: zenGateway, integrationGateway: integrationGateway}, nil
 }
 
 func (a *App) lockInstance(name string) func() {
@@ -494,6 +507,9 @@ func (a *App) Run(ctx context.Context) error {
 		<-groupCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if a.integrationGateway != nil {
+			a.integrationGateway.Close()
+		}
 		if a.zenGateway != nil {
 			a.zenGateway.Close()
 		}
@@ -519,7 +535,7 @@ func (a *App) restoreInstances(ctx context.Context) {
 	a.mu.Lock()
 	err := a.provisioner.RestoreInstances(ctx)
 	a.mu.Unlock()
-	a.syncZenGatewayBestEffort()
+	a.syncManagedGatewaysBestEffort()
 	if err != nil && ctx.Err() == nil {
 		a.log.Error("restore instances on startup", "err", err)
 	}
@@ -699,6 +715,8 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 	switch req.args[0] {
 	case "new":
 		return a.cmdNew(ctx, actor, req.args, req.format)
+	case "integration":
+		return a.cmdIntegration(ctx, actor, req.args, req.format)
 	case "resize":
 		return a.cmdResize(ctx, actor, req.args, req.format)
 	case "backup":
@@ -730,15 +748,23 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 }
 
 func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
-	name, opts, err := parseNewArgs(args)
+	name, opts, integrations, err := parseNewArgs(args)
 	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+	if len(integrations) > 0 && !a.isAdmin(actor) {
+		err := fmt.Errorf("new with --integration requires admin access")
+		return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
+	}
+	requestedIntegrations, err := a.lookupIntegrationsByName(ctx, integrations)
+	if err != nil {
+		return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
 	}
 
 	a.mu.Lock()
 	defer func() {
 		a.mu.Unlock()
-		a.syncZenGatewayBestEffort()
+		a.syncManagedGatewaysBestEffort()
 	}()
 
 	inst, err := a.provisioner.Create(ctx, name, actor, opts)
@@ -748,6 +774,27 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string, outF
 			stderr += instanceDebugHints(a.cfg.Hostname, inst)
 		}
 		return commandResult{stderr: stderr, exitCode: 1}, err
+	}
+	for _, integration := range requestedIntegrations {
+		if err := a.store.BindIntegrationToInstance(ctx, model.InstanceIntegrationBinding{
+			InstanceID:    inst.ID,
+			IntegrationID: integration.ID,
+			CreatedAt:     time.Now().UTC(),
+			CreatedByUser: actor.UserLogin,
+			CreatedByNode: actor.NodeName,
+		}); err != nil {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if _, cleanupErr := a.provisioner.Delete(rollbackCtx, inst.Name); cleanupErr != nil {
+				combinedErr := errors.Join(err, fmt.Errorf("cleanup failed: %w", cleanupErr))
+				return commandResult{stderr: fmt.Sprintf("enable integrations for %s: %v\ncleanup failed for %s: %v\n", name, err, name, cleanupErr), exitCode: 1}, combinedErr
+			}
+			if cleanupErr := a.store.DeleteInstance(rollbackCtx, inst.Name); cleanupErr != nil {
+				combinedErr := errors.Join(err, fmt.Errorf("delete failed instance record: %w", cleanupErr))
+				return commandResult{stderr: fmt.Sprintf("enable integrations for %s: %v\ncleanup failed for %s: %v\n", name, err, name, cleanupErr), exitCode: 1}, combinedErr
+			}
+			return commandResult{stderr: fmt.Sprintf("enable integrations for %s: %v\n", name, err), exitCode: 1}, err
+		}
 	}
 
 	if outFormat == outputFormatJSON {
@@ -940,12 +987,16 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	if err != nil {
 		return missingInstanceResult("inspect", args[1], err)
 	}
+	integrations, err := a.inspectIntegrationsForInstance(ctx, inst)
+	if err != nil {
+		return commandResult{stderr: fmt.Sprintf("load integrations: %v\n", err), exitCode: 1}, err
+	}
 	events, err := a.store.ListEvents(ctx, inst.ID, 10)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("load events: %v\n", err), exitCode: 1}, err
 	}
 	if outFormat == outputFormatJSON {
-		return jsonResult(a.inspectPayload(inst, events))
+		return jsonResult(a.inspectPayload(inst, integrations, events))
 	}
 
 	var b strings.Builder
@@ -971,6 +1022,16 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	fmt.Fprintf(&b, "guest-ip: %s\n", inst.GuestAddr)
 	if gatewayURL := a.zenGatewayBaseURL(inst); gatewayURL != "" {
 		fmt.Fprintf(&b, "zen-gateway: %s\n", gatewayURL)
+	}
+	if len(integrations) > 0 {
+		b.WriteString("integrations:\n")
+		for _, integration := range integrations {
+			if integration.URL == "" {
+				fmt.Fprintf(&b, "- %s\n", integration.Name)
+				continue
+			}
+			fmt.Fprintf(&b, "- %s: %s\n", integration.Name, integration.URL)
+		}
 	}
 	if inst.TailscaleName != "" {
 		fmt.Fprintf(&b, "tailscale-name: %s\n", inst.TailscaleName)
@@ -1935,7 +1996,7 @@ func (a *App) handleImportSession(sess gssh.Session, actor model.Actor, args []s
 	unlock := a.lockInstance(artifactInfo.Name)
 	defer func() {
 		unlock()
-		a.syncZenGatewayBestEffort()
+		a.syncManagedGatewaysBestEffort()
 	}()
 
 	reporter := newImportProgressReporter(sess.Stderr(), 350*time.Millisecond)
@@ -2103,7 +2164,7 @@ func helpResult() commandResult {
 		{
 			header: "INSTANCE COMMANDS",
 			entries: []helpEntry{
-				{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "Create a new microvm instance."},
+				{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE] [--integration NAME]", "Create a new microvm instance."},
 				{"list", "List all instances."},
 				{"inspect <name>", "Show instance details and recent events."},
 				{"start <name>", "Start a stopped instance."},
@@ -2121,6 +2182,18 @@ func helpResult() commandResult {
 				{"restore <name> <backup-id>", "Restore an instance from a backup."},
 				{"export <name>", "Export instance as a portable archive to stdout."},
 				{"import", "Import instance from stdin."},
+			},
+		},
+		{
+			header: "INTEGRATION COMMANDS",
+			entries: []helpEntry{
+				{"integration list", "List all configured integrations."},
+				{"integration inspect <name>", "Show integration details."},
+				{"integration add http <name> --target URL [options]", "Create an HTTP integration."},
+				{"integration delete <name>", "Delete an integration."},
+				{"integration enable <vm> <name>", "Enable an integration for a VM."},
+				{"integration disable <vm> <name>", "Disable an integration for a VM."},
+				{"integration list-enabled <vm>", "List integrations enabled for a VM."},
 			},
 		},
 		{
@@ -2166,6 +2239,8 @@ func helpResult() commandResult {
 	fmt.Fprintln(&b, "        Memory (e.g. 512m, 2g).")
 	fmt.Fprintln(&b, "    --rootfs-size SIZE")
 	fmt.Fprintln(&b, "        Root filesystem size (e.g. 4g, 10g).")
+	fmt.Fprintln(&b, "    --integration NAME")
+	fmt.Fprintln(&b, "        Enable an existing integration during create (admin only).")
 
 	return commandResult{stdout: b.String(), exitCode: 0}
 }
@@ -2469,7 +2544,7 @@ func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string, 
 	unlock := a.lockInstance(name)
 	defer func() {
 		unlock()
-		a.syncZenGatewayBestEffort()
+		a.syncManagedGatewaysBestEffort()
 	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
@@ -2508,7 +2583,7 @@ func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, ou
 	unlock := a.lockInstance(args[1])
 	defer func() {
 		unlock()
-		a.syncZenGatewayBestEffort()
+		a.syncManagedGatewaysBestEffort()
 	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
@@ -2538,7 +2613,7 @@ func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string, out
 	unlock := a.lockInstance(args[1])
 	defer func() {
 		unlock()
-		a.syncZenGatewayBestEffort()
+		a.syncManagedGatewaysBestEffort()
 	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
@@ -2567,7 +2642,7 @@ func (a *App) cmdRestart(ctx context.Context, actor model.Actor, args []string, 
 	unlock := a.lockInstance(args[1])
 	defer func() {
 		unlock()
-		a.syncZenGatewayBestEffort()
+		a.syncManagedGatewaysBestEffort()
 	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
@@ -2603,7 +2678,7 @@ func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string, o
 	unlock := a.lockInstance(args[1])
 	defer func() {
 		unlock()
-		a.syncZenGatewayBestEffort()
+		a.syncManagedGatewaysBestEffort()
 	}()
 
 	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
@@ -2647,7 +2722,7 @@ func (a *App) resolveActor(ctx context.Context, sess gssh.Session) (model.Actor,
 }
 
 func (a *App) authorize(actor model.Actor, command string) (bool, string) {
-	if command == "snapshot" || command == "status" {
+	if command == "snapshot" || command == "status" || command == "integration" {
 		if !a.isAdmin(actor) {
 			return false, fmt.Sprintf("%s is not in SRV_ADMIN_USERS", actor.UserLogin)
 		}
@@ -2717,10 +2792,6 @@ func trimNodeName(primary, fallback string) string {
 		return strings.TrimSuffix(primary, ".")
 	}
 	return strings.TrimSuffix(fallback, ".")
-}
-
-func parseNewArgs(args []string) (string, provision.CreateOptions, error) {
-	return parseSizedInstanceArgs(args, newUsage())
 }
 
 func parseResizeArgs(args []string) (string, provision.CreateOptions, error) {
@@ -2853,7 +2924,7 @@ func importUsage() string {
 }
 
 func newUsage() string {
-	return "usage: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]"
+	return "usage: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE] [--integration NAME]"
 }
 
 func resizeUsage() string {

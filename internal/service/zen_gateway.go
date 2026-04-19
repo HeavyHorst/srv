@@ -186,7 +186,7 @@ func (m *zenGatewayManager) Close() {
 func desiredZenGatewayInstances(instances []model.Instance) map[string]zenGatewaySpec {
 	desired := make(map[string]zenGatewaySpec)
 	for _, inst := range instances {
-		if !shouldExposeZenGateway(inst) {
+		if !shouldExposeGateway(inst) {
 			continue
 		}
 		hostIP, ok := stripInstanceIP(inst.HostAddr)
@@ -202,7 +202,7 @@ func desiredZenGatewayInstances(instances []model.Instance) map[string]zenGatewa
 	return desired
 }
 
-func shouldExposeZenGateway(inst model.Instance) bool {
+func shouldExposeGateway(inst model.Instance) bool {
 	switch inst.State {
 	case model.StateProvisioning, model.StateReady, model.StateAwaitingTailnet:
 		return true
@@ -283,7 +283,7 @@ func (a *App) zenGatewayBaseURL(inst model.Instance) string {
 	if a == nil || a.zenGateway == nil {
 		return ""
 	}
-	if !shouldExposeZenGateway(inst) {
+	if !shouldExposeGateway(inst) {
 		return ""
 	}
 	hostIP, ok := stripInstanceIP(inst.HostAddr)

@@ -804,6 +804,71 @@ func TestCmdInspectJSONReturnsStructuredInstanceAndEvents(t *testing.T) {
 	}
 }
 
+func TestCmdInspectIncludesBoundIntegrations(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	app := &App{
+		cfg:                config.Config{Hostname: "srv", VCPUCount: 1, MemoryMiB: 1024, IntegrationGatewayPort: 11435},
+		log:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:              st,
+		integrationGateway: &integrationGatewayManager{},
+	}
+
+	inst := serviceTestInstance("alpha", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	integration := model.Integration{
+		ID:          "openai-id",
+		Name:        "openai",
+		Kind:        model.IntegrationKindHTTP,
+		TargetURL:   "https://api.openai.com",
+		AuthMode:    model.IntegrationAuthBearerEnv,
+		BearerEnv:   "SRV_SECRET_OPENAI_PROD",
+		HeadersJSON: "[]",
+		CreatedAt:   inst.CreatedAt,
+		UpdatedAt:   inst.CreatedAt,
+	}
+	if err := st.CreateIntegration(ctx, integration); err != nil {
+		t.Fatalf("CreateIntegration: %v", err)
+	}
+	if err := st.BindIntegrationToInstance(ctx, model.InstanceIntegrationBinding{
+		InstanceID:    inst.ID,
+		IntegrationID: integration.ID,
+		CreatedAt:     inst.CreatedAt,
+		CreatedByUser: inst.CreatedByUser,
+		CreatedByNode: inst.CreatedByNode,
+	}); err != nil {
+		t.Fatalf("BindIntegrationToInstance: %v", err)
+	}
+
+	textResult, err := app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name}, outputFormatText)
+	if err != nil {
+		t.Fatalf("cmdInspect(text): %v", err)
+	}
+	if !strings.Contains(textResult.stdout, "integrations:\n") {
+		t.Fatalf("cmdInspect(text) missing integrations block\nfull output:\n%s", textResult.stdout)
+	}
+	if !strings.Contains(textResult.stdout, "- openai: http://172.28.0.1:11435/integrations/openai\n") {
+		t.Fatalf("cmdInspect(text) missing integration URL\nfull output:\n%s", textResult.stdout)
+	}
+
+	jsonResult, err := app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name}, outputFormatJSON)
+	if err != nil {
+		t.Fatalf("cmdInspect(json): %v", err)
+	}
+	var payload inspectResponseJSON
+	if err := json.Unmarshal([]byte(jsonResult.stdout), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(cmdInspect): %v\noutput:\n%s", err, jsonResult.stdout)
+	}
+	if len(payload.Integrations) != 1 {
+		t.Fatalf("cmdInspect(json) integrations = %#v", payload.Integrations)
+	}
+	if payload.Integrations[0] != (inspectIntegrationJSON{Name: "openai", Type: "http", URL: "http://172.28.0.1:11435/integrations/openai"}) {
+		t.Fatalf("cmdInspect(json) integration = %#v", payload.Integrations[0])
+	}
+}
+
 func TestCmdInspectMissingInstanceReturnsFriendlyError(t *testing.T) {
 	app := &App{
 		cfg:   config.Config{Hostname: "srv"},
@@ -1748,6 +1813,7 @@ func TestParseNewArgs(t *testing.T) {
 		args     []string
 		wantName string
 		wantOpts provision.CreateOptions
+		wantInts []string
 		wantErr  string
 	}{
 		{
@@ -1763,6 +1829,12 @@ func TestParseNewArgs(t *testing.T) {
 			wantOpts: provision.CreateOptions{VCPUCount: 4, MemoryMiB: 1536},
 		},
 		{
+			name:     "parses integration flags",
+			args:     []string{"new", "demo", "--integration", "openai", "--integration=github-api"},
+			wantName: "demo",
+			wantInts: []string{"openai", "github-api"},
+		},
+		{
 			name:    "rejects unknown options",
 			args:    []string{"new", "demo", "--wat", "1"},
 			wantErr: `unknown option "--wat"`,
@@ -1776,7 +1848,7 @@ func TestParseNewArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotName, gotOpts, err := parseNewArgs(tt.args)
+			gotName, gotOpts, gotIntegrations, err := parseNewArgs(tt.args)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("parseNewArgs() error = %v, want substring %q", err, tt.wantErr)
@@ -1791,6 +1863,72 @@ func TestParseNewArgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotOpts, tt.wantOpts) {
 				t.Fatalf("parseNewArgs() opts = %#v, want %#v", gotOpts, tt.wantOpts)
+			}
+			if !reflect.DeepEqual(gotIntegrations, tt.wantInts) {
+				t.Fatalf("parseNewArgs() integrations = %#v, want %#v", gotIntegrations, tt.wantInts)
+			}
+		})
+	}
+}
+
+func TestParseIntegrationAddArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantKind string
+		wantName string
+		wantOpts integrationAddOptions
+		wantErr  string
+	}{
+		{
+			name:     "parses bearer auth and header envs",
+			args:     []string{"integration", "add", "http", "openai", "--target", "https://api.openai.com/base", "--header", "X-App:srv", "--header-env", "X-Token:SRV_SECRET_TOKEN", "--bearer-env", "SRV_SECRET_OPENAI_PROD"},
+			wantKind: "http",
+			wantName: "openai",
+			wantOpts: integrationAddOptions{
+				TargetURL: "https://api.openai.com/base",
+				AuthMode:  model.IntegrationAuthBearerEnv,
+				BearerEnv: "SRV_SECRET_OPENAI_PROD",
+				Headers: []model.IntegrationHeader{
+					{Name: "X-App", Value: "srv"},
+					{Name: "X-Token", Env: "SRV_SECRET_TOKEN"},
+				},
+			},
+		},
+		{
+			name:    "rejects secret envs without prefix",
+			args:    []string{"integration", "add", "http", "openai", "--target", "https://api.openai.com", "--bearer-env", "OPENAI_TOKEN"},
+			wantErr: "secret env name must start with SRV_SECRET_",
+		},
+		{
+			name:    "rejects mixed bearer and basic auth",
+			args:    []string{"integration", "add", "http", "openai", "--target", "https://api.openai.com", "--bearer-env", "SRV_SECRET_OPENAI_PROD", "--basic-user", "alice", "--basic-password-env", "SRV_SECRET_BASIC"},
+			wantErr: "bearer auth and basic auth cannot be combined",
+		},
+		{
+			name:    "rejects targets with user info",
+			args:    []string{"integration", "add", "http", "openai", "--target", "https://alice:secret@example.com/api"},
+			wantErr: "target URL must not include user info",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotKind, gotName, gotOpts, err := parseIntegrationAddArgs(tt.args)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("parseIntegrationAddArgs() error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseIntegrationAddArgs() error = %v", err)
+			}
+			if gotKind != tt.wantKind || gotName != tt.wantName {
+				t.Fatalf("parseIntegrationAddArgs() kind/name = %q/%q, want %q/%q", gotKind, gotName, tt.wantKind, tt.wantName)
+			}
+			if !reflect.DeepEqual(gotOpts, tt.wantOpts) {
+				t.Fatalf("parseIntegrationAddArgs() opts = %#v, want %#v", gotOpts, tt.wantOpts)
 			}
 		})
 	}

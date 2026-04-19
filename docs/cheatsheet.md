@@ -13,6 +13,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | Command | Description |
 |---------|-------------|
 | `new <name>` | Create new VM with optional `--cpus`, `--ram`, `--rootfs-size` |
+| `new <name> --integration <name>` | Create a VM and enable one or more existing integrations (admin only) |
 | `list` | Show visible VMs (all for admins, own for regular users) |
 | `top [--interval DURATION]` | Live per-VM CPU, memory, disk, and network view; press `q` to exit |
 | `status` | Admin-only host capacity and allocation summary |
@@ -27,6 +28,17 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | `backup list <name>` | List stored backups for a VM |
 | `restore <name> <backup-id>` | Restore a stopped VM from one of its backups |
 
+## Integrations (admin only)
+
+| Command | Description |
+|---------|-------------|
+| `integration list` | List configured integrations |
+| `integration add http <name> --target <url> ...` | Create an HTTP integration with host-managed auth or headers |
+| `integration inspect <name>` | Show target, auth mode, headers, and timestamps |
+| `integration enable <vm> <name>` | Enable an integration for a VM |
+| `integration disable <vm> <name>` | Disable an integration for a VM |
+| `integration list-enabled <vm>` | Show integrations enabled for a VM |
+
 ## Quick Examples
 
 ```bash
@@ -37,6 +49,11 @@ ssh srv -- --json inspect demo
 
 # With sizing
 ssh srv new demo --cpus 4 --ram 8G --rootfs-size 20G
+
+# Integrations
+ssh srv integration add http openai --target https://api.openai.com/v1 --bearer-env SRV_SECRET_OPENAI_PROD
+ssh srv integration enable demo openai
+ssh srv inspect demo
 
 # Resize (must be stopped)
 ssh srv stop demo
@@ -114,6 +131,8 @@ sudo ./contrib/systemd/install.sh --enable-now
 | `TS_TAILNET` | - | Tailnet name |
 | `SRV_FIRECRACKER_BIN` | `/usr/bin/jailer` | Firecracker binary |
 | `SRV_JAILER_BIN` | `/usr/bin/jailer` | Jailer binary |
+| `SRV_INTEGRATION_GATEWAY_PORT` | `11435` | Per-VM host-side HTTP integration gateway port |
+| `SRV_SECRET_*` | - | Host-managed integration secret values referenced by name from the SSH API |
 
 ## Backup & Restore
 
@@ -156,5 +175,6 @@ cat /sys/fs/cgroup/firecracker-vms/<name>/memory.max
 - Resize only works on stopped VMs
 - Backup and restore only work on stopped VMs and only restore onto the original VM record, not a newly recreated VM with the same name
 - Creators manage their own VMs; admins manage all VMs
+- Integration commands are admin-only, and integration secrets are referenced by host env name rather than passed as raw SSH arguments
 - Warm start/restart reuses tailscaled state
 - Host reboot auto-restarts active VMs

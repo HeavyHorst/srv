@@ -87,3 +87,12 @@ When a VM is deleted, the network helper removes:
 - The MASQUERADE rule
 - The FORWARD rule
 - The gateway address from the host interface
+
+## Host-side API gateways
+
+srv can also expose host-side HTTP gateways on each VM's gateway IP:
+
+- The Zen gateway on `SRV_ZEN_GATEWAY_PORT` proxies `/v1/...` to the configured OpenCode Zen upstream with the host API key injected.
+- The generic integration gateway on `SRV_INTEGRATION_GATEWAY_PORT` proxies `/integrations/<name>/...` to operator-defined HTTP integrations with host-managed auth or headers injected.
+
+Both gateway types only accept requests from the owning guest IP. See [Zen gateway](zen-gateway.md) and [HTTP integrations](integrations.md).

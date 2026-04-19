@@ -22,6 +22,7 @@ const (
 	defaultVMNetworkCIDR    = "172.28.0.0/16"
 	defaultZenBaseURL       = "https://opencode.ai/zen"
 	defaultZenGatewayPort   = 11434
+	defaultIntegrationPort  = 11435
 	defaultGuestAuthExpiry  = 15 * time.Minute
 	defaultGuestReadyTimout = 2 * time.Minute
 	MaxVCPUCount            = 32
@@ -62,6 +63,7 @@ type Config struct {
 	ZenAPIKey                string
 	ZenBaseURL               string
 	ZenGatewayPort           int
+	IntegrationGatewayPort   int
 
 	LogLevel string
 
@@ -101,6 +103,7 @@ func Load() (Config, error) {
 	flag.StringVar(&cfg.ZenAPIKey, "zen-api-key", getenv("SRV_ZEN_API_KEY", ""), "optional OpenCode Zen API key used by the host-side guest gateway")
 	flag.StringVar(&cfg.ZenBaseURL, "zen-base-url", getenv("SRV_ZEN_BASE_URL", defaultZenBaseURL), "base URL for the upstream OpenCode Zen API")
 	flag.IntVar(&cfg.ZenGatewayPort, "zen-gateway-port", getenvInt("SRV_ZEN_GATEWAY_PORT", defaultZenGatewayPort), "TCP port exposed on each VM host/gateway IP for the host-side OpenCode Zen proxy")
+	flag.IntVar(&cfg.IntegrationGatewayPort, "integration-gateway-port", getenvInt("SRV_INTEGRATION_GATEWAY_PORT", defaultIntegrationPort), "TCP port exposed on each VM host/gateway IP for the host-side generic integration proxy")
 	flag.Int64Var(&cfg.VCPUCount, "vm-vcpus", getenvInt64("SRV_VM_VCPUS", 1), "number of guest vCPUs")
 	flag.Int64Var(&cfg.MemoryMiB, "vm-memory-mib", getenvInt64("SRV_VM_MEMORY_MIB", 1024), "guest memory in MiB")
 	flag.StringVar(&cfg.LogLevel, "log-level", getenv("SRV_LOG_LEVEL", "info"), "log level")
@@ -161,6 +164,9 @@ func (c Config) Validate() error {
 	}
 	if c.ZenGatewayPort < 1 || c.ZenGatewayPort > 65535 {
 		return errors.New("zen gateway port must be between 1 and 65535")
+	}
+	if c.IntegrationGatewayPort < 1 || c.IntegrationGatewayPort > 65535 {
+		return errors.New("integration gateway port must be between 1 and 65535")
 	}
 	if strings.TrimSpace(c.ZenBaseURL) == "" {
 		return errors.New("zen base url is required")

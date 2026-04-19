@@ -35,6 +35,7 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_ZEN_API_KEY", "zen-key")
 	t.Setenv("SRV_ZEN_BASE_URL", "https://zen.example.test/base")
 	t.Setenv("SRV_ZEN_GATEWAY_PORT", "12456")
+	t.Setenv("SRV_INTEGRATION_GATEWAY_PORT", "12457")
 	t.Setenv("SRV_VM_VCPUS", "2")
 	t.Setenv("SRV_VM_MEMORY_MIB", "2048")
 	t.Setenv("SRV_LOG_LEVEL", "debug")
@@ -73,6 +74,9 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	}
 	if cfg.ZenGatewayPort != 12456 {
 		t.Fatalf("ZenGatewayPort = %d, want 12456", cfg.ZenGatewayPort)
+	}
+	if cfg.IntegrationGatewayPort != 12457 {
+		t.Fatalf("IntegrationGatewayPort = %d, want 12457", cfg.IntegrationGatewayPort)
 	}
 	if !reflect.DeepEqual(cfg.AllowedUsers, []string{"alice@example.com", "bob@example.com"}) {
 		t.Fatalf("AllowedUsers = %#v", cfg.AllowedUsers)
@@ -228,16 +232,17 @@ func resetFlagsForTest(t *testing.T, args []string) {
 
 func validConfig() Config {
 	return Config{
-		DataDir:             "/tmp/srv",
-		Hostname:            "srv",
-		ListenAddr:          ":22",
-		NetHelperSocketPath: "/run/srv/net-helper.sock",
-		VMRunnerSocketPath:  "/run/srv-vm-runner/vm-runner.sock",
-		ZenBaseURL:          "https://opencode.ai/zen",
-		ZenGatewayPort:      11434,
-		VCPUCount:           2,
-		MemoryMiB:           1024,
-		GuestAuthExpiry:     15 * time.Minute,
-		GuestReadyTimeout:   2 * time.Minute,
+		DataDir:                "/tmp/srv",
+		Hostname:               "srv",
+		ListenAddr:             ":22",
+		NetHelperSocketPath:    "/run/srv/net-helper.sock",
+		VMRunnerSocketPath:     "/run/srv-vm-runner/vm-runner.sock",
+		ZenBaseURL:             "https://opencode.ai/zen",
+		ZenGatewayPort:         11434,
+		IntegrationGatewayPort: 11435,
+		VCPUCount:              2,
+		MemoryMiB:              1024,
+		GuestAuthExpiry:        15 * time.Minute,
+		GuestReadyTimeout:      2 * time.Minute,
 	}
 }

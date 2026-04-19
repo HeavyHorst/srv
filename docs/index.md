@@ -53,6 +53,7 @@ Key components:
 - **VM runner** — root-owned process invokes Firecracker through the official jailer, drops to `srv-vm:srv`, and places each VM into its own cgroup v2 leaf
 - **MMDS** — one-off Tailscale auth keys are injected through Firecracker metadata so guests self-bootstrap
 - **Zen gateway** — per-instance HTTP proxy on the guest's gateway IP forwards to OpenCode Zen with the host key
+- **HTTP integrations** — admin-defined host-side HTTP proxies inject headers or auth for selected guests without storing raw secrets inside the VM
 
 ## Where you can run it
 
@@ -72,3 +73,4 @@ srv runs on Linux with the following requirements:
 - [Walkthrough](getting-started/walkthrough.md)
 - [Architecture](reference/architecture.md)
 - [SSH command reference](reference/ssh-commands.md)
+- [HTTP integrations](networking/integrations.md)

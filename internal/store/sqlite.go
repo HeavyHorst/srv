@@ -172,6 +172,9 @@ func (s *Store) DeleteInstance(ctx context.Context, name string) error {
 	if !found {
 		return nil
 	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM instance_integrations WHERE instance_id = ?`, inst.ID); err != nil {
+		return fmt.Errorf("delete instance integrations for %s: %w", name, err)
+	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM instance_events WHERE instance_id = ?`, inst.ID); err != nil {
 		return fmt.Errorf("delete instance events for %s: %w", name, err)
 	}
@@ -300,6 +303,133 @@ func (s *Store) RecordAuthz(ctx context.Context, decision model.AuthzDecision) e
 	return nil
 }
 
+func (s *Store) CreateIntegration(ctx context.Context, integration model.Integration) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO integrations (
+			id, name, kind, target_url, auth_mode, bearer_env, basic_user,
+			basic_password_env, headers_json, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		integration.ID,
+		integration.Name,
+		integration.Kind,
+		integration.TargetURL,
+		integration.AuthMode,
+		integration.BearerEnv,
+		integration.BasicUser,
+		integration.BasicPasswordEnv,
+		integration.HeadersJSON,
+		timeString(integration.CreatedAt),
+		timeString(integration.UpdatedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("insert integration %s: %w", integration.Name, err)
+	}
+	return nil
+}
+
+func (s *Store) GetIntegrationByName(ctx context.Context, name string) (model.Integration, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, kind, target_url, auth_mode, bearer_env, basic_user,
+			basic_password_env, headers_json, created_at, updated_at
+		FROM integrations
+		WHERE name = ?
+	`, name)
+	return scanIntegration(row.Scan)
+}
+
+func (s *Store) ListIntegrations(ctx context.Context) ([]model.Integration, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, kind, target_url, auth_mode, bearer_env, basic_user,
+			basic_password_env, headers_json, created_at, updated_at
+		FROM integrations
+		ORDER BY name ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list integrations: %w", err)
+	}
+	defer rows.Close()
+
+	var out []model.Integration
+	for rows.Next() {
+		integration, err := scanIntegration(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, integration)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteIntegration(ctx context.Context, name string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM integrations WHERE name = ?`, name); err != nil {
+		return fmt.Errorf("delete integration %s: %w", name, err)
+	}
+	return nil
+}
+
+func (s *Store) CountIntegrationBindings(ctx context.Context, integrationID string) (int, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM instance_integrations WHERE integration_id = ?`, integrationID)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count integration bindings: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) BindIntegrationToInstance(ctx context.Context, binding model.InstanceIntegrationBinding) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO instance_integrations (
+			instance_id, integration_id, created_at, created_by_user, created_by_node
+		) VALUES (?, ?, ?, ?, ?)
+	`,
+		binding.InstanceID,
+		binding.IntegrationID,
+		timeString(binding.CreatedAt),
+		binding.CreatedByUser,
+		binding.CreatedByNode,
+	)
+	if err != nil {
+		return fmt.Errorf("bind integration to instance: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) UnbindIntegrationFromInstance(ctx context.Context, instanceID, integrationID string) error {
+	if _, err := s.db.ExecContext(ctx, `
+		DELETE FROM instance_integrations
+		WHERE instance_id = ? AND integration_id = ?
+	`, instanceID, integrationID); err != nil {
+		return fmt.Errorf("unbind integration from instance: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListInstanceIntegrations(ctx context.Context, instanceID string) ([]model.Integration, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT i.id, i.name, i.kind, i.target_url, i.auth_mode, i.bearer_env, i.basic_user,
+			i.basic_password_env, i.headers_json, i.created_at, i.updated_at
+		FROM integrations i
+		JOIN instance_integrations ii ON ii.integration_id = i.id
+		WHERE ii.instance_id = ?
+		ORDER BY i.name ASC
+	`, instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("list instance integrations: %w", err)
+	}
+	defer rows.Close()
+
+	var out []model.Integration
+	for rows.Next() {
+		integration, err := scanIntegration(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, integration)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	stmts := []string{
 		`PRAGMA journal_mode = WAL;`,
@@ -366,6 +496,32 @@ func (s *Store) migrate(ctx context.Context) error {
 			allowed INTEGER NOT NULL,
 			reason TEXT NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS integrations (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			kind TEXT NOT NULL,
+			target_url TEXT NOT NULL,
+			auth_mode TEXT NOT NULL,
+			bearer_env TEXT NOT NULL DEFAULT '',
+			basic_user TEXT NOT NULL DEFAULT '',
+			basic_password_env TEXT NOT NULL DEFAULT '',
+			headers_json TEXT NOT NULL DEFAULT '[]',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS instance_integrations (
+			instance_id TEXT NOT NULL,
+			integration_id TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			created_by_user TEXT NOT NULL,
+			created_by_node TEXT NOT NULL,
+			PRIMARY KEY (instance_id, integration_id),
+			FOREIGN KEY(instance_id) REFERENCES instances(id),
+			FOREIGN KEY(integration_id) REFERENCES integrations(id)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_instance_integrations_integration_id
+			ON instance_integrations (integration_id)
+		;`,
 	}
 
 	for _, stmt := range stmts {
@@ -488,6 +644,40 @@ func scanInstance(scan func(dest ...any) error) (model.Instance, error) {
 		inst.DeletedAt = &t
 	}
 	return inst, nil
+}
+
+func scanIntegration(scan func(dest ...any) error) (model.Integration, error) {
+	var integration model.Integration
+	var createdAt string
+	var updatedAt string
+	if err := scan(
+		&integration.ID,
+		&integration.Name,
+		&integration.Kind,
+		&integration.TargetURL,
+		&integration.AuthMode,
+		&integration.BearerEnv,
+		&integration.BasicUser,
+		&integration.BasicPasswordEnv,
+		&integration.HeadersJSON,
+		&createdAt,
+		&updatedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Integration{}, err
+		}
+		return model.Integration{}, fmt.Errorf("scan integration: %w", err)
+	}
+	var err error
+	integration.CreatedAt, err = parseTime(createdAt)
+	if err != nil {
+		return model.Integration{}, err
+	}
+	integration.UpdatedAt, err = parseTime(updatedAt)
+	if err != nil {
+		return model.Integration{}, err
+	}
+	return integration, nil
 }
 
 func parseTime(v string) (time.Time, error) {

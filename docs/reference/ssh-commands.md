@@ -21,6 +21,7 @@ ssh srv -- --json status
 | Command | Description |
 |---------|-------------|
 | `new <name>` | Create a new VM |
+| `new <name> --integration <name>` | Create and enable one or more existing integrations (admin only) |
 | `new <name> --cpus <n>` | Create with custom vCPU count |
 | `new <name> --ram <size>` | Create with custom memory (`2G`, `512M`, or MiB integer) |
 | `new <name> --rootfs-size <size>` | Create with custom rootfs size |
@@ -75,12 +76,32 @@ Usage: `ssh srv-a export demo | ssh srv-b import`
 | `status` | Admin-only host capacity and allocation summary |
 | `snapshot create` | Admin-only host-local btrfs snapshot of SRV_DATA_DIR |
 
+## Integration commands
+
+All integration commands are admin-only.
+
+| Command | Description |
+|---------|-------------|
+| `integration list` | List configured integrations |
+| `integration inspect <name>` | Show integration target, auth mode, header references, and timestamps |
+| `integration add http <name> --target <url>` | Create an HTTP integration |
+| `integration add http <name> --target <url> --header NAME:VALUE` | Add a static upstream header |
+| `integration add http <name> --target <url> --header-env NAME:SRV_SECRET_FOO` | Add an env-backed upstream header |
+| `integration add http <name> --target <url> --bearer-env SRV_SECRET_FOO` | Inject bearer auth from a host env var |
+| `integration add http <name> --target <url> --basic-user USER --basic-password-env SRV_SECRET_BAR` | Inject basic auth from host-managed credentials |
+| `integration delete <name>` | Delete an integration that is no longer enabled on any VM |
+| `integration enable <vm> <name>` | Enable an integration for a VM |
+| `integration disable <vm> <name>` | Disable an integration for a VM |
+| `integration list-enabled <vm>` | List integrations currently enabled for a VM |
+
 ## Notes
 
 - `new` accepts `--cpus`, `--ram`, and `--rootfs-size` in any combination
+- `new` also accepts repeated `--integration <name>` flags; the create request fails if any requested integration cannot be enabled
 - `resize` requires the VM to be stopped; CPU and RAM may increase or decrease within limits, while rootfs is grow-only
 - `resize`, `backup`, and `restore` all require the VM to be stopped
 - Backups are tied to the original VM record — they cannot be restored onto a different VM
 - Export requires the source VM to be stopped
 - Import recreates the VM under the same name and leaves it stopped
 - `top` refreshes continuously by default; use `ssh -t srv top --interval 2s` or similar to slow the redraw rate
+- Integration targets are intentionally narrow in v1: HTTP only, operator-managed, no guest-supplied raw secrets, and no automatic outbound interception

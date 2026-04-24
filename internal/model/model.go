@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 const (
 	StateProvisioning    = "provisioning"
@@ -10,6 +13,9 @@ const (
 	StateAwaitingTailnet = "awaiting-tailnet"
 	StateDeleting        = "deleting"
 	StateDeleted         = "deleted"
+
+	MemoryModeFixed = "fixed"
+	MemoryModePool  = "pool"
 )
 
 type Actor struct {
@@ -18,6 +24,13 @@ type Actor struct {
 	NodeName    string
 	RemoteAddr  string
 	SSHUser     string
+}
+
+func NormalizeMemoryMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), MemoryModePool) {
+		return MemoryModePool
+	}
+	return MemoryModeFixed
 }
 
 type Instance struct {
@@ -29,6 +42,8 @@ type Instance struct {
 	CreatedByNode   string
 	VCPUCount       int64
 	MemoryMiB       int64
+	MemoryMode      string
+	MemoryPoolID    string
 	RootFSSizeBytes int64
 	RootFSPath      string
 	KernelPath      string
@@ -48,6 +63,24 @@ type Instance struct {
 	LastError       string
 	DeletedAt       *time.Time
 	UpdatedAt       time.Time
+}
+
+func (i Instance) NormalizedMemoryMode() string {
+	return NormalizeMemoryMode(i.MemoryMode)
+}
+
+func (i Instance) UsesMemoryPool() bool {
+	return i.NormalizedMemoryMode() == MemoryModePool && strings.TrimSpace(i.MemoryPoolID) != ""
+}
+
+type MemoryPool struct {
+	ID            string
+	Name          string
+	ReservedBytes int64
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	CreatedByUser string
+	CreatedByNode string
 }
 
 type InstanceEvent struct {

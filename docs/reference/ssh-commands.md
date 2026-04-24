@@ -8,7 +8,7 @@ All srv commands are invoked through the SSH surface. The service treats SSH as 
 ssh srv <command> [args]
 ```
 
-For machine-readable output, use `--json` with non-streaming instance and backup commands. With OpenSSH, terminate local option parsing first:
+For machine-readable output, use `--json` with supported non-streaming commands such as `list`, `inspect`, `status`, `integration ...`, and `pool ...`. With OpenSSH, terminate local option parsing first:
 
 ```bash
 ssh srv -- --json list
@@ -24,6 +24,7 @@ ssh srv -- --json status
 | `new <name> --integration <name>` | Create and enable one or more existing integrations (admin only) |
 | `new <name> --cpus <n>` | Create with custom vCPU count |
 | `new <name> --ram <size>` | Create with custom memory (`2G`, `512M`, or MiB integer) |
+| `new <name> --pool <name> --ram <size>` | Create a pooled-memory VM in an existing memory pool |
 | `new <name> --rootfs-size <size>` | Create with custom rootfs size |
 | `list` | Show visible VMs (all for admins, own for regular users) |
 | `inspect <name>` | Show VM details and event history |
@@ -52,6 +53,8 @@ ssh srv -- --json status
 
 All flags can be combined. Omitted flags keep the current value.
 
+For pooled VMs, `resize --ram` keeps the VM in the same pool. In v1 it is allowed only while the VM is stopped and only up to the pool's reserved size.
+
 ## Backup commands
 
 | Command | Description |
@@ -69,10 +72,14 @@ All flags can be combined. Omitted flags keep the current value.
 
 Usage: `ssh srv-a export demo | ssh srv-b import`
 
-## Host commands
+## Admin and host commands
 
 | Command | Description |
 |---------|-------------|
+| `pool create <name> --size <size>` | Admin-only create a reserved memory pool |
+| `pool list` | Admin-only list reserved memory pools |
+| `pool inspect <name>` | Admin-only show a memory pool and its member VMs |
+| `pool delete <name>` | Admin-only delete an empty memory pool |
 | `status` | Admin-only host capacity and allocation summary |
 | `snapshot create` | Admin-only host-local btrfs snapshot of SRV_DATA_DIR |
 
@@ -96,12 +103,19 @@ All integration commands are admin-only.
 
 ## Notes
 
-- `new` accepts `--cpus`, `--ram`, and `--rootfs-size` in any combination
+- `new` accepts `--cpus`, `--ram`, `--pool`, and `--rootfs-size` in any combination that matches the memory mode contract
+- `new --pool <name>` requires `--ram <size>` because guest-visible RAM stays explicit in pooled mode
 - `new` also accepts repeated `--integration <name>` flags; the create request fails if any requested integration cannot be enabled
+- Fixed mode remains the default. Without `--pool`, `--ram` still means guest-visible RAM, host reservation, and the hard per-VM cgroup memory cap
+- In pooled mode, `--ram` means guest-visible RAM while host reservation comes from the pool created with `pool create`
 - `resize` requires the VM to be stopped; CPU and RAM may increase or decrease within limits, while rootfs is grow-only
+- Pooled VMs cannot move between pools or switch memory mode through `resize` in v1
 - `resize`, `backup`, and `restore` all require the VM to be stopped
 - Backups are tied to the original VM record — they cannot be restored onto a different VM
 - Export requires the source VM to be stopped
 - Import recreates the VM under the same name and leaves it stopped
 - `top` refreshes continuously by default; use `ssh -t srv top --interval 2s` or similar to slow the redraw rate
+- `inspect` shows `memory-mode` and whether host reservation is dedicated or shared via a pool
+- `status` memory accounting now splits fixed reservations from pool reservations so pooled member VMs are not double-counted
+- `top` shows live/configured RAM for every VM and appends the pool name for pooled rows
 - Integration targets are intentionally narrow in v1: HTTP only, operator-managed, no guest-supplied raw secrets, and no automatic outbound interception

@@ -443,7 +443,7 @@ func TestOpenMigratesExistingInstancesTable(t *testing.T) {
 		}
 		columns[name] = true
 	}
-	for _, want := range []string{"vcpu_count", "memory_mib", "rootfs_size_bytes"} {
+	for _, want := range []string{"vcpu_count", "memory_mib", "memory_mode", "memory_pool_id", "rootfs_size_bytes"} {
 		if !columns[want] {
 			t.Fatalf("missing migrated column %q in %#v", want, columns)
 		}
@@ -478,6 +478,7 @@ func testInstance(name, state string, createdAt time.Time) model.Instance {
 		CreatedByNode:   "laptop",
 		VCPUCount:       2,
 		MemoryMiB:       2048,
+		MemoryMode:      model.MemoryModeFixed,
 		RootFSSizeBytes: 4 << 30,
 		RootFSPath:      filepath.Join(baseDir, "rootfs.img"),
 		KernelPath:      filepath.Join(baseDir, "vmlinux"),

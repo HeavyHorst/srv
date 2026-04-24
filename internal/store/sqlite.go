@@ -53,14 +53,15 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 }
 
 func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
+	normalizeInstanceMemory(&inst)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO instances (
 			id, name, state, created_at, updated_at, created_by_user, created_by_node,
-			vcpu_count, memory_mib, rootfs_size_bytes,
+			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
 			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		inst.ID,
 		inst.Name,
@@ -71,6 +72,8 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 		inst.CreatedByNode,
 		inst.VCPUCount,
 		inst.MemoryMiB,
+		inst.MemoryMode,
+		inst.MemoryPoolID,
 		inst.RootFSSizeBytes,
 		inst.RootFSPath,
 		inst.KernelPath,
@@ -97,9 +100,10 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 }
 
 func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
+	normalizeInstanceMemory(&inst)
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE instances
-		SET state = ?, updated_at = ?, vcpu_count = ?, memory_mib = ?, rootfs_size_bytes = ?,
+		SET state = ?, updated_at = ?, vcpu_count = ?, memory_mib = ?, memory_mode = ?, memory_pool_id = ?, rootfs_size_bytes = ?,
 			rootfs_path = ?, kernel_path = ?, initrd_path = ?, socket_path = ?, log_path = ?,
 			serial_log_path = ?, tap_device = ?, guest_mac = ?, network_cidr = ?, host_addr = ?,
 			guest_addr = ?, gateway_addr = ?, firecracker_pid = ?, tailscale_name = ?,
@@ -110,6 +114,8 @@ func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
 		timeString(inst.UpdatedAt),
 		inst.VCPUCount,
 		inst.MemoryMiB,
+		inst.MemoryMode,
+		inst.MemoryPoolID,
 		inst.RootFSSizeBytes,
 		inst.RootFSPath,
 		inst.KernelPath,
@@ -139,7 +145,7 @@ func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
 func (s *Store) GetInstance(ctx context.Context, name string) (model.Instance, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, state, created_at, updated_at, created_by_user, created_by_node,
-			vcpu_count, memory_mib, rootfs_size_bytes,
+			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
 			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at
@@ -187,7 +193,7 @@ func (s *Store) DeleteInstance(ctx context.Context, name string) error {
 func (s *Store) ListInstances(ctx context.Context, includeDeleted bool) ([]model.Instance, error) {
 	query := `
 		SELECT id, name, state, created_at, updated_at, created_by_user, created_by_node,
-			vcpu_count, memory_mib, rootfs_size_bytes,
+			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
 			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at
@@ -213,6 +219,105 @@ func (s *Store) ListInstances(ctx context.Context, includeDeleted bool) ([]model
 		out = append(out, inst)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) CreateMemoryPool(ctx context.Context, pool model.MemoryPool) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO memory_pools (
+			id, name, reserved_bytes, created_at, updated_at, created_by_user, created_by_node
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`,
+		pool.ID,
+		pool.Name,
+		pool.ReservedBytes,
+		timeString(pool.CreatedAt),
+		timeString(pool.UpdatedAt),
+		pool.CreatedByUser,
+		pool.CreatedByNode,
+	)
+	if err != nil {
+		return fmt.Errorf("insert memory pool: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetMemoryPoolByName(ctx context.Context, name string) (model.MemoryPool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, reserved_bytes, created_at, updated_at, created_by_user, created_by_node
+		FROM memory_pools
+		WHERE name = ?
+	`, name)
+	pool, err := scanMemoryPool(row.Scan)
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	return pool, nil
+}
+
+func (s *Store) FindMemoryPoolByName(ctx context.Context, name string) (model.MemoryPool, bool, error) {
+	pool, err := s.GetMemoryPoolByName(ctx, name)
+	if err == nil {
+		return pool, true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.MemoryPool{}, false, nil
+	}
+	return model.MemoryPool{}, false, err
+}
+
+func (s *Store) GetMemoryPoolByID(ctx context.Context, id string) (model.MemoryPool, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, reserved_bytes, created_at, updated_at, created_by_user, created_by_node
+		FROM memory_pools
+		WHERE id = ?
+	`, id)
+	pool, err := scanMemoryPool(row.Scan)
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	return pool, nil
+}
+
+func (s *Store) ListMemoryPools(ctx context.Context) ([]model.MemoryPool, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, reserved_bytes, created_at, updated_at, created_by_user, created_by_node
+		FROM memory_pools
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list memory pools: %w", err)
+	}
+	defer rows.Close()
+
+	var out []model.MemoryPool
+	for rows.Next() {
+		pool, err := scanMemoryPool(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pool)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CountMemoryPoolMembers(ctx context.Context, poolID string) (int, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM instances
+		WHERE memory_pool_id = ? AND state <> ?
+	`, poolID, model.StateDeleted)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count memory pool members: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) DeleteMemoryPool(ctx context.Context, id string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM memory_pools WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete memory pool %s: %w", id, err)
+	}
+	return nil
 }
 
 func (s *Store) RecordEvent(ctx context.Context, event model.InstanceEvent) error {
@@ -443,6 +548,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_by_node TEXT NOT NULL,
 			vcpu_count INTEGER NOT NULL DEFAULT 0,
 			memory_mib INTEGER NOT NULL DEFAULT 0,
+			memory_mode TEXT NOT NULL DEFAULT 'fixed',
+			memory_pool_id TEXT NOT NULL DEFAULT '',
 			rootfs_size_bytes INTEGER NOT NULL DEFAULT 0,
 			rootfs_path TEXT NOT NULL,
 			kernel_path TEXT NOT NULL,
@@ -461,6 +568,15 @@ func (s *Store) migrate(ctx context.Context) error {
 			tailscale_ip TEXT NOT NULL DEFAULT '',
 			last_error TEXT NOT NULL DEFAULT '',
 			deleted_at TEXT
+		);`,
+		`CREATE TABLE IF NOT EXISTS memory_pools (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			reserved_bytes INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			created_by_user TEXT NOT NULL,
+			created_by_node TEXT NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS instance_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -519,9 +635,6 @@ func (s *Store) migrate(ctx context.Context) error {
 			FOREIGN KEY(instance_id) REFERENCES instances(id),
 			FOREIGN KEY(integration_id) REFERENCES integrations(id)
 		);`,
-		`CREATE INDEX IF NOT EXISTS idx_instance_integrations_integration_id
-			ON instance_integrations (integration_id)
-		;`,
 	}
 
 	for _, stmt := range stmts {
@@ -535,10 +648,24 @@ func (s *Store) migrate(ctx context.Context) error {
 	}{
 		{name: "vcpu_count", decl: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "memory_mib", decl: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "memory_mode", decl: "TEXT NOT NULL DEFAULT 'fixed'"},
+		{name: "memory_pool_id", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "rootfs_size_bytes", decl: "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.ensureColumn(ctx, "instances", column.name, column.decl); err != nil {
 			return err
+		}
+	}
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_instance_integrations_integration_id
+			ON instance_integrations (integration_id)
+		;`,
+		`CREATE INDEX IF NOT EXISTS idx_instances_memory_pool_id
+			ON instances (memory_pool_id)
+		;`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("run migration %q: %w", stmt, err)
 		}
 	}
 	return nil
@@ -603,6 +730,8 @@ func scanInstance(scan func(dest ...any) error) (model.Instance, error) {
 		&inst.CreatedByNode,
 		&inst.VCPUCount,
 		&inst.MemoryMiB,
+		&inst.MemoryMode,
+		&inst.MemoryPoolID,
 		&inst.RootFSSizeBytes,
 		&inst.RootFSPath,
 		&inst.KernelPath,
@@ -643,7 +772,48 @@ func scanInstance(scan func(dest ...any) error) (model.Instance, error) {
 		}
 		inst.DeletedAt = &t
 	}
+	normalizeInstanceMemory(&inst)
 	return inst, nil
+}
+
+func scanMemoryPool(scan func(dest ...any) error) (model.MemoryPool, error) {
+	var pool model.MemoryPool
+	var createdAt string
+	var updatedAt string
+	if err := scan(
+		&pool.ID,
+		&pool.Name,
+		&pool.ReservedBytes,
+		&createdAt,
+		&updatedAt,
+		&pool.CreatedByUser,
+		&pool.CreatedByNode,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.MemoryPool{}, err
+		}
+		return model.MemoryPool{}, fmt.Errorf("scan memory pool: %w", err)
+	}
+	var err error
+	pool.CreatedAt, err = parseTime(createdAt)
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	pool.UpdatedAt, err = parseTime(updatedAt)
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	return pool, nil
+}
+
+func normalizeInstanceMemory(inst *model.Instance) {
+	if inst == nil {
+		return
+	}
+	inst.MemoryMode = model.NormalizeMemoryMode(inst.MemoryMode)
+	if inst.MemoryMode != model.MemoryModePool {
+		inst.MemoryPoolID = ""
+	}
 }
 
 func scanIntegration(scan func(dest ...any) error) (model.Integration, error) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -46,6 +47,9 @@ func TestRequestsValidate(t *testing.T) {
 	if err := (MetricsRequest{Name: "demo"}).Validate(); err != nil {
 		t.Fatalf("MetricsRequest.Validate(): %v", err)
 	}
+	if err := (MemoryPoolRequest{Name: "pool-a"}).Validate(); err != nil {
+		t.Fatalf("MemoryPoolRequest.Validate(): %v", err)
+	}
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -55,6 +59,7 @@ func TestRequestsValidate(t *testing.T) {
 		{name: "bad guest ip", err: func() error { req := valid; req.GuestAddr = "10.0.0.2"; return req.Validate() }()},
 		{name: "bad stop pid", err: (StopRequest{Name: "demo", PID: -1}).Validate()},
 		{name: "bad metrics name", err: (MetricsRequest{Name: "nested/demo"}).Validate()},
+		{name: "bad memory pool name", err: (MemoryPoolRequest{Name: "nested/pool"}).Validate()},
 	} {
 		if tc.err == nil {
 			t.Fatalf("%s unexpectedly passed validation", tc.name)
@@ -101,6 +106,7 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 		mu      sync.Mutex
 		started []StartRequest
 		stopped []StopRequest
+		pools   []MemoryPoolRequest
 	)
 	server := NewServerWithHandlers(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
 		FirecrackerBinary: "/usr/bin/firecracker",
@@ -125,6 +131,12 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 			t.Fatalf("metrics request name = %q, want demo", req.Name)
 		}
 		return MetricsResponse{CPUUsageUsec: 12345, MemoryCurrentBytes: 256 << 20, MemoryLimitBytes: 1024 << 20}, nil
+	}
+	server.deleteMemoryPool = func(_ context.Context, req MemoryPoolRequest) error {
+		mu.Lock()
+		defer mu.Unlock()
+		pools = append(pools, req)
+		return nil
 	}
 
 	socketPath := filepath.Join(t.TempDir(), "vm-runner.sock")
@@ -162,6 +174,9 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadInstanceMetrics(): %v", err)
 	}
+	if err := client.DeleteMemoryPool(ctx, MemoryPoolRequest{Name: "pool-a"}); err != nil {
+		t.Fatalf("DeleteMemoryPool(): %v", err)
+	}
 	if metrics.CPUUsageUsec != 12345 || metrics.MemoryCurrentBytes != 256<<20 || metrics.MemoryLimitBytes != 1024<<20 {
 		t.Fatalf("ReadInstanceMetrics() = %#v", metrics)
 	}
@@ -173,6 +188,373 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 	}
 	if !reflect.DeepEqual(stopped, []StopRequest{{Name: "demo", PID: 4321}}) {
 		t.Fatalf("stopped = %#v", stopped)
+	}
+	if !reflect.DeepEqual(pools, []MemoryPoolRequest{{Name: "pool-a"}}) {
+		t.Fatalf("pools = %#v", pools)
+	}
+}
+
+func TestCreatePooledBalloonDeviceEnablesFreePageReporting(t *testing.T) {
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{})
+	socketPath := filepath.Join(t.TempDir(), "firecracker.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("net.Listen(unix): %v", err)
+	}
+	defer listener.Close()
+
+	reqCh := make(chan *http.Request, 1)
+	bodyCh := make(chan []byte, 1)
+	httpServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll(request body): %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		reqCh <- r
+		bodyCh <- body
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go func() {
+		_ = httpServer.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(ctx)
+	})
+
+	if err := server.createPooledBalloonDevice(context.Background(), socketPath); err != nil {
+		t.Fatalf("createPooledBalloonDevice(): %v", err)
+	}
+
+	var payload struct {
+		AmountMiB                   int64 `json:"amount_mib"`
+		DeflateOnOOM                bool  `json:"deflate_on_oom"`
+		StatsPollingIntervalSeconds int64 `json:"stats_polling_interval_s"`
+		FreePageReporting           bool  `json:"free_page_reporting"`
+	}
+	if err := json.Unmarshal(<-bodyCh, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(request body): %v", err)
+	}
+	req := <-reqCh
+	if req.Method != http.MethodPut {
+		t.Fatalf("request method = %q, want %q", req.Method, http.MethodPut)
+	}
+	if req.URL.Path != "/balloon" {
+		t.Fatalf("request path = %q, want %q", req.URL.Path, "/balloon")
+	}
+	if got := req.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if payload.AmountMiB != 0 {
+		t.Fatalf("amount_mib = %d, want 0", payload.AmountMiB)
+	}
+	if !payload.DeflateOnOOM {
+		t.Fatalf("deflate_on_oom = false, want true")
+	}
+	if payload.StatsPollingIntervalSeconds != pooledBalloonStatsIntervalSeconds {
+		t.Fatalf("stats_polling_interval_s = %d, want %d", payload.StatsPollingIntervalSeconds, pooledBalloonStatsIntervalSeconds)
+	}
+	if !payload.FreePageReporting {
+		t.Fatalf("free_page_reporting = false, want true")
+	}
+}
+
+func TestDesiredPooledBalloonTargetMiB(t *testing.T) {
+	tests := []struct {
+		name          string
+		residentBytes int64
+		stats         firecrackerBalloonStats
+		wantTargetMiB int64
+		wantStepMiB   int64
+		wantOK        bool
+	}{
+		{
+			name:          "reclaims conservative slack",
+			residentBytes: 640 * miBBytes,
+			stats: firecrackerBalloonStats{
+				TargetMiB:       int64Ptr(0),
+				AvailableMemory: 640 * miBBytes,
+				TotalMemory:     1024 * miBBytes,
+			},
+			wantTargetMiB: 384,
+			wantStepMiB:   64,
+			wantOK:        true,
+		},
+		{
+			name:          "keeps target at zero when resident set is already low",
+			residentBytes: 300 * miBBytes,
+			stats: firecrackerBalloonStats{
+				TargetMiB:       int64Ptr(128),
+				AvailableMemory: 700 * miBBytes,
+				TotalMemory:     1024 * miBBytes,
+			},
+			wantTargetMiB: 0,
+			wantStepMiB:   64,
+			wantOK:        true,
+		},
+		{
+			name:          "falls back to free memory plus disk caches",
+			residentBytes: 768 * miBBytes,
+			stats: firecrackerBalloonStats{
+				TargetMiB:   int64Ptr(0),
+				FreeMemory:  256 * miBBytes,
+				DiskCaches:  384 * miBBytes,
+				TotalMemory: 1024 * miBBytes,
+			},
+			wantTargetMiB: 384,
+			wantStepMiB:   64,
+			wantOK:        true,
+		},
+		{
+			name:          "skips when total guest memory is unavailable",
+			residentBytes: 768 * miBBytes,
+			stats: firecrackerBalloonStats{
+				TargetMiB: int64Ptr(0),
+			},
+			wantOK: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotTargetMiB, gotStepMiB, gotOK := desiredPooledBalloonTargetMiB(tc.residentBytes, tc.stats)
+			if gotOK != tc.wantOK {
+				t.Fatalf("desiredPooledBalloonTargetMiB() ok = %v, want %v", gotOK, tc.wantOK)
+			}
+			if !gotOK {
+				return
+			}
+			if gotTargetMiB != tc.wantTargetMiB {
+				t.Fatalf("desiredPooledBalloonTargetMiB() target = %d, want %d", gotTargetMiB, tc.wantTargetMiB)
+			}
+			if gotStepMiB != tc.wantStepMiB {
+				t.Fatalf("desiredPooledBalloonTargetMiB() step = %d, want %d", gotStepMiB, tc.wantStepMiB)
+			}
+		})
+	}
+}
+
+func TestReconcilePooledBalloonUpdatesTarget(t *testing.T) {
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		InstancesDir: filepath.Join(t.TempDir(), "instances"),
+	})
+	cgroupPath := filepath.Join(t.TempDir(), "cgroup", "pool-a", "demo")
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(cgroupPath): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "memory.current"), []byte("671088640\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(memory.current): %v", err)
+	}
+
+	socketPath := filepath.Join(t.TempDir(), "firecracker.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("net.Listen(unix): %v", err)
+	}
+	defer listener.Close()
+
+	var patchedAmountMiB int64 = -1
+	httpServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/balloon/statistics":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"target_mib":0,"actual_mib":0,"available_memory":671088640,"total_memory":1073741824}`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/balloon":
+			var payload struct {
+				AmountMiB int64 `json:"amount_mib"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("Decode(patch body): %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			patchedAmountMiB = payload.AmountMiB
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})}
+	go func() {
+		_ = httpServer.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(ctx)
+	})
+
+	if err := server.reconcilePooledBalloon(context.Background(), pooledBalloonVM{
+		Name:       "demo",
+		CgroupPath: cgroupPath,
+		SocketPath: socketPath,
+	}); err != nil {
+		t.Fatalf("reconcilePooledBalloon(): %v", err)
+	}
+	if patchedAmountMiB != 384 {
+		t.Fatalf("patched amount_mib = %d, want 384", patchedAmountMiB)
+	}
+}
+
+func TestReconcilePooledBalloonCorrectsUnalignedTarget(t *testing.T) {
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		InstancesDir: filepath.Join(t.TempDir(), "instances"),
+	})
+	cgroupPath := filepath.Join(t.TempDir(), "cgroup", "pool-a", "demo")
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(cgroupPath): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "memory.current"), []byte("134217728\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(memory.current): %v", err)
+	}
+
+	socketPath := filepath.Join(t.TempDir(), "firecracker.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("net.Listen(unix): %v", err)
+	}
+	defer listener.Close()
+	t.Cleanup(func() { server.closeFirecrackerClient(socketPath) })
+
+	var patchedAmountMiB int64 = -1
+	httpServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/balloon/statistics":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"target_mib":32,"actual_mib":32,"available_memory":134217728,"total_memory":1073741824}`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/balloon":
+			var payload struct {
+				AmountMiB int64 `json:"amount_mib"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("Decode(patch body): %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			patchedAmountMiB = payload.AmountMiB
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})}
+	go func() {
+		_ = httpServer.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(ctx)
+	})
+
+	if err := server.reconcilePooledBalloon(context.Background(), pooledBalloonVM{
+		Name:       "demo",
+		CgroupPath: cgroupPath,
+		SocketPath: socketPath,
+	}); err != nil {
+		t.Fatalf("reconcilePooledBalloon(): %v", err)
+	}
+	if patchedAmountMiB != 0 {
+		t.Fatalf("patched amount_mib = %d, want 0", patchedAmountMiB)
+	}
+}
+
+func TestReconcilePooledBalloonsDoesNotBlockPeers(t *testing.T) {
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+	})
+
+	cgroupFSRoot = t.TempDir()
+	serviceRel := "/system.slice/srv-vm-runner.service"
+	currentCgroupPath = func() (string, error) {
+		return serviceRel, nil
+	}
+
+	instancesDir := filepath.Join(t.TempDir(), "instances")
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		InstancesDir: instancesDir,
+	})
+
+	for _, name := range []string{"a-slow", "z-fast"} {
+		cgroupPath := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service", firecrackerPoolRootCgroupName, "pool-a", name)
+		if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", cgroupPath, err)
+		}
+		if err := os.WriteFile(filepath.Join(cgroupPath, "memory.current"), []byte("671088640\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(memory.current for %s): %v", name, err)
+		}
+		if err := os.MkdirAll(filepath.Join(instancesDir, name), 0o755); err != nil {
+			t.Fatalf("MkdirAll(instance %s): %v", name, err)
+		}
+	}
+
+	fastPatched := make(chan int64, 1)
+	serveSocket := func(name string, handler http.HandlerFunc) {
+		socketPath := filepath.Join(instancesDir, name, "firecracker.sock")
+		listener, err := net.Listen("unix", socketPath)
+		if err != nil {
+			t.Fatalf("net.Listen(%s): %v", socketPath, err)
+		}
+		t.Cleanup(func() {
+			server.closeFirecrackerClient(socketPath)
+			_ = listener.Close()
+		})
+		httpServer := &http.Server{Handler: handler}
+		go func() {
+			_ = httpServer.Serve(listener)
+		}()
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_ = httpServer.Shutdown(ctx)
+		})
+	}
+
+	serveSocket("a-slow", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/balloon/statistics" {
+			time.Sleep(400 * time.Millisecond)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"target_mib":0,"actual_mib":0,"available_memory":671088640,"total_memory":1073741824}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	serveSocket("z-fast", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/balloon/statistics":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"target_mib":0,"actual_mib":0,"available_memory":671088640,"total_memory":1073741824}`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/balloon":
+			var payload struct {
+				AmountMiB int64 `json:"amount_mib"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("Decode(fast patch body): %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			fastPatched <- payload.AmountMiB
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	server.reconcilePooledBalloons(ctx)
+
+	select {
+	case got := <-fastPatched:
+		if got != 384 {
+			t.Fatalf("fast patch amount_mib = %d, want 384", got)
+		}
+	default:
+		t.Fatal("fast pooled VM was not reconciled before the slow peer timed out")
 	}
 }
 
@@ -608,6 +990,57 @@ func TestReadInt64FileAcceptsMax(t *testing.T) {
 	}
 }
 
+func int64Ptr(value int64) *int64 {
+	return &value
+}
+
+func TestReadInstanceMetricsFindsPooledCgroupWithoutRequestMetadata(t *testing.T) {
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+	})
+
+	cgroupFSRoot = t.TempDir()
+	serviceRel := "/system.slice/srv-vm-runner.service"
+	currentCgroupPath = func() (string, error) {
+		return serviceRel, nil
+	}
+
+	pooledPath := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service", firecrackerPoolRootCgroupName, "pool-a", "demo")
+	if err := os.MkdirAll(pooledPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(pooledPath): %v", err)
+	}
+	for path, payload := range map[string]string{
+		filepath.Join(pooledPath, "cpu.stat"):       "usage_usec 54321\nuser_usec 50000\nsystem_usec 4321\n",
+		filepath.Join(pooledPath, "memory.current"): "134217728\n",
+		filepath.Join(pooledPath, "memory.max"):     "1073741824\n",
+	} {
+		if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", path, err)
+		}
+	}
+
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		JailerBinary:      "/usr/bin/jailer",
+		JailerBaseDir:     "/var/lib/srv/jailer",
+		JailerUID:         123,
+		JailerGID:         456,
+		InstancesDir:      "/var/lib/srv/instances",
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	})
+
+	metrics, err := server.readInstanceMetrics(context.Background(), MetricsRequest{Name: "demo"})
+	if err != nil {
+		t.Fatalf("readInstanceMetrics(): %v", err)
+	}
+	if metrics.CPUUsageUsec != 54321 || metrics.MemoryCurrentBytes != 128<<20 || metrics.MemoryLimitBytes != 1024<<20 {
+		t.Fatalf("readInstanceMetrics() = %#v", metrics)
+	}
+}
+
 func TestValidateJailedFirecrackerBinary(t *testing.T) {
 	t.Run("accepts static elf without interpreter", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "firecracker-static")
@@ -682,6 +1115,109 @@ func TestServerCleanupFirecrackerCgroupPropagatesBusyLeaf(t *testing.T) {
 	}
 	if len(removed) != 1 || removed[0] != cgroupPath {
 		t.Fatalf("cleanupFirecrackerCgroup() removed %#v, want only %q", removed, cgroupPath)
+	}
+}
+
+func TestServerCleanupFirecrackerCgroupKeepsPooledParent(t *testing.T) {
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	oldRemove := removePath
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+		removePath = oldRemove
+	})
+
+	cgroupFSRoot = t.TempDir()
+	serviceRel := "/system.slice/srv-vm-runner.service"
+	currentCgroupPath = func() (string, error) {
+		return serviceRel, nil
+	}
+
+	serviceCgroup := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service")
+	poolPath := filepath.Join(serviceCgroup, firecrackerPoolRootCgroupName, "pool-a")
+	cgroupPath := filepath.Join(poolPath, "demo")
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(demo): %v", err)
+	}
+
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		JailerBinary:      "/usr/bin/jailer",
+		JailerBaseDir:     "/var/lib/srv/jailer",
+		JailerUID:         123,
+		JailerGID:         456,
+		InstancesDir:      "/var/lib/srv/instances",
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	})
+
+	var removed []string
+	removePath = func(path string) error {
+		removed = append(removed, path)
+		return os.Remove(path)
+	}
+
+	if err := server.cleanupFirecrackerCgroup("demo"); err != nil {
+		t.Fatalf("cleanupFirecrackerCgroup(): %v", err)
+	}
+	if len(removed) != 1 || removed[0] != cgroupPath {
+		t.Fatalf("cleanupFirecrackerCgroup() removed %#v, want only %q", removed, cgroupPath)
+	}
+	if _, err := os.Stat(poolPath); err != nil {
+		t.Fatalf("pooled parent cgroup should remain after leaf cleanup: %v", err)
+	}
+}
+
+func TestServerDeleteMemoryPoolCgroupRemovesPoolParent(t *testing.T) {
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	oldRemove := removePath
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+		removePath = oldRemove
+	})
+
+	cgroupFSRoot = t.TempDir()
+	serviceRel := "/system.slice/srv-vm-runner.service"
+	currentCgroupPath = func() (string, error) {
+		return serviceRel, nil
+	}
+
+	serviceCgroup := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service")
+	poolPath := filepath.Join(serviceCgroup, firecrackerPoolRootCgroupName, "pool-a")
+	if err := os.MkdirAll(poolPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(pool): %v", err)
+	}
+
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker",
+		JailerBinary:      "/usr/bin/jailer",
+		JailerBaseDir:     "/var/lib/srv/jailer",
+		JailerUID:         123,
+		JailerGID:         456,
+		InstancesDir:      "/var/lib/srv/instances",
+		KernelPath:        "/var/lib/srv/images/arch-base/vmlinux",
+	})
+
+	var removed []string
+	removePath = func(path string) error {
+		removed = append(removed, path)
+		return os.Remove(path)
+	}
+
+	if err := server.deleteMemoryPoolCgroup(context.Background(), MemoryPoolRequest{Name: "pool-a"}); err != nil {
+		t.Fatalf("deleteMemoryPoolCgroup(): %v", err)
+	}
+	if len(removed) != 1 || removed[0] != poolPath {
+		t.Fatalf("deleteMemoryPoolCgroup() removed %#v, want only %q", removed, poolPath)
+	}
+	if _, err := os.Stat(poolPath); !os.IsNotExist(err) {
+		t.Fatalf("pool cgroup should be removed, stat err = %v", err)
+	}
+
+	if err := server.deleteMemoryPoolCgroup(context.Background(), MemoryPoolRequest{Name: "pool-a"}); err != nil {
+		t.Fatalf("deleteMemoryPoolCgroup() should ignore missing pools: %v", err)
 	}
 }
 

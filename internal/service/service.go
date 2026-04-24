@@ -95,6 +95,8 @@ type instanceSummaryJSON struct {
 	State           string `json:"state"`
 	VCPUCount       int64  `json:"vcpu_count,omitempty"`
 	MemoryMiB       int64  `json:"memory_mib,omitempty"`
+	MemoryMode      string `json:"memory_mode,omitempty"`
+	MemoryPoolID    string `json:"memory_pool_id,omitempty"`
 	RootFSSizeBytes int64  `json:"rootfs_size_bytes,omitempty"`
 	TailscaleName   string `json:"tailscale_name,omitempty"`
 	TailscaleIP     string `json:"tailscale_ip,omitempty"`
@@ -116,6 +118,9 @@ type inspectInstanceJSON struct {
 	UpdatedAt       time.Time       `json:"updated_at"`
 	VCPUCount       int64           `json:"vcpu_count,omitempty"`
 	MemoryMiB       int64           `json:"memory_mib,omitempty"`
+	MemoryMode      string          `json:"memory_mode,omitempty"`
+	MemoryPool      string          `json:"memory_pool,omitempty"`
+	HostReservation string          `json:"host_reservation,omitempty"`
 	RootFSPath      string          `json:"rootfs_path"`
 	RootFSSizeBytes int64           `json:"rootfs_size_bytes,omitempty"`
 	FirecrackerPID  int             `json:"firecracker_pid"`
@@ -202,6 +207,9 @@ type topSnapshot struct {
 type topInstanceSnapshot struct {
 	Name               string
 	State              string
+	MemoryMode         string
+	MemoryPoolName     string
+	GuestMemoryBytes   int64
 	VCPUCount          int64
 	CPUUsageUsec       uint64
 	MemoryCurrentBytes int64
@@ -312,6 +320,8 @@ func instanceSummaryPayload(cfg config.Config, inst model.Instance, includeConne
 		State:           inst.State,
 		VCPUCount:       effectiveInstanceVCPUCount(inst, cfg),
 		MemoryMiB:       effectiveInstanceMemoryMiB(inst, cfg),
+		MemoryMode:      inst.NormalizedMemoryMode(),
+		MemoryPoolID:    inst.MemoryPoolID,
 		RootFSSizeBytes: effectiveInstanceRootFSSizeBytes(inst),
 		TailscaleName:   inst.TailscaleName,
 		TailscaleIP:     inst.TailscaleIP,
@@ -336,8 +346,12 @@ func backupPayload(info provision.BackupInfo) backupJSON {
 	}
 }
 
-func (a *App) inspectPayload(inst model.Instance, integrations []inspectIntegrationJSON, events []model.InstanceEvent) inspectResponseJSON {
+func (a *App) inspectPayload(inst model.Instance, poolName string, integrations []inspectIntegrationJSON, events []model.InstanceEvent) inspectResponseJSON {
 	debugHint := inspectDebugHint(inst)
+	hostReservation := "dedicated"
+	if inst.UsesMemoryPool() {
+		hostReservation = "shared via pool"
+	}
 	payload := inspectResponseJSON{
 		Instance: inspectInstanceJSON{
 			Name:            inst.Name,
@@ -348,6 +362,9 @@ func (a *App) inspectPayload(inst model.Instance, integrations []inspectIntegrat
 			UpdatedAt:       inst.UpdatedAt,
 			VCPUCount:       effectiveInstanceVCPUCount(inst, a.cfg),
 			MemoryMiB:       effectiveInstanceMemoryMiB(inst, a.cfg),
+			MemoryMode:      inst.NormalizedMemoryMode(),
+			MemoryPool:      poolName,
+			HostReservation: hostReservation,
 			RootFSPath:      inst.RootFSPath,
 			RootFSSizeBytes: effectiveInstanceRootFSSizeBytes(inst),
 			FirecrackerPID:  inst.FirecrackerPID,
@@ -727,6 +744,8 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 		return a.cmdInspect(ctx, actor, req.args, req.format)
 	case "status":
 		return a.cmdStatus(ctx, actor, req.args, req.format)
+	case "pool":
+		return a.cmdPool(ctx, actor, req.args, req.format)
 	case "restore":
 		return a.cmdRestore(ctx, actor, req.args, req.format)
 	case "start":
@@ -987,6 +1006,12 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	if err != nil {
 		return missingInstanceResult("inspect", args[1], err)
 	}
+	poolName := ""
+	if inst.UsesMemoryPool() {
+		if pool, err := a.store.GetMemoryPoolByID(ctx, inst.MemoryPoolID); err == nil {
+			poolName = pool.Name
+		}
+	}
 	integrations, err := a.inspectIntegrationsForInstance(ctx, inst)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("load integrations: %v\n", err), exitCode: 1}, err
@@ -996,7 +1021,7 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 		return commandResult{stderr: fmt.Sprintf("load events: %v\n", err), exitCode: 1}, err
 	}
 	if outFormat == outputFormatJSON {
-		return jsonResult(a.inspectPayload(inst, integrations, events))
+		return jsonResult(a.inspectPayload(inst, poolName, integrations, events))
 	}
 
 	var b strings.Builder
@@ -1010,6 +1035,13 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	}
 	if mem := effectiveInstanceMemoryMiB(inst, a.cfg); mem > 0 {
 		fmt.Fprintf(&b, "memory: %d MiB\n", mem)
+	}
+	fmt.Fprintf(&b, "memory-mode: %s\n", inst.NormalizedMemoryMode())
+	if poolName != "" {
+		fmt.Fprintf(&b, "memory-pool: %s\n", poolName)
+		fmt.Fprintf(&b, "host-reservation: shared via pool\n")
+	} else {
+		fmt.Fprintf(&b, "host-reservation: dedicated\n")
 	}
 	fmt.Fprintf(&b, "rootfs: %s\n", inst.RootFSPath)
 	if size := effectiveInstanceRootFSSizeBytes(inst); size > 0 {
@@ -1165,6 +1197,12 @@ func skipStatusSeparator(prevLabel, label string) bool {
 		return true
 	}
 	if strings.HasPrefix(prevLabel, "LOAD ") && strings.HasPrefix(label, "LOAD ") {
+		return true
+	}
+	if (prevLabel == "MEMORY" || prevLabel == "FIXED") && label == "POOLS" {
+		return true
+	}
+	if prevLabel == "MEMORY" && label == "FIXED" {
 		return true
 	}
 	if prevRank := statusStorageLabelRank(prevLabel); prevRank >= 0 {
@@ -1345,6 +1383,14 @@ func (a *App) readTopSnapshot(ctx context.Context, actor model.Actor) (topSnapsh
 	if err != nil {
 		return topSnapshot{}, fmt.Errorf("list instances: %w", err)
 	}
+	pools, err := a.store.ListMemoryPools(ctx)
+	if err != nil {
+		return topSnapshot{}, fmt.Errorf("list memory pools: %w", err)
+	}
+	poolNamesByID := make(map[string]string, len(pools))
+	for _, pool := range pools {
+		poolNamesByID[pool.ID] = pool.Name
+	}
 	instances = a.visibleInstances(actor, instances)
 	snapshot := topSnapshot{
 		capturedAt: time.Now(),
@@ -1361,6 +1407,9 @@ func (a *App) readTopSnapshot(ctx context.Context, actor model.Actor) (topSnapsh
 			sample := topInstanceSnapshot{
 				Name:               inst.Name,
 				State:              inst.State,
+				MemoryMode:         inst.NormalizedMemoryMode(),
+				MemoryPoolName:     poolNamesByID[inst.MemoryPoolID],
+				GuestMemoryBytes:   effectiveInstanceMemoryMiB(inst, a.cfg) * mib,
 				VCPUCount:          effectiveInstanceVCPUCount(inst, a.cfg),
 				DiskAllocatedBytes: topAllocatedFileBytes(inst.RootFSPath),
 				DiskLimitBytes:     effectiveInstanceRootFSSizeBytes(inst),
@@ -1385,7 +1434,7 @@ func (a *App) readTopSnapshot(ctx context.Context, actor model.Actor) (topSnapsh
 				}
 			}
 			if sample.MemoryLimitBytes == 0 {
-				sample.MemoryLimitBytes = effectiveInstanceMemoryMiB(inst, a.cfg) * mib
+				sample.MemoryLimitBytes = sample.GuestMemoryBytes
 			}
 			snapshot.instances[i] = sample
 			return nil
@@ -1431,7 +1480,7 @@ func renderTopScreen(snapshot topSnapshot, prev *topSnapshot, sessionAge, interv
 		b.WriteString(topBoxRow(row.Values, row.Styles, widths))
 	}
 	b.WriteString(topBoxLine("└", "┴", "┘", widths))
-	b.WriteString(topMuted("MEM = live/configured RAM. DISK = host allocated/configured rootfs.\n"))
+	b.WriteString(topMuted("MEM = live/configured RAM; pooled rows also show the pool name. DISK = host allocated/configured rootfs.\n"))
 	return b.String()
 }
 
@@ -1711,6 +1760,20 @@ func formatTopCPU(pct float64) string {
 }
 
 func formatTopMemory(inst topInstanceSnapshot) string {
+	if inst.MemoryMode == model.MemoryModePool {
+		current := "-"
+		if inst.HasLiveMetrics {
+			current = format.BinarySize(inst.MemoryCurrentBytes)
+		}
+		if inst.GuestMemoryBytes <= 0 {
+			return current
+		}
+		value := current + "/" + format.BinarySize(inst.GuestMemoryBytes)
+		if inst.MemoryPoolName != "" {
+			value += " " + inst.MemoryPoolName
+		}
+		return value
+	}
 	if !inst.HasLiveMetrics || inst.MemoryLimitBytes <= 0 {
 		return "-"
 	}
@@ -2164,7 +2227,7 @@ func helpResult() commandResult {
 		{
 			header: "INSTANCE COMMANDS",
 			entries: []helpEntry{
-				{"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE] [--integration NAME]", "Create a new microvm instance."},
+				{"new <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]", "Create a new microvm instance."},
 				{"list", "List all instances."},
 				{"inspect <name>", "Show instance details and recent events."},
 				{"start <name>", "Start a stopped instance."},
@@ -2207,6 +2270,10 @@ func helpResult() commandResult {
 		{
 			header: "ADMIN COMMANDS",
 			entries: []helpEntry{
+				{"pool create <name> --size SIZE", "Create a reserved memory pool."},
+				{"pool list", "List reserved memory pools."},
+				{"pool inspect <name>", "Show memory pool details and member VMs."},
+				{"pool delete <name>", "Delete an empty memory pool."},
 				{"status", "Show host capacity and allocation summary."},
 				{"snapshot create", "Create a read-only btrfs data snapshot."},
 			},
@@ -2237,6 +2304,8 @@ func helpResult() commandResult {
 	fmt.Fprintln(&b, "        Number of vCPUs.")
 	fmt.Fprintln(&b, "    --ram SIZE")
 	fmt.Fprintln(&b, "        Memory (e.g. 512m, 2g).")
+	fmt.Fprintln(&b, "    --pool NAME")
+	fmt.Fprintln(&b, "        Place a new VM into an existing shared memory pool.")
 	fmt.Fprintln(&b, "    --rootfs-size SIZE")
 	fmt.Fprintln(&b, "        Root filesystem size (e.g. 4g, 10g).")
 	fmt.Fprintln(&b, "    --integration NAME")
@@ -2722,7 +2791,7 @@ func (a *App) resolveActor(ctx context.Context, sess gssh.Session) (model.Actor,
 }
 
 func (a *App) authorize(actor model.Actor, command string) (bool, string) {
-	if command == "snapshot" || command == "status" || command == "integration" {
+	if command == "snapshot" || command == "status" || command == "integration" || command == "pool" {
 		if !a.isAdmin(actor) {
 			return false, fmt.Sprintf("%s is not in SRV_ADMIN_USERS", actor.UserLogin)
 		}
@@ -2924,7 +2993,7 @@ func importUsage() string {
 }
 
 func newUsage() string {
-	return "usage: new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE] [--integration NAME]"
+	return "usage: new <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]"
 }
 
 func resizeUsage() string {

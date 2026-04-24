@@ -4,6 +4,13 @@ This runbook is for the supported prepared-host path: systemd-managed `srv`, `sr
 
 Same-host reboot recovery is already built into the control plane: when `srv` comes back under systemd, previously active instances are restarted automatically. The steps below cover the larger operator workflows that were previously only implied.
 
+Hybrid memory pools are now part of the supported runtime model:
+
+- Fixed memory remains the default and preserves the original dedicated-reservation behavior.
+- Pools reserve host memory immediately at `pool create` time.
+- Pooled member VMs consume guest-visible RAM from that shared reservation and are not charged against host memory a second time.
+- Pooled guest RAM changes are stopped-only and must stay within the current pool's reserved size.
+
 ## Supported Upgrade Lanes
 
 - Guest-local maintenance is still guest-local. Running `pacman -Syu` inside a guest is supported when you want that guest to drift independently, but it is not the control plane's golden-image rollout path.
@@ -84,6 +91,8 @@ Operational notes:
 - Import regenerates destination-local runtime state such as absolute file paths, tap device wiring, guest MAC, and VM subnet allocation.
 - The copied rootfs carries the guest's durable Tailscale identity, so do not boot the source and destination copies at the same time.
 - The destination host uses its currently configured `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` on the first later `start`; only the writable guest disk and optional logs come from the streamed artifact.
+
+If the exported VM was in pooled mode, import preserves that metadata. The destination host must already have the referenced memory pool state available through the restored control-plane database before the VM can be started successfully.
 
 ## Restore Or Rebuild A Host
 
@@ -175,11 +184,17 @@ Important caveat: existing guests keep their own writable `rootfs.img`. There is
 
 ## Host Hardening And Caveats
 
-- cgroup v2 is required. The runner now depends on a delegated cgroup v2 subtree to place each VM into its own `firecracker-vms/<name>` leaf with enforced `cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`.
+- cgroup v2 is required. The runner depends on a delegated cgroup v2 subtree for both fixed and pooled layouts:
+- Fixed VMs use `firecracker-vms/<name>` leaves with enforced `cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`.
+- Pooled VMs use `firecracker-pools/<pool>/<name>` leaves. The pool parent holds the hard memory reservation with `memory.max=<pool size>` and `memory.swap.max=0`, while child VM cgroups still carry CPU and PID limits.
 - IPv4 forwarding must stay enabled on the host. Guest egress depends on forwarding packets from each TAP device through the host's outbound interface after the helper installs MASQUERADE and `FORWARD` rules.
 - `srv-vm-runner.service` must keep `User=root`, `Group=srv`, `Delegate=cpu memory pids`, `DelegateSubgroup=supervisor`, and a group-accessible socket under `/run/srv-vm-runner/`.
 - Do not add `NoNewPrivileges=yes` to `srv-vm-runner.service`; the jailer must drop privileges and `exec` Firecracker on real hosts.
 - Keep using the official static Firecracker and jailer release pairing. Distro-provided dynamically linked binaries can fail after chroot before the API socket appears.
 - Preserve `/etc/srv/srv.env` across reinstall or upgrade unless you are intentionally changing configuration and have accounted for the stored absolute paths.
 - Keep `SRV_DATA_DIR` and `SRV_BASE_ROOTFS` on the same reflink-capable filesystem, such as `btrfs` or reflink-enabled `xfs`. Fast per-instance provisioning still depends on reflink cloning the configured base rootfs.
+- Use pooled mode only for workloads that tolerate an elastic memory contract. Fixed mode remains the supported choice for databases, JVMs, and other memory-sensitive services.
+- `status` is now the operator view for host memory accounting: it separates fixed reservations from pool reservations so pooled members do not look like additional dedicated host claims.
+- `inspect` and `top` are the operator views for pooled VM behavior: `inspect` shows `memory-mode` and host reservation style, while `top` shows live/configured RAM and the pool name on pooled rows.
+- On reboot recovery, pooled VMs recreate their pool-parent cgroups before restart; if a recovered VM references a missing pool record, treat that as a control-plane state restore problem rather than a guest runtime issue.
 - Run `sudo ./contrib/smoke/host-smoke.sh` after install, restore, control-plane upgrade, and base-image changes.

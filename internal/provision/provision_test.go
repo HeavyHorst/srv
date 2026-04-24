@@ -1565,6 +1565,143 @@ func TestResolveCreateOptions(t *testing.T) {
 	}
 }
 
+func TestCreateMemoryPoolRejectsWhenHostMemoryBudgetIsExceeded(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:   cfg,
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+		readHostMemoryBytes: func() (int64, error) {
+			return 1024 * format.MiB, nil
+		},
+	}
+
+	if _, err := p.CreateMemoryPool(ctx, "pool-a", model.Actor{UserLogin: "alice@example.com", NodeName: "laptop"}, 768*format.MiB); err == nil || !strings.Contains(err.Error(), "insufficient host memory reservation budget") {
+		t.Fatalf("CreateMemoryPool() error = %v", err)
+	}
+	pools, err := st.ListMemoryPools(ctx)
+	if err != nil {
+		t.Fatalf("ListMemoryPools(): %v", err)
+	}
+	if len(pools) != 0 {
+		t.Fatalf("ListMemoryPools() = %#v, want no pools", pools)
+	}
+}
+
+func TestDeleteMemoryPoolKeepsStoreRecordWhenVMRunnerCleanupFails(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	pool := model.MemoryPool{
+		ID:            "pool-a-id",
+		Name:          "pool-a",
+		ReservedBytes: 1024 * format.MiB,
+		CreatedAt:     time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC),
+		CreatedByUser: "alice@example.com",
+		CreatedByNode: "laptop",
+	}
+	if err := st.CreateMemoryPool(ctx, pool); err != nil {
+		t.Fatalf("CreateMemoryPool(): %v", err)
+	}
+
+	stub := &recordingVMRunner{deleteMemoryPoolErr: errors.New("cleanup failed")}
+	p := &Provisioner{
+		cfg:      cfg,
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:    st,
+		vmRunner: stub,
+	}
+
+	if _, err := p.DeleteMemoryPool(ctx, pool.Name); err == nil || !strings.Contains(err.Error(), "cleanup failed") {
+		t.Fatalf("DeleteMemoryPool() error = %v", err)
+	}
+	if !reflect.DeepEqual(stub.deletedPools, []vmrunner.MemoryPoolRequest{{Name: pool.Name}}) {
+		t.Fatalf("DeleteMemoryPool() vmrunner calls = %#v", stub.deletedPools)
+	}
+	if _, found, err := st.FindMemoryPoolByName(ctx, pool.Name); err != nil {
+		t.Fatalf("FindMemoryPoolByName(): %v", err)
+	} else if !found {
+		t.Fatal("DeleteMemoryPool() should leave the pool record in place when vmrunner cleanup fails")
+	}
+}
+
+func TestCreateRejectsPooledInstanceLargerThanPoolReservation(t *testing.T) {
+	ctx := context.Background()
+	oldLoopDevicesForPath := loopDevicesForPath
+	oldReflinkCloneFile := reflinkCloneFile
+	t.Cleanup(func() {
+		loopDevicesForPath = oldLoopDevicesForPath
+		reflinkCloneFile = oldReflinkCloneFile
+	})
+
+	baseDir := t.TempDir()
+	baseKernel := filepath.Join(baseDir, "images", "vmlinux")
+	baseRootFS := filepath.Join(baseDir, "images", "rootfs.img")
+	cfg := loadProvisionTestConfig(t, map[string]string{
+		"SRV_BASE_KERNEL":     baseKernel,
+		"SRV_BASE_ROOTFS":     baseRootFS,
+		"TS_TAILNET":          "tailnet.example.com",
+		"TS_CLIENT_SECRET":    "secret",
+		"SRV_GUEST_AUTH_TAGS": "tag:microvm",
+	})
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:           cfg,
+		log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:         st,
+		tsClient:      &tailscale.Client{},
+		networkHelper: panicNetworkHelper{t: t},
+		vmRunner:      panicVMRunner{t: t},
+		readHostMemoryBytes: func() (int64, error) {
+			return 8 * 1024 * format.MiB, nil
+		},
+		readFilesystemBytes: func(string) (int64, error) {
+			return 128 * 1024 * format.GiB, nil
+		},
+	}
+	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
+		t.Fatalf("MkdirAll(instances dir): %v", err)
+	}
+	for _, path := range []string{baseKernel, baseRootFS} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+	if err := os.Truncate(baseRootFS, 4*format.MiB); err != nil {
+		t.Fatalf("Truncate(baseRootFS): %v", err)
+	}
+	loopDevicesForPath = func(string) (string, error) { return "", nil }
+	reflinkCloneFile = func(context.Context, string, string) error { return nil }
+
+	pool := model.MemoryPool{
+		ID:            "pool-a-id",
+		Name:          "pool-a",
+		ReservedBytes: 1024 * format.MiB,
+		CreatedAt:     time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC),
+		CreatedByUser: "alice@example.com",
+		CreatedByNode: "laptop",
+	}
+	if err := st.CreateMemoryPool(ctx, pool); err != nil {
+		t.Fatalf("CreateMemoryPool(): %v", err)
+	}
+
+	if _, err := p.Create(ctx, "demo", model.Actor{UserLogin: "alice@example.com", NodeName: "laptop"}, CreateOptions{MemoryMiB: 2048, MemoryPoolName: pool.Name}); err == nil || !strings.Contains(err.Error(), "exceeds memory pool") {
+		t.Fatalf("Create() pooled capacity error = %v", err)
+	}
+	if _, found, err := st.FindInstance(ctx, "demo"); err != nil {
+		t.Fatalf("FindInstance(): %v", err)
+	} else if found {
+		t.Fatal("Create() should fail before persisting an instance row")
+	}
+}
+
 func TestCreateRejectsWhenHostDiskSpaceIsLow(t *testing.T) {
 	oldLoopDevicesForPath := loopDevicesForPath
 	oldReflinkCloneFile := reflinkCloneFile
@@ -1952,6 +2089,45 @@ func TestResizeRejectsShrinkingRootFS(t *testing.T) {
 	}
 	if info.Size() != 8*testMiB {
 		t.Fatalf("rootfs size changed after failed shrink: %d", info.Size())
+	}
+}
+
+func TestResizeRejectsPooledGuestMemoryLargerThanPoolReservation(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+	pool := model.MemoryPool{
+		ID:            "pool-a-id",
+		Name:          "pool-a",
+		ReservedBytes: 1024 * format.MiB,
+		CreatedAt:     time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC),
+		CreatedByUser: "alice@example.com",
+		CreatedByNode: "laptop",
+	}
+	if err := st.CreateMemoryPool(ctx, pool); err != nil {
+		t.Fatalf("CreateMemoryPool(): %v", err)
+	}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.MemoryMode = model.MemoryModePool
+	inst.MemoryPoolID = pool.ID
+	inst.MemoryMiB = 512
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	if _, err := p.Resize(ctx, inst.Name, CreateOptions{MemoryMiB: 2048}); err == nil || !strings.Contains(err.Error(), "exceeds memory pool") {
+		t.Fatalf("Resize() pooled capacity error = %v", err)
+	}
+	stored, err := st.GetInstance(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(): %v", err)
+	}
+	if stored.MemoryMiB != 512 {
+		t.Fatalf("stored.MemoryMiB = %d, want 512", stored.MemoryMiB)
 	}
 }
 
@@ -2385,6 +2561,11 @@ func (r panicVMRunner) ReadInstanceMetrics(context.Context, vmrunner.MetricsRequ
 	return vmrunner.MetricsResponse{}, nil
 }
 
+func (r panicVMRunner) DeleteMemoryPool(context.Context, vmrunner.MemoryPoolRequest) error {
+	r.t.Fatalf("DeleteMemoryPool() should not be called")
+	return nil
+}
+
 type noopVMRunner struct{}
 
 func (noopVMRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (vmrunner.StartResponse, error) {
@@ -2397,4 +2578,30 @@ func (noopVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error 
 
 func (noopVMRunner) ReadInstanceMetrics(context.Context, vmrunner.MetricsRequest) (vmrunner.MetricsResponse, error) {
 	return vmrunner.MetricsResponse{}, nil
+}
+
+func (noopVMRunner) DeleteMemoryPool(context.Context, vmrunner.MemoryPoolRequest) error {
+	return nil
+}
+
+type recordingVMRunner struct {
+	deletedPools        []vmrunner.MemoryPoolRequest
+	deleteMemoryPoolErr error
+}
+
+func (*recordingVMRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (vmrunner.StartResponse, error) {
+	return vmrunner.StartResponse{}, nil
+}
+
+func (*recordingVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {
+	return nil
+}
+
+func (*recordingVMRunner) ReadInstanceMetrics(context.Context, vmrunner.MetricsRequest) (vmrunner.MetricsResponse, error) {
+	return vmrunner.MetricsResponse{}, nil
+}
+
+func (r *recordingVMRunner) DeleteMemoryPool(_ context.Context, req vmrunner.MemoryPoolRequest) error {
+	r.deletedPools = append(r.deletedPools, req)
+	return r.deleteMemoryPoolErr
 }

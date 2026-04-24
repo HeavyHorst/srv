@@ -48,11 +48,16 @@ RUN_STARTED_EPOCH="$(date -u +%s)"
 
 INSTANCE_ATTEMPTED=0
 CLEANUP_COMPLETE=0
+POOL_ATTEMPTED=0
+POOL_CLEANUP_COMPLETE=0
 TAILSCALE_NAME=""
 TAILSCALE_IP=""
 INSTANCE_TAP_DEVICE=""
 BACKUP_ID=""
 BACKUP_PATH=""
+CURRENT_MEMORY_MODE="fixed"
+CURRENT_POOL_NAME=""
+CURRENT_MEMORY_MIB=0
 BACKUP_MARKER_PATH="/root/srv-smoke-backup-marker"
 POST_BACKUP_PATH="/root/srv-smoke-post-backup-only"
 
@@ -75,7 +80,7 @@ require_root() {
 require_commands() {
 	local missing=()
 	local cmd
-	for cmd in awk cp date grep journalctl ls mkdir sed ssh systemctl tailscale; do
+	for cmd in awk cp curl date grep journalctl ls mkdir sed ssh systemctl tailscale; do
 		if ! command -v "${cmd}" >/dev/null 2>&1; then
 			missing+=("${cmd}")
 		fi
@@ -231,6 +236,42 @@ trim_file() {
 	tr -d '\n' <"$1"
 }
 
+json_number_for_key() {
+	local file_path="$1"
+	local key="$2"
+	tr -d '[:space:]' <"${file_path}" | sed -n "s/.*\"${key}\":\([0-9][0-9]*\).*/\1/p"
+}
+
+strip_ansi() {
+	sed -r $'s/\x1B\[[0-9;]*m//g' "$1"
+}
+
+box_value_for_label() {
+	local file_path="$1"
+	local label="$2"
+	strip_ansi "${file_path}" | awk -F '│' -v label="${label}" '
+		NF < 3 { next }
+		{
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+			if ($2 != label) {
+				next
+			}
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3)
+			print $3
+			exit
+		}
+	'
+}
+
+set_active_instance() {
+	INSTANCE_NAME="$1"
+	INSTANCE_DIR="${SRV_DATA_DIR}/instances/${INSTANCE_NAME}"
+	JAILER_WORKSPACE_DIR="${JAILER_BASE_DIR}/${JAILER_EXEC_NAME}/${INSTANCE_NAME}"
+	TAILSCALE_NAME=""
+	TAILSCALE_IP=""
+	INSTANCE_TAP_DEVICE=""
+}
+
 list_output_contains() {
 	local file_path="$1"
 	local name="$2"
@@ -342,23 +383,48 @@ assert_host_runtime() {
 	local vm_runner_cgroup
 	local cgroup_path
 	local expected_cpu_max
-	local expected_memory_max
+	local pool_path
 
 	vm_runner_cgroup="$(systemctl show -p ControlGroup --value srv-vm-runner.service)"
 	if [[ -z "${vm_runner_cgroup}" ]]; then
 		fail "srv-vm-runner.service did not report a control group during ${stage}"
 	fi
+	expected_cpu_max="$(( VM_VCPUS * 100000 )) 100000"
+	if [[ "${CURRENT_MEMORY_MODE}" == "pool" ]]; then
+		pool_path="/sys/fs/cgroup/${vm_runner_cgroup#/}/firecracker-pools/${CURRENT_POOL_NAME}"
+		cgroup_path="${pool_path}/${INSTANCE_NAME}"
+		if [[ ! -d "${pool_path}" ]]; then
+			fail "pooled firecracker parent cgroup ${pool_path} is missing during ${stage}"
+		fi
+		if [[ ! -d "${cgroup_path}" ]]; then
+			fail "pooled firecracker cgroup ${cgroup_path} is missing during ${stage}"
+		fi
+		if [[ "$(trim_file "${pool_path}/memory.max")" != "${POOL_SIZE_BYTES}" ]]; then
+			fail "memory.max for ${pool_path} was $(trim_file "${pool_path}/memory.max"), want ${POOL_SIZE_BYTES} during ${stage}"
+		fi
+		if [[ "$(trim_file "${pool_path}/memory.swap.max")" != "0" ]]; then
+			fail "memory.swap.max for ${pool_path} was $(trim_file "${pool_path}/memory.swap.max"), want 0 during ${stage}"
+		fi
+		if [[ "$(trim_file "${cgroup_path}/cpu.max")" != "${expected_cpu_max}" ]]; then
+			fail "cpu.max for ${cgroup_path} was $(trim_file "${cgroup_path}/cpu.max"), want ${expected_cpu_max} during ${stage}"
+		fi
+		if [[ "$(trim_file "${cgroup_path}/memory.max")" != "max" ]]; then
+			fail "memory.max for ${cgroup_path} was $(trim_file "${cgroup_path}/memory.max"), want max during ${stage}"
+		fi
+		if [[ "$(trim_file "${cgroup_path}/pids.max")" != "${VM_PIDS_MAX}" ]]; then
+			fail "pids.max for ${cgroup_path} was $(trim_file "${cgroup_path}/pids.max"), want ${VM_PIDS_MAX} during ${stage}"
+		fi
+		return 0
+	fi
 	cgroup_path="/sys/fs/cgroup/${vm_runner_cgroup#/}/firecracker-vms/${INSTANCE_NAME}"
 	if [[ ! -d "${cgroup_path}" ]]; then
 		fail "firecracker cgroup ${cgroup_path} is missing during ${stage}"
 	fi
-	expected_cpu_max="$(( VM_VCPUS * 100000 )) 100000"
-	expected_memory_max="$(( VM_MEMORY_MIB * 1024 * 1024 ))"
 	if [[ "$(trim_file "${cgroup_path}/cpu.max")" != "${expected_cpu_max}" ]]; then
 		fail "cpu.max for ${cgroup_path} was $(trim_file "${cgroup_path}/cpu.max"), want ${expected_cpu_max} during ${stage}"
 	fi
-	if [[ "$(trim_file "${cgroup_path}/memory.max")" != "${expected_memory_max}" ]]; then
-		fail "memory.max for ${cgroup_path} was $(trim_file "${cgroup_path}/memory.max"), want ${expected_memory_max} during ${stage}"
+	if [[ "$(trim_file "${cgroup_path}/memory.max")" != "$(( CURRENT_MEMORY_MIB * 1024 * 1024 ))" ]]; then
+		fail "memory.max for ${cgroup_path} was $(trim_file "${cgroup_path}/memory.max"), want $(( CURRENT_MEMORY_MIB * 1024 * 1024 )) during ${stage}"
 	fi
 	if [[ "$(trim_file "${cgroup_path}/memory.swap.max")" != "0" ]]; then
 		fail "memory.swap.max for ${cgroup_path} was $(trim_file "${cgroup_path}/memory.swap.max"), want 0 during ${stage}"
@@ -372,6 +438,7 @@ assert_host_cleanup() {
 	local stage="$1"
 	local vm_runner_cgroup
 	local cgroup_path
+	local pool_path
 
 	if [[ -n "${INSTANCE_TAP_DEVICE}" && -e "/sys/class/net/${INSTANCE_TAP_DEVICE}" ]]; then
 		fail "tap device ${INSTANCE_TAP_DEVICE} still exists after ${stage}"
@@ -381,11 +448,150 @@ assert_host_cleanup() {
 	fi
 	vm_runner_cgroup="$(systemctl show -p ControlGroup --value srv-vm-runner.service)"
 	if [[ -n "${vm_runner_cgroup}" ]]; then
+		if [[ "${CURRENT_MEMORY_MODE}" == "pool" ]]; then
+			pool_path="/sys/fs/cgroup/${vm_runner_cgroup#/}/firecracker-pools/${CURRENT_POOL_NAME}"
+			cgroup_path="${pool_path}/${INSTANCE_NAME}"
+			if [[ -e "${cgroup_path}" ]]; then
+				fail "pooled firecracker cgroup ${cgroup_path} still exists after ${stage}"
+			fi
+			if [[ ! -d "${pool_path}" ]]; then
+				fail "pooled firecracker parent cgroup ${pool_path} is missing after ${stage}; shared pool parents should persist until pool delete"
+			fi
+			return 0
+		fi
 		cgroup_path="/sys/fs/cgroup/${vm_runner_cgroup#/}/firecracker-vms/${INSTANCE_NAME}"
 		if [[ -e "${cgroup_path}" ]]; then
 			fail "firecracker cgroup ${cgroup_path} still exists after ${stage}"
 		fi
 	fi
+}
+
+assert_pool_cleanup() {
+	local stage="$1"
+	local vm_runner_cgroup
+	local pool_path
+
+	vm_runner_cgroup="$(systemctl show -p ControlGroup --value srv-vm-runner.service)"
+	if [[ -z "${vm_runner_cgroup}" ]]; then
+		fail "srv-vm-runner.service did not report a control group during ${stage}"
+	fi
+	pool_path="/sys/fs/cgroup/${vm_runner_cgroup#/}/firecracker-pools/${POOL_NAME}"
+	if [[ -e "${pool_path}" ]]; then
+		fail "pooled firecracker parent cgroup ${pool_path} still exists after ${stage}"
+	fi
+}
+
+assert_pool_present() {
+	local label="$1"
+	if ! srv_ssh_capture "${label}" pool inspect "${POOL_NAME}"; then
+		fail "pool inspect ${POOL_NAME} failed during ${label}"
+	fi
+}
+
+assert_pool_members() {
+	local label="$1"
+	local expected_members="$2"
+	local expected_member_name="${3:-}"
+	assert_pool_present "${label}"
+	if [[ "$(extract_field "${ARTIFACT_DIR}/${label}.stdout" members || true)" != "${expected_members}" ]]; then
+		fail "pool inspect during ${label} reported members $(extract_field "${ARTIFACT_DIR}/${label}.stdout" members || true), want ${expected_members}"
+	fi
+	if [[ -n "${expected_member_name}" ]]; then
+		if ! grep -q "^- ${expected_member_name} (" "${ARTIFACT_DIR}/${label}.stdout"; then
+			fail "pool inspect during ${label} did not list member ${expected_member_name}"
+		fi
+	fi
+}
+
+assert_pool_delete_rejected() {
+	local label="$1"
+	if srv_ssh_capture "${label}" pool delete "${POOL_NAME}"; then
+		fail "pool delete ${POOL_NAME} unexpectedly succeeded during ${label}"
+	fi
+	if ! grep -q "still has" "${ARTIFACT_DIR}/${label}.stderr"; then
+		fail "pool delete ${POOL_NAME} during ${label} did not explain that the pool still has members"
+	fi
+}
+
+assert_pooled_inspect() {
+	local label="$1"
+	if ! srv_ssh_capture "${label}" inspect "${INSTANCE_NAME}"; then
+		fail "inspect ${INSTANCE_NAME} failed during ${label}"
+	fi
+	for want in \
+		"memory: ${CURRENT_MEMORY_MIB} MiB" \
+		"memory-mode: pool" \
+		"memory-pool: ${POOL_NAME}" \
+		"host-reservation: shared via pool"; do
+		if ! grep -q "^${want}$" "${ARTIFACT_DIR}/${label}.stdout"; then
+			fail "inspect ${INSTANCE_NAME} during ${label} did not report ${want}"
+		fi
+	done
+}
+
+assert_pooled_balloon() {
+	local label="$1"
+	local deadline=$(( $(date -u +%s) + GUEST_SSH_READY_TIMEOUT ))
+	local socket_path="${INSTANCE_DIR}/firecracker.sock"
+	local amount_mib
+	local target_mib
+	local actual_mib
+	while :; do
+		if run_capture "${label}-balloon" curl --silent --show-error --fail --unix-socket "${socket_path}" http://localhost/balloon; then
+			if run_capture "${label}-balloon-stats" curl --silent --show-error --fail --unix-socket "${socket_path}" http://localhost/balloon/statistics; then
+				break
+			fi
+		fi
+		if [[ "$(date -u +%s)" -ge "${deadline}" ]]; then
+			fail "balloon API never became available for ${INSTANCE_NAME} during ${label}"
+		fi
+		sleep "${POLL_INTERVAL_SECONDS}"
+	done
+	for want in '"deflate_on_oom":true' '"stats_polling_interval_s":5' '"free_page_reporting":true'; do
+		if ! tr -d '[:space:]' <"${ARTIFACT_DIR}/${label}-balloon.stdout" | grep -q "${want}"; then
+			fail "balloon config for ${INSTANCE_NAME} during ${label} did not report ${want}"
+		fi
+	done
+	amount_mib="$(json_number_for_key "${ARTIFACT_DIR}/${label}-balloon.stdout" amount_mib || true)"
+	target_mib="$(json_number_for_key "${ARTIFACT_DIR}/${label}-balloon-stats.stdout" target_mib || true)"
+	actual_mib="$(json_number_for_key "${ARTIFACT_DIR}/${label}-balloon-stats.stdout" actual_mib || true)"
+	if [[ -z "${amount_mib}" ]]; then
+		fail "balloon config for ${INSTANCE_NAME} during ${label} did not report a numeric amount_mib"
+	fi
+	if [[ -z "${target_mib}" ]]; then
+		fail "balloon statistics for ${INSTANCE_NAME} during ${label} did not report a numeric target_mib"
+	fi
+	if [[ -z "${actual_mib}" ]]; then
+		fail "balloon statistics for ${INSTANCE_NAME} during ${label} did not report a numeric actual_mib"
+	fi
+}
+
+assert_pooled_balloon_reclaims_cache() {
+	local label="$1"
+	local cache_probe_path="/var/tmp/srv-balloon-cache-probe"
+	local socket_path="${INSTANCE_DIR}/firecracker.sock"
+	local latest_label="${label}-latest"
+	local deadline=$(( $(date -u +%s) + GUEST_SSH_READY_TIMEOUT ))
+	local target_mib
+
+	if ! guest_ssh_capture "${label}-seed-cache" "dd if=/dev/zero of='${cache_probe_path}' bs=1M count=256 conv=fsync >/dev/null 2>&1 && sync"; then
+		fail "failed to seed guest page cache for balloon reclaim during ${label}"
+	fi
+	while :; do
+		if run_capture "${latest_label}" curl --silent --show-error --fail --unix-socket "${socket_path}" http://localhost/balloon/statistics; then
+			target_mib="$(json_number_for_key "${ARTIFACT_DIR}/${latest_label}.stdout" target_mib || true)"
+			if [[ -n "${target_mib}" && "${target_mib}" -gt 0 ]]; then
+				copy_capture_result "${latest_label}" "${label}"
+				guest_ssh_capture "${label}-cleanup-cache" "rm -f '${cache_probe_path}' && sync" || true
+				return 0
+			fi
+		fi
+		if [[ "$(date -u +%s)" -ge "${deadline}" ]]; then
+			guest_ssh_capture "${label}-cleanup-cache-timeout" "rm -f '${cache_probe_path}' && sync" || true
+			fail "balloon reclaim loop never raised target_mib above 0 for ${INSTANCE_NAME} during ${label}"
+		fi
+		sleep "${POLL_INTERVAL_SECONDS}"
+	done
 }
 
 capture_diagnostics() {
@@ -394,6 +600,10 @@ capture_diagnostics() {
 	capture_best_effort journalctl-services journalctl --no-pager --since "${RUN_STARTED_AT}" -u srv -u srv-net-helper -u srv-vm-runner
 	capture_best_effort tailscale-status tailscale status
 	capture_best_effort_ssh srv-list list
+	if (( POOL_ATTEMPTED )); then
+		capture_best_effort_ssh pool-inspect-final pool inspect "${POOL_NAME}"
+		capture_best_effort_ssh pool-list-final pool list
+	fi
 	if (( INSTANCE_ATTEMPTED )); then
 		capture_best_effort_ssh inspect-final inspect "${INSTANCE_NAME}"
 		capture_best_effort_ssh logs-serial logs "${INSTANCE_NAME}" serial
@@ -414,11 +624,24 @@ cleanup_instance() {
 	capture_best_effort_ssh cleanup-delete delete "${INSTANCE_NAME}"
 }
 
+cleanup_pool() {
+	if (( POOL_CLEANUP_COMPLETE )) || (( ! POOL_ATTEMPTED )); then
+		return 0
+	fi
+	if [[ "${KEEP_FAILED}" == "1" ]]; then
+		log "KEEP_FAILED=1; leaving pool ${POOL_NAME} intact"
+		return 0
+	fi
+	log "cleaning up pool ${POOL_NAME}"
+	capture_best_effort_ssh cleanup-pool-delete pool delete "${POOL_NAME}"
+}
+
 on_exit() {
 	local rc="$1"
 	if [[ "${rc}" -ne 0 ]]; then
 		capture_diagnostics
 		cleanup_instance
+		cleanup_pool
 		log "smoke test failed; artifacts: ${ARTIFACT_DIR}"
 		return
 	fi
@@ -432,6 +655,9 @@ load_env
 VM_VCPUS="${SRV_VM_VCPUS:-1}"
 VM_MEMORY_MIB="${SRV_VM_MEMORY_MIB:-1024}"
 VM_PIDS_MAX="${SRV_VM_PIDS_MAX:-512}"
+POOL_SIZE_MIB="${POOL_SIZE_MIB:-2048}"
+POOLED_VM_MEMORY_MIB="${POOLED_VM_MEMORY_MIB:-1024}"
+POOLED_VM_RESIZE_MIB="${POOLED_VM_RESIZE_MIB:-1536}"
 
 CONTROL_HOST="${SMOKE_SSH_HOST:-${SRV_HOSTNAME:-srv}}"
 SRV_DATA_DIR="${SRV_DATA_DIR:-/var/lib/srv}"
@@ -440,12 +666,36 @@ BASE_ROOTFS_PATH="${SRV_BASE_ROOTFS:-}"
 FIRECRACKER_BIN_PATH="${SRV_FIRECRACKER_BIN:-/usr/local/bin/firecracker}"
 JAILER_BASE_DIR="${SRV_JAILER_BASE_DIR:-${SRV_DATA_DIR}/jailer}"
 JAILER_EXEC_NAME="$(basename "${FIRECRACKER_BIN_PATH}")"
-INSTANCE_NAME="${INSTANCE_NAME:-smoke-$(date -u +%Y%m%d%H%M%S)-$$}"
+BASE_INSTANCE_NAME="${INSTANCE_NAME:-smoke-$(date -u +%Y%m%d%H%M%S)-$$}"
+POOL_NAME="${POOL_NAME:-${BASE_INSTANCE_NAME}-pool}"
+POOLED_INSTANCE_NAME="${POOLED_INSTANCE_NAME:-${BASE_INSTANCE_NAME}-pooled}"
+POOL_SIZE_BYTES=$(( POOL_SIZE_MIB * 1024 * 1024 ))
+POOL_SIZE_ARG="${POOL_SIZE_MIB}MiB"
+POOLED_VM_MEMORY_ARG="${POOLED_VM_MEMORY_MIB}MiB"
+POOLED_VM_RESIZE_ARG="${POOLED_VM_RESIZE_MIB}MiB"
+POOLED_VM_OVERSIZE_MIB="${POOLED_VM_OVERSIZE_MIB:-$(( POOL_SIZE_MIB + 512 ))}"
+POOLED_VM_OVERSIZE_ARG="${POOLED_VM_OVERSIZE_MIB}MiB"
+INSTANCE_NAME="${BASE_INSTANCE_NAME}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${ARTIFACT_ROOT}/${INSTANCE_NAME}}"
-INSTANCE_DIR="${SRV_DATA_DIR}/instances/${INSTANCE_NAME}"
-JAILER_WORKSPACE_DIR="${JAILER_BASE_DIR}/${JAILER_EXEC_NAME}/${INSTANCE_NAME}"
 READY_TIMEOUT_SECONDS="$(derive_ready_timeout_seconds)"
 READY_TIMEOUT_SECONDS=$(( READY_TIMEOUT_SECONDS + READY_TIMEOUT_BUFFER_SECONDS ))
+
+if (( POOL_SIZE_MIB <= 0 || POOLED_VM_MEMORY_MIB <= 0 || POOLED_VM_RESIZE_MIB <= 0 || POOLED_VM_OVERSIZE_MIB <= 0 )); then
+	fail "pool and pooled VM memory sizes must be positive"
+fi
+
+if (( POOLED_VM_MEMORY_MIB > POOL_SIZE_MIB )); then
+	fail "POOLED_VM_MEMORY_MIB must not exceed POOL_SIZE_MIB"
+fi
+
+if (( POOLED_VM_RESIZE_MIB > POOL_SIZE_MIB )); then
+	fail "POOLED_VM_RESIZE_MIB must not exceed POOL_SIZE_MIB"
+fi
+
+set_active_instance "${BASE_INSTANCE_NAME}"
+CURRENT_MEMORY_MODE="fixed"
+CURRENT_POOL_NAME=""
+CURRENT_MEMORY_MIB="${VM_MEMORY_MIB}"
 
 mkdir -p "${ARTIFACT_DIR}"
 trap 'on_exit "$?"' EXIT
@@ -471,6 +721,11 @@ poll-interval-seconds: ${POLL_INTERVAL_SECONDS}
 guest-ssh-ready-timeout: ${GUEST_SSH_READY_TIMEOUT}
 keep-failed: ${KEEP_FAILED}
 jailer-workspace-dir: ${JAILER_WORKSPACE_DIR}
+pool-name: ${POOL_NAME}
+pooled-instance-name: ${POOLED_INSTANCE_NAME}
+pool-size-mib: ${POOL_SIZE_MIB}
+pooled-vm-memory-mib: ${POOLED_VM_MEMORY_MIB}
+pooled-vm-resize-mib: ${POOLED_VM_RESIZE_MIB}
 EOF
 
 if [[ ! -c /dev/kvm ]]; then
@@ -626,3 +881,126 @@ fi
 assert_host_cleanup delete
 
 CLEANUP_COMPLETE=1
+
+log "creating pooled memory pool ${POOL_NAME}"
+POOL_ATTEMPTED=1
+if ! srv_ssh_capture pool-create pool create "${POOL_NAME}" --size "${POOL_SIZE_ARG}"; then
+	fail "pool create ${POOL_NAME} failed"
+fi
+if ! grep -q "^pool-created: ${POOL_NAME}$" "${ARTIFACT_DIR}/pool-create.stdout"; then
+	fail "pool create ${POOL_NAME} did not report pool-created: ${POOL_NAME}"
+fi
+if ! grep -q '^reserved: ' "${ARTIFACT_DIR}/pool-create.stdout"; then
+	fail "pool create ${POOL_NAME} did not report reserved capacity"
+fi
+assert_pool_members pool-inspect-created 0
+
+log "checking pool reservation shows up in status before any pooled VM exists"
+if ! srv_ssh_capture status-after-pool-create status; then
+	fail "status after pool create failed"
+fi
+STATUS_AFTER_POOL_CREATE_MEMORY="$(box_value_for_label "${ARTIFACT_DIR}/status-after-pool-create.stdout" MEMORY)"
+STATUS_AFTER_POOL_CREATE_POOLS="$(box_value_for_label "${ARTIFACT_DIR}/status-after-pool-create.stdout" POOLS)"
+if [[ -z "${STATUS_AFTER_POOL_CREATE_MEMORY}" || -z "${STATUS_AFTER_POOL_CREATE_POOLS}" ]]; then
+	fail "status after pool create did not expose MEMORY and POOLS rows"
+fi
+if [[ "${STATUS_AFTER_POOL_CREATE_POOLS}" != *"across 1 pool"* ]]; then
+	fail "status after pool create did not report a single reserved pool"
+fi
+
+log "creating pooled instance ${POOLED_INSTANCE_NAME}"
+set_active_instance "${POOLED_INSTANCE_NAME}"
+INSTANCE_ATTEMPTED=1
+CLEANUP_COMPLETE=0
+CURRENT_MEMORY_MODE="pool"
+CURRENT_POOL_NAME="${POOL_NAME}"
+CURRENT_MEMORY_MIB="${POOLED_VM_MEMORY_MIB}"
+if ! srv_ssh_capture pooled-create new "${INSTANCE_NAME}" --pool "${POOL_NAME}" --ram "${POOLED_VM_MEMORY_ARG}"; then
+	fail "create pooled instance ${INSTANCE_NAME} failed"
+fi
+
+wait_for_ready inspect-pooled-create-ready
+
+log "pooled instance is ready as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
+verify_guest_ssh guest-ssh-pooled-ready
+assert_instance_listed list-pooled-ready ready
+assert_pooled_inspect inspect-pooled-ready
+assert_host_runtime pooled-create-ready
+assert_pooled_balloon pooled-create-ready
+assert_pooled_balloon_reclaims_cache pooled-create-reclaim
+assert_pool_members pool-inspect-with-member 1 "${INSTANCE_NAME}"
+assert_pool_delete_rejected pool-delete-non-empty
+
+log "checking pooled instance does not add a second host memory reservation"
+if ! srv_ssh_capture status-with-pooled-member status; then
+	fail "status with pooled member failed"
+fi
+if [[ "$(box_value_for_label "${ARTIFACT_DIR}/status-with-pooled-member.stdout" MEMORY)" != "${STATUS_AFTER_POOL_CREATE_MEMORY}" ]]; then
+	fail "status memory line changed after creating pooled member; pooled VMs should not add host reservation again"
+fi
+if [[ "$(box_value_for_label "${ARTIFACT_DIR}/status-with-pooled-member.stdout" POOLS)" != "${STATUS_AFTER_POOL_CREATE_POOLS}" ]]; then
+	fail "status pools line changed after creating pooled member; pooled VMs should not change pool reservation accounting"
+fi
+
+log "stopping pooled instance ${INSTANCE_NAME} for resize checks"
+if ! srv_ssh_capture pooled-stop stop "${INSTANCE_NAME}"; then
+	fail "stop pooled instance ${INSTANCE_NAME} failed"
+fi
+if ! grep -q '^state: stopped$' "${ARTIFACT_DIR}/pooled-stop.stdout"; then
+	fail "stop pooled instance ${INSTANCE_NAME} did not report state: stopped"
+fi
+assert_stopped_state inspect-pooled-stopped
+assert_host_cleanup pooled-stop
+
+log "resizing pooled instance ${INSTANCE_NAME} within pool reservation"
+if ! srv_ssh_capture pooled-resize-ok resize "${INSTANCE_NAME}" --ram "${POOLED_VM_RESIZE_ARG}"; then
+	fail "resize pooled instance ${INSTANCE_NAME} within pool reservation failed"
+fi
+if ! grep -q "^memory: ${POOLED_VM_RESIZE_MIB} MiB$" "${ARTIFACT_DIR}/pooled-resize-ok.stdout"; then
+	fail "resize pooled instance ${INSTANCE_NAME} did not report memory ${POOLED_VM_RESIZE_MIB} MiB"
+fi
+CURRENT_MEMORY_MIB="${POOLED_VM_RESIZE_MIB}"
+assert_pooled_inspect inspect-pooled-resized-stopped
+
+log "verifying pooled resize beyond pool reservation is rejected"
+if srv_ssh_capture pooled-resize-too-large resize "${INSTANCE_NAME}" --ram "${POOLED_VM_OVERSIZE_ARG}"; then
+	fail "resize pooled instance ${INSTANCE_NAME} beyond pool reservation unexpectedly succeeded"
+fi
+if ! grep -q "exceeds memory pool" "${ARTIFACT_DIR}/pooled-resize-too-large.stderr"; then
+	fail "oversized pooled resize did not explain that it exceeds the pool reservation"
+fi
+assert_pooled_inspect inspect-pooled-resize-rejected
+
+log "starting pooled instance ${INSTANCE_NAME} after resize"
+if ! srv_ssh_capture pooled-start start "${INSTANCE_NAME}"; then
+	fail "start pooled instance ${INSTANCE_NAME} after resize failed"
+fi
+
+wait_for_ready inspect-pooled-resize-ready
+
+log "pooled instance is ready after resize as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
+verify_guest_ssh guest-ssh-pooled-resize-ready
+assert_pooled_inspect inspect-pooled-resize-ready
+assert_host_runtime pooled-resize-ready
+assert_pooled_balloon pooled-resize-ready
+
+log "deleting pooled instance ${INSTANCE_NAME}"
+if ! srv_ssh_capture pooled-delete delete "${INSTANCE_NAME}"; then
+	fail "delete pooled instance ${INSTANCE_NAME} failed"
+fi
+if ! grep -q '^state: deleted$' "${ARTIFACT_DIR}/pooled-delete.stdout"; then
+	fail "delete pooled instance ${INSTANCE_NAME} did not report state: deleted"
+fi
+assert_host_cleanup pooled-delete
+assert_pool_members pool-inspect-empty 0
+CLEANUP_COMPLETE=1
+
+log "deleting pool ${POOL_NAME}"
+if ! srv_ssh_capture pool-delete pool delete "${POOL_NAME}"; then
+	fail "pool delete ${POOL_NAME} failed"
+fi
+if ! grep -q "^pool-deleted: ${POOL_NAME}$" "${ARTIFACT_DIR}/pool-delete.stdout"; then
+	fail "pool delete ${POOL_NAME} did not report pool-deleted: ${POOL_NAME}"
+fi
+POOL_CLEANUP_COMPLETE=1
+assert_pool_cleanup pool-delete

@@ -980,7 +980,7 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
 	for _, want := range []string{
 		"ssh srv [--json] <command>",
-		"new <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]",
+		"new <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]",
 		"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]",
 		"backup create <name>",
 		"backup list <name>",
@@ -999,6 +999,7 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 		"NEW AND RESIZE OPTIONS",
 		"--cpus N",
 		"--ram SIZE",
+		"--pool NAME",
 		"--rootfs-size SIZE",
 	} {
 		if !strings.Contains(result.stdout, want) {
@@ -1359,7 +1360,7 @@ func TestRenderTopScreenFormatsLiveMetrics(t *testing.T) {
 		"2h13m",
 		"\x1b[38;2;0;121;76mrunning\x1b[0m",
 		"\x1b[38;2;0;121;76m13.3%\x1b[0m",
-		topMuted("MEM = live/configured RAM. DISK = host allocated/configured rootfs.\n"),
+		topMuted("MEM = live/configured RAM; pooled rows also show the pool name. DISK = host allocated/configured rootfs.\n"),
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("renderTopScreen() missing %q\nfull output:\n%s", want, out)
@@ -2377,6 +2378,7 @@ func serviceTestInstance(name, state string, createdAt time.Time) model.Instance
 		CreatedByNode:   "laptop",
 		VCPUCount:       2,
 		MemoryMiB:       2048,
+		MemoryMode:      model.MemoryModeFixed,
 		RootFSSizeBytes: 4 << 30,
 		RootFSPath:      filepath.Join(baseDir, "rootfs.img"),
 		KernelPath:      filepath.Join(baseDir, "vmlinux"),

@@ -87,6 +87,7 @@ type vmRunner interface {
 	StartInstanceVM(ctx context.Context, req vmrunner.StartRequest) (vmrunner.StartResponse, error)
 	StopInstanceVM(ctx context.Context, req vmrunner.StopRequest) error
 	ReadInstanceMetrics(ctx context.Context, req vmrunner.MetricsRequest) (vmrunner.MetricsResponse, error)
+	DeleteMemoryPool(ctx context.Context, req vmrunner.MemoryPoolRequest) error
 }
 
 type guestBootstrap = vmrunner.Bootstrap
@@ -100,6 +101,7 @@ type tailnetDeviceSnapshot struct {
 type CreateOptions struct {
 	VCPUCount       int64
 	MemoryMiB       int64
+	MemoryPoolName  string
 	RootFSSizeBytes int64
 }
 
@@ -134,6 +136,78 @@ func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner,
 	return p, nil
 }
 
+func (p *Provisioner) CreateMemoryPool(ctx context.Context, name string, actor model.Actor, sizeBytes int64) (model.MemoryPool, error) {
+	if !validName.MatchString(name) {
+		return model.MemoryPool{}, fmt.Errorf("invalid memory pool name %q", name)
+	}
+	if sizeBytes <= 0 {
+		return model.MemoryPool{}, errors.New("memory pool size must be positive")
+	}
+
+	var pool model.MemoryPool
+	err := func() error {
+		p.admissionMu.Lock()
+		defer p.admissionMu.Unlock()
+
+		if err := p.ensureHostMemoryReservationCapacity(ctx, "", sizeBytes); err != nil {
+			return err
+		}
+
+		now := time.Now().UTC()
+		pool = model.MemoryPool{
+			ID:            uuid.NewString(),
+			Name:          name,
+			ReservedBytes: sizeBytes,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+			CreatedByUser: actor.UserLogin,
+			CreatedByNode: actor.NodeName,
+		}
+		return p.store.CreateMemoryPool(ctx, pool)
+	}()
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	return pool, nil
+}
+
+func (p *Provisioner) DeleteMemoryPool(ctx context.Context, name string) (model.MemoryPool, error) {
+	var pool model.MemoryPool
+	err := func() error {
+		p.admissionMu.Lock()
+		defer p.admissionMu.Unlock()
+
+		current, found, err := p.store.FindMemoryPoolByName(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("memory pool %q does not exist", name)
+		}
+		members, err := p.store.CountMemoryPoolMembers(ctx, current.ID)
+		if err != nil {
+			return err
+		}
+		if members > 0 {
+			return fmt.Errorf("memory pool %q still has %d member VM%s", name, members, pluralSuffix(members))
+		}
+		if p.vmRunner != nil {
+			if err := p.vmRunner.DeleteMemoryPool(ctx, vmrunner.MemoryPoolRequest{Name: current.Name}); err != nil {
+				return err
+			}
+		}
+		if err := p.store.DeleteMemoryPool(ctx, current.ID); err != nil {
+			return err
+		}
+		pool = current
+		return nil
+	}()
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	return pool, nil
+}
+
 func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor, opts CreateOptions) (inst model.Instance, err error) {
 	if !validName.MatchString(name) {
 		return model.Instance{}, fmt.Errorf("invalid instance name %q", name)
@@ -149,12 +223,24 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if err := p.ensureCreatePrereqs(ctx, needsResize); err != nil {
 		return model.Instance{}, err
 	}
+	var pool model.MemoryPool
 	err = func() error {
 		p.admissionMu.Lock()
 		defer p.admissionMu.Unlock()
 
-		if err := p.ensureHostMemoryCapacity(ctx, "", resolved.MemoryMiB); err != nil {
-			return err
+		if resolved.MemoryPoolName != "" {
+			resolvedPool, err := p.requireMemoryPoolByName(ctx, resolved.MemoryPoolName)
+			if err != nil {
+				return err
+			}
+			if err := ensureMemoryPoolSupportsGuestMemory(resolvedPool, resolved.MemoryMiB); err != nil {
+				return err
+			}
+			pool = resolvedPool
+		} else {
+			if err := p.ensureHostMemoryCapacity(ctx, "", resolved.MemoryMiB); err != nil {
+				return err
+			}
 		}
 		if err := p.ensureHostDiskCapacity(ctx, "", resolved.RootFSSizeBytes); err != nil {
 			return err
@@ -182,6 +268,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 			CreatedByNode:   actor.NodeName,
 			VCPUCount:       resolved.VCPUCount,
 			MemoryMiB:       resolved.MemoryMiB,
+			MemoryMode:      model.MemoryModeFixed,
 			RootFSSizeBytes: resolved.RootFSSizeBytes,
 			RootFSPath:      filepath.Join(instanceDir, "rootfs.img"),
 			KernelPath:      p.cfg.BaseKernelPath,
@@ -195,6 +282,10 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 			HostAddr:        hostAddr,
 			GuestAddr:       guestAddr,
 			GatewayAddr:     gateway,
+		}
+		if pool.ID != "" {
+			inst.MemoryMode = model.MemoryModePool
+			inst.MemoryPoolID = pool.ID
 		}
 
 		if err := p.store.CreateInstance(ctx, inst); err != nil {
@@ -214,7 +305,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	defer func() {
 		if cleanup {
 			if startedMachine {
-				_ = p.stopFirecracker(inst.Name, inst.FirecrackerPID)
+				_ = p.stopFirecracker(context.Background(), inst)
 			}
 			_ = p.cleanupNetworking(inst)
 			_ = p.removeInstanceDir(inst.Name)
@@ -276,7 +367,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	}
 	p.recordEvent(inst.ID, "bootstrap", "guest bootstrap metadata written", nil)
 
-	pid, err := p.startFirecracker(ctx, inst, bootstrap)
+	pid, err := p.startFirecracker(ctx, inst, pool, bootstrap)
 	if err != nil {
 		inst.LastError = err.Error()
 		return inst, err
@@ -338,7 +429,7 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 	}
 	p.recordEvent(inst.ID, "delete", "delete requested", nil)
 
-	if err := p.stopFirecracker(inst.Name, inst.FirecrackerPID); err != nil {
+	if err := p.stopFirecracker(ctx, inst); err != nil {
 		p.log.Warn("stop firecracker", "name", inst.Name, "pid", inst.FirecrackerPID, "err", err)
 	}
 	if err := p.cleanupNetworking(inst); err != nil {
@@ -399,7 +490,7 @@ func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) 
 	if inst.FirecrackerPID != 0 {
 		inst.FirecrackerPID = 0
 		inst.UpdatedAt = time.Now().UTC()
-		if err := p.stopFirecracker(inst.Name, 0); err != nil {
+		if err := p.stopFirecracker(ctx, inst); err != nil {
 			p.log.Warn("cleanup stale firecracker state", "name", inst.Name, "err", err)
 		}
 		if err := p.store.UpdateInstance(ctx, inst); err != nil {
@@ -434,7 +525,7 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 	}
 
 	p.recordEvent(inst.ID, "stop", "stop requested", nil)
-	if err := p.stopFirecracker(inst.Name, inst.FirecrackerPID); err != nil {
+	if err := p.stopFirecracker(ctx, inst); err != nil {
 		return inst, err
 	}
 	if err := p.cleanupNetworking(inst); err != nil {
@@ -481,6 +572,15 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 			resized.VCPUCount = opts.VCPUCount
 		}
 		if opts.MemoryMiB > 0 {
+			if current.UsesMemoryPool() {
+				pool, err := p.requireMemoryPoolForInstance(ctx, current)
+				if err != nil {
+					return err
+				}
+				if err := ensureMemoryPoolSupportsGuestMemory(pool, opts.MemoryMiB); err != nil {
+					return err
+				}
+			}
 			resized.MemoryMiB = opts.MemoryMiB
 		}
 		if err := validateMachineShape(p.effectiveVCPUCount(resized), p.effectiveMemoryMiB(resized)); err != nil {
@@ -550,6 +650,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		return inst, fmt.Errorf("instance %q is already running", name)
 	}
 
+	var pool model.MemoryPool
 	err = func() error {
 		p.admissionMu.Lock()
 		defer p.admissionMu.Unlock()
@@ -569,8 +670,19 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		if current.FirecrackerPID > 0 && processExists(current.FirecrackerPID) {
 			return fmt.Errorf("instance %q is already running", name)
 		}
-		if err := p.ensureHostMemoryCapacity(ctx, current.Name, p.effectiveMemoryMiB(current)); err != nil {
-			return err
+		if current.UsesMemoryPool() {
+			resolvedPool, err := p.requireMemoryPoolForInstance(ctx, current)
+			if err != nil {
+				return err
+			}
+			if err := ensureMemoryPoolSupportsGuestMemory(resolvedPool, p.effectiveMemoryMiB(current)); err != nil {
+				return err
+			}
+			pool = resolvedPool
+		} else {
+			if err := p.ensureHostMemoryCapacity(ctx, current.Name, p.effectiveMemoryMiB(current)); err != nil {
+				return err
+			}
 		}
 
 		current.State = model.StateProvisioning
@@ -591,7 +703,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 	defer func() {
 		if cleanup {
 			if startedMachine {
-				_ = p.stopFirecracker(inst.Name, inst.FirecrackerPID)
+				_ = p.stopFirecracker(context.Background(), inst)
 			}
 			_ = p.cleanupNetworking(inst)
 			inst.State = model.StateStopped
@@ -630,7 +742,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		TailscaleTags:       p.cfg.GuestAuthTags,
 		ZenGatewayPort:      zenGatewayPort,
 	}
-	pid, err := p.startFirecracker(ctx, inst, bootstrap)
+	pid, err := p.startFirecracker(ctx, inst, pool, bootstrap)
 	if err != nil {
 		inst.LastError = err.Error()
 		return inst, err
@@ -864,18 +976,33 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 	if err != nil {
 		return host.CapacitySummary{}, fmt.Errorf("list instances: %w", err)
 	}
+	pools, err := p.store.ListMemoryPools(ctx)
+	if err != nil {
+		return host.CapacitySummary{}, fmt.Errorf("list memory pools: %w", err)
+	}
 
 	stateCounts := make(map[string]int)
 	var runningCount int
 	var allocatedVCPUs int64
-	var allocatedMemoryBytes int64
+	var fixedReservedBytes int64
 	for _, inst := range instances {
 		stateCounts[inst.State]++
-		if instanceReservesHostMemory(inst) {
+		if instanceHasActiveRuntime(inst) {
 			runningCount++
 			allocatedVCPUs += p.effectiveVCPUCount(inst)
-			allocatedMemoryBytes += p.effectiveMemoryMiB(inst) * format.MiB
 		}
+		if instanceReservesFixedHostMemory(inst) {
+			fixedReservedBytes += p.effectiveMemoryMiB(inst) * format.MiB
+		}
+	}
+	var poolReservedBytes int64
+	for _, pool := range pools {
+		poolReservedBytes += pool.ReservedBytes
+	}
+	allocatedMemoryBytes := fixedReservedBytes + poolReservedBytes
+	memoryDetails := []host.CapacityDetail{
+		{Label: "fixed", Value: format.BinarySize(fixedReservedBytes)},
+		{Label: "pools", Value: fmt.Sprintf("%s across %d pool%s", format.BinarySize(poolReservedBytes), len(pools), pluralSuffix(len(pools)))},
 	}
 
 	readHostMemoryBytes := p.readHostMemoryBytes
@@ -939,14 +1066,18 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 				Note:      "advisory only; overcommit allowed",
 			},
 			{
-				Resource:  "memory",
-				Unit:      "bytes",
-				Allocated: allocatedMemoryBytes,
-				Budget:    memoryBudgetBytes,
-				Left:      memoryBudgetBytes - allocatedMemoryBytes,
-				Total:     totalMemoryBytes,
-				Reserve:   memoryReserveBytes,
-				Note:      fmt.Sprintf("%s total - %s host reserve", format.BinarySize(totalMemoryBytes), format.BinarySize(memoryReserveBytes)),
+				Resource:      "memory",
+				Unit:          "bytes",
+				Allocated:     allocatedMemoryBytes,
+				Budget:        memoryBudgetBytes,
+				Left:          memoryBudgetBytes - allocatedMemoryBytes,
+				Total:         totalMemoryBytes,
+				Reserve:       memoryReserveBytes,
+				FixedReserved: fixedReservedBytes,
+				PoolReserved:  poolReservedBytes,
+				PoolCount:     len(pools),
+				Note:          fmt.Sprintf("%s total - %s host reserve", format.BinarySize(totalMemoryBytes), format.BinarySize(memoryReserveBytes)),
+				Details:       memoryDetails,
 			},
 			{
 				Resource:  "disk",
@@ -964,6 +1095,10 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 }
 
 func (p *Provisioner) ensureHostMemoryCapacity(ctx context.Context, excludeName string, requestedMemoryMiB int64) error {
+	return p.ensureHostMemoryReservationCapacity(ctx, excludeName, requestedMemoryMiB*format.MiB)
+}
+
+func (p *Provisioner) ensureHostMemoryReservationCapacity(ctx context.Context, excludeName string, requestedBytes int64) error {
 	readHostMemoryBytes := p.readHostMemoryBytes
 	if readHostMemoryBytes == nil {
 		readHostMemoryBytes = host.DefaultReadHostMemoryBytes
@@ -972,20 +1107,14 @@ func (p *Provisioner) ensureHostMemoryCapacity(ctx context.Context, excludeName 
 	if err != nil {
 		return fmt.Errorf("read host memory status: %w", err)
 	}
-	reservedBytes, err := p.sumReservedCapacity(ctx, excludeName, "memory", false, func(inst model.Instance) int64 {
-		if !instanceReservesHostMemory(inst) {
-			return 0
-		}
-		return p.effectiveMemoryMiB(inst) * format.MiB
-	})
+	reservedBytes, err := p.totalReservedHostMemoryBytes(ctx, excludeName)
 	if err != nil {
 		return err
 	}
-	requestedBytes := requestedMemoryMiB * format.MiB
 	budgetBytes := max(totalBytes-hostMemoryReserveMiB*format.MiB, int64(0))
 	if reservedBytes+requestedBytes > budgetBytes {
 		return fmt.Errorf(
-			"insufficient host memory reservation budget: reserving %s across running VMs would exceed %s (%s total minus %s reserve)",
+			"insufficient host memory reservation budget: reserving %s across fixed VMs and memory pools would exceed %s (%s total minus %s reserve)",
 			format.BinarySize(reservedBytes+requestedBytes),
 			format.BinarySize(budgetBytes),
 			format.BinarySize(totalBytes),
@@ -1039,11 +1168,36 @@ func (p *Provisioner) sumReservedCapacity(ctx context.Context, excludeName, labe
 	return total, nil
 }
 
-func instanceReservesHostMemory(inst model.Instance) bool {
+func (p *Provisioner) totalReservedHostMemoryBytes(ctx context.Context, excludeName string) (int64, error) {
+	fixedReservedBytes, err := p.sumReservedCapacity(ctx, excludeName, "memory", false, func(inst model.Instance) int64 {
+		if !instanceReservesFixedHostMemory(inst) {
+			return 0
+		}
+		return p.effectiveMemoryMiB(inst) * format.MiB
+	})
+	if err != nil {
+		return 0, err
+	}
+	pools, err := p.store.ListMemoryPools(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list memory pools for memory capacity: %w", err)
+	}
+	var poolReservedBytes int64
+	for _, pool := range pools {
+		poolReservedBytes += pool.ReservedBytes
+	}
+	return fixedReservedBytes + poolReservedBytes, nil
+}
+
+func instanceHasActiveRuntime(inst model.Instance) bool {
 	if inst.FirecrackerPID > 0 {
 		return processExists(inst.FirecrackerPID)
 	}
 	return inst.State == model.StateProvisioning
+}
+
+func instanceReservesFixedHostMemory(inst model.Instance) bool {
+	return inst.NormalizedMemoryMode() == model.MemoryModeFixed && instanceHasActiveRuntime(inst)
 }
 
 func reservedInstanceRootFSBytes(inst model.Instance) int64 {
@@ -1083,9 +1237,13 @@ func allocatedFileBytes(path string) int64 {
 }
 
 func (p *Provisioner) resolveCreateOptions(opts CreateOptions, baseRootFSSize int64) (CreateOptions, bool, error) {
+	if strings.TrimSpace(opts.MemoryPoolName) != "" && opts.MemoryMiB <= 0 {
+		return CreateOptions{}, false, errors.New("pooled instances require an explicit guest-visible --ram")
+	}
 	resolved := CreateOptions{
 		VCPUCount:       p.effectiveVCPUCount(model.Instance{VCPUCount: opts.VCPUCount}),
 		MemoryMiB:       p.effectiveMemoryMiB(model.Instance{MemoryMiB: opts.MemoryMiB}),
+		MemoryPoolName:  strings.TrimSpace(opts.MemoryPoolName),
 		RootFSSizeBytes: opts.RootFSSizeBytes,
 	}
 	if resolved.RootFSSizeBytes == 0 {
@@ -1250,21 +1408,24 @@ func (p *Provisioner) writeMetadataFile(inst model.Instance, bootstrap guestBoot
 	return nil
 }
 
-func (p *Provisioner) startFirecracker(ctx context.Context, inst model.Instance, bootstrap guestBootstrap) (int, error) {
+func (p *Provisioner) startFirecracker(ctx context.Context, inst model.Instance, pool model.MemoryPool, bootstrap guestBootstrap) (int, error) {
 	if p.vmRunner == nil {
 		return 0, errors.New("vm runner client is unavailable")
 	}
 	resp, err := p.vmRunner.StartInstanceVM(ctx, vmrunner.StartRequest{
-		Name:        inst.Name,
-		TapDevice:   inst.TapDevice,
-		GuestMAC:    inst.GuestMAC,
-		GuestAddr:   inst.GuestAddr,
-		GatewayAddr: inst.GatewayAddr,
-		Nameservers: p.cfg.VMDNSServers,
-		VCPUCount:   p.effectiveVCPUCount(inst),
-		MemoryMiB:   p.effectiveMemoryMiB(inst),
-		KernelArgs:  kernelArgs(p.cfg.ExtraKernelArgs),
-		Bootstrap:   bootstrap,
+		Name:                inst.Name,
+		TapDevice:           inst.TapDevice,
+		GuestMAC:            inst.GuestMAC,
+		GuestAddr:           inst.GuestAddr,
+		GatewayAddr:         inst.GatewayAddr,
+		Nameservers:         p.cfg.VMDNSServers,
+		VCPUCount:           p.effectiveVCPUCount(inst),
+		MemoryMiB:           p.effectiveMemoryMiB(inst),
+		MemoryMode:          inst.NormalizedMemoryMode(),
+		MemoryPoolName:      pool.Name,
+		MemoryPoolSizeBytes: pool.ReservedBytes,
+		KernelArgs:          kernelArgs(p.cfg.ExtraKernelArgs),
+		Bootstrap:           bootstrap,
 	})
 	if err != nil {
 		return 0, err
@@ -1303,6 +1464,59 @@ func (p *Provisioner) effectiveMemoryMiB(inst model.Instance) int64 {
 		return inst.MemoryMiB
 	}
 	return p.cfg.MemoryMiB
+}
+
+func (p *Provisioner) requireMemoryPoolByName(ctx context.Context, name string) (model.MemoryPool, error) {
+	pool, found, err := p.store.FindMemoryPoolByName(ctx, name)
+	if err != nil {
+		return model.MemoryPool{}, fmt.Errorf("load memory pool %q: %w", name, err)
+	}
+	if !found {
+		return model.MemoryPool{}, fmt.Errorf("memory pool %q does not exist", name)
+	}
+	return pool, nil
+}
+
+func (p *Provisioner) memoryPoolForInstance(ctx context.Context, inst model.Instance) (model.MemoryPool, bool, error) {
+	if !inst.UsesMemoryPool() {
+		return model.MemoryPool{}, false, nil
+	}
+	pool, err := p.store.GetMemoryPoolByID(ctx, inst.MemoryPoolID)
+	if err != nil {
+		return model.MemoryPool{}, false, fmt.Errorf("load memory pool for instance %q: %w", inst.Name, err)
+	}
+	return pool, true, nil
+}
+
+func (p *Provisioner) requireMemoryPoolForInstance(ctx context.Context, inst model.Instance) (model.MemoryPool, error) {
+	pool, ok, err := p.memoryPoolForInstance(ctx, inst)
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	if !ok {
+		return model.MemoryPool{}, fmt.Errorf("instance %q does not use a memory pool", inst.Name)
+	}
+	return pool, nil
+}
+
+func ensureMemoryPoolSupportsGuestMemory(pool model.MemoryPool, guestMemoryMiB int64) error {
+	guestBytes := guestMemoryMiB * format.MiB
+	if guestBytes > pool.ReservedBytes {
+		return fmt.Errorf(
+			"guest-visible memory %s exceeds memory pool %q reservation %s",
+			format.BinarySize(guestBytes),
+			pool.Name,
+			format.BinarySize(pool.ReservedBytes),
+		)
+	}
+	return nil
+}
+
+func pluralSuffix(count int) string {
+	if count == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func validateMachineShape(vcpus, memoryMiB int64) error {
@@ -1390,14 +1604,17 @@ func deviceLastSeen(device tailscale.Device) string {
 	return device.LastSeen.UTC().Format(time.RFC3339)
 }
 
-func (p *Provisioner) stopFirecracker(name string, pid int) error {
+func (p *Provisioner) stopFirecracker(_ context.Context, inst model.Instance) error {
 	if p.vmRunner == nil {
 		return errors.New("vm runner client is unavailable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	stopCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := p.vmRunner.StopInstanceVM(ctx, vmrunner.StopRequest{Name: name, PID: pid}); err != nil {
-		return fmt.Errorf("stop firecracker for %q: %w", name, err)
+	if err := p.vmRunner.StopInstanceVM(stopCtx, vmrunner.StopRequest{
+		Name: inst.Name,
+		PID:  inst.FirecrackerPID,
+	}); err != nil {
+		return fmt.Errorf("stop firecracker for %q: %w", inst.Name, err)
 	}
 	return nil
 }

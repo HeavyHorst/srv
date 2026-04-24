@@ -44,16 +44,19 @@ type CapacityInstances struct {
 }
 
 type CapacityResource struct {
-	Resource  string           `json:"resource"`
-	Unit      string           `json:"unit"`
-	Allocated int64            `json:"allocated"`
-	Budget    int64            `json:"budget"`
-	Left      int64            `json:"left"`
-	Total     int64            `json:"total,omitempty"`
-	Reserve   int64            `json:"reserve,omitempty"`
-	Advisory  bool             `json:"advisory,omitempty"`
-	Note      string           `json:"note,omitempty"`
-	Details   []CapacityDetail `json:"details,omitempty"`
+	Resource      string           `json:"resource"`
+	Unit          string           `json:"unit"`
+	Allocated     int64            `json:"allocated"`
+	Budget        int64            `json:"budget"`
+	Left          int64            `json:"left"`
+	Total         int64            `json:"total,omitempty"`
+	Reserve       int64            `json:"reserve,omitempty"`
+	FixedReserved int64            `json:"fixed_reserved,omitempty"`
+	PoolReserved  int64            `json:"pool_reserved,omitempty"`
+	PoolCount     int              `json:"pool_count,omitempty"`
+	Advisory      bool             `json:"advisory,omitempty"`
+	Note          string           `json:"note,omitempty"`
+	Details       []CapacityDetail `json:"details,omitempty"`
 }
 
 type CapacityDetail struct {

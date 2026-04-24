@@ -483,6 +483,7 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, []string, err
 		integrations   []string
 		seenCPUs       bool
 		seenRAM        bool
+		seenPool       bool
 		seenRootFSSize bool
 	)
 
@@ -526,6 +527,16 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, []string, err
 				return "", provision.CreateOptions{}, nil, fmt.Errorf("parse %s: %v\n%s", key, err, newUsage())
 			}
 			opts.MemoryMiB = bytesToMiBCeil(parsed)
+		case "--pool":
+			if seenPool {
+				return "", provision.CreateOptions{}, nil, fmt.Errorf("%s specified more than once\n%s", key, newUsage())
+			}
+			seenPool = true
+			poolName := strings.TrimSpace(value)
+			if !validIntegrationName.MatchString(poolName) {
+				return "", provision.CreateOptions{}, nil, fmt.Errorf("invalid memory pool name %q\n%s", poolName, newUsage())
+			}
+			opts.MemoryPoolName = poolName
 		case "--rootfs-size":
 			if seenRootFSSize {
 				return "", provision.CreateOptions{}, nil, fmt.Errorf("%s specified more than once\n%s", key, newUsage())
@@ -549,6 +560,9 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, []string, err
 
 	if name == "" {
 		return "", provision.CreateOptions{}, nil, errors.New(newUsage())
+	}
+	if opts.MemoryPoolName != "" && !seenRAM {
+		return "", provision.CreateOptions{}, nil, fmt.Errorf("new --pool requires --ram\n%s", newUsage())
 	}
 	return name, opts, integrations, nil
 }

@@ -1275,7 +1275,7 @@ func prepareJailedRuntimeHandler(hostPaths instanceRuntimePaths, jailerPaths jai
 	return firecracker.Handler{
 		Name: firecracker.CreateLogFilesHandlerName,
 		Fn: func(_ context.Context, m *firecracker.Machine) error {
-			if err := prepareInstanceLogFile(hostPaths.LogPath, jailerGID); err != nil {
+			if err := prepareFirecrackerLogFile(hostPaths.LogPath, jailerGID); err != nil {
 				return err
 			}
 			if err := linkFileIntoJail(hostPaths.LogPath, jailerPaths.LogPath); err != nil {
@@ -1290,7 +1290,7 @@ func prepareJailedRuntimeHandler(hostPaths instanceRuntimePaths, jailerPaths jai
 	}
 }
 
-func prepareInstanceLogFile(path string, gid int) error {
+func prepareFirecrackerLogFile(path string, gid int) error {
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			if err := os.Remove(path); err != nil {
@@ -1300,7 +1300,10 @@ func prepareInstanceLogFile(path string, gid int) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat log file %s: %w", path, err)
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o660)
+	// Firecracker rewrites its configured log path from the beginning on each
+	// boot. Truncate first so a shorter new run cannot leave stale old bytes past
+	// EOF for `srv logs` and `srv logs -f` to surface later.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o660)
 	if err != nil {
 		return fmt.Errorf("open log file %s: %w", path, err)
 	}

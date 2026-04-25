@@ -84,4 +84,4 @@ When a host run fails, the fastest useful surfaces are:
 - `ssh srv logs <name> firecracker` for Firecracker API and VMM failures
 - `journalctl -u srv-vm-runner --no-pager` for jailer and stop-time cleanup failures
 
-The serial and Firecracker log files are append-only. Always trust the newest lines first when comparing multiple attempts against the same instance name.
+The serial log is append-only across boots. The Firecracker log is reset when the VMM starts so it only contains the current Firecracker process's output.

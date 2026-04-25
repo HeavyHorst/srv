@@ -32,7 +32,7 @@ Without a log source argument, `ssh srv logs <name>` shows the serial log by def
 | Serial | `SRV_DATA_DIR/instances/<name>/serial.log` |
 | Firecracker | `SRV_DATA_DIR/instances/<name>/firecracker.log` |
 
-Both are append-only. Always check the newest lines first when debugging multiple attempts against the same instance name.
+The serial log is append-only across boots. The Firecracker log is reset when the VMM starts so it only contains the current Firecracker process's output.
 
 ## Systemd logs
 

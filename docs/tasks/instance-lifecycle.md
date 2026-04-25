@@ -57,7 +57,7 @@ ssh srv logs -f <name> serial
 ssh srv logs -f <name> firecracker
 ```
 
-Both log sources are append-only. Always check the newest lines first.
+The serial log is append-only across boots. The Firecracker log is reset when the VMM starts so it only contains the current Firecracker process's output.
 
 ## Stop
 

@@ -1397,6 +1397,32 @@ func TestResolveJailerRuntimePaths(t *testing.T) {
 	}
 }
 
+func TestPrepareFirecrackerLogFileTruncatesExistingLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "firecracker.log")
+	if err := os.WriteFile(path, []byte("new run\nstale tail\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(firecracker): %v", err)
+	}
+
+	if err := prepareFirecrackerLogFile(path, os.Getegid()); err != nil {
+		t.Fatalf("prepareFirecrackerLogFile(): %v", err)
+	}
+
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(firecracker): %v", err)
+	}
+	if len(payload) != 0 {
+		t.Fatalf("prepareFirecrackerLogFile() payload = %q, want empty", string(payload))
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(firecracker): %v", err)
+	}
+	if info.Mode().Perm() != 0o660 {
+		t.Fatalf("firecracker log mode = %v, want 0660", info.Mode().Perm())
+	}
+}
+
 func writeTestELF(path, interp string) error {
 	var (
 		phoff uint64

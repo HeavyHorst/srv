@@ -31,6 +31,10 @@ The harness validates the host-managed deployment end to end by:
 10. Proving the restore actually rolled the rootfs back by checking the pre-backup file contents return and post-backup-only files disappear.
 11. Capturing `inspect`, `logs`, `systemctl status`, `journalctl`, and `tailscale status` artifacts automatically on failure.
 12. Deleting the guest, then confirming the instance disappears from `list`, its runtime directory is removed from `SRV_DATA_DIR/instances/<name>`, and its TAP, jailer workspace, and cgroup artifacts are cleaned up.
+13. Creating a reserved memory pool and verifying the pool reservation appears in `status` before any pooled VM exists.
+14. Creating two VMs in the same pool, confirming both are listed as pool members, and confirming neither VM adds a second host memory reservation.
+15. Verifying pooled runtime cgroups share one pool parent, each pooled VM has a Firecracker balloon device, and the balloon reconcile loop raises a target after reclaimable guest page cache is seeded in both VMs.
+16. Deleting one pooled VM while the other remains, then resizing, restarting, deleting the remaining pooled VM, and deleting the now-empty pool.
 
 ## Run
 
@@ -49,6 +53,8 @@ Artifacts are written under `/var/tmp/srv-smoke/<instance>/` by default.
 - `KEEP_FAILED=1` to leave a failed instance intact for debugging
 - `READY_TIMEOUT_SECONDS=300` to override the derived guest-ready timeout
 - `GUEST_SSH_READY_TIMEOUT=45` to wait longer for guest SSH to become reachable after a ready transition
+- `POOL_SIZE_MIB=3072`, `POOLED_VM_MEMORY_MIB=1024`, and `POOLED_VM_RESIZE_MIB=2048` to tune the pooled-memory portion of the run
+- `POOLED_INSTANCE_NAME=smoke-pool-a` and `POOLED_PEER_INSTANCE_NAME=smoke-pool-b` to force predictable pooled VM names
 
 ## Failure Artifacts
 

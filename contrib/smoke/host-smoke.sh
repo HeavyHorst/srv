@@ -12,6 +12,13 @@ Environment overrides:
   SMOKE_SSH_HOST                default: SRV_HOSTNAME from ENV_PATH, else srv
   SSH_USER                      default: root
   INSTANCE_NAME                 default: smoke-<utc timestamp>-<pid>
+  POOL_NAME                     default: <INSTANCE_NAME>-pool
+  POOLED_INSTANCE_NAME          default: <INSTANCE_NAME>-pooled
+  POOLED_PEER_INSTANCE_NAME     default: <INSTANCE_NAME>-pooled-peer
+  POOL_SIZE_MIB                 default: 2048
+  POOLED_VM_MEMORY_MIB          default: 1024
+  POOLED_VM_RESIZE_MIB          default: 1536
+  POOLED_VM_OVERSIZE_MIB        default: <POOL_SIZE_MIB> + 512
   ARTIFACT_ROOT                 default: /var/tmp/srv-smoke
   ARTIFACT_DIR                  default: <ARTIFACT_ROOT>/<INSTANCE_NAME>
   KEEP_FAILED                   default: 0
@@ -50,6 +57,7 @@ INSTANCE_ATTEMPTED=0
 CLEANUP_COMPLETE=0
 POOL_ATTEMPTED=0
 POOL_CLEANUP_COMPLETE=0
+CLEANUP_INSTANCE_NAMES=()
 TAILSCALE_NAME=""
 TAILSCALE_IP=""
 INSTANCE_TAP_DEVICE=""
@@ -199,6 +207,17 @@ copy_capture_result() {
 	cp "${ARTIFACT_DIR}/${source_label}.stdout" "${ARTIFACT_DIR}/${dest_label}.stdout"
 	cp "${ARTIFACT_DIR}/${source_label}.stderr" "${ARTIFACT_DIR}/${dest_label}.stderr"
 	cp "${ARTIFACT_DIR}/${source_label}.rc" "${ARTIFACT_DIR}/${dest_label}.rc"
+}
+
+register_cleanup_instance() {
+	local name="$1"
+	local existing
+	for existing in "${CLEANUP_INSTANCE_NAMES[@]}"; do
+		if [[ "${existing}" == "${name}" ]]; then
+			return 0
+		fi
+	done
+	CLEANUP_INSTANCE_NAMES+=("${name}")
 }
 
 wait_for_ready() {
@@ -491,16 +510,17 @@ assert_pool_present() {
 assert_pool_members() {
 	local label="$1"
 	local expected_members="$2"
-	local expected_member_name="${3:-}"
+	shift 2
+	local expected_member_name
 	assert_pool_present "${label}"
 	if [[ "$(extract_field "${ARTIFACT_DIR}/${label}.stdout" members || true)" != "${expected_members}" ]]; then
 		fail "pool inspect during ${label} reported members $(extract_field "${ARTIFACT_DIR}/${label}.stdout" members || true), want ${expected_members}"
 	fi
-	if [[ -n "${expected_member_name}" ]]; then
+	for expected_member_name in "$@"; do
 		if ! grep -q "^- ${expected_member_name} (" "${ARTIFACT_DIR}/${label}.stdout"; then
 			fail "pool inspect during ${label} did not list member ${expected_member_name}"
 		fi
-	fi
+	done
 }
 
 assert_pool_delete_rejected() {
@@ -613,15 +633,21 @@ capture_diagnostics() {
 }
 
 cleanup_instance() {
-	if (( CLEANUP_COMPLETE )) || (( ! INSTANCE_ATTEMPTED )); then
+	if (( CLEANUP_COMPLETE )) || (( ! INSTANCE_ATTEMPTED && ${#CLEANUP_INSTANCE_NAMES[@]} == 0 )); then
 		return 0
 	fi
 	if [[ "${KEEP_FAILED}" == "1" ]]; then
-		log "KEEP_FAILED=1; leaving ${INSTANCE_NAME} intact"
+		log "KEEP_FAILED=1; leaving attempted instances intact"
 		return 0
 	fi
-	log "cleaning up ${INSTANCE_NAME}"
-	capture_best_effort_ssh cleanup-delete delete "${INSTANCE_NAME}"
+	if (( ${#CLEANUP_INSTANCE_NAMES[@]} == 0 )); then
+		CLEANUP_INSTANCE_NAMES+=("${INSTANCE_NAME}")
+	fi
+	local name
+	for name in "${CLEANUP_INSTANCE_NAMES[@]}"; do
+		log "cleaning up ${name}"
+		capture_best_effort_ssh "cleanup-delete-${name}" delete "${name}"
+	done
 }
 
 cleanup_pool() {
@@ -669,6 +695,7 @@ JAILER_EXEC_NAME="$(basename "${FIRECRACKER_BIN_PATH}")"
 BASE_INSTANCE_NAME="${INSTANCE_NAME:-smoke-$(date -u +%Y%m%d%H%M%S)-$$}"
 POOL_NAME="${POOL_NAME:-${BASE_INSTANCE_NAME}-pool}"
 POOLED_INSTANCE_NAME="${POOLED_INSTANCE_NAME:-${BASE_INSTANCE_NAME}-pooled}"
+POOLED_PEER_INSTANCE_NAME="${POOLED_PEER_INSTANCE_NAME:-${BASE_INSTANCE_NAME}-pooled-peer}"
 POOL_SIZE_BYTES=$(( POOL_SIZE_MIB * 1024 * 1024 ))
 POOL_SIZE_ARG="${POOL_SIZE_MIB}MiB"
 POOLED_VM_MEMORY_ARG="${POOLED_VM_MEMORY_MIB}MiB"
@@ -723,6 +750,7 @@ keep-failed: ${KEEP_FAILED}
 jailer-workspace-dir: ${JAILER_WORKSPACE_DIR}
 pool-name: ${POOL_NAME}
 pooled-instance-name: ${POOLED_INSTANCE_NAME}
+pooled-peer-instance-name: ${POOLED_PEER_INSTANCE_NAME}
 pool-size-mib: ${POOL_SIZE_MIB}
 pooled-vm-memory-mib: ${POOLED_VM_MEMORY_MIB}
 pooled-vm-resize-mib: ${POOLED_VM_RESIZE_MIB}
@@ -757,6 +785,7 @@ fi
 
 log "creating ${INSTANCE_NAME}"
 INSTANCE_ATTEMPTED=1
+register_cleanup_instance "${INSTANCE_NAME}"
 if ! srv_ssh_capture create new "${INSTANCE_NAME}"; then
 	log "create command failed; inspecting instance state before deciding"
 fi
@@ -882,6 +911,15 @@ assert_host_cleanup delete
 
 CLEANUP_COMPLETE=1
 
+log "checking status before pooled memory pool create"
+if ! srv_ssh_capture status-before-pool-create status; then
+	fail "status before pool create failed"
+fi
+STATUS_BEFORE_POOL_CREATE_POOLS="$(box_value_for_label "${ARTIFACT_DIR}/status-before-pool-create.stdout" POOLS)"
+if [[ -z "${STATUS_BEFORE_POOL_CREATE_POOLS}" ]]; then
+	fail "status before pool create did not expose a POOLS row"
+fi
+
 log "creating pooled memory pool ${POOL_NAME}"
 POOL_ATTEMPTED=1
 if ! srv_ssh_capture pool-create pool create "${POOL_NAME}" --size "${POOL_SIZE_ARG}"; then
@@ -904,14 +942,15 @@ STATUS_AFTER_POOL_CREATE_POOLS="$(box_value_for_label "${ARTIFACT_DIR}/status-af
 if [[ -z "${STATUS_AFTER_POOL_CREATE_MEMORY}" || -z "${STATUS_AFTER_POOL_CREATE_POOLS}" ]]; then
 	fail "status after pool create did not expose MEMORY and POOLS rows"
 fi
-if [[ "${STATUS_AFTER_POOL_CREATE_POOLS}" != *"across 1 pool"* ]]; then
-	fail "status after pool create did not report a single reserved pool"
+if [[ "${STATUS_AFTER_POOL_CREATE_POOLS}" == "${STATUS_BEFORE_POOL_CREATE_POOLS}" ]]; then
+	fail "status pools line did not change after creating pool ${POOL_NAME}; pool reservation should be reflected in status"
 fi
 
 log "creating pooled instance ${POOLED_INSTANCE_NAME}"
 set_active_instance "${POOLED_INSTANCE_NAME}"
 INSTANCE_ATTEMPTED=1
 CLEANUP_COMPLETE=0
+register_cleanup_instance "${INSTANCE_NAME}"
 CURRENT_MEMORY_MODE="pool"
 CURRENT_POOL_NAME="${POOL_NAME}"
 CURRENT_MEMORY_MIB="${POOLED_VM_MEMORY_MIB}"
@@ -927,9 +966,7 @@ assert_instance_listed list-pooled-ready ready
 assert_pooled_inspect inspect-pooled-ready
 assert_host_runtime pooled-create-ready
 assert_pooled_balloon pooled-create-ready
-assert_pooled_balloon_reclaims_cache pooled-create-reclaim
 assert_pool_members pool-inspect-with-member 1 "${INSTANCE_NAME}"
-assert_pool_delete_rejected pool-delete-non-empty
 
 log "checking pooled instance does not add a second host memory reservation"
 if ! srv_ssh_capture status-with-pooled-member status; then
@@ -941,6 +978,58 @@ fi
 if [[ "$(box_value_for_label "${ARTIFACT_DIR}/status-with-pooled-member.stdout" POOLS)" != "${STATUS_AFTER_POOL_CREATE_POOLS}" ]]; then
 	fail "status pools line changed after creating pooled member; pooled VMs should not change pool reservation accounting"
 fi
+
+log "creating peer pooled instance ${POOLED_PEER_INSTANCE_NAME}"
+set_active_instance "${POOLED_PEER_INSTANCE_NAME}"
+register_cleanup_instance "${INSTANCE_NAME}"
+CURRENT_MEMORY_MIB="${POOLED_VM_MEMORY_MIB}"
+if ! srv_ssh_capture pooled-peer-create new "${INSTANCE_NAME}" --pool "${POOL_NAME}" --ram "${POOLED_VM_MEMORY_ARG}"; then
+	fail "create peer pooled instance ${INSTANCE_NAME} failed"
+fi
+
+wait_for_ready inspect-pooled-peer-create-ready
+
+log "peer pooled instance is ready as ${TAILSCALE_NAME} (${TAILSCALE_IP})"
+verify_guest_ssh guest-ssh-pooled-peer-ready
+assert_instance_listed list-pooled-peer-ready ready
+assert_pooled_inspect inspect-pooled-peer-ready
+assert_host_runtime pooled-peer-create-ready
+assert_pooled_balloon pooled-peer-create-ready
+assert_pool_members pool-inspect-with-two-members 2 "${POOLED_INSTANCE_NAME}" "${POOLED_PEER_INSTANCE_NAME}"
+assert_pool_delete_rejected pool-delete-non-empty
+
+log "checking two pooled instances still share one host memory reservation"
+if ! srv_ssh_capture status-with-two-pooled-members status; then
+	fail "status with two pooled members failed"
+fi
+if [[ "$(box_value_for_label "${ARTIFACT_DIR}/status-with-two-pooled-members.stdout" MEMORY)" != "${STATUS_AFTER_POOL_CREATE_MEMORY}" ]]; then
+	fail "status memory line changed after creating second pooled member; pooled VMs should not add host reservation again"
+fi
+if [[ "$(box_value_for_label "${ARTIFACT_DIR}/status-with-two-pooled-members.stdout" POOLS)" != "${STATUS_AFTER_POOL_CREATE_POOLS}" ]]; then
+	fail "status pools line changed after creating second pooled member; pooled VMs should not change pool reservation accounting"
+fi
+
+log "checking balloon reclaim for both pooled instances"
+assert_pooled_balloon_reclaims_cache pooled-peer-reclaim
+set_active_instance "${POOLED_INSTANCE_NAME}"
+CURRENT_MEMORY_MIB="${POOLED_VM_MEMORY_MIB}"
+wait_for_ready inspect-pooled-primary-ready-before-reclaim
+assert_pooled_balloon_reclaims_cache pooled-primary-reclaim-with-peer
+
+log "deleting peer pooled instance ${POOLED_PEER_INSTANCE_NAME}"
+set_active_instance "${POOLED_PEER_INSTANCE_NAME}"
+CURRENT_MEMORY_MIB="${POOLED_VM_MEMORY_MIB}"
+if ! srv_ssh_capture pooled-peer-delete delete "${INSTANCE_NAME}"; then
+	fail "delete peer pooled instance ${INSTANCE_NAME} failed"
+fi
+if ! grep -q '^state: deleted$' "${ARTIFACT_DIR}/pooled-peer-delete.stdout"; then
+	fail "delete peer pooled instance ${INSTANCE_NAME} did not report state: deleted"
+fi
+assert_host_cleanup pooled-peer-delete
+assert_pool_members pool-inspect-after-peer-delete 1 "${POOLED_INSTANCE_NAME}"
+
+set_active_instance "${POOLED_INSTANCE_NAME}"
+CURRENT_MEMORY_MIB="${POOLED_VM_MEMORY_MIB}"
 
 log "stopping pooled instance ${INSTANCE_NAME} for resize checks"
 if ! srv_ssh_capture pooled-stop stop "${INSTANCE_NAME}"; then

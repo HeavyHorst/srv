@@ -32,24 +32,25 @@ const (
 	DefaultSocketPath = "/run/srv-vm-runner/vm-runner.sock"
 	// firecracker-go-sdk requires NumaNode to be set, but a negative value keeps
 	// the SDK from synthesizing cpuset cgroup arguments for every jailed launch.
-	defaultCgroupCPUQuotaPeriodMicros  = int64(100000)
-	defaultVMPIDsMax                   = int64(512)
-	firecrackerSupervisorCgroupName    = "supervisor"
-	firecrackerVMRootCgroupName        = "firecracker-vms"
-	firecrackerPoolRootCgroupName      = "firecracker-pools"
-	pooledBalloonStatsIntervalSeconds  = int64(5)
-	pooledBalloonReconcileInterval     = 5 * time.Second
-	pooledBalloonRequestTimeout        = 2 * time.Second
-	pooledBalloonTargetStepMiB         = int64(64)
-	pooledBalloonGuestHeadroomFloorMiB = int64(256)
-	pooledBalloonGuestHeadroomDivisor  = int64(8)
-	pooledBalloonMaxTargetDivisor      = int64(2)
-	miBBytes                           = int64(1024 * 1024)
-	disabledJailerNumaNode             = -1
-	gracefulStopRequestTimeout         = 2 * time.Second
-	gracefulStopTimeout                = 10 * time.Second
-	forcedStopTimeout                  = 10 * time.Second
-	postKillWaitTimeout                = 2 * time.Second
+	defaultCgroupCPUQuotaPeriodMicros = int64(100000)
+	defaultVMPIDsMax                  = int64(512)
+	firecrackerSupervisorCgroupName   = "supervisor"
+	firecrackerVMRootCgroupName       = "firecracker-vms"
+	firecrackerPoolRootCgroupName     = "firecracker-pools"
+	balloonStatsIntervalSeconds       = int64(5)
+	balloonReconcileInterval          = 5 * time.Second
+	balloonRequestTimeout             = 2 * time.Second
+	balloonTargetStepMiB              = int64(64)
+	balloonMaxTargetChangeMiB         = int64(512)
+	balloonGuestHeadroomFloorMiB      = int64(256)
+	balloonGuestHeadroomDivisor       = int64(8)
+	balloonMaxTargetDivisor           = int64(2)
+	miBBytes                          = int64(1024 * 1024)
+	disabledJailerNumaNode            = -1
+	gracefulStopRequestTimeout        = 2 * time.Second
+	gracefulStopTimeout               = 10 * time.Second
+	forcedStopTimeout                 = 10 * time.Second
+	postKillWaitTimeout               = 2 * time.Second
 )
 
 var (
@@ -267,10 +268,11 @@ type jailerRuntimePaths struct {
 	LogPath      string
 }
 
-type pooledBalloonVM struct {
+type balloonVM struct {
 	Name       string
 	CgroupPath string
 	SocketPath string
+	UseTarget  bool
 }
 
 type firecrackerBalloonStats struct {
@@ -354,7 +356,7 @@ func (s *Server) ServeUnix(ctx context.Context, socketPath, clientGroup string) 
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
-	go s.runPooledBalloonLoop(ctx)
+	go s.runBalloonLoop(ctx)
 
 	err = server.Serve(listener)
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -363,32 +365,32 @@ func (s *Server) ServeUnix(ctx context.Context, socketPath, clientGroup string) 
 	return nil
 }
 
-func (s *Server) runPooledBalloonLoop(ctx context.Context) {
-	s.reconcilePooledBalloons(ctx)
-	ticker := time.NewTicker(pooledBalloonReconcileInterval)
+func (s *Server) runBalloonLoop(ctx context.Context) {
+	s.reconcileBalloons(ctx)
+	ticker := time.NewTicker(balloonReconcileInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.reconcilePooledBalloons(ctx)
+			s.reconcileBalloons(ctx)
 		}
 	}
 }
 
-func (s *Server) reconcilePooledBalloons(ctx context.Context) {
+func (s *Server) reconcileBalloons(ctx context.Context) {
 	rootRel, err := s.delegatedCgroupRoot()
 	if err != nil {
 		if ctx.Err() == nil {
-			s.log.Warn("resolve delegated cgroup root for pooled balloon reconcile", "err", err)
+			s.log.Warn("resolve delegated cgroup root for balloon reconcile", "err", err)
 		}
 		return
 	}
-	vms, err := s.listPooledBalloonVMs(rootRel)
+	vms, err := s.listBalloonVMs(rootRel)
 	if err != nil {
 		if ctx.Err() == nil && !os.IsNotExist(err) {
-			s.log.Warn("list pooled vms for balloon reconcile", "err", err)
+			s.log.Warn("list vms for balloon reconcile", "err", err)
 		}
 		return
 	}
@@ -398,25 +400,48 @@ func (s *Server) reconcilePooledBalloons(ctx context.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			reqCtx, cancel := context.WithTimeout(ctx, pooledBalloonRequestTimeout)
+			reqCtx, cancel := context.WithTimeout(ctx, balloonRequestTimeout)
 			defer cancel()
-			err := s.reconcilePooledBalloon(reqCtx, vm)
+			err := s.reconcileBalloon(reqCtx, vm)
 			if err == nil || errors.Is(err, os.ErrNotExist) || ctx.Err() != nil {
 				return
 			}
-			s.log.Warn("reconcile pooled balloon", "name", vm.Name, "err", err)
+			s.log.Warn("reconcile balloon", "name", vm.Name, "err", err)
 		}()
 	}
 	wg.Wait()
 }
 
-func (s *Server) listPooledBalloonVMs(rootRel string) ([]pooledBalloonVM, error) {
+func (s *Server) listBalloonVMs(rootRel string) ([]balloonVM, error) {
+	vms := make([]balloonVM, 0)
+	fixedRoot := filepath.Join(cgroupPathOnHost(rootRel), firecrackerVMRootCgroupName)
+	fixedEntries, err := os.ReadDir(fixedRoot)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("list fixed vm cgroups under %s: %w", fixedRoot, err)
+	}
+	for _, vmEntry := range fixedEntries {
+		if !vmEntry.IsDir() {
+			continue
+		}
+		paths, err := resolveInstanceRuntimePaths(s.config.InstancesDir, vmEntry.Name())
+		if err != nil {
+			return nil, err
+		}
+		vms = append(vms, balloonVM{
+			Name:       vmEntry.Name(),
+			CgroupPath: filepath.Join(fixedRoot, vmEntry.Name()),
+			SocketPath: paths.SocketPath,
+		})
+	}
+
 	poolRoot := filepath.Join(cgroupPathOnHost(rootRel), firecrackerPoolRootCgroupName)
 	poolEntries, err := os.ReadDir(poolRoot)
 	if err != nil {
+		if os.IsNotExist(err) && len(vms) > 0 {
+			return vms, nil
+		}
 		return nil, err
 	}
-	vms := make([]pooledBalloonVM, 0)
 	for _, poolEntry := range poolEntries {
 		if !poolEntry.IsDir() {
 			continue
@@ -434,38 +459,49 @@ func (s *Server) listPooledBalloonVMs(rootRel string) ([]pooledBalloonVM, error)
 			if err != nil {
 				return nil, err
 			}
-			vms = append(vms, pooledBalloonVM{
+			vms = append(vms, balloonVM{
 				Name:       vmEntry.Name(),
 				CgroupPath: filepath.Join(poolPath, vmEntry.Name()),
 				SocketPath: paths.SocketPath,
+				UseTarget:  true,
 			})
 		}
 	}
 	return vms, nil
 }
 
-func (s *Server) reconcilePooledBalloon(ctx context.Context, vm pooledBalloonVM) error {
+func (s *Server) reconcileBalloon(ctx context.Context, vm balloonVM) error {
 	residentBytes, err := readInt64File(filepath.Join(vm.CgroupPath, "memory.current"))
 	if err != nil {
 		return err
 	}
-	stats, err := s.readPooledBalloonStats(ctx, vm.SocketPath)
+	stats, err := s.readBalloonStats(ctx, vm.SocketPath)
 	if err != nil {
 		return err
 	}
-	desiredTargetMiB, _, ok := desiredPooledBalloonTargetMiB(residentBytes, stats)
+	// Fixed VMs rely on free-page reporting only; active targets are reserved for
+	// pooled VMs where srv needs to enforce shared-reservation pressure.
+	desiredTargetMiB := int64(0)
+	stepMiB := int64(1)
+	ok := stats.TargetMiB != nil
+	if vm.UseTarget {
+		desiredTargetMiB, stepMiB, ok = desiredBalloonTargetMiB(residentBytes, stats)
+	}
 	if !ok {
 		return nil
 	}
 	currentTargetMiB := *stats.TargetMiB
+	if vm.UseTarget {
+		desiredTargetMiB = nextBalloonTargetMiB(currentTargetMiB, desiredTargetMiB, stepMiB)
+	}
 	if desiredTargetMiB == currentTargetMiB {
 		return nil
 	}
-	if err := s.patchPooledBalloonTarget(ctx, vm.SocketPath, desiredTargetMiB); err != nil {
+	if err := s.patchBalloonTarget(ctx, vm.SocketPath, desiredTargetMiB); err != nil {
 		return err
 	}
 	s.log.Debug(
-		"updated pooled balloon target",
+		"updated balloon target",
 		"name", vm.Name,
 		"target_mib", desiredTargetMiB,
 		"previous_target_mib", currentTargetMiB,
@@ -476,7 +512,7 @@ func (s *Server) reconcilePooledBalloon(ctx context.Context, vm pooledBalloonVM)
 	return nil
 }
 
-func desiredPooledBalloonTargetMiB(residentBytes int64, stats firecrackerBalloonStats) (int64, int64, bool) {
+func desiredBalloonTargetMiB(residentBytes int64, stats firecrackerBalloonStats) (int64, int64, bool) {
 	if stats.TargetMiB == nil || stats.TotalMemory < 1 {
 		return 0, 0, false
 	}
@@ -484,7 +520,7 @@ func desiredPooledBalloonTargetMiB(residentBytes int64, stats firecrackerBalloon
 	if guestTotalMiB < 1 {
 		return 0, 0, false
 	}
-	headroomMiB := maxInt64(pooledBalloonGuestHeadroomFloorMiB, guestTotalMiB/pooledBalloonGuestHeadroomDivisor)
+	headroomMiB := maxInt64(balloonGuestHeadroomFloorMiB, guestTotalMiB/balloonGuestHeadroomDivisor)
 	availableBytes := stats.AvailableMemory
 	if availableBytes <= 0 {
 		availableBytes = stats.FreeMemory + stats.DiskCaches
@@ -493,17 +529,48 @@ func desiredPooledBalloonTargetMiB(residentBytes int64, stats firecrackerBalloon
 		availableBytes = 0
 	}
 	reclaimableGuestMiB := maxInt64(bytesToMiBFloor(availableBytes)-headroomMiB, 0)
-	reclaimableResidentMiB := maxInt64(bytesToMiBFloor(residentBytes)-headroomMiB, 0)
-	maxTargetMiB := maxInt64(guestTotalMiB/pooledBalloonMaxTargetDivisor, 1)
-	stepMiB := pooledBalloonAdjustmentStepMiB(guestTotalMiB)
+	currentTargetMiB := maxInt64(*stats.TargetMiB, 0)
+	reclaimableResidentMiB := maxInt64(bytesToMiBFloor(residentBytes)+currentTargetMiB-headroomMiB, 0)
+	maxTargetMiB := maxInt64(guestTotalMiB/balloonMaxTargetDivisor, 1)
+	stepMiB := balloonAdjustmentStepMiB(guestTotalMiB)
 	desiredTargetMiB := minInt64(reclaimableGuestMiB, reclaimableResidentMiB)
 	desiredTargetMiB = minInt64(desiredTargetMiB, maxTargetMiB)
 	desiredTargetMiB = roundDownToMultiple(desiredTargetMiB, stepMiB)
 	return desiredTargetMiB, stepMiB, true
 }
 
-func pooledBalloonAdjustmentStepMiB(guestTotalMiB int64) int64 {
-	return maxInt64(1, minInt64(pooledBalloonTargetStepMiB, maxInt64(guestTotalMiB/8, 1)))
+func nextBalloonTargetMiB(currentMiB, desiredMiB, stepMiB int64) int64 {
+	if stepMiB < 1 {
+		stepMiB = 1
+	}
+	if currentMiB < 0 {
+		currentMiB = 0
+	}
+	if desiredMiB < 0 {
+		desiredMiB = 0
+	}
+	if currentMiB == desiredMiB {
+		return currentMiB
+	}
+	if currentMiB%stepMiB != 0 {
+		if desiredMiB < currentMiB {
+			return roundDownToMultiple(currentMiB, stepMiB)
+		}
+		return minInt64(roundUpToMultiple(currentMiB, stepMiB), desiredMiB)
+	}
+	deltaMiB := desiredMiB - currentMiB
+	if absInt64(deltaMiB) < stepMiB {
+		return currentMiB
+	}
+	maxChangeMiB := maxInt64(stepMiB, roundDownToMultiple(balloonMaxTargetChangeMiB, stepMiB))
+	if deltaMiB > 0 {
+		return currentMiB + minInt64(deltaMiB, maxChangeMiB)
+	}
+	return currentMiB - minInt64(-deltaMiB, maxChangeMiB)
+}
+
+func balloonAdjustmentStepMiB(guestTotalMiB int64) int64 {
+	return maxInt64(1, minInt64(balloonTargetStepMiB, maxInt64(guestTotalMiB/8, 1)))
 }
 
 func bytesToMiBFloor(bytes int64) int64 {
@@ -525,6 +592,24 @@ func roundDownToMultiple(value, multiple int64) int64 {
 		return maxInt64(value, 0)
 	}
 	return value - (value % multiple)
+}
+
+func roundUpToMultiple(value, multiple int64) int64 {
+	if value <= 0 || multiple <= 1 {
+		return maxInt64(value, 0)
+	}
+	remainder := value % multiple
+	if remainder == 0 {
+		return value
+	}
+	return value + multiple - remainder
+}
+
+func absInt64(value int64) int64 {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func minInt64(a, b int64) int64 {
@@ -737,17 +822,15 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	}
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Swap(prepareJailedRuntimeHandler(paths, jailerPaths, s.config.JailerGID))
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.NewSetMetadataHandler(Metadata{SRV: req.Bootstrap}))
-	if model.NormalizeMemoryMode(req.MemoryMode) == model.MemoryModePool {
-		machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.Handler{
-			Name: "srv.CreateBalloonDevice",
-			Fn: func(ctx context.Context, _ *firecracker.Machine) error {
-				if err := s.createPooledBalloonDevice(ctx, paths.SocketPath); err != nil {
-					return fmt.Errorf("create balloon device: %w", err)
-				}
-				return nil
-			},
-		})
-	}
+	machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.Handler{
+		Name: "srv.CreateBalloonDevice",
+		Fn: func(ctx context.Context, _ *firecracker.Machine) error {
+			if err := s.createBalloonDevice(ctx, paths.SocketPath); err != nil {
+				return fmt.Errorf("create balloon device: %w", err)
+			}
+			return nil
+		},
+	})
 
 	if err := machine.Start(vmCtx); err != nil {
 		return StartResponse{}, fmt.Errorf("start firecracker machine: %w", err)
@@ -775,7 +858,7 @@ func newRootDrive(path string) models.Drive {
 	}
 }
 
-func (s *Server) createPooledBalloonDevice(ctx context.Context, socketPath string) error {
+func (s *Server) createBalloonDevice(ctx context.Context, socketPath string) error {
 	amountMiB := int64(0)
 	deflateOnOOM := true
 	return s.doFirecrackerAPIRequest(ctx, socketPath, http.MethodPut, "/balloon", struct {
@@ -786,12 +869,12 @@ func (s *Server) createPooledBalloonDevice(ctx context.Context, socketPath strin
 	}{
 		AmountMiB:                   &amountMiB,
 		DeflateOnOOM:                &deflateOnOOM,
-		StatsPollingIntervalSeconds: pooledBalloonStatsIntervalSeconds,
+		StatsPollingIntervalSeconds: balloonStatsIntervalSeconds,
 		FreePageReporting:           true,
 	}, http.StatusNoContent, nil)
 }
 
-func (s *Server) readPooledBalloonStats(ctx context.Context, socketPath string) (firecrackerBalloonStats, error) {
+func (s *Server) readBalloonStats(ctx context.Context, socketPath string) (firecrackerBalloonStats, error) {
 	var stats firecrackerBalloonStats
 	if err := s.doFirecrackerAPIRequest(ctx, socketPath, http.MethodGet, "/balloon/statistics", nil, http.StatusOK, &stats); err != nil {
 		return firecrackerBalloonStats{}, err
@@ -799,7 +882,7 @@ func (s *Server) readPooledBalloonStats(ctx context.Context, socketPath string) 
 	return stats, nil
 }
 
-func (s *Server) patchPooledBalloonTarget(ctx context.Context, socketPath string, amountMiB int64) error {
+func (s *Server) patchBalloonTarget(ctx context.Context, socketPath string, amountMiB int64) error {
 	return s.doFirecrackerAPIRequest(ctx, socketPath, http.MethodPatch, "/balloon", struct {
 		AmountMiB *int64 `json:"amount_mib"`
 	}{AmountMiB: &amountMiB}, http.StatusNoContent, nil)

@@ -232,6 +232,8 @@ validate_kernel_config() {
 	require_kernel_config "${kernel_config}" 'CONFIG_NF_TABLES_BRIDGE=[ym]' 'bridge nf_tables support'
 	require_kernel_config "${kernel_config}" 'CONFIG_NF_CONNTRACK_BRIDGE=[ym]' 'bridge conntrack support'
 	require_kernel_config "${kernel_config}" 'CONFIG_OVERLAY_FS=[ym]' 'overlayfs support'
+	require_kernel_config "${kernel_config}" 'CONFIG_VIRTIO_BALLOON=[ym]' 'virtio memory balloon support'
+	require_kernel_config "${kernel_config}" 'CONFIG_PAGE_REPORTING=y' 'guest free page reporting support'
 }
 
 bootstrap_lazyvim() {
@@ -322,7 +324,23 @@ install_pi() {
 configure_rootfs() {
 	install -d "${ROOTFS_MOUNT_DIR}/var/lib/srv"
 	chmod 0755 "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/bootstrap.sh"
-	systemctl --root="${ROOTFS_MOUNT_DIR}" enable docker.service tailscaled.service srv-bootstrap.service >/dev/null
+	systemctl --root="${ROOTFS_MOUNT_DIR}" enable docker.socket tailscaled.service srv-bootstrap.service >/dev/null
+	systemctl --root="${ROOTFS_MOUNT_DIR}" disable \
+		docker.service \
+		containerd.service \
+		getty@tty1.service \
+		serial-getty@ttyS0.service >/dev/null || true
+	systemctl --root="${ROOTFS_MOUNT_DIR}" mask \
+		getty.target \
+		getty@.service \
+		serial-getty@.service \
+		systemd-udevd.service \
+		systemd-udevd-control.socket \
+		systemd-udevd-kernel.socket \
+		systemd-udevd-varlink.socket \
+		systemd-udev-trigger.service \
+		systemd-udev-settle.service \
+		systemd-hwdb-update.service >/dev/null
 	truncate -s 0 "${ROOTFS_MOUNT_DIR}/etc/machine-id"
 	rm -f "${ROOTFS_MOUNT_DIR}/var/lib/dbus/machine-id"
 	rm -rf "${ROOTFS_MOUNT_DIR}/var/cache/pacman/pkg"

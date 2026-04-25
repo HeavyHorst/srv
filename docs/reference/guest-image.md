@@ -16,7 +16,7 @@ The builder produces:
 
 The image is intentionally not minimal — it includes tooling for development and AI agent workflows:
 
-- Docker, docker-compose
+- Docker, docker-compose with `docker.socket` activation instead of an idle `dockerd`
 - Go, gopls
 - Odin, odinfmt, OLS
 - Neovim with prewarmed LazyVim (BMW heritage amber theme)
@@ -40,12 +40,15 @@ The guest includes `srv-bootstrap.service`, which runs on every boot:
 
 The `--ssh` flag on `tailscale up` is intentional — it enables Tailscale SSH so the control plane's `connect: ssh root@<name>` output works through the tailnet without per-user OpenSSH keys.
 
+Docker is installed but not started during boot. The image enables `docker.socket`, so the first Docker CLI/API use starts `dockerd` and `containerd` on demand. Getty/serial-getty and udev units are masked to avoid idle daemons that are not needed for the Firecracker bootstrap path.
+
 ## Kernel details
 
 - Starts from Firecracker's `microvm-kernel-ci-x86_64-6.1.config` and runs `olddefconfig` against the selected source tree
 - Enables `CONFIG_PCI=y` for ACPI initialization (required by current Firecracker x86 builds)
 - Disables `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` so the kernel prefers ACPI discovery
 - Enables Landlock and adds it to `CONFIG_LSM` (keeps pacman's download sandbox working)
+- Enables virtio ballooning and page reporting so fixed and pooled VMs can return idle guest pages to the host
 - Builds real `.ko` module files for Docker, overlay, br_netfilter, and nftables
 
 ## DNS

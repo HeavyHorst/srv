@@ -194,7 +194,7 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 	}
 }
 
-func TestCreatePooledBalloonDeviceEnablesFreePageReporting(t *testing.T) {
+func TestCreateBalloonDeviceEnablesFreePageReporting(t *testing.T) {
 	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{})
 	socketPath := filepath.Join(t.TempDir(), "firecracker.sock")
 	listener, err := net.Listen("unix", socketPath)
@@ -225,8 +225,8 @@ func TestCreatePooledBalloonDeviceEnablesFreePageReporting(t *testing.T) {
 		_ = httpServer.Shutdown(ctx)
 	})
 
-	if err := server.createPooledBalloonDevice(context.Background(), socketPath); err != nil {
-		t.Fatalf("createPooledBalloonDevice(): %v", err)
+	if err := server.createBalloonDevice(context.Background(), socketPath); err != nil {
+		t.Fatalf("createBalloonDevice(): %v", err)
 	}
 
 	var payload struct {
@@ -254,15 +254,15 @@ func TestCreatePooledBalloonDeviceEnablesFreePageReporting(t *testing.T) {
 	if !payload.DeflateOnOOM {
 		t.Fatalf("deflate_on_oom = false, want true")
 	}
-	if payload.StatsPollingIntervalSeconds != pooledBalloonStatsIntervalSeconds {
-		t.Fatalf("stats_polling_interval_s = %d, want %d", payload.StatsPollingIntervalSeconds, pooledBalloonStatsIntervalSeconds)
+	if payload.StatsPollingIntervalSeconds != balloonStatsIntervalSeconds {
+		t.Fatalf("stats_polling_interval_s = %d, want %d", payload.StatsPollingIntervalSeconds, balloonStatsIntervalSeconds)
 	}
 	if !payload.FreePageReporting {
 		t.Fatalf("free_page_reporting = false, want true")
 	}
 }
 
-func TestDesiredPooledBalloonTargetMiB(t *testing.T) {
+func TestDesiredBalloonTargetMiB(t *testing.T) {
 	tests := []struct {
 		name          string
 		residentBytes int64
@@ -284,14 +284,14 @@ func TestDesiredPooledBalloonTargetMiB(t *testing.T) {
 			wantOK:        true,
 		},
 		{
-			name:          "keeps target at zero when resident set is already low",
+			name:          "counts current target as already reclaimed resident memory",
 			residentBytes: 300 * miBBytes,
 			stats: firecrackerBalloonStats{
 				TargetMiB:       int64Ptr(128),
 				AvailableMemory: 700 * miBBytes,
 				TotalMemory:     1024 * miBBytes,
 			},
-			wantTargetMiB: 0,
+			wantTargetMiB: 128,
 			wantStepMiB:   64,
 			wantOK:        true,
 		},
@@ -320,24 +320,49 @@ func TestDesiredPooledBalloonTargetMiB(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotTargetMiB, gotStepMiB, gotOK := desiredPooledBalloonTargetMiB(tc.residentBytes, tc.stats)
+			gotTargetMiB, gotStepMiB, gotOK := desiredBalloonTargetMiB(tc.residentBytes, tc.stats)
 			if gotOK != tc.wantOK {
-				t.Fatalf("desiredPooledBalloonTargetMiB() ok = %v, want %v", gotOK, tc.wantOK)
+				t.Fatalf("desiredBalloonTargetMiB() ok = %v, want %v", gotOK, tc.wantOK)
 			}
 			if !gotOK {
 				return
 			}
 			if gotTargetMiB != tc.wantTargetMiB {
-				t.Fatalf("desiredPooledBalloonTargetMiB() target = %d, want %d", gotTargetMiB, tc.wantTargetMiB)
+				t.Fatalf("desiredBalloonTargetMiB() target = %d, want %d", gotTargetMiB, tc.wantTargetMiB)
 			}
 			if gotStepMiB != tc.wantStepMiB {
-				t.Fatalf("desiredPooledBalloonTargetMiB() step = %d, want %d", gotStepMiB, tc.wantStepMiB)
+				t.Fatalf("desiredBalloonTargetMiB() step = %d, want %d", gotStepMiB, tc.wantStepMiB)
 			}
 		})
 	}
 }
 
-func TestReconcilePooledBalloonUpdatesTarget(t *testing.T) {
+func TestNextBalloonTargetMiB(t *testing.T) {
+	tests := []struct {
+		name    string
+		current int64
+		desired int64
+		step    int64
+		want    int64
+	}{
+		{name: "increases by at most max change", current: 0, desired: 2048, step: 64, want: 512},
+		{name: "decreases by at most max change", current: 2816, desired: 0, step: 64, want: 2304},
+		{name: "keeps small changes inside hysteresis band", current: 512, desired: 544, step: 64, want: 512},
+		{name: "allows one step change", current: 512, desired: 448, step: 64, want: 448},
+		{name: "corrects unaligned target downward", current: 32, desired: 0, step: 64, want: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := nextBalloonTargetMiB(tc.current, tc.desired, tc.step)
+			if got != tc.want {
+				t.Fatalf("nextBalloonTargetMiB(%d, %d, %d) = %d, want %d", tc.current, tc.desired, tc.step, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReconcileBalloonUpdatesTarget(t *testing.T) {
 	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
 		InstancesDir: filepath.Join(t.TempDir(), "instances"),
 	})
@@ -386,19 +411,20 @@ func TestReconcilePooledBalloonUpdatesTarget(t *testing.T) {
 		_ = httpServer.Shutdown(ctx)
 	})
 
-	if err := server.reconcilePooledBalloon(context.Background(), pooledBalloonVM{
+	if err := server.reconcileBalloon(context.Background(), balloonVM{
 		Name:       "demo",
 		CgroupPath: cgroupPath,
 		SocketPath: socketPath,
+		UseTarget:  true,
 	}); err != nil {
-		t.Fatalf("reconcilePooledBalloon(): %v", err)
+		t.Fatalf("reconcileBalloon(): %v", err)
 	}
 	if patchedAmountMiB != 384 {
 		t.Fatalf("patched amount_mib = %d, want 384", patchedAmountMiB)
 	}
 }
 
-func TestReconcilePooledBalloonCorrectsUnalignedTarget(t *testing.T) {
+func TestReconcileBalloonCorrectsUnalignedTarget(t *testing.T) {
 	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
 		InstancesDir: filepath.Join(t.TempDir(), "instances"),
 	})
@@ -448,19 +474,20 @@ func TestReconcilePooledBalloonCorrectsUnalignedTarget(t *testing.T) {
 		_ = httpServer.Shutdown(ctx)
 	})
 
-	if err := server.reconcilePooledBalloon(context.Background(), pooledBalloonVM{
+	if err := server.reconcileBalloon(context.Background(), balloonVM{
 		Name:       "demo",
 		CgroupPath: cgroupPath,
 		SocketPath: socketPath,
+		UseTarget:  true,
 	}); err != nil {
-		t.Fatalf("reconcilePooledBalloon(): %v", err)
+		t.Fatalf("reconcileBalloon(): %v", err)
 	}
 	if patchedAmountMiB != 0 {
 		t.Fatalf("patched amount_mib = %d, want 0", patchedAmountMiB)
 	}
 }
 
-func TestReconcilePooledBalloonsDoesNotBlockPeers(t *testing.T) {
+func TestReconcileBalloonsDoesNotBlockPeers(t *testing.T) {
 	oldRoot := cgroupFSRoot
 	oldCurrent := currentCgroupPath
 	t.Cleanup(func() {
@@ -546,7 +573,7 @@ func TestReconcilePooledBalloonsDoesNotBlockPeers(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
-	server.reconcilePooledBalloons(ctx)
+	server.reconcileBalloons(ctx)
 
 	select {
 	case got := <-fastPatched:
@@ -554,7 +581,87 @@ func TestReconcilePooledBalloonsDoesNotBlockPeers(t *testing.T) {
 			t.Fatalf("fast patch amount_mib = %d, want 384", got)
 		}
 	default:
-		t.Fatal("fast pooled VM was not reconciled before the slow peer timed out")
+		t.Fatal("fast VM was not reconciled before the slow peer timed out")
+	}
+}
+
+func TestReconcileBalloonsDeflatesFixedVMTargets(t *testing.T) {
+	oldRoot := cgroupFSRoot
+	oldCurrent := currentCgroupPath
+	t.Cleanup(func() {
+		cgroupFSRoot = oldRoot
+		currentCgroupPath = oldCurrent
+	})
+
+	cgroupFSRoot = t.TempDir()
+	serviceRel := "/system.slice/srv-vm-runner.service"
+	currentCgroupPath = func() (string, error) {
+		return serviceRel, nil
+	}
+
+	instancesDir := filepath.Join(t.TempDir(), "instances")
+	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
+		InstancesDir: instancesDir,
+	})
+
+	cgroupPath := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service", firecrackerVMRootCgroupName, "demo")
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(cgroupPath): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "memory.current"), []byte("671088640\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(memory.current): %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(instancesDir, "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(instance): %v", err)
+	}
+
+	socketPath := filepath.Join(instancesDir, "demo", "firecracker.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("net.Listen(unix): %v", err)
+	}
+	defer listener.Close()
+	t.Cleanup(func() { server.closeFirecrackerClient(socketPath) })
+
+	patchedAmount := make(chan int64, 1)
+	httpServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/balloon/statistics":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"target_mib":256,"actual_mib":256,"available_memory":536870912,"total_memory":1073741824}`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/balloon":
+			var payload struct {
+				AmountMiB int64 `json:"amount_mib"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("Decode(patch body): %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			patchedAmount <- payload.AmountMiB
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})}
+	go func() {
+		_ = httpServer.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(ctx)
+	})
+
+	server.reconcileBalloons(context.Background())
+
+	select {
+	case got := <-patchedAmount:
+		if got != 0 {
+			t.Fatalf("patch amount_mib = %d, want 0", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fixed VM target was not deflated")
 	}
 }
 

@@ -195,6 +195,6 @@ Important caveat: existing guests keep their own writable `rootfs.img`. There is
 - Keep `SRV_DATA_DIR` and `SRV_BASE_ROOTFS` on the same reflink-capable filesystem, such as `btrfs` or reflink-enabled `xfs`. Fast per-instance provisioning still depends on reflink cloning the configured base rootfs.
 - Use pooled mode only for workloads that tolerate an elastic memory contract. Fixed mode remains the supported choice for databases, JVMs, and other memory-sensitive services.
 - `status` is now the operator view for host memory accounting: it separates fixed reservations from pool reservations so pooled members do not look like additional dedicated host claims.
-- `inspect` and `top` are the operator views for pooled VM behavior: `inspect` shows `memory-mode` and host reservation style, while `top` shows live/configured RAM and the pool name on pooled rows.
+- `inspect` and `top` are the operator views for VM memory behavior: `inspect` shows `memory-mode` and host reservation style, while `top` shows host-resident live memory against configured guest RAM. Fixed and pooled VMs both use a virtio balloon with free-page reporting so idle guest pages can be returned to the host; pooled rows also show the pool name.
 - On reboot recovery, pooled VMs recreate their pool-parent cgroups before restart; if a recovered VM references a missing pool record, treat that as a control-plane state restore problem rather than a guest runtime issue.
 - Run `sudo ./contrib/smoke/host-smoke.sh` after install, restore, control-plane upgrade, and base-image changes.

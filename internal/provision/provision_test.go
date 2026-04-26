@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"hegel.dev/go/hegel"
 	"tailscale.com/client/tailscale/v2"
 
 	"srv/internal/config"
@@ -289,6 +290,92 @@ func TestAllocateNetworkSkipsDeletedSubnetsAndDetectsExhaustion(t *testing.T) {
 	if _, _, _, _, err := p.allocateNetwork(ctx); err == nil || !strings.Contains(err.Error(), "no free /30 network blocks remain") {
 		t.Fatalf("allocateNetwork() exhaustion error = %v", err)
 	}
+}
+
+func TestAllocateNetworkHegelFirstFreeSubnet(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, map[string]string{
+		"SRV_VM_NETWORK_CIDR": "10.42.0.0/27",
+	})
+	const slotCount = 8
+
+	slotNetwork := func(slot int) string {
+		return fmt.Sprintf("10.42.0.%d/30", slot*4)
+	}
+	slotHost := func(slot int) string {
+		return fmt.Sprintf("10.42.0.%d", slot*4+1)
+	}
+	slotGuest := func(slot int) string {
+		return fmt.Sprintf("10.42.0.%d", slot*4+2)
+	}
+	setNetworkSlot := func(inst *model.Instance, slot int) {
+		inst.NetworkCIDR = slotNetwork(slot)
+		inst.HostAddr = slotHost(slot) + "/30"
+		inst.GuestAddr = slotGuest(slot) + "/30"
+		inst.GatewayAddr = slotHost(slot)
+	}
+
+	t.Run("first free non-deleted slot", hegel.Case(func(ht *hegel.T) {
+		activeMask := hegel.Draw(ht, hegel.Integers(0, (1<<slotCount)-1))
+		deletedMask := hegel.Draw(ht, hegel.Integers(0, (1<<slotCount)-1))
+
+		st, err := store.Open(filepath.Join(ht.TempDir(), "srv.db"))
+		if err != nil {
+			ht.Fatalf("store.Open: %v", err)
+		}
+		defer func() {
+			if err := st.Close(); err != nil {
+				ht.Fatalf("Store.Close: %v", err)
+			}
+		}()
+
+		p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+		createdAt := time.Date(2026, time.April, 26, 12, 0, 0, 0, time.UTC)
+		for slot := 0; slot < slotCount; slot++ {
+			if activeMask&(1<<slot) != 0 {
+				inst := provisionTestInstance(cfg, fmt.Sprintf("active-%d", slot), model.StateReady, createdAt.Add(time.Duration(slot)*time.Second))
+				setNetworkSlot(&inst, slot)
+				if err := st.CreateInstance(ctx, inst); err != nil {
+					ht.Fatalf("CreateInstance(active %d): %v", slot, err)
+				}
+			}
+			if deletedMask&(1<<slot) != 0 {
+				inst := provisionTestInstance(cfg, fmt.Sprintf("deleted-%d", slot), model.StateDeleted, createdAt.Add(time.Duration(slot+slotCount)*time.Second))
+				setNetworkSlot(&inst, slot)
+				deletedAt := inst.CreatedAt.Add(time.Minute)
+				inst.DeletedAt = &deletedAt
+				if err := st.CreateInstance(ctx, inst); err != nil {
+					ht.Fatalf("CreateInstance(deleted %d): %v", slot, err)
+				}
+			}
+		}
+
+		firstFree := -1
+		for slot := 0; slot < slotCount; slot++ {
+			if activeMask&(1<<slot) == 0 {
+				firstFree = slot
+				break
+			}
+		}
+
+		networkCIDR, hostAddr, guestAddr, gateway, err := p.allocateNetwork(ctx)
+		if firstFree == -1 {
+			if err == nil || !strings.Contains(err.Error(), "no free /30 network blocks remain") {
+				ht.Fatalf("allocateNetwork(activeMask=%08b, deletedMask=%08b) error = %v", activeMask, deletedMask, err)
+			}
+			return
+		}
+		if err != nil {
+			ht.Fatalf("allocateNetwork(activeMask=%08b, deletedMask=%08b): %v", activeMask, deletedMask, err)
+		}
+		wantNetwork := slotNetwork(firstFree)
+		wantHost := slotHost(firstFree) + "/30"
+		wantGuest := slotGuest(firstFree) + "/30"
+		wantGateway := slotHost(firstFree)
+		if networkCIDR != wantNetwork || hostAddr != wantHost || guestAddr != wantGuest || gateway != wantGateway {
+			ht.Fatalf("allocateNetwork(activeMask=%08b, deletedMask=%08b) = (%q, %q, %q, %q), want (%q, %q, %q, %q)", activeMask, deletedMask, networkCIDR, hostAddr, guestAddr, gateway, wantNetwork, wantHost, wantGuest, wantGateway)
+		}
+	}, hegel.WithTestCases(100)))
 }
 
 func TestWriteMetadataFileRedactsAuthKey(t *testing.T) {

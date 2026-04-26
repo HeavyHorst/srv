@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 
 	gssh "github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
+	"hegel.dev/go/hegel"
 
 	"srv/internal/config"
 	"srv/internal/model"
@@ -1874,6 +1876,151 @@ func TestParseNewArgs(t *testing.T) {
 	}
 }
 
+func TestParseNewArgsHegelSizingFlags(t *testing.T) {
+	sizeUnits := []string{"", "b", "B", "k", "kb", "KiB", "m", "mb", "MiB", "g", "gb", "GiB"}
+	unitMultipliers := map[string]int64{
+		"b":   1,
+		"k":   1 << 10,
+		"kb":  1 << 10,
+		"kib": 1 << 10,
+		"m":   1 << 20,
+		"mb":  1 << 20,
+		"mib": 1 << 20,
+		"g":   1 << 30,
+		"gb":  1 << 30,
+		"gib": 1 << 30,
+	}
+	orders := [][3]int{
+		{0, 1, 2},
+		{0, 2, 1},
+		{1, 0, 2},
+		{1, 2, 0},
+		{2, 0, 1},
+		{2, 1, 0},
+	}
+	flagArgs := func(key, value string, equals bool) []string {
+		if equals {
+			return []string{key + "=" + value}
+		}
+		return []string{key, value}
+	}
+	sizeLiteral := func(number int64, suffix string) string {
+		return strconv.FormatInt(number, 10) + suffix
+	}
+	sizeBytes := func(number int64, suffix string) int64 {
+		if suffix == "" {
+			return number * mib
+		}
+		return number * unitMultipliers[strings.ToLower(suffix)]
+	}
+
+	t.Run("sizing flags", hegel.Case(func(ht *hegel.T) {
+		name := hegel.Draw(ht, hegel.SampledFrom([]string{"demo", "demo-1", "alpha"}))
+		cpus := hegel.Draw(ht, hegel.Integers[int64](1, config.MaxVCPUCount))
+		ramNumber := hegel.Draw(ht, hegel.Integers[int64](1, 64))
+		ramSuffix := hegel.Draw(ht, hegel.SampledFrom(sizeUnits))
+		rootNumber := hegel.Draw(ht, hegel.Integers[int64](1, 128))
+		rootSuffix := hegel.Draw(ht, hegel.SampledFrom(sizeUnits))
+		order := orders[hegel.Draw(ht, hegel.Integers(0, len(orders)-1))]
+		namePosition := hegel.Draw(ht, hegel.Integers(0, len(order)))
+
+		flags := [][]string{
+			flagArgs("--cpus", strconv.FormatInt(cpus, 10), hegel.Draw(ht, hegel.Booleans())),
+			flagArgs("--ram", sizeLiteral(ramNumber, ramSuffix), hegel.Draw(ht, hegel.Booleans())),
+			flagArgs("--rootfs-size", sizeLiteral(rootNumber, rootSuffix), hegel.Draw(ht, hegel.Booleans())),
+		}
+		args := []string{"new"}
+		for pos, flagIndex := range order {
+			if pos == namePosition {
+				args = append(args, name)
+			}
+			args = append(args, flags[flagIndex]...)
+		}
+		if namePosition == len(order) {
+			args = append(args, name)
+		}
+
+		gotName, gotOpts, gotIntegrations, err := parseNewArgs(args)
+		if err != nil {
+			ht.Fatalf("parseNewArgs(%#v): %v", args, err)
+		}
+		wantOpts := provision.CreateOptions{
+			VCPUCount:       cpus,
+			MemoryMiB:       bytesToMiBCeil(sizeBytes(ramNumber, ramSuffix)),
+			RootFSSizeBytes: sizeBytes(rootNumber, rootSuffix),
+		}
+		if gotName != name {
+			ht.Fatalf("parseNewArgs(%#v) name = %q, want %q", args, gotName, name)
+		}
+		if !reflect.DeepEqual(gotOpts, wantOpts) {
+			ht.Fatalf("parseNewArgs(%#v) opts = %#v, want %#v", args, gotOpts, wantOpts)
+		}
+		if len(gotIntegrations) != 0 {
+			ht.Fatalf("parseNewArgs(%#v) integrations = %#v, want none", args, gotIntegrations)
+		}
+	}, hegel.WithTestCases(200)))
+}
+
+func TestParseNewArgsHegelRejectsInvalidInputs(t *testing.T) {
+	validNames := []string{"demo", "demo-1", "alpha"}
+	badUnits := []string{"x", "mi", "GiBB", "bytes", "%", "k b"}
+	valueForFlag := func(flag string) string {
+		switch flag {
+		case "--cpus":
+			return "2"
+		case "--ram", "--rootfs-size":
+			return "2G"
+		case "--pool":
+			return "pool-a"
+		default:
+			return "openai"
+		}
+	}
+	assertRejected := func(ht *hegel.T, args []string, wantErr string) {
+		ht.Helper()
+		_, _, _, err := parseNewArgs(args)
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			ht.Fatalf("parseNewArgs(%#v) error = %v, want substring %q", args, err, wantErr)
+		}
+	}
+
+	t.Run("duplicate flags", hegel.Case(func(ht *hegel.T) {
+		flag := hegel.Draw(ht, hegel.SampledFrom([]string{"--cpus", "--ram", "--rootfs-size", "--pool"}))
+		value := valueForFlag(flag)
+		args := []string{"new", hegel.Draw(ht, hegel.SampledFrom(validNames)), flag, value, flag, value}
+		assertRejected(ht, args, flag+" specified more than once")
+	}, hegel.WithTestCases(100)))
+
+	t.Run("missing values", hegel.Case(func(ht *hegel.T) {
+		flag := hegel.Draw(ht, hegel.SampledFrom([]string{"--cpus", "--ram", "--rootfs-size", "--pool", "--integration"}))
+		args := []string{"new", hegel.Draw(ht, hegel.SampledFrom(validNames)), flag}
+		assertRejected(ht, args, "missing value for "+flag)
+	}, hegel.WithTestCases(100)))
+
+	t.Run("bad size units", hegel.Case(func(ht *hegel.T) {
+		flag := hegel.Draw(ht, hegel.SampledFrom([]string{"--ram", "--rootfs-size"}))
+		number := hegel.Draw(ht, hegel.Integers[int64](1, 1_000_000))
+		unit := hegel.Draw(ht, hegel.SampledFrom(badUnits))
+		args := []string{"new", hegel.Draw(ht, hegel.SampledFrom(validNames)), flag, strconv.FormatInt(number, 10) + unit}
+		assertRejected(ht, args, "unknown size unit")
+	}, hegel.WithTestCases(100)))
+
+	t.Run("zero and negative sizes", hegel.Case(func(ht *hegel.T) {
+		flag := hegel.Draw(ht, hegel.SampledFrom([]string{"--ram", "--rootfs-size"}))
+		number := hegel.Draw(ht, hegel.Integers[int64](-1_000_000, 0))
+		unit := hegel.Draw(ht, hegel.SampledFrom([]string{"", "b", "KiB", "m", "G"}))
+		args := []string{"new", hegel.Draw(ht, hegel.SampledFrom(validNames)), flag, strconv.FormatInt(number, 10) + unit}
+		assertRejected(ht, args, "parse "+flag)
+	}, hegel.WithTestCases(100)))
+
+	t.Run("extra names", hegel.Case(func(ht *hegel.T) {
+		name := hegel.Draw(ht, hegel.SampledFrom(validNames))
+		extra := hegel.Draw(ht, hegel.SampledFrom([]string{"other", "extra-1", "beta"}))
+		args := []string{"new", name, extra}
+		assertRejected(ht, args, "unexpected argument")
+	}, hegel.WithTestCases(100)))
+}
+
 func TestParseIntegrationAddArgs(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -2100,6 +2247,77 @@ func TestParseImportArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseSizeHegelSupportedUnits(t *testing.T) {
+	supportedUnits := []string{"", "b", "B", "k", "kb", "KiB", "m", "mb", "MiB", "g", "gb", "GiB", "t", "tb", "TiB"}
+	defaultUnits := []int64{1, 1024, mib, 1 << 30}
+	unitMultipliers := map[string]int64{
+		"b":   1,
+		"k":   1 << 10,
+		"kb":  1 << 10,
+		"kib": 1 << 10,
+		"m":   1 << 20,
+		"mb":  1 << 20,
+		"mib": 1 << 20,
+		"g":   1 << 30,
+		"gb":  1 << 30,
+		"gib": 1 << 30,
+		"t":   1 << 40,
+		"tb":  1 << 40,
+		"tib": 1 << 40,
+	}
+
+	t.Run("supported units", hegel.Case(func(ht *hegel.T) {
+		number := hegel.Draw(ht, hegel.Integers[int64](1, 1_000_000))
+		spaceBefore := hegel.Draw(ht, hegel.SampledFrom([]string{"", " ", "\t"}))
+		spaceBeforeUnit := hegel.Draw(ht, hegel.SampledFrom([]string{"", " "}))
+		suffix := hegel.Draw(ht, hegel.SampledFrom(supportedUnits))
+		spaceAfter := hegel.Draw(ht, hegel.SampledFrom([]string{"", " ", "\t"}))
+		defaultUnit := hegel.Draw(ht, hegel.SampledFrom(defaultUnits))
+
+		input := spaceBefore + strconv.FormatInt(number, 10) + spaceBeforeUnit + suffix + spaceAfter
+		got, err := parseSize(input, defaultUnit)
+		if err != nil {
+			ht.Fatalf("parseSize(%q, %d): %v", input, defaultUnit, err)
+		}
+
+		multiplier := defaultUnit
+		if suffix != "" {
+			multiplier = unitMultipliers[strings.ToLower(suffix)]
+		}
+		want := number * multiplier
+		if got != want {
+			ht.Fatalf("parseSize(%q, %d) = %d, want %d", input, defaultUnit, got, want)
+		}
+	}, hegel.WithTestCases(200)))
+}
+
+func TestParseSizeHegelRejectsInvalidInputs(t *testing.T) {
+	defaultUnits := []int64{1, 1024, mib, 1 << 30}
+
+	t.Run("bad units", hegel.Case(func(ht *hegel.T) {
+		number := hegel.Draw(ht, hegel.Integers[int64](1, 1_000_000))
+		unit := hegel.Draw(ht, hegel.SampledFrom([]string{"x", "mi", "GiBB", "bytes", "%", "k b"}))
+		spaceBeforeUnit := hegel.Draw(ht, hegel.SampledFrom([]string{"", " "}))
+		input := strconv.FormatInt(number, 10) + spaceBeforeUnit + unit
+		_, err := parseSize(input, hegel.Draw(ht, hegel.SampledFrom(defaultUnits)))
+		if err == nil || !strings.Contains(err.Error(), "unknown size unit") {
+			ht.Fatalf("parseSize(%q) error = %v, want unknown size unit", input, err)
+		}
+	}, hegel.WithTestCases(100)))
+
+	t.Run("zero and negative sizes", hegel.Case(func(ht *hegel.T) {
+		number := hegel.Draw(ht, hegel.Integers[int64](-1_000_000, 0))
+		unit := hegel.Draw(ht, hegel.SampledFrom([]string{"", "b", "KiB", "m", "G"}))
+		spaceBefore := hegel.Draw(ht, hegel.SampledFrom([]string{"", " ", "\t"}))
+		spaceAfter := hegel.Draw(ht, hegel.SampledFrom([]string{"", " ", "\t"}))
+		input := spaceBefore + strconv.FormatInt(number, 10) + unit + spaceAfter
+		_, err := parseSize(input, hegel.Draw(ht, hegel.SampledFrom(defaultUnits)))
+		if err == nil {
+			ht.Fatalf("parseSize(%q) unexpectedly succeeded", input)
+		}
+	}, hegel.WithTestCases(100)))
 }
 
 func TestFormatImportProgress(t *testing.T) {

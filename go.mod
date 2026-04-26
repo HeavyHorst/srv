@@ -12,6 +12,7 @@ require (
 	golang.org/x/crypto v0.46.0
 	golang.org/x/sync v0.19.0
 	golang.org/x/sys v0.42.0
+	hegel.dev/go/hegel v0.1.3
 	modernc.org/sqlite v1.48.0
 	tailscale.com v1.96.5
 	tailscale.com/client/tailscale/v2 v2.9.0

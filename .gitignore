@@ -1,4 +1,5 @@
 images/arch-base/out/
+/.hegel/
 /.config
 /.opencode
 /srv

@@ -2306,6 +2306,8 @@ func helpResult() commandResult {
 	fmt.Fprintln(&b, "        Memory (e.g. 512m, 2g).")
 	fmt.Fprintln(&b, "    --pool NAME")
 	fmt.Fprintln(&b, "        Place a new VM into an existing shared memory pool.")
+	fmt.Fprintln(&b, "        Pooled VMs use elastic memory and may have idle guest RAM")
+	fmt.Fprintln(&b, "        reclaimed; use fixed mode for databases, JVMs, and caches.")
 	fmt.Fprintln(&b, "    --rootfs-size SIZE")
 	fmt.Fprintln(&b, "        Root filesystem size (e.g. 4g, 10g).")
 	fmt.Fprintln(&b, "    --integration NAME")

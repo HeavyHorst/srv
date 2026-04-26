@@ -13,6 +13,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | Command | Description |
 |---------|-------------|
 | `new <name>` | Create new VM with optional `--cpus`, `--ram`, `--rootfs-size` |
+| `new <name> --pool <pool> --ram <size>` | Create a pooled VM with elastic memory; idle guest RAM may be reclaimed |
 | `new <name> --integration <name>` | Create a VM and enable one or more existing integrations (admin only) |
 | `list` | Show visible VMs (all for admins, own for regular users) |
 | `top [--interval DURATION]` | Live per-VM CPU, memory, disk, and network view; press `q` to exit |
@@ -27,6 +28,8 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | `backup create <name>` | Create an in-place backup for a stopped VM |
 | `backup list <name>` | List stored backups for a VM |
 | `restore <name> <backup-id>` | Restore a stopped VM from one of its backups |
+
+Use fixed mode for databases, JVMs, caches, and other memory-sensitive services. Pooled mode is for workloads that tolerate elastic memory.
 
 ## Integrations (admin only)
 

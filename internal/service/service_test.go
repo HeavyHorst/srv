@@ -1000,6 +1000,8 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 		"--cpus N",
 		"--ram SIZE",
 		"--pool NAME",
+		"Pooled VMs use elastic memory",
+		"use fixed mode for databases, JVMs, and caches",
 		"--rootfs-size SIZE",
 	} {
 		if !strings.Contains(result.stdout, want) {

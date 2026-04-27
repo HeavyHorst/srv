@@ -318,12 +318,14 @@ install_pi() {
 	install -d -m 0755 "${ROOTFS_MOUNT_DIR}/opt" "${ROOTFS_MOUNT_DIR}/usr/local/bin"
 	rm -rf "${ROOTFS_MOUNT_DIR}/opt/pi"
 	tar -xzf "${tarball}" -C "${ROOTFS_MOUNT_DIR}/opt"
+	printf 'v%s' "${PI_VERSION}" >"${ROOTFS_MOUNT_DIR}/opt/pi/VERSION"
 	ln -sf /opt/pi/pi "${ROOTFS_MOUNT_DIR}/usr/local/bin/pi"
 }
 
 configure_rootfs() {
 	install -d "${ROOTFS_MOUNT_DIR}/var/lib/srv"
 	chmod 0755 "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/bootstrap.sh"
+	chmod 0755 "${ROOTFS_MOUNT_DIR}/usr/local/bin/update-pi"
 	systemctl --root="${ROOTFS_MOUNT_DIR}" enable docker.socket tailscaled.service srv-bootstrap.service >/dev/null
 	systemctl --root="${ROOTFS_MOUNT_DIR}" disable \
 		docker.service \

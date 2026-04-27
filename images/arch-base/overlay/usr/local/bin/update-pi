@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PI_DIR=/opt/pi
+PI_VERSION_FILE="${PI_DIR}/VERSION"
+PI_REPO=badlogic/pi-mono
+GH_API="https://api.github.com/repos/${PI_REPO}/releases/latest"
+
+log() {
+	echo "update-pi: $*" >&2
+}
+
+arch_label() {
+	local arch
+	arch="$(uname -m)"
+	case "${arch}" in
+		x86_64) echo "x64" ;;
+		aarch64 | arm64) echo "arm64" ;;
+		*)
+			log "unsupported architecture: ${arch}"
+			exit 1
+			;;
+	esac
+}
+
+latest_release_tag() {
+	curl -fsSL "${GH_API}" | jq -er '.tag_name'
+}
+
+installed_version() {
+	if [[ -f "${PI_VERSION_FILE}" ]]; then
+		cat "${PI_VERSION_FILE}"
+		return
+	fi
+	log "no version file found at ${PI_VERSION_FILE}; forcing update"
+	echo "v0.0.0"
+}
+
+main() {
+	local release_arch current latest download_url
+	release_arch="$(arch_label)"
+	current="$(installed_version)"
+	latest="$(latest_release_tag)"
+
+	if [[ "${current}" == "${latest}" ]]; then
+		log "pi is already at the latest release (${latest})"
+		exit 0
+	fi
+
+	log "updating pi from ${current} to ${latest}"
+
+	download_url="https://github.com/${PI_REPO}/releases/download/${latest}/pi-linux-${release_arch}.tar.gz"
+	tarball="$(mktemp /tmp/pi-update.XXXXXX.tar.gz)"
+
+	curl -fsSL "${download_url}" -o "${tarball}"
+
+	rm -rf "${PI_DIR}"
+	tar -xzf "${tarball}" -C /opt
+	rm -f "${tarball}"
+
+	printf '%s' "${latest}" >"${PI_VERSION_FILE}"
+
+	ln -sf "${PI_DIR}/pi" /usr/local/bin/pi
+
+	log "pi updated to ${latest}"
+}
+
+main "$@"

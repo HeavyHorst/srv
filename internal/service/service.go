@@ -51,6 +51,7 @@ type App struct {
 	localAPI           *local.Client
 	sshServer          *gssh.Server
 	zenGateway         *zenGatewayManager
+	deepseekGateway    *deepseekGatewayManager
 	integrationGateway *integrationGatewayManager
 	commandMu          sync.Mutex
 	commandCond        *sync.Cond
@@ -129,6 +130,7 @@ type inspectInstanceJSON struct {
 	HostIP          string          `json:"host_ip,omitempty"`
 	GuestIP         string          `json:"guest_ip,omitempty"`
 	ZenGateway      string          `json:"zen_gateway,omitempty"`
+	DeepSeekGateway string          `json:"deepseek_gateway,omitempty"`
 	TailscaleName   string          `json:"tailscale_name,omitempty"`
 	TailscaleIP     string          `json:"tailscale_ip,omitempty"`
 	LastError       string          `json:"last_error,omitempty"`
@@ -373,6 +375,7 @@ func (a *App) inspectPayload(inst model.Instance, poolName string, integrations 
 			HostIP:          inst.HostAddr,
 			GuestIP:         inst.GuestAddr,
 			ZenGateway:      a.zenGatewayBaseURL(inst),
+			DeepSeekGateway: a.deepseekGatewayBaseURL(inst),
 			TailscaleName:   inst.TailscaleName,
 			TailscaleIP:     inst.TailscaleIP,
 			LastError:       inst.LastError,
@@ -413,6 +416,10 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	deepseekGateway, err := newDeepseekGatewayManager(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
 	integrationGateway, err := newIntegrationGatewayManager(cfg, logger)
 	if err != nil {
 		return nil, err
@@ -429,7 +436,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 
-	return &App{cfg: cfg, log: logger, store: st, provisioner: prov, zenGateway: zenGateway, integrationGateway: integrationGateway}, nil
+	return &App{cfg: cfg, log: logger, store: st, provisioner: prov, zenGateway: zenGateway, deepseekGateway: deepseekGateway, integrationGateway: integrationGateway}, nil
 }
 
 func (a *App) lockInstance(name string) func() {
@@ -529,6 +536,9 @@ func (a *App) Run(ctx context.Context) error {
 		}
 		if a.zenGateway != nil {
 			a.zenGateway.Close()
+		}
+		if a.deepseekGateway != nil {
+			a.deepseekGateway.Close()
 		}
 		if a.sshServer != nil {
 			_ = a.sshServer.Shutdown(shutdownCtx)
@@ -1054,6 +1064,9 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	fmt.Fprintf(&b, "guest-ip: %s\n", inst.GuestAddr)
 	if gatewayURL := a.zenGatewayBaseURL(inst); gatewayURL != "" {
 		fmt.Fprintf(&b, "zen-gateway: %s\n", gatewayURL)
+	}
+	if gatewayURL := a.deepseekGatewayBaseURL(inst); gatewayURL != "" {
+		fmt.Fprintf(&b, "deepseek-gateway: %s\n", gatewayURL)
 	}
 	if len(integrations) > 0 {
 		b.WriteString("integrations:\n")

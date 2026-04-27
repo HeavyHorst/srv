@@ -1,6 +1,6 @@
 # Sandboxed AI coding agent
 
-srv makes it straightforward to run AI coding agents in isolated microVMs. Each VM gets its own cgroup limits, per-instance Tailscale identity, and an optional Zen API proxy that injects the host's API key without exposing it inside the guest.
+srv makes it straightforward to run AI coding agents in isolated microVMs. Each VM gets its own cgroup limits, per-instance Tailscale identity, and optional provider API proxies that inject host API keys without exposing them inside the guest.
 
 ## Create a VM for an agent
 
@@ -16,15 +16,15 @@ ssh srv inspect agent-1
 
 Look for `state: ready` and a `tailscale-ip`.
 
-## Zen API proxy
+## Provider API proxies
 
-When `SRV_ZEN_API_KEY` is configured on the host, `srv` binds a per-instance HTTP proxy on the guest's gateway IP and port `11434` (configurable via `SRV_ZEN_GATEWAY_PORT`). The proxy:
+When provider API keys such as `SRV_ZEN_API_KEY` or `SRV_DEEPSEEK_API_KEY` are configured on the host, `srv` binds per-instance HTTP proxies on the guest's gateway IP and the provider gateway ports. The proxies:
 
-- Only accepts requests from that VM's guest IP
-- Forwards `/v1/...` requests to the upstream OpenCode Zen API with the host key injected
-- The guest bootstrap writes `/root/.config/opencode/opencode.json` and Pi config under `/root/.pi/agent/` pointing at this gateway
+- Only accept requests from that VM's guest IP
+- Forward `/v1/...` requests to upstream provider APIs with host keys injected
+- The guest bootstrap writes `/root/.config/opencode/opencode.json` and Pi config under `/root/.pi/agent/` pointing at these gateways
 
-This means the agent inside the VM can use `opencode`, `pi`, or any OpenAI-compatible client against `http://<gateway-ip>:11434/v1` without ever seeing the real API key.
+This means the agent inside the VM can use `opencode`, `pi`, or any OpenAI-compatible client against the per-provider gateway URLs without ever seeing the real API keys.
 
 ## Connect the agent
 

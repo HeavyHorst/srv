@@ -92,7 +92,7 @@ When a VM is deleted, the network helper removes:
 
 srv can also expose host-side HTTP gateways on each VM's gateway IP:
 
-- The Zen gateway on `SRV_ZEN_GATEWAY_PORT` proxies `/v1/...` to the configured OpenCode Zen upstream with the host API key injected.
+- Provider gateways on `SRV_ZEN_GATEWAY_PORT` and `SRV_DEEPSEEK_GATEWAY_PORT` proxy `/v1/...` to configured LLM upstreams with host API keys injected.
 - The generic integration gateway on `SRV_INTEGRATION_GATEWAY_PORT` proxies `/integrations/<name>/...` to operator-defined HTTP integrations with host-managed auth or headers injected.
 
-Both gateway types only accept requests from the owning guest IP. See [Zen gateway](zen-gateway.md) and [HTTP integrations](integrations.md).
+Both gateway types only accept requests from the owning guest IP. See [Provider gateways](provider-gateways.md) and [HTTP integrations](integrations.md).

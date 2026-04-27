@@ -59,13 +59,16 @@ Use either `TS_AUTHKEY` or `TS_CLIENT_ID`/`TS_CLIENT_SECRET` for the control-pla
 | `SRV_ALLOWED_USERS` | (empty) | Comma-separated Tailscale login allowlist. Empty means allow all tailnet users. |
 | `SRV_ADMIN_USERS` | (empty) | Comma-separated Tailscale logins with cross-instance visibility and management rights |
 
-## Zen gateway
+## Provider gateways
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SRV_ZEN_API_KEY` | (empty) | OpenCode Zen API key. When set, enables per-VM Zen gateways. |
 | `SRV_ZEN_BASE_URL` | `https://opencode.ai/zen` | Upstream Zen API base URL |
-| `SRV_ZEN_GATEWAY_PORT` | `11434` | TCP port for each VM's gateway proxy |
+| `SRV_ZEN_GATEWAY_PORT` | `11434` | TCP port for each VM's Zen gateway proxy |
+| `SRV_DEEPSEEK_API_KEY` | (empty) | DeepSeek API key. When set, enables per-VM DeepSeek gateways. |
+| `SRV_DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | Upstream DeepSeek API base URL |
+| `SRV_DEEPSEEK_GATEWAY_PORT` | `11436` | TCP port for each VM's DeepSeek gateway proxy |
 
 ## HTTP integrations
 

@@ -20,7 +20,7 @@ This produces two artifacts:
 - Docker, docker-compose
 - Go, gopls, Odin, odinfmt, OLS
 - Neovim with a prewarmed LazyVim config (BMW heritage amber theme)
-- OpenCode and Pi CLIs with per-VM Zen gateway bootstrap
+- OpenCode and Pi CLIs with per-VM provider gateway bootstrap
 - Git, fd, ripgrep, tree-sitter-cli, gcc, perf, valgrind
 - iptables-nft with IPv4/IPv6 nftables support
 - `srv-bootstrap.service` for Tailscale and MMDS setup

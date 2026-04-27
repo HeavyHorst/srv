@@ -16,7 +16,7 @@ ssh srv new demo
 srv is useful for both short-lived sandboxes and persistent isolated services.
 
 - **Throwaway debug VMs** — spin up an isolated environment, break things, and delete it without affecting the host
-- **Sandboxed agent VMs** — give AI coding agents their own cgroup-limited VM with per-instance Tailscale identity and a scoped Zen API proxy
+- **Sandboxed agent VMs** — give AI coding agents their own cgroup-limited VM with per-instance Tailscale identity and scoped provider API proxies
 - **Dev/test environments** — fast reflink-based clones from a single base image, with backup/restore for instant reset
 - **Isolated workloads** — run services in separate microVMs with per-VM networking, auth, and resource limits
 
@@ -52,7 +52,7 @@ Key components:
 - **Network helper** — root-only process owns TAP creation, iptables MASQUERADE, and FORWARD rules
 - **VM runner** — root-owned process invokes Firecracker through the official jailer, drops to `srv-vm:srv`, and places each VM into its own cgroup v2 leaf
 - **MMDS** — one-off Tailscale auth keys are injected through Firecracker metadata so guests self-bootstrap
-- **Zen gateway** — per-instance HTTP proxy on the guest's gateway IP forwards to OpenCode Zen with the host key
+- **Provider gateways** — per-instance HTTP proxies on the guest's gateway IP forward to LLM providers with host keys
 - **HTTP integrations** — admin-defined host-side HTTP proxies inject headers or auth for selected guests without storing raw secrets inside the VM
 
 ## Where you can run it

@@ -5,7 +5,7 @@ This directory builds the Arch guest image expected by `srv`.
 It produces two artifacts:
 
 - `vmlinux`: an x86_64 Firecracker-compatible kernel built from the upstream 6.12 LTS kernel using Firecracker's recommended 6.1 guest config as a seed plus a small fragment for Tailscale, Arch guest usability, Firecracker's current x86 ACPI boot requirements, and virtio balloon/page-reporting reclaim.
-- `rootfs-base.img`: a sparse ext4 image populated with an Arch userspace via `pacstrap`, including Docker tooling with socket activation, a small developer toolset (`go`, `gopls`, `lua-language-server`, `neovim`, `opencode`, `pi`, `odin`, `odinfmt`, `ols`, `shfmt`, `stylua`), a root LazyVim starter config preloaded with the BMW heritage amber theme assets mirrored from the `config` repo, default OpenCode and Pi configs that bootstrap rewrites to the per-VM host Zen gateway when available, and a matching `/lib/modules/<kernel>` tree for the separately built guest kernel.
+- `rootfs-base.img`: a sparse ext4 image populated with an Arch userspace via `pacstrap`, including Docker tooling with socket activation, a small developer toolset (`go`, `gopls`, `lua-language-server`, `neovim`, `opencode`, `pi`, `odin`, `odinfmt`, `ols`, `shfmt`, `stylua`), a root LazyVim starter config preloaded with the BMW heritage amber theme assets mirrored from the `config` repo, default OpenCode and Pi configs that bootstrap rewrites to the per-VM host provider gateways when available, and a matching `/lib/modules/<kernel>` tree for the separately built guest kernel.
 
 The guest rootfs includes a boot-time `srv-bootstrap.service` that:
 
@@ -15,7 +15,7 @@ The guest rootfs includes a boot-time `srv-bootstrap.service` that:
 4. sets the hostname from `srv.hostname`
 5. starts `tailscaled`
 6. runs `tailscale up --auth-key=... --hostname=... --ssh` on the first authenticated boot and relies on persisted `tailscaled` state on later boots
-7. writes `/root/.config/opencode/opencode.json` plus Pi config under `/root/.pi/agent/` to the per-VM host Zen gateway when the host enabled `SRV_ZEN_API_KEY`, or removes those managed defaults when the gateway is disabled
+7. writes `/root/.config/opencode/opencode.json` plus Pi config under `/root/.pi/agent/` to the per-VM host provider gateways when the host enabled provider API keys, or removes those managed defaults when all provider gateways are disabled
 8. writes `/var/lib/srv/bootstrap.done` with the latest successful bootstrap timestamp for debugging
 
 That `--ssh` flag is intentional: it makes the control plane's existing `connect: ssh root@<name>` output usable through Tailscale SSH without injecting per-user OpenSSH keys into the guest image.
@@ -43,12 +43,12 @@ To keep idle memory low, the image masks getty/serial-getty and the udev device 
 
 The LazyVim config lives under `/root/.config/nvim`. The image overlay now includes the shared BMW LazyVim colorscheme files, a managed `lua/plugins/bootstrap-theme.lua`, and overrides that point `lua_ls`, `gopls`, and `ols` at system binaries already installed in the image while clearing Mason's default `ensure_installed` list. That keeps the build-time `nvim --headless "+Lazy! sync"` prewarm deterministic instead of racing Mason's background installers, so fresh guests inherit the downloaded plugin set and do not need to bootstrap LazyVim on first launch.
 
-OpenCode is installed from Arch's `extra` repository, while Pi is fetched from the upstream `badlogic/pi-mono` release tarball during the image build and installed under `/opt/pi` with `/usr/local/bin/pi` symlinked to the bundled binary. Guest bootstrap manages `/root/.config/opencode/opencode.json` and `/root/.pi/agent/{auth,models,settings}.json` at boot. When the host-side Zen gateway is enabled, bootstrap points both CLIs at `http://<default-gateway>:<zen-gateway-port>/v1` and uses a local placeholder `apiKey` only so the clients keep the OpenCode provider available; the real upstream credential still lives only on the host and is injected by `srv`'s proxy.
+OpenCode is installed from Arch's `extra` repository, while Pi is fetched from the upstream `badlogic/pi-mono` release tarball during the image build and installed under `/opt/pi` with `/usr/local/bin/pi` symlinked to the bundled binary. Guest bootstrap manages `/root/.config/opencode/opencode.json` and `/root/.pi/agent/{auth,models,settings}.json` at boot. When host-side provider gateways are enabled, bootstrap points both CLIs at the per-VM gateway URLs and uses a local placeholder `apiKey` only so the clients keep provider model catalogs available; the real upstream credentials still live only on the host and are injected by `srv`'s proxies.
 
 If you want to pin a different Pi release, override `PI_VERSION`:
 
 ```bash
-sudo PI_VERSION=0.67.1 ./images/arch-base/build.sh
+sudo PI_VERSION=0.70.2 ./images/arch-base/build.sh
 ```
 
 The kernel build parallelism is conservative by default. Override it if needed:
@@ -141,7 +141,7 @@ You can then point the service at those paths with `-base-kernel` and `-base-roo
 - If the kernel build still fails with a generic top-level `Makefile:... Error 2`, retry with `KERNEL_JOBS=1` to surface the first real error line.
 - The rootfs intentionally still omits the Arch `linux` package. The custom kernel is supplied separately as `vmlinux`, which matches how Firecracker boots guests, and the builder disables `90-mkinitcpio-install.hook` during `pacstrap` because no guest initramfs is needed.
 - The rootfs package set now includes `docker`, `docker-compose`, `go`, `gopls`, `lua-language-server`, `neovim`, `opencode`, `odin`, `odinfmt`, `ols`, `perf`, `shfmt`, `stylua`, `valgrind`, `git`, `fd`, `ripgrep`, `tree-sitter-cli`, `gcc`, `iptables-nft`, and `kmod`, while the image build also installs the upstream Pi release tarball under `/opt/pi`, which makes fresh guests ready for Docker-based workloads, Go or Odin development, low-level profiling/debugging, and both OpenCode and Pi agent workflows without additional package installs. Docker starts on demand through `docker.socket` instead of consuming memory at idle.
-- Guest bootstrap now also manages `/root/.config/opencode/opencode.json` and Pi config under `/root/.pi/agent/` from MMDS/bootstrap metadata so the root account automatically targets the per-VM host Zen gateway when `SRV_ZEN_API_KEY` is configured, without ever storing the real Zen API key inside the guest.
+- Guest bootstrap now also manages `/root/.config/opencode/opencode.json` and Pi config under `/root/.pi/agent/` from MMDS/bootstrap metadata so the root account automatically targets per-VM host provider gateways when provider API keys are configured, without ever storing the real API keys inside the guest.
 - The overlay now adds the repo-managed BMW LazyVim theme files and a default `bootstrap-theme.lua`, so new guests start on the same heritage amber colorscheme used by the `config` repo's LazyVim tooling.
 - The builder also prewarms LazyVim inside the guest with `nvim --headless "+Lazy! sync"`, and the shipped config clears Mason's default auto-installs so that bootstrap work finishes before Neovim exits instead of leaving background package installs running.
 - The builder uses its own minimal `pacman.conf` with only the standard Arch repositories so host-local repos and pacman hooks do not leak into the guest image build.

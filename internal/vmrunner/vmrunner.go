@@ -89,6 +89,7 @@ type Bootstrap struct {
 	TailscaleControlURL string   `json:"tailscale_control_url,omitempty"`
 	TailscaleTags       []string `json:"tailscale_tags,omitempty"`
 	ZenGatewayPort      int      `json:"zen_gateway_port,omitempty"`
+	DeepSeekGatewayPort int      `json:"deepseek_gateway_port,omitempty"`
 }
 
 type Metadata struct {

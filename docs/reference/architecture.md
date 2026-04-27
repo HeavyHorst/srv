@@ -22,8 +22,8 @@ srv is a single-host control plane that manages Firecracker microVMs through an 
 │                                  └──────────────────┘  │
 │                                                        │
 │  ┌─────────────┐  ┌─────────────────────────────────┐  │
-│  │ Zen gateway │  │ per-VM HTTP proxy               │  │
-│  │ manager     │  │ (injects SRV_ZEN_API_KEY)       │  │
+│  │ Provider    │  │ per-VM HTTP proxies             │  │
+│  │ gateways    │  │ (inject host API keys)          │  │
 │  └─────────────┘  └─────────────────────────────────┘  │
 └────────────────────────────────────────────────────────┘
          │                    │                  │
@@ -75,9 +75,9 @@ For each new VM, the control plane:
 
 On warm reboots (after a `stop` + `start` or `restart`), the guest reuses its persisted `tailscaled` state instead of minting a new key.
 
-### Zen gateway
+### Provider gateways
 
-When `SRV_ZEN_API_KEY` is set, `srv` binds a per-instance HTTP proxy on each VM's gateway IP and `SRV_ZEN_GATEWAY_PORT`. The proxy forwards guest requests to the upstream Zen API while injecting the host key. See [Zen gateway](../networking/zen-gateway.md) for details.
+When `SRV_ZEN_API_KEY` or `SRV_DEEPSEEK_API_KEY` is set, `srv` binds a per-instance HTTP proxy on each VM's gateway IP and the provider's configured port (`SRV_ZEN_GATEWAY_PORT` for Zen, `SRV_DEEPSEEK_GATEWAY_PORT` for DeepSeek). The proxies forward guest requests to the upstream APIs while injecting the host keys. See [Provider gateways](../networking/provider-gateways.md) for details.
 
 ## Data paths
 

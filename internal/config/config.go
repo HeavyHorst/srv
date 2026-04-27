@@ -13,20 +13,22 @@ import (
 )
 
 const (
-	defaultDataDir          = "/var/lib/srv"
-	defaultHostname         = "srv"
-	defaultListenAddr       = ":22"
-	defaultNetHelperSocket  = "/run/srv/net-helper.sock"
-	defaultVMRunnerSocket   = "/run/srv-vm-runner/vm-runner.sock"
-	defaultFirecrackerBin   = "/usr/bin/firecracker"
-	defaultVMNetworkCIDR    = "172.28.0.0/16"
-	defaultZenBaseURL       = "https://opencode.ai/zen"
-	defaultZenGatewayPort   = 11434
-	defaultIntegrationPort  = 11435
-	defaultGuestAuthExpiry  = 15 * time.Minute
-	defaultGuestReadyTimout = 2 * time.Minute
-	MaxVCPUCount            = 32
-	MinMemoryMiB            = 128
+	defaultDataDir             = "/var/lib/srv"
+	defaultHostname            = "srv"
+	defaultListenAddr          = ":22"
+	defaultNetHelperSocket     = "/run/srv/net-helper.sock"
+	defaultVMRunnerSocket      = "/run/srv-vm-runner/vm-runner.sock"
+	defaultFirecrackerBin      = "/usr/bin/firecracker"
+	defaultVMNetworkCIDR       = "172.28.0.0/16"
+	defaultZenBaseURL          = "https://opencode.ai/zen"
+	defaultZenGatewayPort      = 11434
+	defaultDeepSeekBaseURL     = "https://api.deepseek.com"
+	defaultDeepSeekGatewayPort = 11436
+	defaultIntegrationPort     = 11435
+	defaultGuestAuthExpiry     = 15 * time.Minute
+	defaultGuestReadyTimout    = 2 * time.Minute
+	MaxVCPUCount               = 32
+	MinMemoryMiB               = 128
 )
 
 type Config struct {
@@ -63,6 +65,9 @@ type Config struct {
 	ZenAPIKey                string
 	ZenBaseURL               string
 	ZenGatewayPort           int
+	DeepSeekAPIKey           string
+	DeepSeekBaseURL          string
+	DeepSeekGatewayPort      int
 	IntegrationGatewayPort   int
 
 	LogLevel string
@@ -103,6 +108,9 @@ func Load() (Config, error) {
 	flag.StringVar(&cfg.ZenAPIKey, "zen-api-key", getenv("SRV_ZEN_API_KEY", ""), "optional OpenCode Zen API key used by the host-side guest gateway")
 	flag.StringVar(&cfg.ZenBaseURL, "zen-base-url", getenv("SRV_ZEN_BASE_URL", defaultZenBaseURL), "base URL for the upstream OpenCode Zen API")
 	flag.IntVar(&cfg.ZenGatewayPort, "zen-gateway-port", getenvInt("SRV_ZEN_GATEWAY_PORT", defaultZenGatewayPort), "TCP port exposed on each VM host/gateway IP for the host-side OpenCode Zen proxy")
+	flag.StringVar(&cfg.DeepSeekAPIKey, "deepseek-api-key", getenv("SRV_DEEPSEEK_API_KEY", ""), "optional DeepSeek API key used by the host-side guest gateway")
+	flag.StringVar(&cfg.DeepSeekBaseURL, "deepseek-base-url", getenv("SRV_DEEPSEEK_BASE_URL", defaultDeepSeekBaseURL), "base URL for the upstream DeepSeek API")
+	flag.IntVar(&cfg.DeepSeekGatewayPort, "deepseek-gateway-port", getenvInt("SRV_DEEPSEEK_GATEWAY_PORT", defaultDeepSeekGatewayPort), "TCP port exposed on each VM host/gateway IP for the host-side DeepSeek proxy")
 	flag.IntVar(&cfg.IntegrationGatewayPort, "integration-gateway-port", getenvInt("SRV_INTEGRATION_GATEWAY_PORT", defaultIntegrationPort), "TCP port exposed on each VM host/gateway IP for the host-side generic integration proxy")
 	flag.Int64Var(&cfg.VCPUCount, "vm-vcpus", getenvInt64("SRV_VM_VCPUS", 1), "number of guest vCPUs")
 	flag.Int64Var(&cfg.MemoryMiB, "vm-memory-mib", getenvInt64("SRV_VM_MEMORY_MIB", 1024), "guest memory in MiB")
@@ -165,13 +173,22 @@ func (c Config) Validate() error {
 	if c.ZenGatewayPort < 1 || c.ZenGatewayPort > 65535 {
 		return errors.New("zen gateway port must be between 1 and 65535")
 	}
+	if c.DeepSeekGatewayPort < 1 || c.DeepSeekGatewayPort > 65535 {
+		return errors.New("deepseek gateway port must be between 1 and 65535")
+	}
 	if c.IntegrationGatewayPort < 1 || c.IntegrationGatewayPort > 65535 {
 		return errors.New("integration gateway port must be between 1 and 65535")
 	}
 	if strings.TrimSpace(c.ZenBaseURL) == "" {
 		return errors.New("zen base url is required")
 	}
-	if _, err := parseZenBaseURL(c.ZenBaseURL); err != nil {
+	if _, err := parseProviderBaseURL(c.ZenBaseURL); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.DeepSeekBaseURL) == "" {
+		return errors.New("deepseek base url is required")
+	}
+	if _, err := parseProviderBaseURL(c.DeepSeekBaseURL); err != nil {
 		return err
 	}
 	return nil
@@ -260,20 +277,20 @@ func getenvInt(key string, fallback int) int {
 	return parsed
 }
 
-func parseZenBaseURL(raw string) (string, error) {
+func parseProviderBaseURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", errors.New("zen base url is required")
+		return "", errors.New("base url is required")
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("parse zen base url: %w", err)
+		return "", fmt.Errorf("parse base url: %w", err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", errors.New("zen base url must use http or https")
+		return "", errors.New("base url must use http or https")
 	}
 	if parsed.Host == "" {
-		return "", errors.New("zen base url must include a host")
+		return "", errors.New("base url must include a host")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	return parsed.String(), nil

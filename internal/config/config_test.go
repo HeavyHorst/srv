@@ -182,7 +182,17 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 		{
 			name:    "invalid zen base url",
 			mutate:  func(cfg *Config) { cfg.ZenBaseURL = "mailto:zen@example.com" },
-			wantErr: "zen base url must use http or https",
+			wantErr: "base url must use http or https",
+		},
+		{
+			name:    "invalid deepseek gateway port",
+			mutate:  func(cfg *Config) { cfg.DeepSeekGatewayPort = 70000 },
+			wantErr: "deepseek gateway port must be between 1 and 65535",
+		},
+		{
+			name:    "invalid deepseek base url",
+			mutate:  func(cfg *Config) { cfg.DeepSeekBaseURL = "mailto:ds@example.com" },
+			wantErr: "base url must use http or https",
 		},
 	}
 
@@ -239,6 +249,8 @@ func validConfig() Config {
 		VMRunnerSocketPath:     "/run/srv-vm-runner/vm-runner.sock",
 		ZenBaseURL:             "https://opencode.ai/zen",
 		ZenGatewayPort:         11434,
+		DeepSeekBaseURL:        "https://api.deepseek.com",
+		DeepSeekGatewayPort:    11436,
 		IntegrationGatewayPort: 11435,
 		VCPUCount:              2,
 		MemoryMiB:              1024,

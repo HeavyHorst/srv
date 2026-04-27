@@ -38,11 +38,13 @@ func TestZenGatewayHandlerProxiesOnlyOwningGuest(t *testing.T) {
 		t.Fatalf("url.Parse: %v", err)
 	}
 	manager := &zenGatewayManager{
+		name:      "zen",
 		log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		apiKey:    "zen-test-key",
 		port:      11434,
 		upstream:  upstreamURL,
 		transport: http.DefaultTransport.(*http.Transport).Clone(),
+		applyAuth: applyZenGatewayAuth,
 	}
 	handler := manager.newHandler(zenGatewaySpec{name: "demo", hostIP: "172.28.0.1", guestIP: "172.28.0.2"})
 

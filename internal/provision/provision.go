@@ -352,6 +352,10 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if strings.TrimSpace(p.cfg.ZenAPIKey) != "" {
 		zenGatewayPort = p.cfg.ZenGatewayPort
 	}
+	deepseekGatewayPort := 0
+	if strings.TrimSpace(p.cfg.DeepSeekAPIKey) != "" {
+		deepseekGatewayPort = p.cfg.DeepSeekGatewayPort
+	}
 
 	bootstrap := guestBootstrap{
 		Version:             1,
@@ -360,6 +364,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		TailscaleControlURL: p.cfg.GuestTailscaleControlURL,
 		TailscaleTags:       p.cfg.GuestAuthTags,
 		ZenGatewayPort:      zenGatewayPort,
+		DeepSeekGatewayPort: deepseekGatewayPort,
 	}
 	if err := p.writeMetadataFile(inst, bootstrap); err != nil {
 		inst.LastError = err.Error()
@@ -734,6 +739,10 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 	if strings.TrimSpace(p.cfg.ZenAPIKey) != "" {
 		zenGatewayPort = p.cfg.ZenGatewayPort
 	}
+	deepseekGatewayPort := 0
+	if strings.TrimSpace(p.cfg.DeepSeekAPIKey) != "" {
+		deepseekGatewayPort = p.cfg.DeepSeekGatewayPort
+	}
 
 	bootstrap := guestBootstrap{
 		Version:             1,
@@ -741,6 +750,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		TailscaleControlURL: p.cfg.GuestTailscaleControlURL,
 		TailscaleTags:       p.cfg.GuestAuthTags,
 		ZenGatewayPort:      zenGatewayPort,
+		DeepSeekGatewayPort: deepseekGatewayPort,
 	}
 	pid, err := p.startFirecracker(ctx, inst, pool, bootstrap)
 	if err != nil {

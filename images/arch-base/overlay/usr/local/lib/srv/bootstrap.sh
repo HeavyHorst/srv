@@ -11,6 +11,8 @@ PI_CONFIG_DIR=/root/.pi/agent
 PI_AUTH_PATH="${PI_CONFIG_DIR}/auth.json"
 PI_MODELS_PATH="${PI_CONFIG_DIR}/models.json"
 PI_SETTINGS_PATH="${PI_CONFIG_DIR}/settings.json"
+MANAGED_GATEWAY_PLACEHOLDER="srv-provider-gateway"
+LEGACY_MANAGED_GATEWAY_PLACEHOLDER="srv-zen-gateway"
 trap 'rm -f "${METADATA_FILE}"' EXIT
 
 log() {
@@ -37,7 +39,9 @@ file_matches_expected_content() {
 }
 
 opencode_config_is_managed() {
-	[[ -f "${OPENCODE_CONFIG_PATH}" ]] && grep -Fq '"apiKey": "srv-zen-gateway"' "${OPENCODE_CONFIG_PATH}"
+	[[ -f "${OPENCODE_CONFIG_PATH}" ]] && \
+		(grep -Fq "\"apiKey\": \"${MANAGED_GATEWAY_PLACEHOLDER}\"" "${OPENCODE_CONFIG_PATH}" || \
+			grep -Fq "\"apiKey\": \"${LEGACY_MANAGED_GATEWAY_PLACEHOLDER}\"" "${OPENCODE_CONFIG_PATH}")
 }
 
 remove_opencode_config() {
@@ -48,53 +52,88 @@ remove_opencode_config() {
 
 write_opencode_config() {
 	local gateway_ip="$1"
-	local gateway_port="$2"
+	local zen_port="$2"
+	local deepseek_port="$3"
 	if [[ -f "${OPENCODE_CONFIG_PATH}" ]] && ! opencode_config_is_managed; then
 		log "leaving existing OpenCode config in place"
 		return 1
 	fi
 
 	install -d -m 0700 "${OPENCODE_CONFIG_DIR}"
-	# OpenCode's built-in "opencode" provider hides paid Zen models unless it sees
-	# a non-empty apiKey locally. This placeholder never reaches the real upstream
-	# because the host-side srv gateway overwrites auth before proxying.
-	cat >"${OPENCODE_CONFIG_PATH}" <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "opencode": {
-      "options": {
-        "baseURL": "http://${gateway_ip}:${gateway_port}/v1",
-        "apiKey": "srv-zen-gateway"
-      }
-    }
-  }
-}
-EOF
+	local config_json
+	config_json="$(jq -n \
+		--arg schema "https://opencode.ai/config.json" \
+		--arg zen_url "http://${gateway_ip}:${zen_port}/v1" \
+		--arg deepseek_url "http://${gateway_ip}:${deepseek_port}/v1" \
+		--arg zen_port "${zen_port}" \
+		--arg deepseek_port "${deepseek_port}" \
+		--arg gateway_key "${MANAGED_GATEWAY_PLACEHOLDER}" \
+		'{
+			"\u0024schema": $schema,
+			"provider": {}
+		}
+		| if $zen_port != "" and ($zen_port|test("^[1-9]")) then
+			.provider.opencode.options.baseURL = $zen_url |
+			.provider.opencode.options.apiKey = $gateway_key
+		  else . end
+		| if $deepseek_port != "" and ($deepseek_port|test("^[1-9]")) then
+			.provider.deepseek.options.baseURL = $deepseek_url |
+			.provider.deepseek.options.apiKey = $gateway_key
+		  else . end')"
+	printf '%s\n' "${config_json}" >"${OPENCODE_CONFIG_PATH}"
 	chmod 0600 "${OPENCODE_CONFIG_PATH}"
 	return 0
 }
 
 pi_auth_config_is_managed() {
-	[[ -f "${PI_AUTH_PATH}" ]] && grep -Fq '"opencode"' "${PI_AUTH_PATH}" && grep -Fq '"key": "srv-zen-gateway"' "${PI_AUTH_PATH}"
+	[[ -f "${PI_AUTH_PATH}" ]] && jq -e \
+		--arg gateway_key "${MANAGED_GATEWAY_PLACEHOLDER}" \
+		--arg legacy_gateway_key "${LEGACY_MANAGED_GATEWAY_PLACEHOLDER}" \
+		'(.opencode.key == $gateway_key) or (.deepseek.key == $gateway_key) or (.opencode.key == $legacy_gateway_key) or (.deepseek.key == $legacy_gateway_key)' \
+		"${PI_AUTH_PATH}" >/dev/null 2>&1
 }
 
 pi_models_config_is_managed() {
-	[[ -f "${PI_MODELS_PATH}" ]] && grep -Fq '"opencode"' "${PI_MODELS_PATH}" && grep -Fq '"apiKey": "srv-zen-gateway"' "${PI_MODELS_PATH}"
+	[[ -f "${PI_MODELS_PATH}" ]] && jq -e \
+		--arg gateway_key "${MANAGED_GATEWAY_PLACEHOLDER}" \
+		--arg legacy_gateway_key "${LEGACY_MANAGED_GATEWAY_PLACEHOLDER}" \
+		'(.providers.opencode.apiKey == $gateway_key) or (.providers.deepseek.apiKey == $gateway_key) or (.providers.opencode.apiKey == $legacy_gateway_key) or (.providers.deepseek.apiKey == $legacy_gateway_key)' \
+		"${PI_MODELS_PATH}" >/dev/null 2>&1
 }
 
 managed_pi_settings_content() {
-	cat <<'EOF'
+	local default_provider="$1"
+	cat <<EOF
 {
-  "defaultProvider": "opencode"
+  "defaultProvider": "${default_provider}"
 }
 EOF
 }
 
+pi_settings_default_provider() {
+	local zen_port="$1"
+	local deepseek_port="$2"
+	if [[ -n "${zen_port}" ]] && [[ "${zen_port}" =~ ^[1-9] ]]; then
+		echo "opencode"
+		return 0
+	fi
+	if [[ -n "${deepseek_port}" ]] && [[ "${deepseek_port}" =~ ^[1-9] ]]; then
+		echo "deepseek"
+		return 0
+	fi
+	echo "opencode"
+}
+
 pi_settings_config_is_managed() {
+	local default_provider
 	local expected
-	expected="$(managed_pi_settings_content)"
-	file_matches_expected_content "${PI_SETTINGS_PATH}" "${expected}"
+	for default_provider in opencode deepseek; do
+		expected="$(managed_pi_settings_content "${default_provider}")"
+		if file_matches_expected_content "${PI_SETTINGS_PATH}" "${expected}"; then
+			return 0
+		fi
+	done
+	return 1
 }
 
 remove_pi_config() {
@@ -111,46 +150,67 @@ remove_pi_config() {
 }
 
 write_pi_auth_config() {
+	local zen_port="$1"
+	local deepseek_port="$2"
 	if [[ -f "${PI_AUTH_PATH}" ]] && ! pi_auth_config_is_managed; then
 		log "leaving existing Pi auth config in place"
 		return 1
 	fi
-	cat >"${PI_AUTH_PATH}" <<'EOF'
-{
-  "opencode": {
-    "type": "api_key",
-    "key": "srv-zen-gateway"
-  }
-}
-EOF
+	local auth_json
+	auth_json="$(jq -n \
+		--arg zen_port "${zen_port}" \
+		--arg deepseek_port "${deepseek_port}" \
+		--arg gateway_key "${MANAGED_GATEWAY_PLACEHOLDER}" \
+		'{}
+		| if $zen_port != "" and ($zen_port|test("^[1-9]")) then
+			.opencode.type = "api_key" |
+			.opencode.key = $gateway_key
+		  else . end
+		| if $deepseek_port != "" and ($deepseek_port|test("^[1-9]")) then
+			.deepseek.type = "api_key" |
+			.deepseek.key = $gateway_key
+		  else . end')"
+	printf '%s\n' "${auth_json}" >"${PI_AUTH_PATH}"
 	chmod 0600 "${PI_AUTH_PATH}"
 	return 0
 }
 
 write_pi_models_config() {
 	local gateway_ip="$1"
-	local gateway_port="$2"
+	local zen_port="$2"
+	local deepseek_port="$3"
 	if [[ -f "${PI_MODELS_PATH}" ]] && ! pi_models_config_is_managed; then
 		log "leaving existing Pi models config in place"
 		return 1
 	fi
-	cat >"${PI_MODELS_PATH}" <<EOF
-{
-  "providers": {
-    "opencode": {
-      "baseUrl": "http://${gateway_ip}:${gateway_port}/v1",
-      "apiKey": "srv-zen-gateway"
-    }
-  }
-}
-EOF
+	local models_json
+	models_json="$(jq -n \
+		--arg zen_url "http://${gateway_ip}:${zen_port}/v1" \
+		--arg deepseek_url "http://${gateway_ip}:${deepseek_port}/v1" \
+		--arg zen_port "${zen_port}" \
+		--arg deepseek_port "${deepseek_port}" \
+		--arg gateway_key "${MANAGED_GATEWAY_PLACEHOLDER}" \
+		'{ "providers": {} }
+		| if $zen_port != "" and ($zen_port|test("^[1-9]")) then
+			.providers.opencode.baseUrl = $zen_url |
+			.providers.opencode.apiKey = $gateway_key
+		  else . end
+		| if $deepseek_port != "" and ($deepseek_port|test("^[1-9]")) then
+			.providers.deepseek.baseUrl = $deepseek_url |
+			.providers.deepseek.apiKey = $gateway_key |
+			.providers.deepseek.compat.supportsDeveloperRole = false |
+			.providers.deepseek.compat.supportsStore = false
+		  else . end')"
+	printf '%s\n' "${models_json}" >"${PI_MODELS_PATH}"
 	chmod 0600 "${PI_MODELS_PATH}"
 	return 0
 }
 
 write_pi_settings_config() {
+	local zen_port="$1"
+	local deepseek_port="$2"
 	local expected
-	expected="$(managed_pi_settings_content)"
+	expected="$(managed_pi_settings_content "$(pi_settings_default_provider "${zen_port}" "${deepseek_port}")")"
 	if [[ -f "${PI_SETTINGS_PATH}" ]] && ! pi_settings_config_is_managed; then
 		log "leaving existing Pi settings in place"
 		return 1
@@ -162,17 +222,18 @@ write_pi_settings_config() {
 
 write_pi_config() {
 	local gateway_ip="$1"
-	local gateway_port="$2"
+	local zen_port="$2"
+	local deepseek_port="$3"
 	local wrote_any=1
 
 	install -d -m 0700 "${PI_CONFIG_DIR}"
-	if write_pi_auth_config; then
+	if write_pi_auth_config "${zen_port}" "${deepseek_port}"; then
 		wrote_any=0
 	fi
-	if write_pi_models_config "${gateway_ip}" "${gateway_port}"; then
+	if write_pi_models_config "${gateway_ip}" "${zen_port}" "${deepseek_port}"; then
 		wrote_any=0
 	fi
-	if write_pi_settings_config; then
+	if write_pi_settings_config "${zen_port}" "${deepseek_port}"; then
 		wrote_any=0
 	fi
 	return "${wrote_any}"
@@ -207,22 +268,32 @@ hostname_value="$(jq -er '.srv.hostname' "${METADATA_FILE}")"
 auth_key="$(jq -r '.srv.tailscale_auth_key // empty' "${METADATA_FILE}")"
 control_url="$(jq -r '.srv.tailscale_control_url // empty' "${METADATA_FILE}")"
 zen_gateway_port="$(jq -r '.srv.zen_gateway_port // empty' "${METADATA_FILE}")"
+deepseek_gateway_port="$(jq -r '.srv.deepseek_gateway_port // empty' "${METADATA_FILE}")"
 mapfile -t tags < <(jq -r '.srv.tailscale_tags[]? // empty' "${METADATA_FILE}")
 tag_csv="$(IFS=,; echo "${tags[*]}")"
 log "starting bootstrap for ${hostname_value} via ${iface}"
 
-if [[ -n "${zen_gateway_port}" ]]; then
-	zen_gateway_host="$(default_gateway_ip || true)"
-	if [[ -z "${zen_gateway_host}" ]]; then
+zen_enabled=0
+if [[ -n "${zen_gateway_port}" ]] && [[ "${zen_gateway_port}" =~ ^[1-9] ]]; then
+	zen_enabled=1
+fi
+deepseek_enabled=0
+if [[ -n "${deepseek_gateway_port}" ]] && [[ "${deepseek_gateway_port}" =~ ^[1-9] ]]; then
+	deepseek_enabled=1
+fi
+
+if [[ "${zen_enabled}" -eq 1 ]] || [[ "${deepseek_enabled}" -eq 1 ]]; then
+	gateway_host="$(default_gateway_ip || true)"
+	if [[ -z "${gateway_host}" ]]; then
 		remove_opencode_config
 		remove_pi_config
-		log "skipping Zen gateway guest config because the default gateway IP is unavailable"
+		log "skipping gateway guest config because the default gateway IP is unavailable"
 	else
-		if write_opencode_config "${zen_gateway_host}" "${zen_gateway_port}"; then
-			log "configured OpenCode to use http://${zen_gateway_host}:${zen_gateway_port}/v1"
+		if write_opencode_config "${gateway_host}" "${zen_gateway_port}" "${deepseek_gateway_port}"; then
+			log "configured OpenCode"
 		fi
-		if write_pi_config "${zen_gateway_host}" "${zen_gateway_port}"; then
-			log "configured Pi to use http://${zen_gateway_host}:${zen_gateway_port}/v1"
+		if write_pi_config "${gateway_host}" "${zen_gateway_port}" "${deepseek_gateway_port}"; then
+			log "configured Pi"
 		fi
 	fi
 else

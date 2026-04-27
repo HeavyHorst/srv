@@ -382,6 +382,7 @@ func (a *App) integrationGatewayBaseURL(inst model.Instance, name string) string
 
 func (a *App) syncManagedGatewaysBestEffort() {
 	a.syncZenGatewayBestEffort()
+	a.syncDeepseekGatewayBestEffort()
 	a.syncIntegrationGatewayBestEffort()
 }
 

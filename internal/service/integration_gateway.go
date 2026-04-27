@@ -109,7 +109,7 @@ func (m *integrationGatewayManager) startListener(spec integrationGatewaySpec) (
 	}
 	server := &http.Server{
 		Handler:           m.newHandler(spec),
-		ReadHeaderTimeout: zenGatewayReadHeaderTimeout,
+		ReadHeaderTimeout: gatewayReadHeaderTimeout,
 	}
 	listener := &integrationGatewayListener{spec: spec, server: server, ln: ln}
 	go func() {
@@ -222,12 +222,12 @@ func cleanIntegrationGatewayPath(rawPath string) string {
 }
 
 func integrationGatewayTargetPaths(targetURL, requestURL *url.URL, integrationName, upstreamPath string) (string, string) {
-	pathValue := joinZenGatewayPath(targetURL.Path, upstreamPath)
+	pathValue := joinProviderGatewayPath(targetURL.Path, upstreamPath)
 	rawUpstreamPath := (&url.URL{Path: upstreamPath}).EscapedPath()
 	if preservedRawPath, ok := preservedIntegrationGatewayRawPath(requestURL, integrationName, upstreamPath); ok {
 		rawUpstreamPath = preservedRawPath
 	}
-	rawPathValue := joinZenGatewayPath(targetURL.EscapedPath(), rawUpstreamPath)
+	rawPathValue := joinProviderGatewayPath(targetURL.EscapedPath(), rawUpstreamPath)
 	if rawPathValue == pathValue {
 		return pathValue, ""
 	}

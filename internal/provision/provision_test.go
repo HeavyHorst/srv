@@ -1231,7 +1231,7 @@ func (r *gatedReadCloser) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func TestBackupRequiresStoppedInstance(t *testing.T) {
+func TestBackupAllowsNonStoppedInstanceWithWarning(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
@@ -1253,9 +1253,24 @@ func TestBackupRequiresStoppedInstance(t *testing.T) {
 		t.Fatalf("CreateInstance(): %v", err)
 	}
 
-	_, err := p.CreateBackup(ctx, inst.Name)
-	if err == nil || !strings.Contains(err.Error(), "must be stopped before backup or restore") {
+	oldReflinkCloneFile := reflinkCloneFile
+	t.Cleanup(func() {
+		reflinkCloneFile = oldReflinkCloneFile
+	})
+	reflinkCloneFile = func(_ context.Context, src, dest string) error {
+		payload, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dest, payload, 0o644)
+	}
+
+	info, err := p.CreateBackup(ctx, inst.Name)
+	if err != nil {
 		t.Fatalf("CreateBackup() error = %v", err)
+	}
+	if info.Name != inst.Name {
+		t.Fatalf("CreateBackup() name = %q, want %q", info.Name, inst.Name)
 	}
 }
 

@@ -105,9 +105,14 @@ type replacedRestoreFile struct {
 }
 
 func (p *Provisioner) CreateBackup(ctx context.Context, name string) (BackupInfo, error) {
-	inst, err := p.requireStoppedInstance(ctx, name)
+	inst, err := p.requireExistingInstance(ctx, name)
 	if err != nil {
 		return BackupInfo{}, err
+	}
+	if inst.FirecrackerPID > 0 {
+		if p.log != nil {
+			p.log.Warn("creating crash-consistent backup of running VM; stop the VM first for a fully safe backup", "name", name, "pid", inst.FirecrackerPID)
+		}
 	}
 
 	createdAt := time.Now().UTC()
@@ -289,6 +294,20 @@ func (p *Provisioner) RestoreBackup(ctx context.Context, name, backupID string) 
 }
 
 func (p *Provisioner) requireStoppedInstance(ctx context.Context, name string) (model.Instance, error) {
+	inst, err := p.requireExistingInstance(ctx, name)
+	if err != nil {
+		return model.Instance{}, err
+	}
+	if inst.FirecrackerPID > 0 {
+		return model.Instance{}, fmt.Errorf("instance %q must be stopped before backup or restore", name)
+	}
+	if inst.State != model.StateStopped {
+		return model.Instance{}, fmt.Errorf("instance %q must be stopped before backup or restore (current state: %s)", name, inst.State)
+	}
+	return inst, nil
+}
+
+func (p *Provisioner) requireExistingInstance(ctx context.Context, name string) (model.Instance, error) {
 	inst, err := p.store.GetInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
@@ -296,18 +315,12 @@ func (p *Provisioner) requireStoppedInstance(ctx context.Context, name string) (
 	if inst.State == model.StateDeleted {
 		return model.Instance{}, fmt.Errorf("instance %q is deleted", name)
 	}
-	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
-		return model.Instance{}, fmt.Errorf("instance %q must be stopped before backup or restore", name)
-	}
-	if inst.FirecrackerPID != 0 {
+	if inst.FirecrackerPID != 0 && !processExists(inst.FirecrackerPID) {
 		inst.FirecrackerPID = 0
 		inst.UpdatedAt = time.Now().UTC()
 		if err := p.store.UpdateInstance(ctx, inst); err != nil {
 			return model.Instance{}, fmt.Errorf("clear stale firecracker pid for %q: %w", name, err)
 		}
-	}
-	if inst.State != model.StateStopped {
-		return model.Instance{}, fmt.Errorf("instance %q must be stopped before backup or restore (current state: %s)", name, inst.State)
 	}
 	if inst.RootFSPath == "" {
 		return model.Instance{}, fmt.Errorf("instance %q is missing a rootfs path", name)

@@ -63,8 +63,7 @@ ssh srv stop demo
 ssh srv resize demo --cpus 4 --ram 8G
 ssh srv start demo
 
-# Backup and restore (VM must be stopped)
-ssh srv stop demo
+# Backup and restore (stop VM first for safety)
 ssh srv backup create demo
 ssh srv backup list demo
 ssh srv restore demo <backup-id>

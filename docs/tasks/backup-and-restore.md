@@ -1,15 +1,16 @@
 # Backup and restore
 
-srv provides in-place backup and restore for stopped VMs. This is useful for checkpointing VMs before risky changes and rolling them back when something goes wrong.
+srv provides in-place backup and restore for VMs. This is useful for checkpointing VMs before risky changes and rolling them back when something goes wrong.
 
 ## Create a backup
 
 ```bash
-ssh srv stop demo
 ssh srv backup create demo
 ```
 
 This copies the current rootfs image into the backup store under `SRV_DATA_DIR/backups/demo/<backup-id>/`.
+
+**Stopping the VM first is strongly recommended.** If you back up a running VM, the resulting rootfs is crash-consistent only — like pulling the power cord on a running machine — and the guest filesystem may need journal replay on restore. A crash-consistent backup is still better than no backup at all.
 
 ## List backups
 
@@ -52,7 +53,8 @@ ssh srv start demo
 
 ## Constraints
 
-- **Stopped only**: both backup and restore require the VM to be stopped
+- **Restore requires stopped**: restoring onto a running VM is not supported
+- **Stopped recommended for backup**: backing up a stopped VM produces a fully safe, clean-filesystem snapshot. Backups of running VMs are crash-consistent only
 - **In-place only**: backups are tied to the original VM record. They cannot be restored onto a newly created VM that reuses the same name
 - **Single host**: backups live on the same host. For cross-host migration, use [export/import](export-import-vm.md)
 - **Rootfs only**: backups capture the writable rootfs. The kernel and initrd come from the host's current configuration on the next `start`

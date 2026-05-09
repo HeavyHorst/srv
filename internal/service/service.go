@@ -2253,7 +2253,7 @@ func helpResult() commandResult {
 		{
 			header: "BACKUP COMMANDS",
 			entries: []helpEntry{
-				{"backup create <name>", "Create a backup of an instance."},
+				{"backup create <name>", "Create a backup of an instance (stopped VM recommended for safety)."},
 				{"backup list <name>", "List backups for an instance."},
 				{"restore <name> <backup-id>", "Restore an instance from a backup."},
 				{"export <name>", "Export instance as a portable archive to stdout."},

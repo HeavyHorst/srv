@@ -951,6 +951,11 @@ func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string, o
 }
 
 func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFormat) (commandResult, error) {
+	if a.provisioner != nil {
+		if err := a.provisioner.ReconcileInstancesRuntime(ctx); err != nil {
+			return commandResult{stderr: fmt.Sprintf("reconcile instances: %v\n", err), exitCode: 1}, err
+		}
+	}
 	instances, err := a.store.ListInstances(ctx, false)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("list instances: %v\n", err), exitCode: 1}, err
@@ -1015,6 +1020,12 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	inst, err := a.lookupVisibleInstance(ctx, actor, args[1])
 	if err != nil {
 		return missingInstanceResult("inspect", args[1], err)
+	}
+	if a.provisioner != nil {
+		inst, err = a.provisioner.ReconcileInstanceRuntime(ctx, inst.Name)
+		if err != nil {
+			return commandResult{stderr: fmt.Sprintf("reconcile instance %s: %v\n", args[1], err), exitCode: 1}, err
+		}
 	}
 	poolName := ""
 	if inst.UsesMemoryPool() {

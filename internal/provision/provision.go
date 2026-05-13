@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -38,6 +39,7 @@ import (
 const (
 	hostMemoryReserveMiB = int64(512)
 	hostDiskReserveBytes = int64(1 << 30)
+	guestHaltTailBytes   = int64(64 << 10)
 )
 
 var (
@@ -489,20 +491,23 @@ func (p *Provisioner) RestoreInstances(ctx context.Context) error {
 }
 
 func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) error {
-	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
+	shouldAutoStart := shouldAutoStartAfterStartup(inst)
+	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) && !serialLogShowsGuestHalted(inst.SerialLogPath) {
 		return nil
 	}
 	if inst.FirecrackerPID != 0 {
+		if processExists(inst.FirecrackerPID) {
+			if err := p.stopFirecracker(ctx, inst); err != nil {
+				p.log.Warn("cleanup stale firecracker state", "name", inst.Name, "err", err)
+			}
+		}
 		inst.FirecrackerPID = 0
 		inst.UpdatedAt = time.Now().UTC()
-		if err := p.stopFirecracker(ctx, inst); err != nil {
-			p.log.Warn("cleanup stale firecracker state", "name", inst.Name, "err", err)
-		}
 		if err := p.store.UpdateInstance(ctx, inst); err != nil {
 			return err
 		}
 	}
-	if !shouldAutoStartAfterStartup(inst) {
+	if !shouldAutoStart {
 		return nil
 	}
 	if !hasTailnetIdentity(inst) {
@@ -515,6 +520,74 @@ func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) 
 		return err
 	}
 	return nil
+}
+
+func (p *Provisioner) ReconcileInstanceRuntime(ctx context.Context, name string) (model.Instance, error) {
+	inst, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return model.Instance{}, err
+	}
+	_, err = p.reconcileRuntime(ctx, inst)
+	if err != nil {
+		return inst, err
+	}
+	return p.store.GetInstance(ctx, name)
+}
+
+func (p *Provisioner) ReconcileInstancesRuntime(ctx context.Context) error {
+	instances, err := p.store.ListInstances(ctx, false)
+	if err != nil {
+		return err
+	}
+	for _, inst := range instances {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if _, err := p.reconcileRuntime(ctx, inst); err != nil {
+			p.log.Warn("reconcile instance runtime", "name", inst.Name, "state", inst.State, "err", err)
+		}
+	}
+	return nil
+}
+
+func (p *Provisioner) reconcileRuntime(ctx context.Context, inst model.Instance) (bool, error) {
+	if inst.State == model.StateStopped || inst.State == model.StateDeleted || inst.State == model.StateDeleting || inst.State == model.StateFailed {
+		return false, nil
+	}
+	if inst.FirecrackerPID <= 0 {
+		return false, nil
+	}
+
+	runtimeExited := !processExists(inst.FirecrackerPID)
+	guestHalted := false
+	if !runtimeExited {
+		guestHalted = serialLogShowsGuestHalted(inst.SerialLogPath)
+	}
+	if !runtimeExited && !guestHalted {
+		return false, nil
+	}
+
+	if runtimeExited {
+		p.recordEvent(inst.ID, "runtime", "firecracker process exited outside srv stop", map[string]any{"pid": inst.FirecrackerPID})
+	} else {
+		p.recordEvent(inst.ID, "runtime", "guest halted; stopping firecracker runtime", map[string]any{"pid": inst.FirecrackerPID})
+		if err := p.stopFirecracker(ctx, inst); err != nil {
+			return false, err
+		}
+	}
+	if err := p.cleanupNetworking(inst); err != nil {
+		p.log.Warn("cleanup networking after runtime reconciliation", "name", inst.Name, "err", err)
+	}
+
+	inst.State = model.StateStopped
+	inst.FirecrackerPID = 0
+	inst.LastError = ""
+	inst.UpdatedAt = time.Now().UTC()
+	if err := p.store.UpdateInstance(ctx, inst); err != nil {
+		return false, err
+	}
+	p.recordEvent(inst.ID, "stop", "instance marked stopped after runtime reconciliation", nil)
+	return true, nil
 }
 
 func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, error) {
@@ -634,7 +707,7 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 }
 
 func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instance, err error) {
-	inst, err = p.store.GetInstance(ctx, name)
+	inst, err = p.ReconcileInstanceRuntime(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
 	}
@@ -661,6 +734,13 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		defer p.admissionMu.Unlock()
 
 		current, err := p.store.GetInstance(ctx, name)
+		if err != nil {
+			return err
+		}
+		if _, err := p.reconcileRuntime(ctx, current); err != nil {
+			return err
+		}
+		current, err = p.store.GetInstance(ctx, name)
 		if err != nil {
 			return err
 		}
@@ -1734,6 +1814,40 @@ func processExists(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+func serialLogShowsGuestHalted(path string) bool {
+	if path == "" {
+		return false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	offset := info.Size() - guestHaltTailBytes
+	if offset < 0 {
+		offset = 0
+	}
+	buf := make([]byte, info.Size()-offset)
+	if _, err := file.ReadAt(buf, offset); err != nil && !errors.Is(err, io.EOF) {
+		return false
+	}
+	text := string(buf)
+	return serialLogEndsWith(text, "reboot: Power off not available: System halted instead") || serialLogEndsWith(text, "reboot: System halted")
+}
+
+func serialLogEndsWith(text, marker string) bool {
+	idx := strings.LastIndex(text, marker)
+	if idx < 0 {
+		return false
+	}
+	after := strings.TrimRight(text[idx+len(marker):], "\x00\t\n\v\f\r ")
+	return after == ""
+}
+
 func uint32ToIP(v uint32) net.IP {
 	buf := make([]byte, 4)
 	binary.BigEndian.PutUint32(buf, v)
@@ -1741,7 +1855,7 @@ func uint32ToIP(v uint32) net.IP {
 }
 
 func kernelArgs(extra string) string {
-	base := []string{"console=ttyS0", "reboot=k", "panic=1", "pci=off", "root=/dev/vda", "rw"}
+	base := []string{"console=ttyS0", "reboot=k", "panic=1", "root=/dev/vda", "rw"}
 	if extra != "" {
 		base = append(base, strings.Fields(extra)...)
 	}

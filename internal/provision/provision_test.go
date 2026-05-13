@@ -2494,6 +2494,128 @@ func TestProcessExistsTreatsPermissionDeniedAsRunning(t *testing.T) {
 	}
 }
 
+func TestReconcileInstanceRuntimeMarksExitedRuntimeStopped(t *testing.T) {
+	oldSignalProcess := signalProcess
+	t.Cleanup(func() { signalProcess = oldSignalProcess })
+	signalProcess = func(pid int, sig syscall.Signal) error {
+		if pid != 4321 {
+			t.Fatalf("signalProcess pid = %d, want 4321", pid)
+		}
+		return syscall.ESRCH
+	}
+
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{
+		cfg:           cfg,
+		log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:         st,
+		networkHelper: noopNetworkHelper{},
+		vmRunner:      noopVMRunner{},
+	}
+	inst := provisionTestInstance(cfg, "demo", model.StateReady, time.Now().UTC())
+	inst.FirecrackerPID = 4321
+	if err := st.CreateInstance(context.Background(), inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	got, err := p.ReconcileInstanceRuntime(context.Background(), inst.Name)
+	if err != nil {
+		t.Fatalf("ReconcileInstanceRuntime(): %v", err)
+	}
+	if got.State != model.StateStopped || got.FirecrackerPID != 0 {
+		t.Fatalf("reconciled instance = state %q pid %d, want stopped pid 0", got.State, got.FirecrackerPID)
+	}
+}
+
+func TestRestoreInstancesAutoStartsReadyInstanceWithStaleRuntime(t *testing.T) {
+	oldSignalProcess := signalProcess
+	oldListTailnetDevices := listTailnetDevices
+	t.Cleanup(func() {
+		signalProcess = oldSignalProcess
+		listTailnetDevices = oldListTailnetDevices
+	})
+	signalProcess = func(pid int, sig syscall.Signal) error {
+		if pid == 4321 {
+			return syscall.ESRCH
+		}
+		return oldSignalProcess(pid, sig)
+	}
+	deviceCalls := 0
+	listTailnetDevices = func(context.Context, *tailscale.Client) ([]tailscale.Device, error) {
+		deviceCalls++
+		if deviceCalls == 1 {
+			return nil, nil
+		}
+		return []tailscale.Device{{
+			Hostname:  "demo",
+			Name:      "demo.tailnet.ts.net",
+			Addresses: []string{"100.64.0.10"},
+		}}, nil
+	}
+
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, map[string]string{"SRV_GUEST_READY_TIMEOUT": "50ms"})
+	cfg.OutboundInterface = "eth0"
+	st := newProvisionTestStore(t, cfg)
+	runner := &recordingVMRunner{startPID: os.Getpid()}
+	p := &Provisioner{
+		cfg:                 cfg,
+		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:               st,
+		tsClient:            &tailscale.Client{},
+		networkHelper:       noopNetworkHelper{},
+		vmRunner:            runner,
+		readHostMemoryBytes: func() (int64, error) { return 64 << 30, nil },
+	}
+	inst := provisionTestInstance(cfg, "demo", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.FirecrackerPID = 4321
+	inst.TailscaleName = "demo"
+	inst.TailscaleIP = "100.64.0.9"
+	inst.InitrdPath = ""
+	for _, path := range []string{inst.RootFSPath, inst.KernelPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance(): %v", err)
+	}
+
+	if err := p.RestoreInstances(ctx); err != nil {
+		t.Fatalf("RestoreInstances(): %v", err)
+	}
+	if len(runner.started) != 1 {
+		t.Fatalf("StartInstanceVM calls = %d, want 1", len(runner.started))
+	}
+	got, err := st.GetInstance(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("GetInstance(): %v", err)
+	}
+	if got.State != model.StateReady || got.FirecrackerPID != os.Getpid() || got.TailscaleIP != "100.64.0.10" {
+		t.Fatalf("restored instance = state %q pid %d ip %q, want ready pid %d ip 100.64.0.10", got.State, got.FirecrackerPID, got.TailscaleIP, os.Getpid())
+	}
+}
+
+func TestSerialLogShowsGuestHalted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "serial.log")
+	if err := os.WriteFile(path, []byte("systemd-shutdown[1]: Powering off.\nreboot: Power off not available: System halted instead\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+	if !serialLogShowsGuestHalted(path) {
+		t.Fatal("serialLogShowsGuestHalted() = false, want true")
+	}
+	if err := os.WriteFile(path, []byte("reboot: Power off not available: System halted instead\n[    0.000000] Linux version 6.12.79\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(serial): %v", err)
+	}
+	if serialLogShowsGuestHalted(path) {
+		t.Fatal("serialLogShowsGuestHalted() = true after later boot log, want false")
+	}
+}
+
 func TestShouldAutoStartAfterStartup(t *testing.T) {
 	tests := []struct {
 		state string
@@ -2535,7 +2657,7 @@ func TestHelperFunctions(t *testing.T) {
 	if matched, _ := regexp.MatchString(`^02:fc:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$`, guestMAC("demo")); !matched {
 		t.Fatalf("guestMAC(demo) did not match expected format")
 	}
-	if got := kernelArgs("quiet loglevel=3"); got != "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet loglevel=3" {
+	if got := kernelArgs("quiet loglevel=3"); got != "console=ttyS0 reboot=k panic=1 root=/dev/vda rw quiet loglevel=3" {
 		t.Fatalf("kernelArgs() = %q", got)
 	}
 	if got, err := directChildPath("/tmp/srv", "demo"); err != nil || got != "/tmp/srv/demo" {
@@ -2644,6 +2766,16 @@ func (h panicNetworkHelper) CleanupInstanceNetwork(context.Context, nethelper.Cl
 	return nil
 }
 
+type noopNetworkHelper struct{}
+
+func (noopNetworkHelper) SetupInstanceNetwork(context.Context, nethelper.SetupRequest) error {
+	return nil
+}
+
+func (noopNetworkHelper) CleanupInstanceNetwork(context.Context, nethelper.CleanupRequest) error {
+	return nil
+}
+
 type panicVMRunner struct {
 	t *testing.T
 }
@@ -2689,10 +2821,13 @@ func (noopVMRunner) DeleteMemoryPool(context.Context, vmrunner.MemoryPoolRequest
 type recordingVMRunner struct {
 	deletedPools        []vmrunner.MemoryPoolRequest
 	deleteMemoryPoolErr error
+	started             []vmrunner.StartRequest
+	startPID            int
 }
 
-func (*recordingVMRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (vmrunner.StartResponse, error) {
-	return vmrunner.StartResponse{}, nil
+func (r *recordingVMRunner) StartInstanceVM(_ context.Context, req vmrunner.StartRequest) (vmrunner.StartResponse, error) {
+	r.started = append(r.started, req)
+	return vmrunner.StartResponse{PID: r.startPID}, nil
 }
 
 func (*recordingVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {

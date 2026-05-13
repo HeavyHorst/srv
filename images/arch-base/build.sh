@@ -205,6 +205,19 @@ require_kernel_config() {
 
 validate_kernel_config() {
 	local kernel_config="$1"
+	# srv boots without an initramfs. Keep the Firecracker PCI virtio root-disk
+	# path built into the kernel so guests can mount /dev/vda when Firecracker is
+	# launched with --enable-pci.
+	require_kernel_config "${kernel_config}" 'CONFIG_ACPI=y' 'ACPI support'
+	require_kernel_config "${kernel_config}" 'CONFIG_PCI=y' 'PCI core support'
+	require_kernel_config "${kernel_config}" 'CONFIG_PCI_MSI=y' 'PCI MSI support'
+	require_kernel_config "${kernel_config}" 'CONFIG_PCI_MMCONFIG=y' 'PCI MMCONFIG support'
+	require_kernel_config "${kernel_config}" 'CONFIG_PCIEPORTBUS=y' 'PCIe port bus support'
+	require_kernel_config "${kernel_config}" 'CONFIG_BLK_MQ_PCI=y' 'block multiqueue PCI helpers'
+	require_kernel_config "${kernel_config}" 'CONFIG_VIRTIO=y' 'virtio core support'
+	require_kernel_config "${kernel_config}" 'CONFIG_VIRTIO_PCI=y' 'virtio PCI transport'
+	require_kernel_config "${kernel_config}" 'CONFIG_VIRTIO_BLK=y' 'virtio block support'
+	require_kernel_config "${kernel_config}" 'CONFIG_VIRTIO_NET=y' 'virtio network support'
 	# Docker on Arch uses the iptables-nft userspace, so the guest kernel needs
 	# both the nf_tables family implementations and the classic xtables pieces.
 	require_kernel_config "${kernel_config}" 'CONFIG_MODULES=y' 'loadable module support'

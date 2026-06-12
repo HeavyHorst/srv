@@ -106,7 +106,7 @@ All integration commands are admin-only.
 - `new` accepts `--cpus`, `--ram`, `--pool`, and `--rootfs-size` in any combination that matches the memory mode contract
 - `new --pool <name>` requires `--ram <size>` because guest-visible RAM stays explicit in pooled mode
 - `new` also accepts repeated `--integration <name>` flags; the create request fails if any requested integration cannot be enabled
-- Fixed mode remains the default. Without `--pool`, `--ram` still means guest-visible RAM, host reservation, and the hard per-VM cgroup memory cap
+- Fixed mode remains the default. Without `--pool`, `--ram` means guest-visible RAM; the hard per-VM host cgroup cap is that RAM plus `max(256 MiB, RAM/16)` Firecracker overhead reserve
 - In pooled mode, `--ram` means guest-visible RAM while host reservation comes from the pool created with `pool create`
 - `resize` requires the VM to be stopped; CPU and RAM may increase or decrease within limits, while rootfs is grow-only
 - Pooled VMs cannot move between pools or switch memory mode through `resize` in v1

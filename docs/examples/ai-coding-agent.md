@@ -45,7 +45,7 @@ The gateway IP is the default route inside the VM. You can read it from the `ins
 Each VM runs in its own cgroup v2 leaf with:
 
 - `cpu.max` — capped at the vCPU count
-- `memory.max` — capped at the requested RAM
+- `memory.max` — capped at the requested guest RAM plus a small Firecracker overhead reserve
 - `memory.swap.max` — set to 0 (no swap)
 - `pids.max` — default 512, configurable via `SRV_VM_PIDS_MAX`
 

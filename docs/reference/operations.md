@@ -185,7 +185,7 @@ Important caveat: existing guests keep their own writable `rootfs.img`. There is
 ## Host Hardening And Caveats
 
 - cgroup v2 is required. The runner depends on a delegated cgroup v2 subtree for both fixed and pooled layouts:
-- Fixed VMs use `firecracker-vms/<name>` leaves with enforced `cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`.
+- Fixed VMs use `firecracker-vms/<name>` leaves with enforced `cpu.max`, `memory.max`, `memory.swap.max`, and `pids.max`. The guest sees the configured RAM; the host `memory.max` adds a small Firecracker overhead reserve (`max(256 MiB, RAM/16)`) so VMM/page-table overhead does not consume guest-visible memory headroom.
 - Pooled VMs use `firecracker-pools/<pool>/<name>` leaves. The pool parent holds the hard memory reservation with `memory.max=<pool size>` and `memory.swap.max=0`, while child VM cgroups still carry CPU and PID limits.
 - IPv4 forwarding must stay enabled on the host. Guest egress depends on forwarding packets from each TAP device through the host's outbound interface after the helper installs MASQUERADE and `FORWARD` rules.
 - `srv-vm-runner.service` must keep `User=root`, `Group=srv`, `Delegate=cpu memory pids`, `DelegateSubgroup=supervisor`, and a group-accessible socket under `/run/srv-vm-runner/`.

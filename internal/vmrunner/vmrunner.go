@@ -45,6 +45,8 @@ const (
 	balloonGuestHeadroomFloorMiB      = int64(256)
 	balloonGuestHeadroomDivisor       = int64(8)
 	balloonMaxTargetDivisor           = int64(2)
+	fixedMemoryOverheadFloorMiB       = int64(256)
+	fixedMemoryOverheadDivisor        = int64(16)
 	miBBytes                          = int64(1024 * 1024)
 	disabledJailerNumaNode            = -1
 	gracefulStopRequestTimeout        = 2 * time.Second
@@ -1115,12 +1117,23 @@ func jailerCgroupSettings(req StartRequest, pidsMax int64) []string {
 	}
 	if model.NormalizeMemoryMode(req.MemoryMode) == model.MemoryModeFixed {
 		settings = append(settings,
-			fmt.Sprintf("memory.max=%d", req.MemoryMiB*miBBytes),
+			fmt.Sprintf("memory.max=%d", FixedMemoryLimitBytes(req.MemoryMiB)),
 			"memory.swap.max=0",
 		)
 	}
 	settings = append(settings, fmt.Sprintf("pids.max=%d", pidsMax))
 	return settings
+}
+
+func FixedMemoryLimitBytes(memoryMiB int64) int64 {
+	if memoryMiB <= 0 {
+		return 0
+	}
+	overheadMiB := memoryMiB / fixedMemoryOverheadDivisor
+	if overheadMiB < fixedMemoryOverheadFloorMiB {
+		overheadMiB = fixedMemoryOverheadFloorMiB
+	}
+	return (memoryMiB + overheadMiB) * miBBytes
 }
 
 func insertBeforeDoubleDash(args []string, insert ...string) []string {

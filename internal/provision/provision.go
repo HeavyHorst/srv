@@ -1082,7 +1082,7 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 			allocatedVCPUs += p.effectiveVCPUCount(inst)
 		}
 		if instanceReservesFixedHostMemory(inst) {
-			fixedReservedBytes += p.effectiveMemoryMiB(inst) * format.MiB
+			fixedReservedBytes += vmrunner.FixedMemoryLimitBytes(p.effectiveMemoryMiB(inst))
 		}
 	}
 	var poolReservedBytes int64
@@ -1185,7 +1185,7 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 }
 
 func (p *Provisioner) ensureHostMemoryCapacity(ctx context.Context, excludeName string, requestedMemoryMiB int64) error {
-	return p.ensureHostMemoryReservationCapacity(ctx, excludeName, requestedMemoryMiB*format.MiB)
+	return p.ensureHostMemoryReservationCapacity(ctx, excludeName, vmrunner.FixedMemoryLimitBytes(requestedMemoryMiB))
 }
 
 func (p *Provisioner) ensureHostMemoryReservationCapacity(ctx context.Context, excludeName string, requestedBytes int64) error {
@@ -1263,7 +1263,7 @@ func (p *Provisioner) totalReservedHostMemoryBytes(ctx context.Context, excludeN
 		if !instanceReservesFixedHostMemory(inst) {
 			return 0
 		}
-		return p.effectiveMemoryMiB(inst) * format.MiB
+		return vmrunner.FixedMemoryLimitBytes(p.effectiveMemoryMiB(inst))
 	})
 	if err != nil {
 		return 0, err

@@ -930,7 +930,7 @@ func TestBuildJailedVMCommandIncludesResourceLimits(t *testing.T) {
 		"--chroot-base-dir", "/var/lib/srv/jailer",
 		"--parent-cgroup", "system.slice/srv-vm-runner.service/firecracker-vms",
 		"--cgroup", "cpu.max=200000 100000",
-		"--cgroup", "memory.max=1073741824",
+		"--cgroup", "memory.max=1342177280",
 		"--cgroup", "memory.swap.max=0",
 		"--cgroup", "pids.max=321",
 		"--",
@@ -940,6 +940,24 @@ func TestBuildJailedVMCommandIncludesResourceLimits(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cmd.Args, want) {
 		t.Fatalf("buildJailedVMCommand() args = %#v, want %#v", cmd.Args, want)
+	}
+}
+
+func TestFixedMemoryLimitBytesIncludesHostOverhead(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		memoryMiB int64
+		wantBytes int64
+	}{
+		{name: "non-positive", memoryMiB: 0, wantBytes: 0},
+		{name: "floor", memoryMiB: 1024, wantBytes: 1280 << 20},
+		{name: "sixteenth", memoryMiB: 8192, wantBytes: 8704 << 20},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := FixedMemoryLimitBytes(tt.memoryMiB); got != tt.wantBytes {
+				t.Fatalf("FixedMemoryLimitBytes(%d) = %d, want %d", tt.memoryMiB, got, tt.wantBytes)
+			}
+		})
 	}
 }
 

@@ -458,7 +458,7 @@ func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
 		t.Fatalf("cpu status = %#v", cpu)
 	}
 	memory := resources["memory"]
-	if memory.Allocated != 2048*mib || memory.Reserve != 512*mib || memory.Budget != max(memory.Total-memory.Reserve, int64(0)) || memory.Left != memory.Budget-memory.Allocated {
+	if memory.Allocated != vmrunner.FixedMemoryLimitBytes(2048) || memory.Reserve != 512*mib || memory.Budget != max(memory.Total-memory.Reserve, int64(0)) || memory.Left != memory.Budget-memory.Allocated {
 		t.Fatalf("memory status = %#v", memory)
 	}
 	disk := resources["disk"]

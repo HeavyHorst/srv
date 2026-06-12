@@ -255,6 +255,15 @@ trim_file() {
 	tr -d '\n' <"$1"
 }
 
+fixed_memory_limit_bytes() {
+	local memory_mib="$1"
+	local overhead_mib="$(( memory_mib / 16 ))"
+	if (( overhead_mib < 256 )); then
+		overhead_mib=256
+	fi
+	echo "$(( (memory_mib + overhead_mib) * 1024 * 1024 ))"
+}
+
 json_number_for_key() {
 	local file_path="$1"
 	local key="$2"
@@ -402,6 +411,7 @@ assert_host_runtime() {
 	local vm_runner_cgroup
 	local cgroup_path
 	local expected_cpu_max
+	local expected_memory_max
 	local pool_path
 
 	vm_runner_cgroup="$(systemctl show -p ControlGroup --value srv-vm-runner.service)"
@@ -442,8 +452,9 @@ assert_host_runtime() {
 	if [[ "$(trim_file "${cgroup_path}/cpu.max")" != "${expected_cpu_max}" ]]; then
 		fail "cpu.max for ${cgroup_path} was $(trim_file "${cgroup_path}/cpu.max"), want ${expected_cpu_max} during ${stage}"
 	fi
-	if [[ "$(trim_file "${cgroup_path}/memory.max")" != "$(( CURRENT_MEMORY_MIB * 1024 * 1024 ))" ]]; then
-		fail "memory.max for ${cgroup_path} was $(trim_file "${cgroup_path}/memory.max"), want $(( CURRENT_MEMORY_MIB * 1024 * 1024 )) during ${stage}"
+	expected_memory_max="$(fixed_memory_limit_bytes "${CURRENT_MEMORY_MIB}")"
+	if [[ "$(trim_file "${cgroup_path}/memory.max")" != "${expected_memory_max}" ]]; then
+		fail "memory.max for ${cgroup_path} was $(trim_file "${cgroup_path}/memory.max"), want ${expected_memory_max} during ${stage}"
 	fi
 	if [[ "$(trim_file "${cgroup_path}/memory.swap.max")" != "0" ]]; then
 		fail "memory.swap.max for ${cgroup_path} was $(trim_file "${cgroup_path}/memory.swap.max"), want 0 during ${stage}"

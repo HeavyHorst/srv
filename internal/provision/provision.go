@@ -665,16 +665,17 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 			return err
 		}
 		if opts.RootFSSizeBytes > 0 {
-			currentSize, err := p.rootFSSize(resized.RootFSPath)
+			currentFileSize, err := p.rootFSSize(resized.RootFSPath)
 			if err != nil {
 				return err
 			}
-			if opts.RootFSSizeBytes < currentSize {
-				return fmt.Errorf("rootfs size %d bytes is smaller than the current image size %d bytes", opts.RootFSSizeBytes, currentSize)
+			if opts.RootFSSizeBytes < currentFileSize {
+				return fmt.Errorf("rootfs size %d bytes is smaller than the current image size %d bytes", opts.RootFSSizeBytes, currentFileSize)
 			}
-			if opts.RootFSSizeBytes > currentSize {
-				if _, err := exec.LookPath("resize2fs"); err != nil {
-					return errors.New("resize with a larger rootfs requires resize2fs on the host")
+			needsFilesystemResize := opts.RootFSSizeBytes > currentFileSize || opts.RootFSSizeBytes > current.RootFSSizeBytes
+			if needsFilesystemResize {
+				if err := ensureRootFSResizeTools("resize with a larger rootfs"); err != nil {
+					return err
 				}
 				if err := p.ensureHostDiskCapacity(ctx, current.Name, opts.RootFSSizeBytes); err != nil {
 					return err
@@ -952,8 +953,8 @@ func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool)
 		return fmt.Errorf("base rootfs image %s is still attached to a loop device; wait for the image build or mount to finish before creating instances", p.cfg.BaseRootFSPath)
 	}
 	if needsResize {
-		if _, err := exec.LookPath("resize2fs"); err != nil {
-			return errors.New("create with a custom rootfs size requires resize2fs on the host")
+		if err := ensureRootFSResizeTools("create with a custom rootfs size"); err != nil {
+			return err
 		}
 	}
 	if p.tsClient == nil {
@@ -1359,6 +1360,9 @@ func (p *Provisioner) cloneRootFS(ctx context.Context, dest string) error {
 }
 
 func (p *Provisioner) growRootFS(path string, sizeBytes int64) error {
+	if err := runRootFSCheck(path); err != nil {
+		return err
+	}
 	if err := os.Truncate(path, sizeBytes); err != nil {
 		return fmt.Errorf("expand rootfs image to %d bytes: %w", sizeBytes, err)
 	}
@@ -1367,6 +1371,36 @@ func (p *Provisioner) growRootFS(path string, sizeBytes int64) error {
 		return fmt.Errorf("resize rootfs filesystem: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func ensureRootFSResizeTools(context string) error {
+	if _, err := exec.LookPath("e2fsck"); err != nil {
+		return fmt.Errorf("%s requires e2fsck on the host", context)
+	}
+	if _, err := exec.LookPath("resize2fs"); err != nil {
+		return fmt.Errorf("%s requires resize2fs on the host", context)
+	}
+	return nil
+}
+
+func runRootFSCheck(path string) error {
+	cmd := exec.Command("e2fsck", "-f", "-p", path)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok && e2fsckExitCodeAllowsContinue(exitErr.ExitCode()) {
+		return nil
+	}
+	return fmt.Errorf("check rootfs filesystem before resize: %w: %s", err, strings.TrimSpace(string(output)))
+}
+
+func e2fsckExitCodeAllowsContinue(code int) bool {
+	// e2fsck uses bit flags. Bits 0 and 1 mean errors were corrected and/or a
+	// reboot would be needed for a mounted root filesystem. This rootfs image is
+	// offline during resize, so continuing is safe as long as no fatal or
+	// uncorrected-error bits are set.
+	return code&^3 == 0
 }
 
 func (p *Provisioner) ensureInstanceRuntimePermissions(inst model.Instance) error {

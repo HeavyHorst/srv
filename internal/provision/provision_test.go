@@ -2108,8 +2108,13 @@ func TestResizeStoppedInstanceUpdatesStoredConfigAndGrowsRootFS(t *testing.T) {
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(bin): %v", err)
 	}
+	callsPath := filepath.Join(t.TempDir(), "calls")
+	e2fsck := filepath.Join(binDir, "e2fsck")
+	if err := os.WriteFile(e2fsck, []byte("#!/bin/sh\necho e2fsck \"$@\" >> \""+callsPath+"\"\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(e2fsck): %v", err)
+	}
 	resize2fs := filepath.Join(binDir, "resize2fs")
-	if err := os.WriteFile(resize2fs, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(resize2fs, []byte("#!/bin/sh\necho resize2fs \"$@\" >> \""+callsPath+"\"\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile(resize2fs): %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -2128,6 +2133,14 @@ func TestResizeStoppedInstanceUpdatesStoredConfigAndGrowsRootFS(t *testing.T) {
 	}
 	if info.Size() != 12*testMiB {
 		t.Fatalf("rootfs size after resize = %d, want %d", info.Size(), 12*testMiB)
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(calls): %v", err)
+	}
+	wantCalls := fmt.Sprintf("e2fsck -f -p %s\nresize2fs %s\n", inst.RootFSPath, inst.RootFSPath)
+	if string(calls) != wantCalls {
+		t.Fatalf("resize tool calls = %q, want %q", string(calls), wantCalls)
 	}
 
 	stored, err := st.GetInstance(ctx, inst.Name)
@@ -2154,6 +2167,147 @@ func TestResizeStoppedInstanceUpdatesStoredConfigAndGrowsRootFS(t *testing.T) {
 	}
 	if !sawResize || !sawStorage {
 		t.Fatalf("expected resize and storage events, got %#v", events)
+	}
+}
+
+func TestResizeFailsWhenRootFSCheckCannotRepair(t *testing.T) {
+	const testMiB = int64(1024 * 1024)
+
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.RootFSSizeBytes = 8 * testMiB
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(rootfs dir): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.Truncate(inst.RootFSPath, inst.RootFSSizeBytes); err != nil {
+		t.Fatalf("Truncate(rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(bin): %v", err)
+	}
+	callsPath := filepath.Join(t.TempDir(), "calls")
+	e2fsck := filepath.Join(binDir, "e2fsck")
+	if err := os.WriteFile(e2fsck, []byte("#!/bin/sh\necho e2fsck \"$@\" >> \""+callsPath+"\"\necho unrepaired >&2\nexit 4\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(e2fsck): %v", err)
+	}
+	resize2fs := filepath.Join(binDir, "resize2fs")
+	if err := os.WriteFile(resize2fs, []byte("#!/bin/sh\necho resize2fs \"$@\" >> \""+callsPath+"\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(resize2fs): %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := p.Resize(ctx, inst.Name, CreateOptions{RootFSSizeBytes: 12 * testMiB})
+	if err == nil || !strings.Contains(err.Error(), "check rootfs filesystem before resize") {
+		t.Fatalf("Resize() error = %v, want rootfs check error", err)
+	}
+	info, err := os.Stat(inst.RootFSPath)
+	if err != nil {
+		t.Fatalf("Stat(rootfs): %v", err)
+	}
+	if info.Size() != 8*testMiB {
+		t.Fatalf("rootfs size after failed resize = %d, want %d", info.Size(), 8*testMiB)
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(calls): %v", err)
+	}
+	wantCalls := fmt.Sprintf("e2fsck -f -p %s\n", inst.RootFSPath)
+	if string(calls) != wantCalls {
+		t.Fatalf("resize tool calls = %q, want %q", string(calls), wantCalls)
+	}
+}
+
+func TestResizeRetriesFilesystemResizeWhenImageFileAlreadyExpanded(t *testing.T) {
+	const testMiB = int64(1024 * 1024)
+
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.RootFSSizeBytes = 8 * testMiB
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(rootfs dir): %v", err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := os.Truncate(inst.RootFSPath, 12*testMiB); err != nil {
+		t.Fatalf("Truncate(rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(bin): %v", err)
+	}
+	callsPath := filepath.Join(t.TempDir(), "calls")
+	e2fsck := filepath.Join(binDir, "e2fsck")
+	if err := os.WriteFile(e2fsck, []byte("#!/bin/sh\necho e2fsck \"$@\" >> \""+callsPath+"\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(e2fsck): %v", err)
+	}
+	resize2fs := filepath.Join(binDir, "resize2fs")
+	if err := os.WriteFile(resize2fs, []byte("#!/bin/sh\necho resize2fs \"$@\" >> \""+callsPath+"\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(resize2fs): %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	resized, err := p.Resize(ctx, inst.Name, CreateOptions{RootFSSizeBytes: 12 * testMiB})
+	if err != nil {
+		t.Fatalf("Resize(): %v", err)
+	}
+	if resized.RootFSSizeBytes != 12*testMiB {
+		t.Fatalf("Resize() rootfs size = %d, want %d", resized.RootFSSizeBytes, 12*testMiB)
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(calls): %v", err)
+	}
+	wantCalls := fmt.Sprintf("e2fsck -f -p %s\nresize2fs %s\n", inst.RootFSPath, inst.RootFSPath)
+	if string(calls) != wantCalls {
+		t.Fatalf("resize tool calls = %q, want %q", string(calls), wantCalls)
+	}
+}
+
+func TestE2fsckExitCodeAllowsContinue(t *testing.T) {
+	tests := []struct {
+		code int
+		want bool
+	}{
+		{code: 0, want: true},
+		{code: 1, want: true},
+		{code: 2, want: true},
+		{code: 3, want: true},
+		{code: 4, want: false},
+		{code: 5, want: false},
+		{code: 8, want: false},
+		{code: 16, want: false},
+		{code: 32, want: false},
+		{code: 128, want: false},
+		{code: -1, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d", tt.code), func(t *testing.T) {
+			if got := e2fsckExitCodeAllowsContinue(tt.code); got != tt.want {
+				t.Fatalf("e2fsckExitCodeAllowsContinue(%d) = %v, want %v", tt.code, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -2266,6 +2420,10 @@ func TestResizeRejectsGrowingRootFSWhenHostDiskSpaceIsLow(t *testing.T) {
 	binDir := filepath.Join(t.TempDir(), "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(bin): %v", err)
+	}
+	e2fsck := filepath.Join(binDir, "e2fsck")
+	if err := os.WriteFile(e2fsck, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(e2fsck): %v", err)
 	}
 	resize2fs := filepath.Join(binDir, "resize2fs")
 	if err := os.WriteFile(resize2fs, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {

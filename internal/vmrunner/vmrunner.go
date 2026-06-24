@@ -35,6 +35,7 @@ const (
 	defaultCgroupCPUQuotaPeriodMicros = int64(100000)
 	defaultVMPIDsMax                  = int64(512)
 	firecrackerSupervisorCgroupName   = "supervisor"
+	systemdControlCgroupName          = "control"
 	firecrackerVMRootCgroupName       = "firecracker-vms"
 	firecrackerPoolRootCgroupName     = "firecracker-pools"
 	balloonStatsIntervalSeconds       = int64(5)
@@ -53,6 +54,8 @@ const (
 	gracefulStopTimeout               = 10 * time.Second
 	forcedStopTimeout                 = 10 * time.Second
 	postKillWaitTimeout               = 2 * time.Second
+	runnerShutdownTimeout             = 120 * time.Second
+	runnerShutdownConcurrency         = 8
 )
 
 var (
@@ -255,6 +258,7 @@ type ServerConfig struct {
 	KernelPath        string
 	InitrdPath        string
 	VMPIDsMax         int64
+	CgroupRoot        string
 }
 
 type instanceRuntimePaths struct {
@@ -276,6 +280,13 @@ type balloonVM struct {
 	CgroupPath string
 	SocketPath string
 	UseTarget  bool
+}
+
+type runningVM struct {
+	Name       string
+	CgroupPath string
+	SocketPath string
+	PIDs       []int
 }
 
 type firecrackerBalloonStats struct {
@@ -356,8 +367,8 @@ func (s *Server) ServeUnix(ctx context.Context, socketPath, clientGroup string) 
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
+		cancel()
 	}()
 	go s.runBalloonLoop(ctx)
 
@@ -365,7 +376,18 @@ func (s *Server) ServeUnix(ctx context.Context, socketPath, clientGroup string) 
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	if ctx.Err() != nil {
+		drainCtx, cancel := context.WithTimeout(context.Background(), runnerShutdownTimeout)
+		defer cancel()
+		if err := s.shutdownRunningVMs(drainCtx); err != nil {
+			s.log.Warn("shutdown running vms before runner exit", "err", err)
+		}
+	}
 	return nil
+}
+
+func (s *Server) ShutdownRunningVMs(ctx context.Context) error {
+	return s.shutdownRunningVMs(ctx)
 }
 
 func (s *Server) runBalloonLoop(ctx context.Context) {
@@ -1017,6 +1039,133 @@ func (s *Server) tryGracefulStop(ctx context.Context, req StopRequest) (bool, er
 	return true, nil
 }
 
+func (s *Server) shutdownRunningVMs(ctx context.Context) error {
+	vms, err := s.listRunningVMs()
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("list running vms during runner shutdown: %w", err)
+	}
+	if len(vms) == 0 {
+		return nil
+	}
+	s.log.Info("shutting down running vms before runner exit", "count", len(vms))
+
+	limit := runnerShutdownConcurrency
+	if limit < 1 {
+		limit = 1
+	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var errs []error
+
+drainLoop:
+	for _, vm := range vms {
+		if ctx.Err() != nil {
+			break
+		}
+		vm := vm
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break drainLoop
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := s.shutdownRunningVM(ctx, vm); err != nil {
+				if ctx.Err() == nil {
+					s.log.Warn("shutdown vm before runner exit", "name", vm.Name, "pids", vm.PIDs, "err", err)
+				}
+				errMu.Lock()
+				errs = append(errs, fmt.Errorf("shutdown vm %q: %w", vm.Name, err))
+				errMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		errs = append(errs, ctx.Err())
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Server) shutdownRunningVM(ctx context.Context, vm runningVM) error {
+	var errs []error
+	if stoppedGracefully, err := tryGracefulStopRunningVM(ctx, vm); err != nil {
+		s.log.Warn("graceful guest shutdown failed during runner exit; falling back to forced stop", "name", vm.Name, "pids", vm.PIDs, "err", err)
+		stop := forceStopProcess
+		if errors.Is(err, errProcessExitTimeout) {
+			stop = killProcessNow
+		}
+		for _, pid := range vm.PIDs {
+			if err := stop(pid); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	} else if !stoppedGracefully {
+		for _, pid := range vm.PIDs {
+			if err := forceStopProcess(pid); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	if err := cleanupFirecrackerCgroupPath(vm.Name, vm.CgroupPath); err != nil {
+		errs = append(errs, err)
+	}
+	if err := s.cleanupVMRuntime(vm.Name); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func tryGracefulStopRunningVM(ctx context.Context, vm runningVM) (bool, error) {
+	livePIDs := liveProcessPIDs(vm.PIDs)
+	if len(livePIDs) == 0 {
+		return true, nil
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, gracefulStopRequestTimeout)
+	defer cancel()
+	if err := requestGuestShutdown(stopCtx, vm.SocketPath); err != nil {
+		return false, err
+	}
+	deadline := time.Now().Add(gracefulStopTimeout)
+	for _, pid := range livePIDs {
+		if !processExists(pid) {
+			continue
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false, errProcessExitTimeout
+		}
+		if err := waitForProcessExit(pid, remaining); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func liveProcessPIDs(pids []int) []int {
+	live := make([]int, 0, len(pids))
+	seen := make(map[int]struct{}, len(pids))
+	for _, pid := range pids {
+		if pid <= 0 {
+			continue
+		}
+		if _, ok := seen[pid]; ok {
+			continue
+		}
+		seen[pid] = struct{}{}
+		if processExists(pid) {
+			live = append(live, pid)
+		}
+	}
+	return live
+}
+
 func (r StartRequest) Validate() error {
 	if !validName.MatchString(strings.TrimSpace(r.Name)) {
 		return fmt.Errorf("invalid instance name %q", r.Name)
@@ -1165,6 +1314,7 @@ func (c ServerConfig) normalized() ServerConfig {
 		KernelPath:        strings.TrimSpace(c.KernelPath),
 		InitrdPath:        strings.TrimSpace(c.InitrdPath),
 		VMPIDsMax:         pidsMax,
+		CgroupRoot:        strings.TrimSpace(c.CgroupRoot),
 	}
 }
 
@@ -1192,6 +1342,9 @@ func (c ServerConfig) Validate() error {
 	}
 	if c.VMPIDsMax < 1 {
 		return fmt.Errorf("vm pids max %d is invalid", c.VMPIDsMax)
+	}
+	if c.CgroupRoot != "" && !filepath.IsAbs(c.CgroupRoot) {
+		return fmt.Errorf("cgroup root %q is not absolute", c.CgroupRoot)
 	}
 	return nil
 }
@@ -1607,6 +1760,10 @@ func (s *Server) delegatedCgroupRoot() (string, error) {
 	if s.delegatedCgroupRel != "" {
 		return s.delegatedCgroupRel, nil
 	}
+	if s.config.CgroupRoot != "" {
+		s.delegatedCgroupRel = s.config.CgroupRoot
+		return s.delegatedCgroupRel, nil
+	}
 	currentRel, err := currentCgroupPath()
 	if err != nil {
 		return "", err
@@ -1614,7 +1771,8 @@ func (s *Server) delegatedCgroupRoot() (string, error) {
 	if !filepath.IsAbs(currentRel) {
 		return "", fmt.Errorf("current cgroup path %q is not absolute", currentRel)
 	}
-	if filepath.Base(currentRel) == firecrackerSupervisorCgroupName {
+	switch filepath.Base(currentRel) {
+	case firecrackerSupervisorCgroupName, systemdControlCgroupName:
 		currentRel = filepath.Dir(currentRel)
 	}
 	s.delegatedCgroupRel = currentRel
@@ -1741,8 +1899,102 @@ func readInt64File(path string) (int64, error) {
 	return value, nil
 }
 
+func readCgroupPIDs(path string) ([]int, error) {
+	payload, err := readTextFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	pids := make([]int, 0)
+	for _, field := range strings.Fields(string(payload)) {
+		pid, err := strconv.Atoi(field)
+		if err != nil {
+			return nil, fmt.Errorf("parse pid %q from %s: %w", field, path, err)
+		}
+		if pid > 0 {
+			pids = append(pids, pid)
+		}
+	}
+	return pids, nil
+}
+
 func cgroupPathOnHost(rel string) string {
 	return filepath.Join(cgroupFSRoot, strings.TrimPrefix(rel, "/"))
+}
+
+func (s *Server) listRunningVMs() ([]runningVM, error) {
+	rootRel, err := s.delegatedCgroupRoot()
+	if err != nil {
+		return nil, err
+	}
+	rootPath := cgroupPathOnHost(rootRel)
+	vms := make([]runningVM, 0)
+	if err := s.appendRunningVMsFromRoot(&vms, filepath.Join(rootPath, firecrackerVMRootCgroupName)); err != nil {
+		return nil, err
+	}
+
+	poolRoot := filepath.Join(rootPath, firecrackerPoolRootCgroupName)
+	poolEntries, err := os.ReadDir(poolRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return vms, nil
+		}
+		return nil, fmt.Errorf("list firecracker memory pool cgroups: %w", err)
+	}
+	for _, poolEntry := range poolEntries {
+		if !poolEntry.IsDir() {
+			continue
+		}
+		poolPath, err := directChildPath(poolRoot, poolEntry.Name())
+		if err != nil {
+			return nil, fmt.Errorf("resolve firecracker memory pool cgroup for %q: %w", poolEntry.Name(), err)
+		}
+		if err := s.appendRunningVMsFromRoot(&vms, poolPath); err != nil {
+			return nil, err
+		}
+	}
+	return vms, nil
+}
+
+func (s *Server) appendRunningVMsFromRoot(vms *[]runningVM, parent string) error {
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("list firecracker vm cgroups under %s: %w", parent, err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		cgroupPath, err := directChildPath(parent, name)
+		if err != nil {
+			return fmt.Errorf("resolve firecracker cgroup for %q: %w", name, err)
+		}
+		pids, err := readCgroupPIDs(filepath.Join(cgroupPath, "cgroup.procs"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		pids = liveProcessPIDs(pids)
+		if len(pids) == 0 {
+			continue
+		}
+		paths, err := resolveInstanceRuntimePaths(s.config.InstancesDir, name)
+		if err != nil {
+			return err
+		}
+		*vms = append(*vms, runningVM{
+			Name:       name,
+			CgroupPath: cgroupPath,
+			SocketPath: paths.SocketPath,
+			PIDs:       pids,
+		})
+	}
+	return nil
 }
 
 func firecrackerFixedCgroupPathUnder(cgroupRel, name string) (string, error) {
@@ -1816,6 +2068,10 @@ func cleanupFirecrackerCgroupUnder(rootRel, name string) error {
 	if err != nil {
 		return fmt.Errorf("cleanup firecracker cgroup for %q: %w", name, err)
 	}
+	return cleanupFirecrackerCgroupPath(name, cgroupPath)
+}
+
+func cleanupFirecrackerCgroupPath(name, cgroupPath string) error {
 	if err := removePath(cgroupPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("cleanup firecracker cgroup for %q: remove %s: %w", name, cgroupPath, err)
 	}

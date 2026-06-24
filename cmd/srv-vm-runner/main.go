@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"srv/internal/vmrunner"
 )
@@ -28,6 +29,8 @@ func main() {
 		jailerUser        string
 		jailerGroup       string
 		vmPIDsMax         int64
+		cgroupRoot        string
+		drainOnly         bool
 	)
 
 	defaultDataDir := getenv("SRV_DATA_DIR", "/var/lib/srv")
@@ -42,16 +45,33 @@ func main() {
 	flag.StringVar(&jailerUser, "jailer-user", getenv("SRV_JAILER_USER", "srv-vm"), "user that the jailer drops the Firecracker process to")
 	flag.StringVar(&jailerGroup, "jailer-group", getenv("SRV_JAILER_GROUP", "srv"), "group that the jailer drops the Firecracker process to")
 	flag.Int64Var(&vmPIDsMax, "vm-pids-max", getenvInt64("SRV_VM_PIDS_MAX", 512), "maximum tasks allowed in each VM cgroup")
+	flag.StringVar(&cgroupRoot, "cgroup-root", getenv("SRV_VM_RUNNER_CGROUP_ROOT", ""), "absolute cgroup v2 root that contains runner-managed VM cgroups")
+	flag.BoolVar(&drainOnly, "drain-only", false, "shut down running Firecracker VMs and exit")
 	flag.Parse()
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if drainOnly {
+		server := vmrunner.NewServer(logger, vmrunner.ServerConfig{
+			FirecrackerBinary: firecrackerBinary,
+			JailerBaseDir:     jailerBaseDir,
+			InstancesDir:      instancesDir,
+			CgroupRoot:        cgroupRoot,
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		if err := server.ShutdownRunningVMs(ctx); err != nil {
+			logger.Error("drain running vms", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	uid, gid, err := resolveProcessIdentity(jailerUser, jailerGroup)
 	if err != nil {
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 		logger.Error("resolve jailer identity", "err", err)
 		os.Exit(2)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg := vmrunner.ServerConfig{
 		FirecrackerBinary: firecrackerBinary,
 		JailerBinary:      jailerBinary,
@@ -62,6 +82,7 @@ func main() {
 		KernelPath:        kernelPath,
 		InitrdPath:        initrdPath,
 		VMPIDsMax:         vmPIDsMax,
+		CgroupRoot:        cgroupRoot,
 	}
 	if err := cfg.Validate(); err != nil {
 		logger.Error("invalid vm runner config", "err", err)

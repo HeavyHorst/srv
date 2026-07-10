@@ -305,7 +305,8 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 		"failed",
 		"CPU",
 		"MEMORY",
-		"DISK",
+		"DISK RSV",
+		"FS SPACE",
 		expectedCPUUsage,
 		expectedMemoryUsage,
 		expectedDiskUsage,
@@ -465,6 +466,9 @@ func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
 	if disk.Allocated != expectedDiskAllocated || disk.Reserve != 1<<30 || disk.Budget != max(disk.Total-disk.Reserve, int64(0)) || disk.Left != disk.Budget-disk.Allocated {
 		t.Fatalf("disk status = %#v", disk)
 	}
+	if disk.Filesystem == nil {
+		t.Fatalf("disk filesystem usage = %#v, want measured usage", disk)
+	}
 }
 
 func TestBoxRowKeepsUTF8BarsWhenTheyFit(t *testing.T) {
@@ -495,8 +499,11 @@ func TestSkipStatusSeparatorKeepsDiskStorageDetailsGrouped(t *testing.T) {
 		prev string
 		curr string
 	}{
-		{prev: "DISK", curr: "BTRFS"},
-		{prev: "DISK", curr: "MDADM"},
+		{prev: "DISK RSV", curr: "FS SPACE"},
+		{prev: "FS SPACE", curr: "BTRFS"},
+		{prev: "FS SPACE", curr: "MDADM"},
+		{prev: "DISK RSV", curr: "BTRFS"},
+		{prev: "DISK RSV", curr: "MDADM"},
 		{prev: "BTRFS", curr: "MDADM"},
 	} {
 		if !skipStatusSeparator(tc.prev, tc.curr) {

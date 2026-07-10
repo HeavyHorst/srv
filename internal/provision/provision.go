@@ -77,6 +77,7 @@ type Provisioner struct {
 	vmRunner            vmRunner
 	readHostMemoryBytes func() (int64, error)
 	readFilesystemBytes func(path string) (int64, error)
+	readFilesystemUsage func(path string) (host.FilesystemUsage, error)
 	admissionMu         sync.Mutex
 }
 
@@ -115,7 +116,7 @@ func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner,
 		networkHelper:       nethelper.NewClient(cfg.NetHelperSocketPath),
 		vmRunner:            vmrunner.NewClient(cfg.VMRunnerSocketPath),
 		readHostMemoryBytes: host.DefaultReadHostMemoryBytes,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 	if cfg.Tailnet != "" && cfg.TailscaleClientSecret != "" {
 		client := &tailscale.Client{
@@ -1111,14 +1112,11 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 	if _, statErr := os.Stat(statusFilesystemPath); errors.Is(statErr, os.ErrNotExist) {
 		statusFilesystemPath = p.cfg.DataDirAbs()
 	}
-	readFilesystemBytes := p.readFilesystemBytes
-	if readFilesystemBytes == nil {
-		readFilesystemBytes = host.DefaultReadFilesystemBytes
-	}
-	totalDiskBytes, err := readFilesystemBytes(statusFilesystemPath)
+	filesystemUsage, filesystemMeasured, err := p.filesystemUsage(statusFilesystemPath)
 	if err != nil {
 		return host.CapacitySummary{}, fmt.Errorf("read filesystem status for %s: %w", statusFilesystemPath, err)
 	}
+	totalDiskBytes := filesystemUsage.Total
 	allocatedDiskBytes, err := p.sumReservedCapacity(ctx, "", "disk", true, func(inst model.Instance) int64 {
 		return reservedInstanceRootFSBytes(inst)
 	})
@@ -1127,6 +1125,13 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 	}
 	diskBudgetBytes := max(totalDiskBytes-hostDiskReserveBytes, int64(0))
 	diskDetails := p.capacityStorageDetails(ctx, statusFilesystemPath)
+	var capacityFilesystem *host.CapacityFilesystem
+	if filesystemMeasured {
+		capacityFilesystem = &host.CapacityFilesystem{
+			Used:      filesystemUsage.Used,
+			Available: filesystemUsage.Available,
+		}
+	}
 
 	hostCPUs := int64(runtime.NumCPU())
 
@@ -1171,15 +1176,16 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 				Details:       memoryDetails,
 			},
 			{
-				Resource:  "disk",
-				Unit:      "bytes",
-				Allocated: allocatedDiskBytes,
-				Budget:    diskBudgetBytes,
-				Left:      diskBudgetBytes - allocatedDiskBytes,
-				Total:     totalDiskBytes,
-				Reserve:   hostDiskReserveBytes,
-				Note:      fmt.Sprintf("%s total - %s host reserve", format.BinarySize(totalDiskBytes), format.BinarySize(hostDiskReserveBytes)),
-				Details:   diskDetails,
+				Resource:   "disk",
+				Unit:       "bytes",
+				Allocated:  allocatedDiskBytes,
+				Budget:     diskBudgetBytes,
+				Left:       diskBudgetBytes - allocatedDiskBytes,
+				Total:      totalDiskBytes,
+				Filesystem: capacityFilesystem,
+				Reserve:    hostDiskReserveBytes,
+				Note:       fmt.Sprintf("%s total - %s host reserve", format.BinarySize(totalDiskBytes), format.BinarySize(hostDiskReserveBytes)),
+				Details:    diskDetails,
 			},
 		},
 	}, nil
@@ -1216,14 +1222,11 @@ func (p *Provisioner) ensureHostMemoryReservationCapacity(ctx context.Context, e
 }
 
 func (p *Provisioner) ensureHostDiskCapacity(ctx context.Context, excludeName string, requestedRootFSBytes int64) error {
-	readFilesystemBytes := p.readFilesystemBytes
-	if readFilesystemBytes == nil {
-		readFilesystemBytes = host.DefaultReadFilesystemBytes
-	}
-	totalBytes, err := readFilesystemBytes(p.cfg.InstancesDir())
+	filesystemUsage, _, err := p.filesystemUsage(p.cfg.InstancesDir())
 	if err != nil {
 		return fmt.Errorf("read filesystem status for %s: %w", p.cfg.InstancesDir(), err)
 	}
+	totalBytes := filesystemUsage.Total
 	reservedBytes, err := p.sumReservedCapacity(ctx, excludeName, "disk", true, func(inst model.Instance) int64 {
 		return reservedInstanceRootFSBytes(inst)
 	})
@@ -1242,6 +1245,19 @@ func (p *Provisioner) ensureHostDiskCapacity(ctx context.Context, excludeName st
 		)
 	}
 	return nil
+}
+
+func (p *Provisioner) filesystemUsage(path string) (host.FilesystemUsage, bool, error) {
+	if p.readFilesystemUsage != nil {
+		usage, err := p.readFilesystemUsage(path)
+		return usage, true, err
+	}
+	if p.readFilesystemBytes != nil {
+		total, err := p.readFilesystemBytes(path)
+		return host.FilesystemUsage{Total: total}, false, err
+	}
+	usage, err := host.DefaultReadFilesystemUsage(path)
+	return usage, true, err
 }
 
 func (p *Provisioner) sumReservedCapacity(ctx context.Context, excludeName, label string, includeDeleted bool, measure func(model.Instance) int64) (int64, error) {

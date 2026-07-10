@@ -44,24 +44,36 @@ type CapacityInstances struct {
 }
 
 type CapacityResource struct {
-	Resource      string           `json:"resource"`
-	Unit          string           `json:"unit"`
-	Allocated     int64            `json:"allocated"`
-	Budget        int64            `json:"budget"`
-	Left          int64            `json:"left"`
-	Total         int64            `json:"total,omitempty"`
-	Reserve       int64            `json:"reserve,omitempty"`
-	FixedReserved int64            `json:"fixed_reserved,omitempty"`
-	PoolReserved  int64            `json:"pool_reserved,omitempty"`
-	PoolCount     int              `json:"pool_count,omitempty"`
-	Advisory      bool             `json:"advisory,omitempty"`
-	Note          string           `json:"note,omitempty"`
-	Details       []CapacityDetail `json:"details,omitempty"`
+	Resource      string              `json:"resource"`
+	Unit          string              `json:"unit"`
+	Allocated     int64               `json:"allocated"`
+	Budget        int64               `json:"budget"`
+	Left          int64               `json:"left"`
+	Total         int64               `json:"total,omitempty"`
+	Filesystem    *CapacityFilesystem `json:"filesystem,omitempty"`
+	Reserve       int64               `json:"reserve,omitempty"`
+	FixedReserved int64               `json:"fixed_reserved,omitempty"`
+	PoolReserved  int64               `json:"pool_reserved,omitempty"`
+	PoolCount     int                 `json:"pool_count,omitempty"`
+	Advisory      bool                `json:"advisory,omitempty"`
+	Note          string              `json:"note,omitempty"`
+	Details       []CapacityDetail    `json:"details,omitempty"`
 }
 
 type CapacityDetail struct {
 	Label string `json:"label"`
 	Value string `json:"value"`
+}
+
+type CapacityFilesystem struct {
+	Used      int64 `json:"used"`
+	Available int64 `json:"available"`
+}
+
+type FilesystemUsage struct {
+	Total     int64
+	Used      int64
+	Available int64
 }
 
 var readFile = func(path string) ([]byte, error) { return os.ReadFile(path) }
@@ -71,11 +83,25 @@ func DefaultReadHostMemoryBytes() (int64, error) {
 }
 
 func DefaultReadFilesystemBytes(path string) (int64, error) {
+	usage, err := DefaultReadFilesystemUsage(path)
+	return usage.Total, err
+}
+
+func DefaultReadFilesystemUsage(path string) (FilesystemUsage, error) {
 	var fs syscall.Statfs_t
 	if err := syscall.Statfs(path, &fs); err != nil {
-		return 0, err
+		return FilesystemUsage{}, err
 	}
-	return int64(fs.Blocks) * int64(fs.Bsize), nil
+	return filesystemUsageFromStatfs(fs), nil
+}
+
+func filesystemUsageFromStatfs(fs syscall.Statfs_t) FilesystemUsage {
+	blockSize := int64(fs.Bsize)
+	return FilesystemUsage{
+		Total:     int64(fs.Blocks) * blockSize,
+		Used:      int64(fs.Blocks-fs.Bfree) * blockSize,
+		Available: int64(fs.Bavail) * blockSize,
+	}
 }
 
 func LoadHostMemoryBytes(path string) (int64, error) {

@@ -1156,6 +1156,9 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 
 	for _, resource := range summary.Capacity {
 		label := strings.ToUpper(resource.Resource)
+		if resource.Resource == "disk" {
+			label = "DISK RSV"
+		}
 		pct := 0
 		if resource.Budget > 0 {
 			pct = int(float64(resource.Allocated) / float64(resource.Budget) * 100)
@@ -1165,6 +1168,9 @@ func (a *App) cmdStatus(ctx context.Context, actor model.Actor, args []string, o
 
 		bar := formatStatusBar(valueWidth, resource.Allocated, resource.Budget)
 		rows = append(rows, [2]string{"", bar})
+		if resource.Filesystem != nil {
+			rows = append(rows, [2]string{"FS SPACE", fmt.Sprintf("%s used / %s available", format.BinarySize(resource.Filesystem.Used), format.BinarySize(resource.Filesystem.Available))})
+		}
 
 		for _, detail := range resource.Details {
 			rows = append(rows, [2]string{strings.ToUpper(detail.Label), detail.Value})
@@ -1239,12 +1245,14 @@ func skipStatusSeparator(prevLabel, label string) bool {
 
 func statusStorageLabelRank(label string) int {
 	switch label {
-	case "DISK":
+	case "DISK RSV":
 		return 0
-	case "BTRFS":
+	case "FS SPACE":
 		return 1
-	case "MDADM":
+	case "BTRFS":
 		return 2
+	case "MDADM":
+		return 3
 	default:
 		return -1
 	}

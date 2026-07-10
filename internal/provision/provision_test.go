@@ -2451,6 +2451,11 @@ func TestCapacitySummaryIncludesDiskStorageDetails(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
+	filesystemUsage := host.FilesystemUsage{
+		Total:     128 * 1024 * format.MiB,
+		Used:      37 * 1024 * format.MiB,
+		Available: 89 * 1024 * format.MiB,
+	}
 	p := &Provisioner{
 		cfg:   cfg,
 		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -2458,8 +2463,8 @@ func TestCapacitySummaryIncludesDiskStorageDetails(t *testing.T) {
 		readHostMemoryBytes: func() (int64, error) {
 			return 8 * 1024 * format.MiB, nil
 		},
-		readFilesystemBytes: func(string) (int64, error) {
-			return 128 * 1024 * format.MiB, nil
+		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
+			return filesystemUsage, nil
 		},
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o755); err != nil {
@@ -2518,6 +2523,13 @@ func TestCapacitySummaryIncludesDiskStorageDetails(t *testing.T) {
 	}
 	if !reflect.DeepEqual(disk.Details, want) {
 		t.Fatalf("disk details = %#v, want %#v", disk.Details, want)
+	}
+	wantFilesystem := &host.CapacityFilesystem{
+		Used:      filesystemUsage.Used,
+		Available: filesystemUsage.Available,
+	}
+	if disk.Total != filesystemUsage.Total || !reflect.DeepEqual(disk.Filesystem, wantFilesystem) {
+		t.Fatalf("disk filesystem usage = %#v with total %d, want %#v with total %d", disk.Filesystem, disk.Total, wantFilesystem, filesystemUsage.Total)
 	}
 }
 
@@ -2590,8 +2602,8 @@ func TestEnsureHostDiskCapacityCountsDeletedInstancesStillPresentInStore(t *test
 		cfg:   cfg,
 		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store: st,
-		readFilesystemBytes: func(string) (int64, error) {
-			return hostDiskReserveBytes + allocatedBytes + requestedBytes - 1, nil
+		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
+			return host.FilesystemUsage{Total: hostDiskReserveBytes + allocatedBytes + requestedBytes - 1}, nil
 		},
 	}
 

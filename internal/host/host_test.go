@@ -1,6 +1,9 @@
 package host
 
 import (
+	"encoding/json"
+	"strings"
+	"syscall"
 	"testing"
 
 	"srv/internal/format"
@@ -44,6 +47,46 @@ func TestDefaultReadFilesystemBytes(t *testing.T) {
 	}
 	if total <= 0 {
 		t.Fatalf("DefaultReadFilesystemBytes() = %d, want positive", total)
+	}
+}
+
+func TestDefaultReadFilesystemUsage(t *testing.T) {
+	usage, err := DefaultReadFilesystemUsage("/")
+	if err != nil {
+		t.Fatalf("DefaultReadFilesystemUsage() error = %v", err)
+	}
+	if usage.Total <= 0 || usage.Used < 0 || usage.Available < 0 {
+		t.Fatalf("DefaultReadFilesystemUsage() = %#v, want valid non-negative usage", usage)
+	}
+	if usage.Used > usage.Total || usage.Available > usage.Total {
+		t.Fatalf("DefaultReadFilesystemUsage() = %#v, values exceed total", usage)
+	}
+}
+
+func TestFilesystemUsageFromStatfsDistinguishesFreeAndAvailable(t *testing.T) {
+	usage := filesystemUsageFromStatfs(syscall.Statfs_t{
+		Blocks: 100,
+		Bfree:  30,
+		Bavail: 20,
+		Bsize:  4096,
+	})
+	want := FilesystemUsage{
+		Total:     100 * 4096,
+		Used:      70 * 4096,
+		Available: 20 * 4096,
+	}
+	if usage != want {
+		t.Fatalf("filesystemUsageFromStatfs() = %#v, want %#v", usage, want)
+	}
+}
+
+func TestCapacityFilesystemIncludesMeasuredZeroValuesInJSON(t *testing.T) {
+	payload, err := json.Marshal(CapacityResource{Filesystem: &CapacityFilesystem{}})
+	if err != nil {
+		t.Fatalf("json.Marshal(): %v", err)
+	}
+	if !strings.Contains(string(payload), `"filesystem":{"used":0,"available":0}`) {
+		t.Fatalf("json.Marshal() = %s, want measured zero filesystem values", payload)
 	}
 }
 

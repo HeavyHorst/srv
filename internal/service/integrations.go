@@ -384,6 +384,23 @@ func (a *App) syncManagedGatewaysBestEffort() {
 	a.syncZenGatewayBestEffort()
 	a.syncDeepseekGatewayBestEffort()
 	a.syncIntegrationGatewayBestEffort()
+	a.syncAmpConnectGatewayBestEffort()
+}
+
+func (a *App) syncAmpConnectGatewayBestEffort() {
+	if a == nil || a.ampConnectGateway == nil || a.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	instances, err := a.store.ListInstances(ctx, false)
+	if err != nil {
+		a.log.Error("list instances for Amp CONNECT gateway sync", "err", err)
+		return
+	}
+	if err := a.ampConnectGateway.Reconcile(ctx, instances); err != nil {
+		a.log.Error("sync Amp CONNECT gateways", "err", err)
+	}
 }
 
 func (a *App) syncIntegrationGatewayBestEffort() {

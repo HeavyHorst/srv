@@ -75,6 +75,7 @@ Use either `TS_AUTHKEY` or `TS_CLIENT_ID`/`TS_CLIENT_SECRET` for the control-pla
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SRV_INTEGRATION_GATEWAY_PORT` | `11435` | TCP port for each VM's host-side integration gateway |
+| `SRV_AMP_CONNECT_GATEWAY_PORT` | `3128` | Per-VM HTTP CONNECT gateway for public HTTPS destinations on port 443; private, local, and special-use networks are blocked |
 | `SRV_SECRET_*` | (empty) | Host-managed secret env vars referenced by integration definitions for bearer auth, basic auth passwords, or env-backed headers |
 
 The `SRV_SECRET_*` entries are a naming convention rather than a fixed list. They are meant to live in `/etc/srv/srv.env` so the SSH control surface only ever receives secret names such as `SRV_SECRET_OPENAI_PROD`, not the raw credential values.

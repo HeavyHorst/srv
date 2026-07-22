@@ -36,6 +36,7 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_ZEN_BASE_URL", "https://zen.example.test/base")
 	t.Setenv("SRV_ZEN_GATEWAY_PORT", "12456")
 	t.Setenv("SRV_INTEGRATION_GATEWAY_PORT", "12457")
+	t.Setenv("SRV_AMP_CONNECT_GATEWAY_PORT", "12458")
 	t.Setenv("SRV_VM_VCPUS", "2")
 	t.Setenv("SRV_VM_MEMORY_MIB", "2048")
 	t.Setenv("SRV_LOG_LEVEL", "debug")
@@ -77,6 +78,9 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	}
 	if cfg.IntegrationGatewayPort != 12457 {
 		t.Fatalf("IntegrationGatewayPort = %d, want 12457", cfg.IntegrationGatewayPort)
+	}
+	if cfg.AmpConnectGatewayPort != 12458 {
+		t.Fatalf("AmpConnectGatewayPort = %d, want 12458", cfg.AmpConnectGatewayPort)
 	}
 	if !reflect.DeepEqual(cfg.AllowedUsers, []string{"alice@example.com", "bob@example.com"}) {
 		t.Fatalf("AllowedUsers = %#v", cfg.AllowedUsers)
@@ -190,6 +194,11 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 			wantErr: "deepseek gateway port must be between 1 and 65535",
 		},
 		{
+			name:    "invalid amp connect gateway port",
+			mutate:  func(cfg *Config) { cfg.AmpConnectGatewayPort = 70000 },
+			wantErr: "amp connect gateway port must be between 1 and 65535",
+		},
+		{
 			name:    "invalid deepseek base url",
 			mutate:  func(cfg *Config) { cfg.DeepSeekBaseURL = "mailto:ds@example.com" },
 			wantErr: "base url must use http or https",
@@ -252,6 +261,7 @@ func validConfig() Config {
 		DeepSeekBaseURL:        "https://api.deepseek.com",
 		DeepSeekGatewayPort:    11436,
 		IntegrationGatewayPort: 11435,
+		AmpConnectGatewayPort:  3128,
 		VCPUCount:              2,
 		MemoryMiB:              1024,
 		GuestAuthExpiry:        15 * time.Minute,

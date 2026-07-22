@@ -25,6 +25,7 @@ const (
 	defaultDeepSeekBaseURL     = "https://api.deepseek.com"
 	defaultDeepSeekGatewayPort = 11436
 	defaultIntegrationPort     = 11435
+	defaultAmpConnectPort      = 3128
 	defaultGuestAuthExpiry     = 15 * time.Minute
 	defaultGuestReadyTimout    = 2 * time.Minute
 	MaxVCPUCount               = 32
@@ -69,6 +70,7 @@ type Config struct {
 	DeepSeekBaseURL          string
 	DeepSeekGatewayPort      int
 	IntegrationGatewayPort   int
+	AmpConnectGatewayPort    int
 
 	LogLevel string
 
@@ -112,6 +114,7 @@ func Load() (Config, error) {
 	flag.StringVar(&cfg.DeepSeekBaseURL, "deepseek-base-url", getenv("SRV_DEEPSEEK_BASE_URL", defaultDeepSeekBaseURL), "base URL for the upstream DeepSeek API")
 	flag.IntVar(&cfg.DeepSeekGatewayPort, "deepseek-gateway-port", getenvInt("SRV_DEEPSEEK_GATEWAY_PORT", defaultDeepSeekGatewayPort), "TCP port exposed on each VM host/gateway IP for the host-side DeepSeek proxy")
 	flag.IntVar(&cfg.IntegrationGatewayPort, "integration-gateway-port", getenvInt("SRV_INTEGRATION_GATEWAY_PORT", defaultIntegrationPort), "TCP port exposed on each VM host/gateway IP for the host-side generic integration proxy")
+	flag.IntVar(&cfg.AmpConnectGatewayPort, "amp-connect-gateway-port", getenvInt("SRV_AMP_CONNECT_GATEWAY_PORT", defaultAmpConnectPort), "TCP port exposed on each VM host/gateway IP for the Amp HTTP CONNECT gateway")
 	flag.Int64Var(&cfg.VCPUCount, "vm-vcpus", getenvInt64("SRV_VM_VCPUS", 1), "number of guest vCPUs")
 	flag.Int64Var(&cfg.MemoryMiB, "vm-memory-mib", getenvInt64("SRV_VM_MEMORY_MIB", 1024), "guest memory in MiB")
 	flag.StringVar(&cfg.LogLevel, "log-level", getenv("SRV_LOG_LEVEL", "info"), "log level")
@@ -178,6 +181,9 @@ func (c Config) Validate() error {
 	}
 	if c.IntegrationGatewayPort < 1 || c.IntegrationGatewayPort > 65535 {
 		return errors.New("integration gateway port must be between 1 and 65535")
+	}
+	if c.AmpConnectGatewayPort < 1 || c.AmpConnectGatewayPort > 65535 {
+		return errors.New("amp connect gateway port must be between 1 and 65535")
 	}
 	if strings.TrimSpace(c.ZenBaseURL) == "" {
 		return errors.New("zen base url is required")

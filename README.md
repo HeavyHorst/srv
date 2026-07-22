@@ -109,6 +109,7 @@ ssh srv snapshot create
 # stopped-VM backups
 ssh srv backup create demo
 ssh srv backup list demo
+ssh srv backup delete demo <backup-id>
 ssh srv restore demo <backup-id>
 
 # stopped-VM transfer between hosts

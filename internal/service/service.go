@@ -53,6 +53,7 @@ type App struct {
 	zenGateway         *zenGatewayManager
 	deepseekGateway    *deepseekGatewayManager
 	integrationGateway *integrationGatewayManager
+	ampConnectGateway  *ampConnectGatewayManager
 	commandMu          sync.Mutex
 	commandCond        *sync.Cond
 	commandOnce        sync.Once
@@ -111,32 +112,33 @@ type inspectResponseJSON struct {
 }
 
 type inspectInstanceJSON struct {
-	Name            string          `json:"name"`
-	State           string          `json:"state"`
-	CreatedByUser   string          `json:"created_by_user,omitempty"`
-	CreatedByNode   string          `json:"created_by_node,omitempty"`
-	CreatedAt       time.Time       `json:"created_at"`
-	UpdatedAt       time.Time       `json:"updated_at"`
-	VCPUCount       int64           `json:"vcpu_count,omitempty"`
-	MemoryMiB       int64           `json:"memory_mib,omitempty"`
-	MemoryMode      string          `json:"memory_mode,omitempty"`
-	MemoryPool      string          `json:"memory_pool,omitempty"`
-	HostReservation string          `json:"host_reservation,omitempty"`
-	RootFSPath      string          `json:"rootfs_path"`
-	RootFSSizeBytes int64           `json:"rootfs_size_bytes,omitempty"`
-	FirecrackerPID  int             `json:"firecracker_pid"`
-	TapDevice       string          `json:"tap_device,omitempty"`
-	NetworkCIDR     string          `json:"network_cidr,omitempty"`
-	HostIP          string          `json:"host_ip,omitempty"`
-	GuestIP         string          `json:"guest_ip,omitempty"`
-	ZenGateway      string          `json:"zen_gateway,omitempty"`
-	DeepSeekGateway string          `json:"deepseek_gateway,omitempty"`
-	TailscaleName   string          `json:"tailscale_name,omitempty"`
-	TailscaleIP     string          `json:"tailscale_ip,omitempty"`
-	LastError       string          `json:"last_error,omitempty"`
-	DeletedAt       *time.Time      `json:"deleted_at,omitempty"`
-	Logs            inspectLogsJSON `json:"logs"`
-	DebugHint       string          `json:"debug_hint,omitempty"`
+	Name              string          `json:"name"`
+	State             string          `json:"state"`
+	CreatedByUser     string          `json:"created_by_user,omitempty"`
+	CreatedByNode     string          `json:"created_by_node,omitempty"`
+	CreatedAt         time.Time       `json:"created_at"`
+	UpdatedAt         time.Time       `json:"updated_at"`
+	VCPUCount         int64           `json:"vcpu_count,omitempty"`
+	MemoryMiB         int64           `json:"memory_mib,omitempty"`
+	MemoryMode        string          `json:"memory_mode,omitempty"`
+	MemoryPool        string          `json:"memory_pool,omitempty"`
+	HostReservation   string          `json:"host_reservation,omitempty"`
+	RootFSPath        string          `json:"rootfs_path"`
+	RootFSSizeBytes   int64           `json:"rootfs_size_bytes,omitempty"`
+	FirecrackerPID    int             `json:"firecracker_pid"`
+	TapDevice         string          `json:"tap_device,omitempty"`
+	NetworkCIDR       string          `json:"network_cidr,omitempty"`
+	HostIP            string          `json:"host_ip,omitempty"`
+	GuestIP           string          `json:"guest_ip,omitempty"`
+	ZenGateway        string          `json:"zen_gateway,omitempty"`
+	AmpConnectGateway string          `json:"amp_connect_gateway,omitempty"`
+	DeepSeekGateway   string          `json:"deepseek_gateway,omitempty"`
+	TailscaleName     string          `json:"tailscale_name,omitempty"`
+	TailscaleIP       string          `json:"tailscale_ip,omitempty"`
+	LastError         string          `json:"last_error,omitempty"`
+	DeletedAt         *time.Time      `json:"deleted_at,omitempty"`
+	Logs              inspectLogsJSON `json:"logs"`
+	DebugHint         string          `json:"debug_hint,omitempty"`
 }
 
 type inspectLogsJSON struct {
@@ -177,6 +179,12 @@ type backupCreateResponseJSON struct {
 type backupListResponseJSON struct {
 	Instance string       `json:"instance"`
 	Backups  []backupJSON `json:"backups"`
+}
+
+type backupDeleteResponseJSON struct {
+	Action   string `json:"action"`
+	Instance string `json:"instance"`
+	BackupID string `json:"backup_id"`
 }
 
 type restoreResponseJSON struct {
@@ -356,30 +364,31 @@ func (a *App) inspectPayload(inst model.Instance, poolName string, integrations 
 	}
 	payload := inspectResponseJSON{
 		Instance: inspectInstanceJSON{
-			Name:            inst.Name,
-			State:           inst.State,
-			CreatedByUser:   inst.CreatedByUser,
-			CreatedByNode:   inst.CreatedByNode,
-			CreatedAt:       inst.CreatedAt,
-			UpdatedAt:       inst.UpdatedAt,
-			VCPUCount:       effectiveInstanceVCPUCount(inst, a.cfg),
-			MemoryMiB:       effectiveInstanceMemoryMiB(inst, a.cfg),
-			MemoryMode:      inst.NormalizedMemoryMode(),
-			MemoryPool:      poolName,
-			HostReservation: hostReservation,
-			RootFSPath:      inst.RootFSPath,
-			RootFSSizeBytes: effectiveInstanceRootFSSizeBytes(inst),
-			FirecrackerPID:  inst.FirecrackerPID,
-			TapDevice:       inst.TapDevice,
-			NetworkCIDR:     inst.NetworkCIDR,
-			HostIP:          inst.HostAddr,
-			GuestIP:         inst.GuestAddr,
-			ZenGateway:      a.zenGatewayBaseURL(inst),
-			DeepSeekGateway: a.deepseekGatewayBaseURL(inst),
-			TailscaleName:   inst.TailscaleName,
-			TailscaleIP:     inst.TailscaleIP,
-			LastError:       inst.LastError,
-			DeletedAt:       inst.DeletedAt,
+			Name:              inst.Name,
+			State:             inst.State,
+			CreatedByUser:     inst.CreatedByUser,
+			CreatedByNode:     inst.CreatedByNode,
+			CreatedAt:         inst.CreatedAt,
+			UpdatedAt:         inst.UpdatedAt,
+			VCPUCount:         effectiveInstanceVCPUCount(inst, a.cfg),
+			MemoryMiB:         effectiveInstanceMemoryMiB(inst, a.cfg),
+			MemoryMode:        inst.NormalizedMemoryMode(),
+			MemoryPool:        poolName,
+			HostReservation:   hostReservation,
+			RootFSPath:        inst.RootFSPath,
+			RootFSSizeBytes:   effectiveInstanceRootFSSizeBytes(inst),
+			FirecrackerPID:    inst.FirecrackerPID,
+			TapDevice:         inst.TapDevice,
+			NetworkCIDR:       inst.NetworkCIDR,
+			HostIP:            inst.HostAddr,
+			GuestIP:           inst.GuestAddr,
+			ZenGateway:        a.zenGatewayBaseURL(inst),
+			AmpConnectGateway: a.ampConnectGatewayURL(inst),
+			DeepSeekGateway:   a.deepseekGatewayBaseURL(inst),
+			TailscaleName:     inst.TailscaleName,
+			TailscaleIP:       inst.TailscaleIP,
+			LastError:         inst.LastError,
+			DeletedAt:         inst.DeletedAt,
 			Logs: inspectLogsJSON{
 				SerialCommand:      fmt.Sprintf("ssh %s logs %s serial", a.cfg.Hostname, inst.Name),
 				FirecrackerCommand: fmt.Sprintf("ssh %s logs %s firecracker", a.cfg.Hostname, inst.Name),
@@ -424,6 +433,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	ampConnectGateway := newAmpConnectGatewayManager(cfg, logger)
 
 	st, err := store.Open(cfg.DatabasePath())
 	if err != nil {
@@ -436,7 +446,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 
-	return &App{cfg: cfg, log: logger, store: st, provisioner: prov, zenGateway: zenGateway, deepseekGateway: deepseekGateway, integrationGateway: integrationGateway}, nil
+	return &App{cfg: cfg, log: logger, store: st, provisioner: prov, zenGateway: zenGateway, deepseekGateway: deepseekGateway, integrationGateway: integrationGateway, ampConnectGateway: ampConnectGateway}, nil
 }
 
 func (a *App) lockInstance(name string) func() {
@@ -533,6 +543,9 @@ func (a *App) Run(ctx context.Context) error {
 		defer cancel()
 		if a.integrationGateway != nil {
 			a.integrationGateway.Close()
+		}
+		if a.ampConnectGateway != nil {
+			a.ampConnectGateway.Close()
 		}
 		if a.zenGateway != nil {
 			a.zenGateway.Close()
@@ -872,7 +885,7 @@ func (a *App) cmdResize(ctx context.Context, actor model.Actor, args []string, o
 }
 
 func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
-	action, name, err := parseBackupArgs(args)
+	action, name, backupID, err := parseBackupArgs(args)
 	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
@@ -945,6 +958,22 @@ func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string, o
 			return commandResult{stderr: fmt.Sprintf("render backup list: %v\n", err), exitCode: 1}, err
 		}
 		return commandResult{stdout: fmt.Sprintf("backups for %s:\n%s", name, tableOutput), exitCode: 0}, nil
+	case "delete":
+		unlock := a.lockInstance(name)
+		defer unlock()
+
+		if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
+			return missingInstanceResult("backup", name, err)
+		}
+
+		info, err := a.provisioner.DeleteBackup(ctx, name, backupID)
+		if err != nil {
+			return commandResult{stderr: fmt.Sprintf("backup delete %s %s: %v\n", name, backupID, err), exitCode: 1}, err
+		}
+		if outFormat == outputFormatJSON {
+			return jsonResult(backupDeleteResponseJSON{Action: "backup-deleted", Instance: name, BackupID: info.ID})
+		}
+		return commandResult{stdout: fmt.Sprintf("backup-deleted: %s\nbackup-id: %s\n", name, info.ID), exitCode: 0}, nil
 	default:
 		return commandResult{stderr: backupUsage() + "\n", exitCode: 2}, errors.New(backupUsage())
 	}
@@ -1075,6 +1104,9 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	fmt.Fprintf(&b, "guest-ip: %s\n", inst.GuestAddr)
 	if gatewayURL := a.zenGatewayBaseURL(inst); gatewayURL != "" {
 		fmt.Fprintf(&b, "zen-gateway: %s\n", gatewayURL)
+	}
+	if gatewayURL := a.ampConnectGatewayURL(inst); gatewayURL != "" {
+		fmt.Fprintf(&b, "amp-connect-gateway: %s\n", gatewayURL)
 	}
 	if gatewayURL := a.deepseekGatewayBaseURL(inst); gatewayURL != "" {
 		fmt.Fprintf(&b, "deepseek-gateway: %s\n", gatewayURL)
@@ -2274,6 +2306,7 @@ func helpResult() commandResult {
 			entries: []helpEntry{
 				{"backup create <name>", "Create a backup of an instance (stopped VM recommended for safety)."},
 				{"backup list <name>", "List backups for an instance."},
+				{"backup delete <name> <backup-id>", "Delete a backup of an instance."},
 				{"restore <name> <backup-id>", "Restore an instance from a backup."},
 				{"export <name>", "Export instance as a portable archive to stdout."},
 				{"import", "Import instance from stdin."},
@@ -2908,15 +2941,23 @@ func parseResizeArgs(args []string) (string, provision.CreateOptions, error) {
 	return name, opts, nil
 }
 
-func parseBackupArgs(args []string) (string, string, error) {
-	if len(args) != 3 {
-		return "", "", errors.New(backupUsage())
+func parseBackupArgs(args []string) (string, string, string, error) {
+	if len(args) < 2 {
+		return "", "", "", errors.New(backupUsage())
 	}
 	switch args[1] {
 	case "create", "list":
-		return args[1], args[2], nil
+		if len(args) != 3 {
+			return "", "", "", errors.New(backupUsage())
+		}
+		return args[1], args[2], "", nil
+	case "delete":
+		if len(args) != 4 {
+			return "", "", "", errors.New(backupUsage())
+		}
+		return args[1], args[2], args[3], nil
 	default:
-		return "", "", fmt.Errorf("unknown backup action %q\n%s", args[1], backupUsage())
+		return "", "", "", fmt.Errorf("unknown backup action %q\n%s", args[1], backupUsage())
 	}
 }
 
@@ -3035,7 +3076,7 @@ func resizeUsage() string {
 }
 
 func backupUsage() string {
-	return "usage: backup <create|list> <name>"
+	return "usage: backup <create|list> <name> | backup delete <name> <backup-id>"
 }
 
 func restoreUsage() string {

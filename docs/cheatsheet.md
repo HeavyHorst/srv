@@ -27,6 +27,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | `resize <name>` | Resize stopped VM (CPU/RAM up or down, rootfs grow-only) |
 | `backup create <name>` | Create an in-place backup for a stopped VM |
 | `backup list <name>` | List stored backups for a VM |
+| `backup delete <name> <backup-id>` | Permanently delete a stored backup |
 | `restore <name> <backup-id>` | Restore a stopped VM from one of its backups |
 
 Use fixed mode for databases, JVMs, caches, and other memory-sensitive services. Pooled mode is for workloads that tolerate elastic memory.
@@ -66,6 +67,7 @@ ssh srv start demo
 # Backup and restore (stop VM first for safety)
 ssh srv backup create demo
 ssh srv backup list demo
+ssh srv backup delete demo <backup-id>
 ssh srv restore demo <backup-id>
 
 # View logs

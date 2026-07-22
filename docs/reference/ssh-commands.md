@@ -61,6 +61,7 @@ For pooled VMs, `resize --ram` keeps the VM in the same pool. In v1 it is allowe
 |---------|-------------|
 | `backup create <name>` | Create a backup from a stopped VM |
 | `backup list <name>` | List backups for a VM |
+| `backup delete <name> <backup-id>` | Permanently delete a backup |
 | `restore <name> <backup-id>` | Restore a stopped VM from a backup |
 
 ## Transfer commands

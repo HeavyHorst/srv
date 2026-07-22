@@ -217,6 +217,34 @@ func (p *Provisioner) ListBackups(_ context.Context, name string) ([]BackupInfo,
 	return backups, nil
 }
 
+func (p *Provisioner) DeleteBackup(ctx context.Context, name, backupID string) (BackupInfo, error) {
+	inst, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return BackupInfo{}, err
+	}
+	if inst.State == model.StateDeleted {
+		return BackupInfo{}, fmt.Errorf("instance %q is deleted", name)
+	}
+
+	manifest, backupDir, err := p.readBackupManifest(name, backupID)
+	if err != nil {
+		return BackupInfo{}, err
+	}
+	if manifest.Instance.Name != name {
+		return BackupInfo{}, fmt.Errorf("backup %q belongs to instance %q, not %q", backupID, manifest.Instance.Name, name)
+	}
+	if manifest.ID != backupID {
+		return BackupInfo{}, fmt.Errorf("backup directory %q contains manifest for backup %q", backupID, manifest.ID)
+	}
+
+	info := backupInfoFromManifest(backupDir, manifest)
+	if err := os.RemoveAll(backupDir); err != nil {
+		return BackupInfo{}, fmt.Errorf("delete backup %q for %q: %w", backupID, name, err)
+	}
+	p.recordEvent(inst.ID, "backup", "instance backup deleted", map[string]any{"backup_id": info.ID, "path": info.Path})
+	return info, nil
+}
+
 func (p *Provisioner) RestoreBackup(ctx context.Context, name, backupID string) (model.Instance, BackupInfo, error) {
 	inst, err := p.requireStoppedInstance(ctx, name)
 	if err != nil {

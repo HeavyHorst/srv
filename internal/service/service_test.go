@@ -598,6 +598,19 @@ func TestCmdBackupListFormatsBackupsAsTable(t *testing.T) {
 			t.Fatalf("cmdBackup(list) stdout missing %q\nfull output:\n%s", want, result.stdout)
 		}
 	}
+
+	result, err = app.cmdBackup(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"backup", "delete", inst.Name, backupID}, outputFormatText)
+	if err != nil {
+		t.Fatalf("cmdBackup(delete): %v", err)
+	}
+	for _, want := range []string{"backup-deleted: alpha", "backup-id: " + backupID} {
+		if !strings.Contains(result.stdout, want) {
+			t.Fatalf("cmdBackup(delete) stdout missing %q\nfull output:\n%s", want, result.stdout)
+		}
+	}
+	if _, err := os.Stat(backupDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat(deleted backup) error = %v, want os.ErrNotExist", err)
+	}
 }
 
 func TestCmdBackupListJSONReturnsStructuredBackups(t *testing.T) {
@@ -993,6 +1006,7 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 		"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]",
 		"backup create <name>",
 		"backup list <name>",
+		"backup delete <name> <backup-id>",
 		"export <name>",
 		"import",
 		"logs <name> [serial|firecracker]",
@@ -2140,17 +2154,20 @@ func TestParseBackupArgs(t *testing.T) {
 		args       []string
 		wantAction string
 		wantName   string
+		wantID     string
 		wantErr    string
 	}{
 		{name: "create", args: []string{"backup", "create", "demo"}, wantAction: "create", wantName: "demo"},
 		{name: "list", args: []string{"backup", "list", "demo"}, wantAction: "list", wantName: "demo"},
+		{name: "delete", args: []string{"backup", "delete", "demo", "20260331T120000.000000000Z"}, wantAction: "delete", wantName: "demo", wantID: "20260331T120000.000000000Z"},
 		{name: "rejects unknown action", args: []string{"backup", "prune", "demo"}, wantErr: `unknown backup action "prune"`},
 		{name: "requires name", args: []string{"backup", "create"}, wantErr: backupUsage()},
+		{name: "delete requires backup id", args: []string{"backup", "delete", "demo"}, wantErr: backupUsage()},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotAction, gotName, err := parseBackupArgs(tt.args)
+			gotAction, gotName, gotID, err := parseBackupArgs(tt.args)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("parseBackupArgs() error = %v, want substring %q", err, tt.wantErr)
@@ -2160,8 +2177,8 @@ func TestParseBackupArgs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseBackupArgs() error = %v", err)
 			}
-			if gotAction != tt.wantAction || gotName != tt.wantName {
-				t.Fatalf("parseBackupArgs() = (%q, %q), want (%q, %q)", gotAction, gotName, tt.wantAction, tt.wantName)
+			if gotAction != tt.wantAction || gotName != tt.wantName || gotID != tt.wantID {
+				t.Fatalf("parseBackupArgs() = (%q, %q, %q), want (%q, %q, %q)", gotAction, gotName, gotID, tt.wantAction, tt.wantName, tt.wantID)
 			}
 		})
 	}

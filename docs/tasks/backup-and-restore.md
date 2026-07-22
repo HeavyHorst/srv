@@ -20,6 +20,14 @@ ssh srv backup list demo
 
 Each backup has a unique ID and timestamp.
 
+## Delete a backup
+
+```bash
+ssh srv backup delete demo <backup-id>
+```
+
+This permanently removes the selected backup. The VM may be running or stopped.
+
 ## Restore from a backup
 
 ```bash

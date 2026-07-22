@@ -565,12 +565,34 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 		}
 	}
 
+	deletedBackup, err := p.DeleteBackup(ctx, inst.Name, backup.ID)
+	if err != nil {
+		t.Fatalf("DeleteBackup(): %v", err)
+	}
+	if deletedBackup.ID != backup.ID {
+		t.Fatalf("DeleteBackup() backup ID = %q, want %q", deletedBackup.ID, backup.ID)
+	}
+	if _, err := os.Stat(backup.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat(deleted backup) error = %v, want os.ErrNotExist", err)
+	}
+	backups, err = p.ListBackups(ctx, inst.Name)
+	if err != nil {
+		t.Fatalf("ListBackups() after delete: %v", err)
+	}
+	if len(backups) != 0 {
+		t.Fatalf("ListBackups() after delete = %#v, want none", backups)
+	}
+	if _, err := p.DeleteBackup(ctx, inst.Name, backup.ID); err == nil {
+		t.Fatal("second DeleteBackup() returned nil error")
+	}
+
 	events, err := st.ListEvents(ctx, inst.ID, 10)
 	if err != nil {
 		t.Fatalf("ListEvents(): %v", err)
 	}
 	var sawBackupCreate bool
 	var sawBackupRestore bool
+	var sawBackupDelete bool
 	for _, evt := range events {
 		if evt.Type == "backup" && evt.Message == "instance backup created" {
 			sawBackupCreate = true
@@ -578,9 +600,12 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 		if evt.Type == "backup" && evt.Message == "instance restored from backup" {
 			sawBackupRestore = true
 		}
+		if evt.Type == "backup" && evt.Message == "instance backup deleted" {
+			sawBackupDelete = true
+		}
 	}
-	if !sawBackupCreate || !sawBackupRestore {
-		t.Fatalf("expected backup create and restore events, got %#v", events)
+	if !sawBackupCreate || !sawBackupRestore || !sawBackupDelete {
+		t.Fatalf("expected backup create, restore, and delete events, got %#v", events)
 	}
 }
 

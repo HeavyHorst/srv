@@ -94,5 +94,14 @@ srv can also expose host-side HTTP gateways on each VM's gateway IP:
 
 - Provider gateways on `SRV_ZEN_GATEWAY_PORT` and `SRV_DEEPSEEK_GATEWAY_PORT` proxy `/v1/...` to configured LLM upstreams with host API keys injected.
 - The generic integration gateway on `SRV_INTEGRATION_GATEWAY_PORT` proxies `/integrations/<name>/...` to operator-defined HTTP integrations with host-managed auth or headers injected.
+- The Amp CONNECT gateway on `SRV_AMP_CONNECT_GATEWAY_PORT` (default `3128`) provides an HTTP proxy for public HTTPS destinations. `inspect --json` exposes its URL as `instance.amp_connect_gateway` while the VM is active.
 
-Both gateway types only accept requests from the owning guest IP. See [Provider gateways](provider-gateways.md) and [HTTP integrations](integrations.md).
+All gateway types only accept requests from the owning guest IP. See [Provider gateways](provider-gateways.md) and [HTTP integrations](integrations.md).
+
+### Amp CONNECT gateway
+
+The CONNECT gateway is intended for an Amp runner whose general HTTPS egress must pass through the per-VM host endpoint. Set both `HTTP_PROXY` and `HTTPS_PROXY` in the guest to the URL returned by `inspect --json`; the bundled Amp runner plugin does this automatically.
+
+This is a tunnel, not a TLS-terminating proxy: srv does not inspect HTTPS payloads or inject credentials. To prevent the proxy from becoming a path into the host or tailnet, it accepts only the `CONNECT` method, only permits destination port `443`, and rejects loopback, link-local, private, carrier-grade NAT, documentation, multicast, other special-use, and host-local addresses. Destinations are checked again after DNS resolution and connection.
+
+Use `NO_PROXY` for guest-local services, the VM gateway services, tailnet destinations, and other endpoints that should not use public HTTPS proxying. The bundled Amp runner config excludes localhost, MMDS, the tailnet, the guest gateway, and its known internal service names.

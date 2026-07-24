@@ -31,9 +31,13 @@ sudo systemctl start srv-vm-runner srv-net-helper srv
 
 ## Host reboot recovery
 
-Same-host reboot recovery is built into the control plane. When `srv` comes back under systemd, previously active instances are restarted automatically.
+When `srv-vm-runner.service` stops, its systemd `ExecStop` drain discovers running fixed and pooled Firecracker VMs, asks up to eight guests at a time to shut down cleanly, and falls back to terminating guests that do not exit. The drain is bounded by the unit's 120-second stop timeout. It cleans runtime cgroups and sockets without changing the control plane's desired instance state.
+
+Same-host reboot recovery is built into the control plane. Because the drain preserves that desired state, previously active instances are restarted automatically when `srv` comes back under systemd.
 
 You do not need to manually restart VMs after a host reboot.
+
+Check `journalctl -u srv-vm-runner` if a service stop reports a drain failure. After the timeout, systemd still terminates processes left in the unit cgroup; the next control-plane startup reconciles persisted state.
 
 ## Environment file
 

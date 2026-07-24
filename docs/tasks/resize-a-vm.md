@@ -7,6 +7,7 @@ Resize lets you change the vCPU count, memory, and rootfs size of a stopped VM.
 - The VM must be **stopped** — resize is rejected for running VMs
 - **vCPUs** and **memory** can be increased or decreased as long as the requested values stay within the supported limits
 - **Rootfs size** is **grow-only** — shrink requests are rejected
+- The srv host must have both `e2fsck` and `resize2fs` available for a rootfs grow (and when creating a VM with a custom rootfs size)
 
 ## Resize
 
@@ -29,7 +30,9 @@ ssh srv start demo
 
 - **vCPU count**: stored in the instance record and applied on the next boot
 - **Memory**: stored in the instance record and applied on the next boot
-- **Rootfs size**: uses `resize2fs` to grow the ext4 filesystem. The underlying file is expanded first, then the filesystem is grown. This operation only increases the filesystem — it never shrinks
+- **Rootfs size**: runs `e2fsck -f -p` against the stopped ext4 image, expands the underlying file, and then uses `resize2fs` to grow the filesystem. Fatal or uncorrected filesystem errors stop the resize before the image is expanded. This operation only increases the filesystem — it never shrinks
+
+If an earlier attempt expanded the image file but did not finish growing the filesystem, retrying the same `resize` request checks the filesystem and resumes the pending filesystem grow.
 
 !!! warning
     Rootfs resize modifies the disk image in place. Take a [backup](backup-and-restore.md) first if you want a safety net.

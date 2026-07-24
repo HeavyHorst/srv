@@ -64,13 +64,14 @@ srv runs on Linux with the following requirements:
 - `SRV_DATA_DIR` on a reflink-capable filesystem (`btrfs` or reflink-enabled `xfs`)
 - Tailscale installed and working on the host
 - Tailscale OAuth client credentials with permission to mint auth keys for guest tags
-- `ip`, `iptables`, `cp`, and `resize2fs` available on the host
+- `ip`, `iptables`, `cp`, `e2fsck`, and `resize2fs` available on the host
 - Official static Firecracker and jailer release pair
 
 ## Next steps
 
 - [Install srv](getting-started/install.md)
 - [Walkthrough](getting-started/walkthrough.md)
+- [Sandboxed AI coding agent](examples/ai-coding-agent.md)
 - [Architecture](reference/architecture.md)
 - [SSH command reference](reference/ssh-commands.md)
 - [RFC: Hybrid memory pools](reference/hybrid-memory-pools-rfc.md)

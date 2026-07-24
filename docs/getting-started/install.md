@@ -7,7 +7,7 @@
 - `SRV_DATA_DIR` on a reflink-capable filesystem (`btrfs` or reflink-enabled `xfs`), with `SRV_BASE_ROOTFS` on the same filesystem
 - Tailscale installed and working on the host
 - Tailscale OAuth client credentials (`TS_CLIENT_ID` and `TS_CLIENT_SECRET`) with permission to mint auth keys for the configured guest tags
-- `ip`, `iptables`, `cp`, and `resize2fs` available on the host
+- `ip`, `iptables`, `cp`, `e2fsck`, and `resize2fs` available on the host
 - Official static Firecracker and jailer release pair (the installer can download these for you)
 
 !!! note

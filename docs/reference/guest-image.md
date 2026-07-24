@@ -17,7 +17,7 @@ The builder produces:
 The image is intentionally not minimal — it includes tooling for development and AI agent workflows:
 
 - Docker, docker-compose with `docker.socket` activation instead of an idle `dockerd`
-- Chromium and the pinned native `agent-browser` CLI with matching runtime skill data
+- Chromium and the pinned native `agent-browser` CLI with matching runtime skill data; `/root/.agent-browser/config.json` selects `/usr/bin/chromium`
 - Go, gopls
 - Odin, odinfmt, OLS
 - Neovim with prewarmed LazyVim (BMW heritage amber theme)

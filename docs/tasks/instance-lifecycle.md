@@ -47,6 +47,13 @@ ssh srv status
 
 `list` shows the VMs visible to the caller: all VMs for admins, or only the caller's own VMs for regular users. `status` is admin-only and reports host capacity — instance counts plus CPU, memory, and disk headroom.
 
+The storage rows answer two different questions:
+
+- `DISK RSV` is logical rootfs reservation headroom. This is the budget used to admit `new`, `start`, and rootfs-growing `resize` operations.
+- `FS SPACE` is the filesystem's actual used and available space. It also reflects backups, reflink divergence, logs, and other files outside rootfs reservations; shared reflink extents count only once until they diverge.
+
+Use `FS SPACE` to detect physical storage pressure even when the logical reservation budget still has room.
+
 ## Logs
 
 ```bash

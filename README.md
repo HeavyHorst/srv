@@ -139,7 +139,7 @@ Because the guest's durable Tailscale identity lives in the copied rootfs, treat
 - `snapshot create` additionally requires `SRV_DATA_DIR` itself to be a btrfs subvolume root, not just a directory on btrfs
 - Tailscale installed and working on the host
 - Tailscale OAuth client credentials with permission to mint auth keys for the configured guest tags
-- `ip`, `iptables`, `cp`, and `resize2fs` available on the host
+- `ip`, `iptables`, `cp`, `e2fsck`, and `resize2fs` available on the host
 - Official static Firecracker and jailer release pair, or let `contrib/systemd/install.sh` install them
 
 ## Key Configuration
@@ -198,6 +198,7 @@ The current Arch guest image expects a boot-time service that reads MMDS, sets t
 - [`docs/reference/operations.md`](docs/reference/operations.md): backup, restore, rebuild, upgrade, rollback, and host hardening
 - [`contrib/smoke/README.md`](contrib/smoke/README.md): smoke-test prerequisites, behavior, overrides, and artifacts
 - [`docs/cheatsheet.md`](docs/cheatsheet.md): operator command reference
+- [`docs/examples/ai-coding-agent.md`](docs/examples/ai-coding-agent.md): isolated agent VMs and the bundled Amp runner workflow
 - [`docs/networking/integrations.md`](docs/networking/integrations.md): host-managed HTTP integrations and per-VM gateway behavior
 - [`images/arch-base/README.md`](images/arch-base/README.md): guest image builder and overlay details
 - [`contrib/systemd/install.sh`](contrib/systemd/install.sh): one-shot installer for the supported host path

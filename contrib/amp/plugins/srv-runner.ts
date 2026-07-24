@@ -225,7 +225,7 @@ export default function (amp: PluginAPI) {
 		{
 			title: 'Push current VM branch…',
 			category: 'srv Runner',
-			description: 'Temporarily forward the local SSH agent and push the current VM branch.',
+			description: 'Temporarily forward the local SSH agent, push the current VM branch, and learn the thread.',
 		},
 		async (ctx) => {
 			await pushCurrentVMBranch(ctx)
@@ -907,7 +907,32 @@ git --git-dir="$push_directory" push --no-verify "$repository" "$expected_oid:re
 	}
 
 	const output = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join('\n') || 'Everything up-to-date'
-	await ctx.ui.notify(`✓ srv Runner: pushed ${branch} from ${managed.instance}.\n${output.slice(-2_000)}`)
+	const pushSummary = `✓ srv Runner: pushed ${branch} from ${managed.instance}.\n${output.slice(-2_000)}`
+	try {
+		await askCurrentAgentToLearnThread(ctx)
+		await ctx.ui.notify(`${pushSummary}\nNRC Memory: asked the current agent to learn this thread.`)
+	} catch (error) {
+		await ctx.ui.notify(`${pushSummary}\n⚠ NRC Memory: could not start learning this thread:\n${errorMessage(error)}`)
+	}
+}
+
+async function askCurrentAgentToLearnThread(ctx: PluginCommandContext) {
+	if (!ctx.thread) throw new Error('no active Amp thread')
+
+	const threadURL = new URL(`/threads/${ctx.thread.id}`, ctx.system.ampURL).toString()
+	const prompt = `Use the maintaining-room-memory skill.
+
+Distill this thread into durable NRC notes. Prefer updating existing notes over creating duplicates. Create new notes only for stable concepts with distinct future retrieval intent. Keep the result compact: normally 1-3 notes. Do not create one note per implementation step, bug fix, prompt tweak, or transient error.
+
+Add useful edges to existing and new notes. Include this Amp thread URL in note bodies as \`Source: ${threadURL}\`. Preview the note and edge operations before writing anything.`
+
+	await ctx.thread.appendUserMessage(
+		{
+			type: 'user-message',
+			content: prompt,
+		},
+		{ steer: true },
+	)
 }
 
 async function managedThreadForContext(ctx: PluginCommandContext): Promise<ManagedInstance | undefined> {

@@ -28,6 +28,7 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_ADVERTISE_TAGS", "tag:control, tag:ssh")
 	t.Setenv("SRV_VM_DNS", "1.1.1.1, 8.8.8.8")
 	t.Setenv("SRV_GUEST_AUTH_TAGS", "tag:microvm")
+	t.Setenv("SRV_GUEST_USER_AUTH_TAGS", " Rene.Michaelis@antares.net=TAG:Rene ")
 	t.Setenv("SRV_GUEST_AUTH_EXPIRY", "20m")
 	t.Setenv("SRV_GUEST_READY_TIMEOUT", "3m")
 	t.Setenv("SRV_NET_HELPER_SOCKET", "/run/srv/custom-net-helper.sock")
@@ -96,6 +97,9 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cfg.GuestAuthTags, []string{"tag:microvm"}) {
 		t.Fatalf("GuestAuthTags = %#v", cfg.GuestAuthTags)
+	}
+	if !reflect.DeepEqual(cfg.GuestUserAuthTags, map[string]string{"rene.michaelis@antares.net": "tag:rene"}) {
+		t.Fatalf("GuestUserAuthTags = %#v", cfg.GuestUserAuthTags)
 	}
 	if cfg.GuestAuthExpiry != 20*time.Minute {
 		t.Fatalf("GuestAuthExpiry = %s, want %s", cfg.GuestAuthExpiry, 20*time.Minute)
@@ -230,6 +234,20 @@ func TestSplitCSVTrimsAndDropsEmptyValues(t *testing.T) {
 
 	if got := splitCSV("   "); got != nil {
 		t.Fatalf("splitCSV(blank) = %#v, want nil", got)
+	}
+}
+
+func TestParseGuestUserAuthTagsRejectsInvalidMappings(t *testing.T) {
+	for _, value := range []string{
+		"rene.michaelis@antares.net",
+		"=tag:rene",
+		"rene.michaelis@antares.net=rene",
+		"rene.michaelis@antares.net=tag:",
+		"rene.michaelis@antares.net=tag:rene,RENE.MICHAELIS@ANTARES.NET=tag:other",
+	} {
+		if _, err := parseGuestUserAuthTags(value); err == nil {
+			t.Fatalf("parseGuestUserAuthTags(%q) returned nil error", value)
+		}
 	}
 }
 

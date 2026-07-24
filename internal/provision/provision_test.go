@@ -2877,6 +2877,32 @@ func TestHelperFunctions(t *testing.T) {
 	}
 }
 
+func TestGuestAuthTagsForUser(t *testing.T) {
+	p := &Provisioner{cfg: config.Config{
+		GuestAuthTags: []string{"tag:microvm"},
+		GuestUserAuthTags: map[string]string{
+			"rene.michaelis@antares.net": "tag:rene",
+		},
+	}}
+
+	tests := []struct {
+		name  string
+		login string
+		want  []string
+	}{
+		{name: "mapped login", login: "rene.michaelis@antares.net", want: []string{"tag:rene"}},
+		{name: "case insensitive login", login: "RENE.MICHAELIS@ANTARES.NET", want: []string{"tag:rene"}},
+		{name: "unmapped login", login: "alice@example.com", want: []string{"tag:microvm"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := p.guestAuthTagsForUser(tt.login); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("guestAuthTagsForUser(%q) = %#v, want %#v", tt.login, got, tt.want)
+			}
+		})
+	}
+}
+
 func loadProvisionTestConfig(t *testing.T, env map[string]string) config.Config {
 	t.Helper()
 	oldArgs := os.Args

@@ -60,6 +60,7 @@ type Config struct {
 	GuestAuthExpiry          time.Duration
 	GuestReadyTimeout        time.Duration
 	GuestAuthTags            []string
+	GuestUserAuthTags        map[string]string
 	GuestTailscaleControlURL string
 	GuestTailscaleAuthOnce   bool
 	ExtraKernelArgs          string
@@ -103,6 +104,7 @@ func Load() (Config, error) {
 	flag.StringVar(&cfg.VMNetworkCIDR, "vm-network-cidr", getenv("SRV_VM_NETWORK_CIDR", defaultVMNetworkCIDR), "IPv4 network reserved for VM /30 allocations")
 	vmDNS := flag.String("vm-dns", getenv("SRV_VM_DNS", "1.1.1.1,1.0.0.1"), "comma separated guest nameservers")
 	guestTags := flag.String("guest-auth-tags", getenv("SRV_GUEST_AUTH_TAGS", ""), "comma separated tags applied to one-off guest auth keys")
+	guestUserTags := flag.String("guest-user-auth-tags", getenv("SRV_GUEST_USER_AUTH_TAGS", ""), "comma separated tailscale-login=tag mappings that replace the default guest auth tags")
 	guestExpiry := flag.String("guest-auth-expiry", getenv("SRV_GUEST_AUTH_EXPIRY", defaultGuestAuthExpiry.String()), "one-off guest auth key TTL")
 	guestReadyTimeout := flag.String("guest-ready-timeout", getenv("SRV_GUEST_READY_TIMEOUT", defaultGuestReadyTimout.String()), "time to wait for a guest to join the tailnet")
 	flag.StringVar(&cfg.GuestTailscaleControlURL, "guest-tailscale-control-url", getenv("SRV_GUEST_TAILSCALE_CONTROL_URL", os.Getenv("TS_CONTROL_URL")), "optional alternate control URL injected into the guest bootstrap contract")
@@ -129,6 +131,9 @@ func Load() (Config, error) {
 	cfg.GuestTailscaleAuthOnce = true
 
 	var err error
+	if cfg.GuestUserAuthTags, err = parseGuestUserAuthTags(*guestUserTags); err != nil {
+		return Config{}, err
+	}
 	if cfg.GuestAuthExpiry, err = time.ParseDuration(*guestExpiry); err != nil {
 		return Config{}, fmt.Errorf("parse guest auth expiry: %w", err)
 	}
@@ -318,4 +323,25 @@ func splitCSV(v string) []string {
 		return nil
 	}
 	return out
+}
+
+func parseGuestUserAuthTags(value string) (map[string]string, error) {
+	entries := splitCSV(value)
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	mappings := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		login, tag, found := strings.Cut(entry, "=")
+		login = strings.ToLower(strings.TrimSpace(login))
+		tag = strings.ToLower(strings.TrimSpace(tag))
+		if !found || login == "" || strings.Contains(tag, "=") || !strings.HasPrefix(tag, "tag:") || len(tag) == len("tag:") {
+			return nil, fmt.Errorf("invalid SRV_GUEST_USER_AUTH_TAGS entry %q; expected tailscale-login=tag:name", entry)
+		}
+		if _, exists := mappings[login]; exists {
+			return nil, fmt.Errorf("duplicate SRV_GUEST_USER_AUTH_TAGS login %q", login)
+		}
+		mappings[login] = tag
+	}
+	return mappings, nil
 }

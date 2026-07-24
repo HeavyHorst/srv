@@ -1,6 +1,6 @@
 # Guest image reference
 
-The default guest image is an Arch Linux rootfs designed for srv. It is built by `images/arch-base/build.sh` and contains a full Linux userspace with developer tooling preinstalled.
+The default guest image is an Arch Linux rootfs designed for srv. It is built by `images/arch-base/build.sh` and contains a full Linux userspace with developer tooling, Chromium, and the `agent-browser` automation CLI preinstalled.
 
 ## Artifacts
 
@@ -17,6 +17,7 @@ The builder produces:
 The image is intentionally not minimal — it includes tooling for development and AI agent workflows:
 
 - Docker, docker-compose with `docker.socket` activation instead of an idle `dockerd`
+- Chromium and the pinned native `agent-browser` CLI with matching runtime skill data
 - Go, gopls
 - Odin, odinfmt, OLS
 - Neovim with prewarmed LazyVim (BMW heritage amber theme)

@@ -345,7 +345,8 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	}
 	p.recordEvent(inst.ID, "network", "tap device and NAT configured", map[string]any{"tap": inst.TapDevice, "network": inst.NetworkCIDR})
 
-	authKey, keyID, err := p.mintGuestAuthKey(ctx)
+	guestAuthTags := p.guestAuthTagsForUser(actor.UserLogin)
+	authKey, keyID, err := p.mintGuestAuthKey(ctx, guestAuthTags)
 	if err != nil {
 		inst.LastError = err.Error()
 		return inst, err
@@ -365,7 +366,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		Hostname:            inst.Name,
 		TailscaleAuthKey:    authKey,
 		TailscaleControlURL: p.cfg.GuestTailscaleControlURL,
-		TailscaleTags:       p.cfg.GuestAuthTags,
+		TailscaleTags:       guestAuthTags,
 		ZenGatewayPort:      zenGatewayPort,
 		DeepSeekGatewayPort: deepseekGatewayPort,
 	}
@@ -373,7 +374,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		inst.LastError = err.Error()
 		return inst, err
 	}
-	p.recordEvent(inst.ID, "bootstrap", "guest bootstrap metadata written", nil)
+	p.recordEvent(inst.ID, "bootstrap", "guest bootstrap metadata written", map[string]any{"tailscale_tags": guestAuthTags})
 
 	pid, err := p.startFirecracker(ctx, inst, pool, bootstrap)
 	if err != nil {
@@ -1498,7 +1499,15 @@ func (p *Provisioner) cleanupNetworking(inst model.Instance) error {
 	})
 }
 
-func (p *Provisioner) mintGuestAuthKey(ctx context.Context) (secret string, keyID string, err error) {
+func (p *Provisioner) guestAuthTagsForUser(userLogin string) []string {
+	userTag := p.cfg.GuestUserAuthTags[strings.ToLower(strings.TrimSpace(userLogin))]
+	if userTag != "" {
+		return []string{userTag}
+	}
+	return append([]string(nil), p.cfg.GuestAuthTags...)
+}
+
+func (p *Provisioner) mintGuestAuthKey(ctx context.Context, tags []string) (secret string, keyID string, err error) {
 	caps := tailscale.KeyCapabilities{
 		Devices: struct {
 			Create struct {
@@ -1512,7 +1521,7 @@ func (p *Provisioner) mintGuestAuthKey(ctx context.Context) (secret string, keyI
 	caps.Devices.Create.Reusable = false
 	caps.Devices.Create.Ephemeral = false
 	caps.Devices.Create.Preauthorized = true
-	caps.Devices.Create.Tags = p.cfg.GuestAuthTags
+	caps.Devices.Create.Tags = tags
 	meta, err := p.tsClient.Keys().CreateAuthKey(ctx, tailscale.CreateKeyRequest{
 		Capabilities:  caps,
 		ExpirySeconds: int64(p.cfg.GuestAuthExpiry / time.Second),

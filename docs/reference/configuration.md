@@ -41,8 +41,18 @@ Use either `TS_AUTHKEY` or `TS_CLIENT_ID`/`TS_CLIENT_SECRET` for the control-pla
 | `SRV_VM_MEMORY_MIB` | `1024` | Default memory in MiB for new VMs |
 | `SRV_VM_PIDS_MAX` | `512` | Maximum tasks in each VM cgroup |
 | `SRV_GUEST_AUTH_TAGS` | (required) | Comma-separated tags applied to guest auth keys |
+| `SRV_GUEST_USER_AUTH_TAGS` | — | Optional comma-separated `tailscale-login=tag:name` mappings; a matching creator's tag replaces `SRV_GUEST_AUTH_TAGS` |
 | `SRV_GUEST_AUTH_EXPIRY` | `15m` | TTL for one-off guest auth keys |
 | `SRV_GUEST_READY_TIMEOUT` | `2m` | Time to wait for a guest to join the tailnet |
+
+User tag mappings are matched case-insensitively against the login returned by Tailscale `WhoIs`; callers cannot request arbitrary tags. For example:
+
+```bash
+SRV_GUEST_AUTH_TAGS=tag:microvm
+SRV_GUEST_USER_AUTH_TAGS=rene.michaelis@antares.net=tag:rene
+```
+
+VMs created by `rene.michaelis@antares.net` receive only `tag:rene`; unmapped creators continue to receive `tag:microvm`. Every configured tag must exist in the tailnet policy and be assignable by the OAuth client used by srv.
 
 ## Networking
 

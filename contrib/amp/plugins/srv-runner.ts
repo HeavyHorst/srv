@@ -1,13 +1,41 @@
 import type { BuiltinAgentMode, PluginAPI, PluginCommandContext, StatusItem, ThreadID } from '@ampcode/plugin'
-import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 
 const stateDirectory = join(homedir(), '.local', 'state', 'amp-srv')
 const ampSecretsPath = join(homedir(), '.local', 'share', 'amp', 'secrets.json')
+const personalSkillsDirectory = join(homedir(), '.agents', 'skills')
+const personalSkillNames = [
+	'managing-nrc-tasks',
+	'maintaining-room-memory',
+	'querying-victorialogs-logsql',
+	'searching-victorialogs',
+	'using-mysqlsync-vm',
+	'using-planner-cli',
+	'using-sourcebot',
+	'using-zoho-cli',
+]
+const personalBinaries = [
+	{ source: join(homedir(), '.local', 'bin', 'nrc'), target: '/usr/local/bin/nrc' },
+	{ source: join(homedir(), '.local', 'bin', 'sourcebot'), target: '/usr/local/bin/sourcebot' },
+	{ source: join(homedir(), 'Code', 'planner_cli', 'planner'), target: '/usr/local/bin/planner' },
+	{
+		source: join(homedir(), 'Code', 'zoho_zeiterfassung', 'bin', 'zoho'),
+		target: '/home/rene/Code/zoho_zeiterfassung/bin/zoho',
+	},
+]
+const personalConfigs = [
+	{ source: join(homedir(), '.config', 'nrc', 'config.yaml'), target: '/root/.config/nrc/config.yaml' },
+	{ source: join(homedir(), '.config', 'planner-cli', 'config.json'), target: '/root/.config/planner-cli/config.json' },
+	{ source: join(homedir(), '.config', 'planner-cli', 'msal_cache.json'), target: '/root/.config/planner-cli/msal_cache.json' },
+	{ source: join(homedir(), 'Code', 'zoho_zeiterfassung', 'bin', '.env'), target: '/home/rene/Code/zoho_zeiterfassung/bin/.env' },
+]
 const guestSSHOptions = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=5']
 const trustedGuestSSHOptions = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=5']
 const pushTimeoutMs = 120_000
+const personalProfileConsentMessage =
+	'The persistent VM will receive your Amp credential, NRC config, Planner OAuth cache, and Zoho OAuth environment, plus the selected skills and CLI binaries. Secret files will be root-only and are removed when the VM is deleted.'
 
 interface ManagedInstance {
 	instance: string
@@ -32,6 +60,12 @@ interface ProcessResult {
 	stderr: string
 	exitCode: number
 	timedOut: boolean
+}
+
+interface BinaryProcessResult {
+	stdout: Uint8Array
+	stderr: string
+	exitCode: number
 }
 
 interface ProgressDisplay {
@@ -316,10 +350,16 @@ async function createIsolatedThread(amp: PluginAPI, ctx: PluginCommandContext) {
 	if (!size) return
 	const resources = resourcesForSize(size)
 
+	try {
+		await validatePersonalProfileSources()
+	} catch (error) {
+		await ctx.ui.notify(`srv Runner: personal profile is incomplete:\n${errorMessage(error)}`)
+		return
+	}
+
 	const copyCredential = await ctx.ui.confirm({
-		title: 'Copy Amp credential into the VM?',
-		message:
-			'The dedicated VM needs your current Amp API credential to run unattended. It will be stored root-only inside the persistent VM and removed when the VM is deleted.',
+		title: 'Copy credentials and personal tools into the VM?',
+		message: personalProfileConsentMessage,
 		confirmButtonText: 'Create VM',
 	})
 	if (!copyCredential) return
@@ -377,6 +417,18 @@ async function retryFailedVM(amp: PluginAPI, ctx: PluginCommandContext) {
 		initialValue: 'medium',
 	})
 	if (!modeSelection) return
+	try {
+		await validatePersonalProfileSources()
+	} catch (error) {
+		await ctx.ui.notify(`srv Runner: personal profile is incomplete:\n${errorMessage(error)}`)
+		return
+	}
+	const copyCredential = await ctx.ui.confirm({
+		title: 'Copy credentials and personal tools into the VM?',
+		message: personalProfileConsentMessage,
+		confirmButtonText: 'Retry provisioning',
+	})
+	if (!copyCredential) return
 
 	let secrets: Uint8Array
 	try {
@@ -413,7 +465,7 @@ async function provisionNewVM(
 ) {
 	let managed = initialManaged
 	const { instance, repository, branch } = managed
-	const progress = createProgressDisplay(amp, instance, 8)
+	const progress = createProgressDisplay(amp, instance, 9)
 
 	try {
 		progress.update(1, 'Creating VM')
@@ -427,15 +479,17 @@ async function provisionNewVM(
 		await waitForGuestSSH(instance, (seconds) => progress.update(3, `Waiting for SSH · ${seconds}s`))
 		progress.update(4, 'Copying Amp credential')
 		await copyAmpCredential(instance, secrets)
-		progress.update(5, 'Installing Amp and preparing repository')
+		progress.update(5, 'Installing personal tools and skills')
+		await installPersonalProfile(instance)
+		progress.update(6, 'Installing Amp and preparing repository')
 		const proxyURL = await ampConnectGatewayURL(instance)
 		await bootstrapRunner(instance, repository, branch, proxyURL)
-		await waitForRunnerRegistration(instance, (seconds) => progress.update(6, `Waiting for Amp runner · ${seconds}s`))
-		progress.update(7, 'Creating Amp thread')
+		await waitForRunnerRegistration(instance, (seconds) => progress.update(7, `Waiting for Amp runner · ${seconds}s`))
+		progress.update(8, 'Creating Amp thread')
 		const thread = await createRunnerThread(amp.getBuiltinAgent(mode), instance, parentThreadID)
 		managed = { ...managed, status: 'ready', threadID: thread.id }
 		await writeInstance(managed)
-		progress.update(8, 'Starting task')
+		progress.update(9, 'Starting task')
 		await thread.appendUserMessage({ type: 'user-message', content: prompt })
 		await amp.ui.notify(`✓ srv Runner: thread ${thread.id} is running on ${instance}.`)
 	} catch (error) {
@@ -462,22 +516,24 @@ async function provisionExistingVM(
 	parentThreadID?: ThreadID,
 ) {
 	let managed = initialManaged
-	const progress = createProgressDisplay(amp, managed.instance, 7)
+	const progress = createProgressDisplay(amp, managed.instance, 8)
 
 	try {
 		await waitForInstance(managed.instance, (seconds, state) => progress.update(1, `Waiting for VM · ${seconds}s · ${state}`))
 		await waitForGuestSSH(managed.instance, (seconds) => progress.update(2, `Waiting for SSH · ${seconds}s`))
 		progress.update(3, 'Copying Amp credential')
 		await copyAmpCredential(managed.instance, secrets)
-		progress.update(4, 'Installing Amp and preparing repository')
+		progress.update(4, 'Installing personal tools and skills')
+		await installPersonalProfile(managed.instance)
+		progress.update(5, 'Installing Amp and preparing repository')
 		const proxyURL = await ampConnectGatewayURL(managed.instance)
 		await bootstrapRunner(managed.instance, managed.repository, managed.branch, proxyURL)
-		await waitForRunnerRegistration(managed.instance, (seconds) => progress.update(5, `Waiting for Amp runner · ${seconds}s`))
-		progress.update(6, 'Creating Amp thread')
+		await waitForRunnerRegistration(managed.instance, (seconds) => progress.update(6, `Waiting for Amp runner · ${seconds}s`))
+		progress.update(7, 'Creating Amp thread')
 		const thread = await createRunnerThread(amp.getBuiltinAgent(mode), managed.runnerID, parentThreadID)
 		managed = { ...managed, status: 'ready', threadID: thread.id }
 		await writeInstance(managed)
-		progress.update(7, 'Starting task')
+		progress.update(8, 'Starting task')
 		await thread.appendUserMessage({ type: 'user-message', content: prompt })
 		await amp.ui.notify(`✓ srv Runner: thread ${thread.id} is running on ${managed.instance}.`)
 	} catch (error) {
@@ -499,6 +555,65 @@ async function copyAmpCredential(instance: string, secrets: Uint8Array) {
 		],
 		{ stdin: secrets },
 	)
+}
+
+async function validatePersonalProfileSources() {
+	const sources = [
+		...personalSkillNames.map((name) => join(personalSkillsDirectory, name)),
+		...personalBinaries.map(({ source }) => source),
+		...personalConfigs.map(({ source }) => source),
+	]
+	for (const source of sources) {
+		try {
+			await stat(source)
+		} catch {
+			throw new Error(`missing ${source}`)
+		}
+	}
+}
+
+async function installPersonalProfile(instance: string) {
+	await validatePersonalProfileSources()
+	const skills = await runBinaryProcess([
+		'tar',
+		'-chf',
+		'-',
+		'-C',
+		personalSkillsDirectory,
+		...personalSkillNames,
+	])
+	await runProcess(
+		[
+			'ssh',
+			...guestSSHOptions,
+			`root@${instance}`,
+			'install -d -m 0755 /root/.agents/skills; tar --no-same-owner -xf - -C /root/.agents/skills',
+		],
+		{ stdin: skills.stdout },
+	)
+
+	for (const binary of personalBinaries) {
+		await copyGuestFile(instance, binary.source, binary.target, 0o755, 0o755)
+	}
+	for (const config of personalConfigs) {
+		await copyGuestFile(instance, config.source, config.target, 0o600, 0o700)
+	}
+	await runProcess([
+		'ssh',
+		...guestSSHOptions,
+		`root@${instance}`,
+		'ln -sfn /home/rene/Code/zoho_zeiterfassung/bin/zoho /usr/local/bin/zoho',
+	])
+}
+
+async function copyGuestFile(instance: string, source: string, target: string, mode: number, directoryMode: number) {
+	const contents = await readFile(source)
+	const targetArgument = base64(target)
+	const command =
+		`target=$(printf '%s' '${targetArgument}' | base64 -d); ` +
+		`install -d -m ${directoryMode.toString(8)} "$(dirname -- "$target")"; ` +
+		`cat > "$target"; chmod ${mode.toString(8)} "$target"`
+	await runProcess(['ssh', ...guestSSHOptions, `root@${instance}`, command], { stdin: contents })
 }
 
 async function ampConnectGatewayURL(instance: string): Promise<string> {
@@ -547,7 +662,7 @@ fi
 
 gateway_ip=$(ip -4 route show default | awk '/^default / { print $3; exit }')
 tailnet_suffix=$(tailscale status --json | jq -r '.Self.DNSName // empty' | cut -d. -f2- | sed 's/\.$//')
-no_proxy="localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10,$gateway_ip"
+no_proxy="localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10,monitoring,sourcebot,$gateway_ip"
 if [[ -n "$tailnet_suffix" ]]; then
   no_proxy="$no_proxy,.$tailnet_suffix"
 fi
@@ -877,6 +992,25 @@ async function runProcess(args: string[], options: ProcessOptions = {}): Promise
 	const result = { stdout, stderr, exitCode, timedOut }
 	if (exitCode !== 0 && !options.allowFailure) {
 		throw new Error(`${args[0]} exited with status ${exitCode}: ${failureMessage(result)}`)
+	}
+	return result
+}
+
+async function runBinaryProcess(args: string[]): Promise<BinaryProcessResult> {
+	const process = Bun.spawn(args, {
+		env: globalThis.process.env,
+		stdin: 'ignore',
+		stdout: 'pipe',
+		stderr: 'pipe',
+	})
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(process.stdout).arrayBuffer(),
+		new Response(process.stderr).text(),
+		process.exited,
+	])
+	const result = { stdout: new Uint8Array(stdout), stderr, exitCode }
+	if (exitCode !== 0) {
+		throw new Error(`${args[0]} exited with status ${exitCode}: ${stderr.trim() || 'unknown error'}`)
 	}
 	return result
 }

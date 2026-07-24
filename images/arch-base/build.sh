@@ -14,6 +14,7 @@ ROOTFS_LABEL="${ROOTFS_LABEL:-srv-root}"
 KERNEL_VERSION="${KERNEL_VERSION:-6.12.79}"
 FIRECRACKER_CONFIG_VERSION="${FIRECRACKER_CONFIG_VERSION:-6.1}"
 PI_VERSION="${PI_VERSION:-0.70.2}"
+AGENT_BROWSER_VERSION="${AGENT_BROWSER_VERSION:-0.32.0}"
 
 KERNEL_TARBALL="${WORK_DIR}/linux-${KERNEL_VERSION}.tar.xz"
 KERNEL_SOURCE_DIR="${WORK_DIR}/linux-${KERNEL_VERSION}"
@@ -31,6 +32,7 @@ KERNEL_RELEASE=""
 ROOTFS_PACKAGES=(
 	base
 	ca-certificates
+	chromium
 	curl
 	fd
 	docker
@@ -335,10 +337,48 @@ install_pi() {
 	ln -sf /opt/pi/pi "${ROOTFS_MOUNT_DIR}/usr/local/bin/pi"
 }
 
+install_agent_browser() {
+	local release_arch binary binary_url install_dir source_archive source_url
+	case "${ARCH}" in
+		x86_64)
+			release_arch="x64"
+			;;
+		aarch64 | arm64)
+			release_arch="arm64"
+			;;
+		*)
+			echo "unsupported architecture for agent-browser release: ${ARCH}" >&2
+			exit 1
+			;;
+	esac
+
+	binary="${WORK_DIR}/agent-browser-linux-${release_arch}-${AGENT_BROWSER_VERSION}"
+	binary_url="${AGENT_BROWSER_URL:-https://github.com/vercel-labs/agent-browser/releases/download/v${AGENT_BROWSER_VERSION}/agent-browser-linux-${release_arch}}"
+	source_archive="${WORK_DIR}/agent-browser-${AGENT_BROWSER_VERSION}.tar.gz"
+	source_url="${AGENT_BROWSER_SOURCE_URL:-https://github.com/vercel-labs/agent-browser/archive/refs/tags/v${AGENT_BROWSER_VERSION}.tar.gz}"
+	fetch "${binary_url}" "${binary}"
+	fetch "${source_url}" "${source_archive}"
+
+	install_dir="${ROOTFS_MOUNT_DIR}/opt/agent-browser"
+	rm -rf "${install_dir}"
+	install -d -m 0755 "${install_dir}/bin"
+	install -m 0755 "${binary}" "${install_dir}/bin/agent-browser"
+	tar -xzf "${source_archive}" \
+		-C "${install_dir}" \
+		--strip-components=1 \
+		"agent-browser-${AGENT_BROWSER_VERSION}/skills" \
+		"agent-browser-${AGENT_BROWSER_VERSION}/skill-data"
+	ln -sfn /opt/agent-browser/bin/agent-browser "${ROOTFS_MOUNT_DIR}/usr/local/bin/agent-browser"
+}
+
 configure_rootfs() {
 	install -d "${ROOTFS_MOUNT_DIR}/var/lib/srv"
 	chmod 0755 "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/bootstrap.sh"
 	chmod 0755 "${ROOTFS_MOUNT_DIR}/usr/local/bin/update-pi"
+	arch-chroot "${ROOTFS_MOUNT_DIR}" agent-browser --version
+	arch-chroot "${ROOTFS_MOUNT_DIR}" agent-browser skills get core >/dev/null
+	arch-chroot "${ROOTFS_MOUNT_DIR}" agent-browser skills get core --full >/dev/null
+	arch-chroot "${ROOTFS_MOUNT_DIR}" chromium --version
 	systemctl --root="${ROOTFS_MOUNT_DIR}" enable docker.socket tailscaled.service srv-bootstrap.service >/dev/null
 	systemctl --root="${ROOTFS_MOUNT_DIR}" disable \
 		docker.service \
@@ -379,6 +419,7 @@ build_rootfs() {
 
 	rsync -a "${SCRIPT_DIR}/overlay/" "${ROOTFS_MOUNT_DIR}/"
 	install_pi
+	install_agent_browser
 	bootstrap_lazyvim
 	configure_rootfs
 	detach_rootfs
@@ -392,6 +433,7 @@ kernel_version=${KERNEL_VERSION}
 kernel_release=${KERNEL_RELEASE}
 firecracker_config_url=${FIRECRACKER_CONFIG_URL}
 pi_version=${PI_VERSION}
+agent_browser_version=${AGENT_BROWSER_VERSION}
 rootfs_size=${ROOTFS_SIZE}
 packages=$(IFS=,; echo "${ROOTFS_PACKAGES[*]}")
 artifacts=$(basename -- "${VMLINUX_OUTPUT}"),$(basename -- "${ROOTFS_OUTPUT}")

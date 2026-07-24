@@ -37,13 +37,17 @@ Users listed in `SRV_ADMIN_USERS` can additionally:
 |----------|-------------|
 | `SRV_ALLOWED_USERS` | Comma-separated Tailscale login allowlist. Empty means allow all tailnet users. |
 | `SRV_ADMIN_USERS` | Comma-separated Tailscale logins with cross-instance visibility and admin rights. |
+| `SRV_GUEST_USER_AUTH_TAGS` | Optional `tailscale-login=tag:name` mappings used to replace the default tags on new VM auth keys. |
 
 Example `/etc/srv/srv.env`:
 
 ```bash
 SRV_ALLOWED_USERS=alice@example.com,bob@example.com
 SRV_ADMIN_USERS=ops@example.com
+SRV_GUEST_USER_AUTH_TAGS=alice@example.com=tag:alice,bob@example.com=tag:bob
 ```
+
+Creator-specific guest tags are selected only from this operator-controlled mapping after `WhoIs` succeeds. The `new` command does not accept caller-supplied tags.
 
 ## Audit trail
 

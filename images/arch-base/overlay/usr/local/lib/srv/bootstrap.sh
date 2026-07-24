@@ -240,7 +240,6 @@ write_pi_config() {
 }
 
 mkdir -p "${STATE_DIR}"
-ln -sf /proc/net/pnp /etc/resolv.conf
 
 iface="$(primary_iface || true)"
 if [[ -z "${iface}" ]]; then
@@ -249,6 +248,12 @@ fi
 if [[ -z "${iface}" ]]; then
 	echo "srv-bootstrap: unable to determine primary guest interface" >&2
 	exit 1
+fi
+
+mapfile -t nameservers < <(awk '$1 == "nameserver" { print $2 }' /proc/net/pnp)
+if [[ "${#nameservers[@]}" -gt 0 ]]; then
+	resolvectl dns "${iface}" "${nameservers[@]}"
+	resolvectl default-route "${iface}" yes
 fi
 
 # Firecracker MMDS lives on a link-local address, so add a direct route before fetching metadata.

@@ -1,7 +1,7 @@
 [Unit]
 Description=srv guest tailscale bootstrap
-After=local-fs.target tailscaled.service
-Wants=tailscaled.service
+After=local-fs.target systemd-resolved.service tailscaled.service
+Wants=systemd-resolved.service tailscaled.service
 
 [Service]
 Type=oneshot

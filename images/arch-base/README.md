@@ -151,5 +151,5 @@ You can then point the service at those paths with `-base-kernel` and `-base-roo
 - The overlay now adds the repo-managed BMW LazyVim theme files and a default `bootstrap-theme.lua`, so new guests start on the same heritage amber colorscheme used by the `config` repo's LazyVim tooling.
 - The builder also prewarms LazyVim inside the guest with `nvim --headless "+Lazy! sync"`, and the shipped config clears Mason's default auto-installs so that bootstrap work finishes before Neovim exits instead of leaving background package installs running.
 - The builder uses its own minimal `pacman.conf` with only the standard Arch repositories so host-local repos and pacman hooks do not leak into the guest image build.
-- `/etc/resolv.conf` is symlinked to `/proc/net/pnp` so the kernel `ip=` boot parameter inserted by `firecracker-go-sdk` provides working DNS before `tailscale up` runs.
+- `systemd-resolved` receives the nameservers from `/proc/net/pnp` during guest bootstrap. `/etc/resolv.conf` uses its stub resolver so Tailscale can add MagicDNS and split-DNS routes after `tailscale up` runs.
 - Journald is configured to forward logs to `ttyS0`, which makes the guest bootstrap flow visible in each instance's `serial.log`.

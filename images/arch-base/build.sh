@@ -379,7 +379,11 @@ configure_rootfs() {
 	arch-chroot "${ROOTFS_MOUNT_DIR}" agent-browser skills get core >/dev/null
 	arch-chroot "${ROOTFS_MOUNT_DIR}" agent-browser skills get core --full >/dev/null
 	arch-chroot "${ROOTFS_MOUNT_DIR}" chromium --version
-	systemctl --root="${ROOTFS_MOUNT_DIR}" enable docker.socket tailscaled.service srv-bootstrap.service >/dev/null
+	systemctl --root="${ROOTFS_MOUNT_DIR}" enable \
+		docker.socket \
+		systemd-resolved.service \
+		tailscaled.service \
+		srv-bootstrap.service >/dev/null
 	systemctl --root="${ROOTFS_MOUNT_DIR}" disable \
 		docker.service \
 		containerd.service \
@@ -401,7 +405,7 @@ configure_rootfs() {
 	rm -rf "${ROOTFS_MOUNT_DIR}/var/cache/pacman/pkg"
 	install -d -m 0755 "${ROOTFS_MOUNT_DIR}/var/cache/pacman/pkg"
 	rm -f "${ROOTFS_MOUNT_DIR}/etc/resolv.conf"
-	ln -s /proc/net/pnp "${ROOTFS_MOUNT_DIR}/etc/resolv.conf"
+	ln -s /run/systemd/resolve/stub-resolv.conf "${ROOTFS_MOUNT_DIR}/etc/resolv.conf"
 }
 
 build_rootfs() {

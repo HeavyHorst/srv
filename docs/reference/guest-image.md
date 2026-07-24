@@ -54,7 +54,7 @@ Docker is installed but not started during boot. The image enables `docker.socke
 
 ## DNS
 
-`/etc/resolv.conf` is symlinked to `/proc/net/pnp` so the kernel `ip=` boot parameter provides working DNS before `tailscale up` runs.
+Guest bootstrap configures `systemd-resolved` with the nameservers supplied through the kernel `ip=` boot parameter in `/proc/net/pnp`. `/etc/resolv.conf` points at the systemd-resolved stub, allowing Tailscale to install MagicDNS and split-DNS routes after joining the tailnet.
 
 ## Logging
 

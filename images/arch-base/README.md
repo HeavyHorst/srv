@@ -51,7 +51,7 @@ If you want to pin a different Pi release, override `PI_VERSION`:
 sudo PI_VERSION=0.70.2 ./images/arch-base/build.sh
 ```
 
-`agent-browser` is installed as a pinned native binary with the matching upstream skill data and uses the image's Arch-managed Chromium. Override its release when rebuilding with `AGENT_BROWSER_VERSION`:
+`agent-browser` is installed as a pinned native binary with the matching upstream skill data and is configured to use the image's Arch-managed Chromium at `/usr/bin/chromium`. Override its release when rebuilding with `AGENT_BROWSER_VERSION`:
 
 ```bash
 sudo AGENT_BROWSER_VERSION=0.32.0 ./images/arch-base/build.sh

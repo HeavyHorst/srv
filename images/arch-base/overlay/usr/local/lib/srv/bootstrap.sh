@@ -315,6 +315,7 @@ if [[ -n "${auth_key}" ]]; then
 	log "joining the tailnet with tailscale up"
 	tailscale_args=(
 		up
+		--accept-dns=false
 		--hostname="${hostname_value}"
 		--ssh
 		--timeout=30s
@@ -327,6 +328,9 @@ if [[ -n "${auth_key}" ]]; then
 		tailscale_args+=(--advertise-tags="${tag_csv}")
 	fi
 	tailscale "${tailscale_args[@]}"
+	# The DNS map arrives during the first authenticated join. Enable it only
+	# afterwards so tailscaled applies MagicDNS to systemd-resolved immediately.
+	tailscale set --accept-dns=true
 fi
 
 date --iso-8601=seconds >"${DONE_FILE}"

@@ -58,6 +58,12 @@ This means any machine on the tailnet can reach the VM by its Tailscale name or 
 
 Guests expose SSH through Tailscale's `--ssh` flag, so `ssh root@<tailscale-name>` works from any tailnet machine. Per-user OpenSSH keys are not injected — Tailscale SSH handles authentication based on tailnet identity.
 
+### Application and development services
+
+Tailscale connectivity is not limited to SSH or HTTP. A service listening on a Tailscale-reachable guest address can be reached by authorized tailnet devices over TCP or UDP, under the VM identity and the tailnet's ACLs. This supports web applications, databases, debuggers, custom protocols, and multiple ports without host-side port forwarding.
+
+For Amp runner VMs, this provides the network-connectivity role of an Orb Portal with a broader protocol surface. It does not provide Amp-managed HTTPS, thread embedding or annotation, public/thread-visibility access, or automatic Orb sleep/wake integration. Service availability follows the srv VM lifecycle.
+
 ## Configuration
 
 | Variable | Default | Description |

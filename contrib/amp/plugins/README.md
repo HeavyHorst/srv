@@ -25,4 +25,4 @@ The plugin validates every configured source before creating a VM, dereferences 
 
 Use `srv Runner: Push current VM branch…` from a managed thread to push its current commit. The command asks for confirmation, forwards the local SSH agent only for the push, and closes the forwarding connection after at most two minutes.
 
-See [Sandboxed AI coding agent](../../../docs/examples/ai-coding-agent.md#run-amp-on-a-dedicated-vm-runner) for prerequisites, provisioning behavior, lifecycle commands, and the branch-push security model.
+See [Amp runners on srv](../../../docs/examples/amp-runners.md) for the feature overview and [Sandboxed AI coding agent](../../../docs/examples/ai-coding-agent.md#run-amp-on-a-dedicated-vm-runner) for prerequisites, provisioning behavior, lifecycle commands, and the branch-push security model.

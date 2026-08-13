@@ -32,7 +32,7 @@ Most non-streaming instance and backup commands accept a global `--json` flag. W
 ## Use Cases
 
 - **Throwaway debug VMs** — spin up an isolated environment, break things, and delete it without affecting the host
-- **Sandboxed agent VMs** — give AI coding agents their own cgroup-limited VM with per-instance Tailscale identity and scoped provider API proxies
+- **[Remote Amp runners](docs/examples/amp-runners.md) and sandboxed agent VMs** — run normal web- and mobile-controlled Amp threads in dedicated cgroup-limited microVMs with private Tailscale TCP/UDP access and scoped provider API proxies
 - **Dev/test environments** — fast reflink-based clones from a single base image, with backup/restore for instant reset
 - **Isolated workloads** — run services in separate microVMs with per-VM networking, auth, and resource limits
 
@@ -198,7 +198,8 @@ The current Arch guest image expects a boot-time service that reads MMDS, sets t
 - [`docs/reference/operations.md`](docs/reference/operations.md): backup, restore, rebuild, upgrade, rollback, and host hardening
 - [`contrib/smoke/README.md`](contrib/smoke/README.md): smoke-test prerequisites, behavior, overrides, and artifacts
 - [`docs/cheatsheet.md`](docs/cheatsheet.md): operator command reference
-- [`docs/examples/ai-coding-agent.md`](docs/examples/ai-coding-agent.md): isolated agent VMs and the bundled Amp runner workflow
+- [`docs/examples/amp-runners.md`](docs/examples/amp-runners.md): overview of self-hosted Amp runners, inherited Amp thread features, Tailscale services, and Orb differences
+- [`docs/examples/ai-coding-agent.md`](docs/examples/ai-coding-agent.md): detailed agent VM and bundled Amp runner workflow
 - [`docs/networking/integrations.md`](docs/networking/integrations.md): host-managed HTTP integrations and per-VM gateway behavior
 - [`images/arch-base/README.md`](images/arch-base/README.md): guest image builder and overlay details
 - [`contrib/systemd/install.sh`](contrib/systemd/install.sh): one-shot installer for the supported host path

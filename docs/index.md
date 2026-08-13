@@ -16,7 +16,7 @@ ssh srv new demo
 srv is useful for both short-lived sandboxes and persistent isolated services.
 
 - **Throwaway debug VMs** — spin up an isolated environment, break things, and delete it without affecting the host
-- **Sandboxed agent VMs** — give AI coding agents their own cgroup-limited VM with per-instance Tailscale identity and scoped provider API proxies
+- **[Remote Amp runners](examples/amp-runners.md) and sandboxed agent VMs** — run normal web- and mobile-controlled Amp threads in dedicated cgroup-limited microVMs with private Tailscale TCP/UDP access and scoped provider API proxies
 - **Dev/test environments** — fast reflink-based clones from a single base image, with backup/restore for instant reset
 - **Isolated workloads** — run services in separate microVMs with per-VM networking, auth, and resource limits
 
@@ -71,6 +71,7 @@ srv runs on Linux with the following requirements:
 
 - [Install srv](getting-started/install.md)
 - [Walkthrough](getting-started/walkthrough.md)
+- [Amp runners on srv](examples/amp-runners.md)
 - [Sandboxed AI coding agent](examples/ai-coding-agent.md)
 - [Architecture](reference/architecture.md)
 - [SSH command reference](reference/ssh-commands.md)

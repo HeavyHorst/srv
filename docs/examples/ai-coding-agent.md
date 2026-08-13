@@ -4,6 +4,8 @@ srv makes it straightforward to run AI coding agents in isolated microVMs. Each 
 
 For Amp users, the repository also includes an opinionated plugin that creates the VM, installs a dedicated Amp runner, opens a thread on that runner, and later pushes the thread's branch from the VM.
 
+For an outcome-oriented overview, including Amp remote control, thread URLs, Tailscale development services, and a comparison with Orbs, start with [Amp runners on srv](amp-runners.md).
+
 ## Create a VM for an agent
 
 ```bash
@@ -74,6 +76,18 @@ The clone comes from `origin`; uncommitted and untracked workstation changes are
 
 The plugin also provides commands to show the VM for the current thread, list all managed VMs, start or stop the current VM, retry failed provisioning, and permanently delete a managed VM. Failed provisioning leaves the VM intact for inspection.
 
+### Amp remote control and thread features
+
+The dedicated process runs with `--remote-control-terminal`. It is a normal Amp runner thread rather than a separate agent UI, so the thread remains available through ampcode.com on desktop or mobile with its conversation, visibility, changes UI, and remote terminal while the VM is online.
+
+Amp plugins and agents can target the live runner for additional threads. Scheduled or plugin-created work needs the runner to be online, and Amp cannot currently wake a stopped srv VM; start it first with **srv Runner: Start current thread VM**. Amp currently limits Multiplayer to Orb-backed threads.
+
+### Development services over Tailscale
+
+The VM's Tailscale name is a private network endpoint for more than SSH. Services that listen on a Tailscale-reachable address can be opened directly from authorized tailnet devices over TCP or UDP—for example a web app on `http://<vm-name>:3000` or a database on `<vm-name>:5432`.
+
+This covers the connectivity role of an Amp Portal and supports more protocols, but it does not embed the service in the Amp thread, create Amp-managed HTTPS, or grant access based on thread visibility. Tailnet ACLs control access. See [Networking overview](../networking/overview.md#application-and-development-services).
+
 ## Push an isolated thread's branch
 
 From a plugin-managed thread, run **srv Runner: Push current VM branch…**. This command only supports SSH Git remotes. Before asking for confirmation, it reads the VM's current branch and commit over host-key-verified SSH. The confirmation shows the repository, branch, and abbreviated commit that will be pushed.
@@ -103,6 +117,8 @@ This prevents a misbehaving agent from consuming the entire host.
 ```bash
 ssh srv delete agent-1
 ```
+
+For a plugin-managed thread, **srv Runner: Delete current thread VM** removes the VM, persistent checkout, copied Amp credential, workstation profile files, and local plugin record.
 
 ## Multiple agents
 

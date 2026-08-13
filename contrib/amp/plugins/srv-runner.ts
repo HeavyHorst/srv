@@ -1,41 +1,14 @@
 import type { BuiltinAgentMode, PluginAPI, PluginCommandContext, StatusItem, ThreadID } from '@ampcode/plugin'
 import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, normalize } from 'node:path'
 
 const stateDirectory = join(homedir(), '.local', 'state', 'amp-srv')
 const ampSecretsPath = join(homedir(), '.local', 'share', 'amp', 'secrets.json')
-const personalSkillsDirectory = join(homedir(), '.agents', 'skills')
-const personalSkillNames = [
-	'managing-nrc-tasks',
-	'maintaining-room-memory',
-	'querying-victorialogs-logsql',
-	'searching-victorialogs',
-	'using-mysqlsync-vm',
-	'using-planner-cli',
-	'using-sourcebot',
-	'using-zoho-cli',
-]
-const personalBinaries = [
-	{ source: join(homedir(), '.local', 'bin', 'nrc'), target: '/usr/local/bin/nrc' },
-	{ source: join(homedir(), '.local', 'bin', 'sourcebot'), target: '/usr/local/bin/sourcebot' },
-	{ source: join(homedir(), 'Code', 'planner_cli', 'planner'), target: '/usr/local/bin/planner' },
-	{
-		source: join(homedir(), 'Code', 'zoho_zeiterfassung', 'bin', 'zoho'),
-		target: '/home/rene/Code/zoho_zeiterfassung/bin/zoho',
-	},
-]
-const personalConfigs = [
-	{ source: join(homedir(), '.config', 'nrc', 'config.yaml'), target: '/root/.config/nrc/config.yaml' },
-	{ source: join(homedir(), '.config', 'planner-cli', 'config.json'), target: '/root/.config/planner-cli/config.json' },
-	{ source: join(homedir(), '.config', 'planner-cli', 'msal_cache.json'), target: '/root/.config/planner-cli/msal_cache.json' },
-	{ source: join(homedir(), 'Code', 'zoho_zeiterfassung', 'bin', '.env'), target: '/home/rene/Code/zoho_zeiterfassung/bin/.env' },
-]
+const runnerProfilePath = join(homedir(), '.config', 'amp', 'srv-runner.json')
 const guestSSHOptions = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=5']
 const trustedGuestSSHOptions = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=5']
 const pushTimeoutMs = 120_000
-const personalProfileConsentMessage =
-	'The persistent VM will receive your Amp credential, NRC config, Planner OAuth cache, and Zoho OAuth environment, plus the selected skills and CLI binaries. Secret files will be root-only and are removed when the VM is deleted.'
 
 interface ManagedInstance {
 	instance: string
@@ -60,6 +33,31 @@ interface ProcessResult {
 	stderr: string
 	exitCode: number
 	timedOut: boolean
+}
+
+interface ProfileFile {
+	source: string
+	target: string
+	mode: number
+	directoryMode: number
+}
+
+interface ProfileSymlink {
+	target: string
+	link: string
+}
+
+interface ProfileSkill {
+	source: string
+	guestName: string
+}
+
+interface RunnerProfile {
+	skills: ProfileSkill[]
+	binaries: ProfileFile[]
+	files: ProfileFile[]
+	symlinks: ProfileSymlink[]
+	noProxy: string[]
 }
 
 interface BinaryProcessResult {
@@ -350,16 +348,17 @@ async function createIsolatedThread(amp: PluginAPI, ctx: PluginCommandContext) {
 	if (!size) return
 	const resources = resourcesForSize(size)
 
+	let profile: RunnerProfile
 	try {
-		await validatePersonalProfileSources()
+		profile = await loadRunnerProfile()
 	} catch (error) {
-		await ctx.ui.notify(`srv Runner: personal profile is incomplete:\n${errorMessage(error)}`)
+		await ctx.ui.notify(`srv Runner: invalid profile ${runnerProfilePath}:\n${errorMessage(error)}`)
 		return
 	}
 
 	const copyCredential = await ctx.ui.confirm({
-		title: 'Copy credentials and personal tools into the VM?',
-		message: personalProfileConsentMessage,
+		title: 'Copy Amp credential and configured defaults into the VM?',
+		message: profileConsentMessage(profile),
 		confirmButtonText: 'Create VM',
 	})
 	if (!copyCredential) return
@@ -385,7 +384,7 @@ async function createIsolatedThread(amp: PluginAPI, ctx: PluginCommandContext) {
 	const parentThreadID = ctx.thread?.id
 	await ctx.ui.notify(`srv Runner: provisioning ${instance} in the background. Follow progress in the status bar.`)
 	setTimeout(() => {
-		void provisionNewVM(amp, managed, resources, secrets, mode, prompt.trim(), parentThreadID)
+		void provisionNewVM(amp, managed, resources, secrets, profile, mode, prompt.trim(), parentThreadID)
 	}, 0)
 }
 
@@ -417,15 +416,16 @@ async function retryFailedVM(amp: PluginAPI, ctx: PluginCommandContext) {
 		initialValue: 'medium',
 	})
 	if (!modeSelection) return
+	let profile: RunnerProfile
 	try {
-		await validatePersonalProfileSources()
+		profile = await loadRunnerProfile()
 	} catch (error) {
-		await ctx.ui.notify(`srv Runner: personal profile is incomplete:\n${errorMessage(error)}`)
+		await ctx.ui.notify(`srv Runner: invalid profile ${runnerProfilePath}:\n${errorMessage(error)}`)
 		return
 	}
 	const copyCredential = await ctx.ui.confirm({
-		title: 'Copy credentials and personal tools into the VM?',
-		message: personalProfileConsentMessage,
+		title: 'Copy Amp credential and configured defaults into the VM?',
+		message: profileConsentMessage(profile),
 		confirmButtonText: 'Retry provisioning',
 	})
 	if (!copyCredential) return
@@ -447,6 +447,7 @@ async function retryFailedVM(amp: PluginAPI, ctx: PluginCommandContext) {
 			amp,
 			managed,
 			secrets,
+			profile,
 			modeSelection as BuiltinAgentMode,
 			prompt.trim(),
 			parentThreadID,
@@ -459,6 +460,7 @@ async function provisionNewVM(
 	initialManaged: ManagedInstance,
 	resources: ReturnType<typeof resourcesForSize>,
 	secrets: Uint8Array,
+	profile: RunnerProfile,
 	mode: BuiltinAgentMode,
 	prompt: string,
 	parentThreadID?: ThreadID,
@@ -479,11 +481,11 @@ async function provisionNewVM(
 		await waitForGuestSSH(instance, (seconds) => progress.update(3, `Waiting for SSH · ${seconds}s`))
 		progress.update(4, 'Copying Amp credential')
 		await copyAmpCredential(instance, secrets)
-		progress.update(5, 'Installing personal tools and skills')
-		await installPersonalProfile(instance)
+		progress.update(5, 'Installing configured defaults')
+		await installRunnerProfile(instance, profile)
 		progress.update(6, 'Installing Amp and preparing repository')
 		const proxyURL = await ampConnectGatewayURL(instance)
-		await bootstrapRunner(instance, repository, branch, proxyURL)
+		await bootstrapRunner(instance, repository, branch, proxyURL, profile.noProxy)
 		await waitForRunnerRegistration(instance, (seconds) => progress.update(7, `Waiting for Amp runner · ${seconds}s`))
 		progress.update(8, 'Creating Amp thread')
 		const thread = await createRunnerThread(amp.getBuiltinAgent(mode), instance, parentThreadID)
@@ -511,6 +513,7 @@ async function provisionExistingVM(
 	amp: PluginAPI,
 	initialManaged: ManagedInstance,
 	secrets: Uint8Array,
+	profile: RunnerProfile,
 	mode: BuiltinAgentMode,
 	prompt: string,
 	parentThreadID?: ThreadID,
@@ -523,11 +526,11 @@ async function provisionExistingVM(
 		await waitForGuestSSH(managed.instance, (seconds) => progress.update(2, `Waiting for SSH · ${seconds}s`))
 		progress.update(3, 'Copying Amp credential')
 		await copyAmpCredential(managed.instance, secrets)
-		progress.update(4, 'Installing personal tools and skills')
-		await installPersonalProfile(managed.instance)
+		progress.update(4, 'Installing configured defaults')
+		await installRunnerProfile(managed.instance, profile)
 		progress.update(5, 'Installing Amp and preparing repository')
 		const proxyURL = await ampConnectGatewayURL(managed.instance)
-		await bootstrapRunner(managed.instance, managed.repository, managed.branch, proxyURL)
+		await bootstrapRunner(managed.instance, managed.repository, managed.branch, proxyURL, profile.noProxy)
 		await waitForRunnerRegistration(managed.instance, (seconds) => progress.update(6, `Waiting for Amp runner · ${seconds}s`))
 		progress.update(7, 'Creating Amp thread')
 		const thread = await createRunnerThread(amp.getBuiltinAgent(mode), managed.runnerID, parentThreadID)
@@ -557,62 +560,169 @@ async function copyAmpCredential(instance: string, secrets: Uint8Array) {
 	)
 }
 
-async function validatePersonalProfileSources() {
-	const sources = [
-		...personalSkillNames.map((name) => join(personalSkillsDirectory, name)),
-		...personalBinaries.map(({ source }) => source),
-		...personalConfigs.map(({ source }) => source),
-	]
-	for (const source of sources) {
-		try {
-			await stat(source)
-		} catch {
-			throw new Error(`missing ${source}`)
+async function loadRunnerProfile(): Promise<RunnerProfile> {
+	let raw: string
+	try {
+		raw = await readFile(runnerProfilePath, 'utf8')
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			return { skills: [], binaries: [], files: [], symlinks: [], noProxy: [] }
+		}
+		throw error
+	}
+
+	const parsed = JSON.parse(raw) as Record<string, unknown>
+	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		throw new Error('expected a JSON object')
+	}
+	assertProfileKeys(parsed, ['skills', 'binaries', 'files', 'symlinks', 'noProxy'], 'profile')
+
+	const skills = profileArray(parsed.skills, 'skills').map((value, index) => {
+		if (typeof value !== 'string' || !value.trim() || value.includes('\0')) {
+			throw new Error(`skills[${index}] must be a non-empty path or skill name`)
+		}
+		if (value.split('/').some((segment) => segment === '.' || segment === '..')) {
+			throw new Error(`skills[${index}] cannot contain . or .. path segments`)
+		}
+		const source = value.includes('/') ? expandHome(value) : join(homedir(), '.agents', 'skills', value)
+		const guestName = basename(source)
+		if (!guestName || guestName === '.' || guestName === '..') {
+			throw new Error(`skills[${index}] does not identify one skill directory: ${value}`)
+		}
+		return { source, guestName }
+	})
+	const skillNames = new Set<string>()
+	for (const [index, skill] of skills.entries()) {
+		if (skillNames.has(skill.guestName)) throw new Error(`skills[${index}] duplicates guest skill name ${skill.guestName}`)
+		skillNames.add(skill.guestName)
+	}
+	const binaries = profileArray(parsed.binaries, 'binaries').map((value, index) =>
+		parseProfileFile(value, `binaries[${index}]`, 0o755, 0o755),
+	)
+	const files = profileArray(parsed.files, 'files').map((value, index) =>
+		parseProfileFile(value, `files[${index}]`, 0o600, 0o700),
+	)
+	const symlinks = profileArray(parsed.symlinks, 'symlinks').map((value, index) => {
+		const entry = profileObject(value, `symlinks[${index}]`)
+		assertProfileKeys(entry, ['target', 'link'], `symlinks[${index}]`)
+		return {
+			target: guestPath(entry.target, `symlinks[${index}].target`),
+			link: guestPath(entry.link, `symlinks[${index}].link`),
+		}
+	})
+	const noProxy = profileArray(parsed.noProxy, 'noProxy').map((value, index) => {
+		if (typeof value !== 'string' || !/^[A-Za-z0-9.*:/_-]+$/.test(value)) {
+			throw new Error(`noProxy[${index}] must be a hostname, address, or CIDR without whitespace or commas`)
+		}
+		return value
+	})
+
+	for (const [index, skill] of skills.entries()) {
+		const info = await stat(skill.source).catch(() => undefined)
+		if (!info?.isDirectory()) throw new Error(`skills[${index}] is not a directory: ${skill.source}`)
+	}
+	for (const [kind, entries] of [['binaries', binaries], ['files', files]] as const) {
+		for (const [index, entry] of entries.entries()) {
+			const info = await stat(entry.source).catch(() => undefined)
+			if (!info?.isFile()) throw new Error(`${kind}[${index}].source is not a file: ${entry.source}`)
 		}
 	}
+
+	return { skills, binaries, files, symlinks, noProxy }
 }
 
-async function installPersonalProfile(instance: string) {
-	await validatePersonalProfileSources()
-	const skills = await runBinaryProcess([
-		'tar',
-		'-chf',
-		'-',
-		'-C',
-		personalSkillsDirectory,
-		...personalSkillNames,
-	])
-	await runProcess(
-		[
-			'ssh',
-			...guestSSHOptions,
-			`root@${instance}`,
-			'install -d -m 0755 /root/.agents/skills; tar --no-same-owner -xf - -C /root/.agents/skills',
-		],
-		{ stdin: skills.stdout },
-	)
-
-	for (const binary of personalBinaries) {
-		await copyGuestFile(instance, binary.source, binary.target, 0o755, 0o755)
-	}
-	for (const config of personalConfigs) {
-		await copyGuestFile(instance, config.source, config.target, 0o600, 0o700)
-	}
-	await runProcess([
-		'ssh',
-		...guestSSHOptions,
-		`root@${instance}`,
-		'ln -sfn /home/rene/Code/zoho_zeiterfassung/bin/zoho /usr/local/bin/zoho',
-	])
+function profileArray(value: unknown, name: string): unknown[] {
+	if (value === undefined) return []
+	if (!Array.isArray(value)) throw new Error(`${name} must be an array`)
+	return value
 }
 
-async function copyGuestFile(instance: string, source: string, target: string, mode: number, directoryMode: number) {
-	const contents = await readFile(source)
-	const targetArgument = base64(target)
+function profileObject(value: unknown, name: string): Record<string, unknown> {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${name} must be an object`)
+	return value as Record<string, unknown>
+}
+
+function assertProfileKeys(value: Record<string, unknown>, allowed: string[], name: string) {
+	const allowedKeys = new Set(allowed)
+	for (const key of Object.keys(value)) {
+		if (!allowedKeys.has(key)) throw new Error(`${name} has unknown property ${key}`)
+	}
+}
+
+function parseProfileFile(value: unknown, name: string, defaultMode: number, directoryMode: number): ProfileFile {
+	const entry = profileObject(value, name)
+	assertProfileKeys(entry, ['source', 'target', 'mode'], name)
+	if (typeof entry.source !== 'string' || !entry.source.trim()) throw new Error(`${name}.source must be a non-empty string`)
+	return {
+		source: expandHome(entry.source),
+		target: guestPath(entry.target, `${name}.target`),
+		mode: profileMode(entry.mode, `${name}.mode`, defaultMode),
+		directoryMode,
+	}
+}
+
+function profileMode(value: unknown, name: string, fallback: number): number {
+	if (value === undefined) return fallback
+	if (typeof value !== 'string' || !/^0[0-7]{3}$/.test(value)) throw new Error(`${name} must be an octal string such as "0600"`)
+	return Number.parseInt(value, 8)
+}
+
+function expandHome(path: string): string {
+	if (path === '~') return homedir()
+	if (path.startsWith('~/')) return join(homedir(), path.slice(2))
+	if (!isAbsolute(path)) throw new Error(`host path must be absolute or start with ~/: ${path}`)
+	return normalize(path)
+}
+
+function guestPath(value: unknown, name: string): string {
+	if (typeof value !== 'string' || !isAbsolute(value) || value.includes('\0')) {
+		throw new Error(`${name} must be an absolute guest path`)
+	}
+	return normalize(value)
+}
+
+function profileConsentMessage(profile: RunnerProfile): string {
+	const configured =
+		profile.skills.length + profile.binaries.length + profile.files.length + profile.symlinks.length + profile.noProxy.length
+	const summary = configured === 0
+		? `No optional defaults are configured in ${runnerProfilePath}.`
+		: `The profile ${runnerProfilePath} adds ${profile.skills.length} skills, ${profile.binaries.length} binaries, ${profile.files.length} files, ${profile.symlinks.length} symlinks, and ${profile.noProxy.length} NO_PROXY entries.`
+	return `The dedicated runner needs your current Amp credential. It and all configured files remain in the persistent VM until the VM is deleted.\n\n${summary}`
+}
+
+async function installRunnerProfile(instance: string, profile: RunnerProfile) {
+	for (const skill of profile.skills) {
+		const archive = await runBinaryProcess(['tar', '-chf', '-', '-C', dirname(skill.source), '--', skill.guestName])
+		await runProcess(
+			[
+				'ssh',
+				...guestSSHOptions,
+				`root@${instance}`,
+				'install -d -m 0755 /root/.agents/skills; tar --no-same-owner -xf - -C /root/.agents/skills',
+			],
+			{ stdin: archive.stdout },
+		)
+	}
+	for (const entry of [...profile.binaries, ...profile.files]) {
+		await copyGuestFile(instance, entry)
+	}
+	for (const symlink of profile.symlinks) {
+		const command =
+			`set -eu; target=$(printf '%s' '${base64(symlink.target)}' | base64 -d); ` +
+			`link=$(printf '%s' '${base64(symlink.link)}' | base64 -d); ` +
+			'install -d -m 0755 "$(dirname -- "$link")"; ln -sfnT -- "$target" "$link"'
+		await runProcess(['ssh', ...guestSSHOptions, `root@${instance}`, command])
+	}
+}
+
+async function copyGuestFile(instance: string, entry: ProfileFile) {
+	const contents = await readFile(entry.source)
 	const command =
-		`target=$(printf '%s' '${targetArgument}' | base64 -d); ` +
-		`install -d -m ${directoryMode.toString(8)} "$(dirname -- "$target")"; ` +
-		`cat > "$target"; chmod ${mode.toString(8)} "$target"`
+		`set -eu; umask 077; target=$(printf '%s' '${base64(entry.target)}' | base64 -d); ` +
+		`directory=$(dirname -- "$target"); install -d -m ${entry.directoryMode.toString(8)} "$directory"; ` +
+		`temporary=$(mktemp "$directory/.srv-runner.XXXXXX"); trap 'rm -f -- "$temporary"' EXIT; ` +
+		`cat > "$temporary"; chmod ${entry.mode.toString(8)} "$temporary"; ` +
+		'mv -T -- "$temporary" "$target"; trap - EXIT'
 	await runProcess(['ssh', ...guestSSHOptions, `root@${instance}`, command], { stdin: contents })
 }
 
@@ -626,12 +736,13 @@ async function ampConnectGatewayURL(instance: string): Promise<string> {
 	return proxyURL
 }
 
-async function bootstrapRunner(instance: string, repository: string, branch: string, proxyURL: string) {
+async function bootstrapRunner(instance: string, repository: string, branch: string, proxyURL: string, profileNoProxy: string[]) {
 	const script = `set -euo pipefail
 repository=$(printf '%s' "$1" | base64 -d)
 branch=$(printf '%s' "$2" | base64 -d)
 runner_id=$(printf '%s' "$3" | base64 -d)
 proxy_url=$(printf '%s' "$4" | base64 -d)
+profile_no_proxy=$(printf '%s' "$5" | base64 -d)
 
 packages=()
 command -v curl >/dev/null 2>&1 || packages+=(curl)
@@ -662,9 +773,12 @@ fi
 
 gateway_ip=$(ip -4 route show default | awk '/^default / { print $3; exit }')
 tailnet_suffix=$(tailscale status --json | jq -r '.Self.DNSName // empty' | cut -d. -f2- | sed 's/\.$//')
-no_proxy="localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10,monitoring,sourcebot,$gateway_ip"
+no_proxy="localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10,$gateway_ip"
 if [[ -n "$tailnet_suffix" ]]; then
   no_proxy="$no_proxy,.$tailnet_suffix"
+fi
+if [[ -n "$profile_no_proxy" ]]; then
+  no_proxy="$no_proxy,$profile_no_proxy"
 fi
 
 cat > /etc/systemd/system/amp-runner.service <<EOF
@@ -704,7 +818,7 @@ systemctl is-active --quiet amp-runner.service
 			'-A',
 			...guestSSHOptions,
 			`root@${instance}`,
-			`bash -s -- ${base64(repository)} ${base64(branch)} ${base64(instance)} ${base64(proxyURL)}`,
+			`bash -s -- '${base64(repository)}' '${base64(branch)}' '${base64(instance)}' '${base64(proxyURL)}' '${base64(profileNoProxy.join(','))}'`,
 		],
 		{ stdin: script },
 	)
@@ -907,32 +1021,7 @@ git --git-dir="$push_directory" push --no-verify "$repository" "$expected_oid:re
 	}
 
 	const output = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join('\n') || 'Everything up-to-date'
-	const pushSummary = `✓ srv Runner: pushed ${branch} from ${managed.instance}.\n${output.slice(-2_000)}`
-	try {
-		await askCurrentAgentToLearnThread(ctx)
-		await ctx.ui.notify(`${pushSummary}\nNRC Memory: asked the current agent to learn this thread.`)
-	} catch (error) {
-		await ctx.ui.notify(`${pushSummary}\n⚠ NRC Memory: could not start learning this thread:\n${errorMessage(error)}`)
-	}
-}
-
-async function askCurrentAgentToLearnThread(ctx: PluginCommandContext) {
-	if (!ctx.thread) throw new Error('no active Amp thread')
-
-	const threadURL = new URL(`/threads/${ctx.thread.id}`, ctx.system.ampURL).toString()
-	const prompt = `Use the maintaining-room-memory skill.
-
-Distill this thread into durable NRC notes. Prefer updating existing notes over creating duplicates. Create new notes only for stable concepts with distinct future retrieval intent. Keep the result compact: normally 1-3 notes. Do not create one note per implementation step, bug fix, prompt tweak, or transient error.
-
-Add useful edges to existing and new notes. Include this Amp thread URL in note bodies as \`Source: ${threadURL}\`. Preview the note and edge operations before writing anything.`
-
-	await ctx.thread.appendUserMessage(
-		{
-			type: 'user-message',
-			content: prompt,
-		},
-		{ steer: true },
-	)
+	await ctx.ui.notify(`✓ srv Runner: pushed ${branch} from ${managed.instance}.\n${output.slice(-2_000)}`)
 }
 
 async function managedThreadForContext(ctx: PluginCommandContext): Promise<ManagedInstance | undefined> {
@@ -1033,11 +1122,10 @@ async function runBinaryProcess(args: string[]): Promise<BinaryProcessResult> {
 		new Response(process.stderr).text(),
 		process.exited,
 	])
-	const result = { stdout: new Uint8Array(stdout), stderr, exitCode }
 	if (exitCode !== 0) {
 		throw new Error(`${args[0]} exited with status ${exitCode}: ${stderr.trim() || 'unknown error'}`)
 	}
-	return result
+	return { stdout: new Uint8Array(stdout), stderr, exitCode }
 }
 
 function createProgressDisplay(amp: PluginAPI, instance: string, totalSteps: number): ProgressDisplay {

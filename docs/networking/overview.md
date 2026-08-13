@@ -104,4 +104,4 @@ The CONNECT gateway is intended for an Amp runner whose general HTTPS egress mus
 
 This is a tunnel, not a TLS-terminating proxy: srv does not inspect HTTPS payloads or inject credentials. To prevent the proxy from becoming a path into the host or tailnet, it accepts only the `CONNECT` method, only permits destination port `443`, and rejects loopback, link-local, private, carrier-grade NAT, documentation, multicast, other special-use, and host-local addresses. Destinations are checked again after DNS resolution and connection.
 
-Use `NO_PROXY` for guest-local services, the VM gateway services, tailnet destinations, and other endpoints that should not use public HTTPS proxying. The bundled Amp runner config excludes localhost, MMDS, the tailnet, the guest gateway, and its known internal service names.
+Use `NO_PROXY` for guest-local services, the VM gateway services, tailnet destinations, and other endpoints that should not use public HTTPS proxying. The bundled Amp runner config excludes localhost, MMDS, the tailnet, and the guest gateway, then appends any `noProxy` entries from `~/.config/amp/srv-runner.json`.

@@ -1,0 +1,58 @@
+{
+  "skills": [
+    "managing-nrc-tasks",
+    "maintaining-room-memory",
+    "querying-victorialogs-logsql",
+    "searching-victorialogs",
+    "using-mysqlsync-vm",
+    "using-planner-cli",
+    "using-sourcebot",
+    "using-zoho-cli"
+  ],
+  "binaries": [
+    {
+      "source": "~/.local/bin/nrc",
+      "target": "/usr/local/bin/nrc"
+    },
+    {
+      "source": "~/.local/bin/sourcebot",
+      "target": "/usr/local/bin/sourcebot"
+    },
+    {
+      "source": "~/Code/planner_cli/planner",
+      "target": "/usr/local/bin/planner"
+    },
+    {
+      "source": "~/Code/zoho_zeiterfassung/bin/zoho",
+      "target": "/opt/zoho/bin/zoho"
+    }
+  ],
+  "files": [
+    {
+      "source": "~/.config/nrc/config.yaml",
+      "target": "/root/.config/nrc/config.yaml"
+    },
+    {
+      "source": "~/.config/planner-cli/config.json",
+      "target": "/root/.config/planner-cli/config.json"
+    },
+    {
+      "source": "~/.config/planner-cli/msal_cache.json",
+      "target": "/root/.config/planner-cli/msal_cache.json"
+    },
+    {
+      "source": "~/Code/zoho_zeiterfassung/bin/.env",
+      "target": "/opt/zoho/bin/.env"
+    }
+  ],
+  "symlinks": [
+    {
+      "target": "/opt/zoho/bin/zoho",
+      "link": "/usr/local/bin/zoho"
+    }
+  ],
+  "noProxy": [
+    "monitoring",
+    "sourcebot"
+  ]
+}

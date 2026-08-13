@@ -59,15 +59,14 @@ Reload plugins from Amp's command palette after installing or updating it. The p
 - Working `ssh srv ...` and `ssh root@<vm-name>` access from the workstation
 - An authenticated Amp installation at `~/.local/share/amp/secrets.json`
 - A local SSH agent when the repository uses an SSH remote
-- The personal skills, CLI binaries, and credential files declared near the top of `contrib/amp/plugins/srv-runner.ts`
 
 !!! note
-    The bundled profile is deliberately workstation-specific. Review and customize `personalSkillNames`, `personalBinaries`, and `personalConfigs` before using the plugin on another workstation. Provisioning stops before VM creation if any declared source is missing.
+    The plugin always copies the Amp credential required by the runner. To add workstation-wide default skills, binaries, private files, guest symlinks, or `NO_PROXY` entries, create `~/.config/amp/srv-runner.json`; see the [plugin README](../../contrib/amp/plugins/README.md) and its full example profile. Put repository-specific dependencies and setup in an executable `.agents/setup` script, which runs inside the cloned repository before the runner starts.
 
-Run **srv Runner: New isolated thread** from the command palette. The plugin asks for the task, Amp mode, VM size, and explicit consent to copy the personal profile. It then:
+Run **srv Runner: New isolated thread** from the command palette. The plugin asks for the task, Amp mode, VM size, and explicit consent to copy the Amp credential and configured defaults. It then:
 
 1. Creates an `amp-<repository>-<suffix>` VM and waits for guest SSH.
-2. Copies the Amp credential, selected skills, CLI binaries, and root-only personal configuration into the persistent VM.
+2. Copies the Amp credential and optional workstation-wide profile into the persistent VM.
 3. Installs Amp, makes a fresh clone of the current branch under `/workspace/repository`, initializes submodules, and runs `.agents/setup` when that executable exists.
 4. Configures `amp-runner.service` to use the VM's per-instance Amp CONNECT gateway, starts a dedicated Amp runner, creates a thread on it, and sends the requested task.
 
@@ -87,8 +86,6 @@ After confirmation, the plugin temporarily forwards the workstation's SSH agent 
 - Ends agent forwarding when the command completes, with a two-minute overall timeout
 
 The push does not include uncommitted changes. Commit all intended VM changes first.
-
-After a successful push, the plugin asks the current Amp agent to use the `maintaining-room-memory` skill to distill the thread into a compact set of durable NRC notes, add useful note edges, and cite the Amp thread URL. The memory step is queued after the push; if it cannot be queued or later fails, the successful Git push is not rolled back.
 
 ## Resource limits
 

@@ -41,6 +41,7 @@ ssh srv -- --json status
 | `start <name>` | Start a stopped VM |
 | `stop <name>` | Stop a running VM (graceful shutdown) |
 | `restart <name>` | Stop and start a VM |
+| `fsck <name>` | Force-check and repair the rootfs of a stopped VM |
 | `delete <name>` | Delete a VM and all its resources |
 
 ## Resize command
@@ -111,7 +112,7 @@ All integration commands are admin-only.
 - In pooled mode, `--ram` means guest-visible RAM while host reservation comes from the pool created with `pool create`
 - `resize` requires the VM to be stopped; CPU and RAM may increase or decrease within limits, while rootfs is grow-only
 - Pooled VMs cannot move between pools or switch memory mode through `resize` in v1
-- `resize`, `backup`, and `restore` all require the VM to be stopped
+- `resize`, `fsck`, `backup`, and `restore` all require the VM to be stopped
 - Backups are tied to the original VM record — they cannot be restored onto a different VM
 - Export requires the source VM to be stopped
 - Import recreates the VM under the same name and leaves it stopped

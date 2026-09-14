@@ -2106,6 +2106,101 @@ func TestEnsureStartPrereqsUsesCurrentBaseKernelPath(t *testing.T) {
 	}
 }
 
+func TestCheckRootFSRunsForcedRepairOnlyForStoppedInstance(t *testing.T) {
+	tests := []struct {
+		name       string
+		state      string
+		livePID    bool
+		exitCode   int
+		wantErr    string
+		wantCalled bool
+	}{
+		{name: "clean", state: model.StateStopped, exitCode: 0, wantCalled: true},
+		{name: "corrected", state: model.StateStopped, exitCode: 1, wantCalled: true},
+		{name: "uncorrected", state: model.StateStopped, exitCode: 4, wantErr: "check rootfs filesystem", wantCalled: true},
+		{name: "running", state: model.StateReady, exitCode: 0, wantErr: "must be stopped before fsck"},
+		{name: "stopped with live pid", state: model.StateStopped, livePID: true, exitCode: 0, wantErr: "must be stopped before fsck"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := loadProvisionTestConfig(t, nil)
+			st := newProvisionTestStore(t, cfg)
+			p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+
+			inst := provisionTestInstance(cfg, "demo", tt.state, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+			if tt.livePID {
+				inst.FirecrackerPID = os.Getpid()
+			}
+			if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+				t.Fatalf("MkdirAll(rootfs dir): %v", err)
+			}
+			if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0o644); err != nil {
+				t.Fatalf("WriteFile(rootfs): %v", err)
+			}
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatalf("CreateInstance: %v", err)
+			}
+
+			binDir := filepath.Join(t.TempDir(), "bin")
+			if err := os.MkdirAll(binDir, 0o755); err != nil {
+				t.Fatalf("MkdirAll(bin): %v", err)
+			}
+			callsPath := filepath.Join(t.TempDir(), "calls")
+			e2fsck := filepath.Join(binDir, "e2fsck")
+			script := fmt.Sprintf("#!/bin/sh\necho e2fsck \"$@\" >> %q\nexit %d\n", callsPath, tt.exitCode)
+			if err := os.WriteFile(e2fsck, []byte(script), 0o755); err != nil {
+				t.Fatalf("WriteFile(e2fsck): %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			_, err := p.CheckRootFS(ctx, inst.Name)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("CheckRootFS(): %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("CheckRootFS() error = %v, want containing %q", err, tt.wantErr)
+			}
+
+			calls, readErr := os.ReadFile(callsPath)
+			if tt.wantCalled {
+				if readErr != nil {
+					t.Fatalf("ReadFile(calls): %v", readErr)
+				}
+				want := fmt.Sprintf("e2fsck -f -p %s\n", inst.RootFSPath)
+				if string(calls) != want {
+					t.Fatalf("fsck calls = %q, want %q", string(calls), want)
+				}
+			} else if !os.IsNotExist(readErr) {
+				t.Fatalf("e2fsck unexpectedly ran, calls = %q, read error = %v", string(calls), readErr)
+			}
+
+			events, err := st.ListEvents(ctx, inst.ID, 10)
+			if err != nil {
+				t.Fatalf("ListEvents(): %v", err)
+			}
+			var checked bool
+			for _, evt := range events {
+				if evt.Type == "storage" && evt.Message == "rootfs filesystem checked" {
+					checked = true
+				}
+			}
+			if want := tt.wantErr == ""; checked != want {
+				t.Fatalf("filesystem checked event = %v, want %v; events = %#v", checked, want, events)
+			}
+			stored, err := st.GetInstance(ctx, inst.Name)
+			if err != nil {
+				t.Fatalf("GetInstance(): %v", err)
+			}
+			if stored.State != tt.state || stored.FirecrackerPID != inst.FirecrackerPID {
+				t.Fatalf("CheckRootFS changed lifecycle state: before=%#v after=%#v", inst, stored)
+			}
+		})
+	}
+}
+
 func TestResizeStoppedInstanceUpdatesStoredConfigAndGrowsRootFS(t *testing.T) {
 	const testMiB = int64(1024 * 1024)
 

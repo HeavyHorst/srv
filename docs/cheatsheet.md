@@ -23,6 +23,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | `start <name>` | Start a stopped VM |
 | `stop <name>` | Stop VM (graceful shutdown) |
 | `restart <name>` | Restart VM |
+| `fsck <name>` | Force-check and repair stopped VM rootfs |
 | `delete <name>` | Remove VM |
 | `resize <name>` | Resize stopped VM (CPU/RAM up or down, rootfs grow-only) |
 | `backup create <name>` | Create an in-place backup for a stopped VM |
@@ -63,6 +64,10 @@ ssh srv inspect demo
 ssh srv stop demo
 ssh srv resize demo --cpus 4 --ram 8G
 ssh srv start demo
+
+# Force rootfs check (must be stopped)
+ssh srv stop demo
+ssh srv fsck demo && ssh srv start demo
 
 # Backup and restore (stop VM first for safety)
 ssh srv backup create demo
@@ -176,7 +181,7 @@ cat /sys/fs/cgroup/firecracker-vms/<name>/memory.max
 - VM disks at: `SRV_DATA_DIR/instances/<name>/rootfs.img`
 - VM backups live at: `SRV_DATA_DIR/backups/<name>/<backup-id>/`
 - Resize requires a stopped VM; CPU and RAM can go up or down within limits, but rootfs shrink is rejected
-- Resize only works on stopped VMs
+- Resize and fsck only work on stopped VMs
 - Backup and restore only work on stopped VMs and only restore onto the original VM record, not a newly recreated VM with the same name
 - Creators manage their own VMs; admins manage all VMs
 - Integration commands are admin-only, and integration secrets are referenced by host env name rather than passed as raw SSH arguments

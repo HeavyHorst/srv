@@ -16,7 +16,7 @@ srv uses Tailscale identity for authentication and authorization. The SSH surfac
 If `SRV_ALLOWED_USERS` is unset or empty, any authenticated tailnet user can invoke commands. Regular users can:
 
 - Create VMs (`new`)
-- Manage their own VMs (`inspect`, `logs`, `stop`, `start`, `restart`, `delete`)
+- Manage their own VMs (`inspect`, `logs`, `stop`, `start`, `restart`, `fsck`, `delete`)
 - View their own VMs in `list`
 - Create backups and restores for their own VMs
 - Resize their own VMs

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -1017,6 +1018,7 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 		"start <name>",
 		"stop <name>",
 		"restart <name>",
+		"fsck <name>",
 		"GLOBAL OPTIONS",
 		"--json",
 		"NEW AND RESIZE OPTIONS",
@@ -1528,6 +1530,97 @@ func TestCmdResizeDeniesOtherUsers(t *testing.T) {
 	}
 	if !strings.Contains(result.stderr, `resize alpha: instance "alpha" does not exist`) {
 		t.Fatalf("cmdResize() stderr = %q", result.stderr)
+	}
+}
+
+func TestCmdFSCKChecksOwnedStoppedInstance(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.Config{Hostname: "srv", VCPUCount: 1, MemoryMiB: 1024}
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatalf("provision.New(): %v", err)
+	}
+	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+
+	inst := serviceTestInstance("alpha", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.RootFSPath = filepath.Join(t.TempDir(), "rootfs.img")
+	if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs): %v", err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(bin): %v", err)
+	}
+	callsPath := filepath.Join(t.TempDir(), "calls")
+	e2fsck := filepath.Join(binDir, "e2fsck")
+	script := fmt.Sprintf("#!/bin/sh\necho e2fsck \"$@\" >> %q\nexit 0\n", callsPath)
+	if err := os.WriteFile(e2fsck, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(e2fsck): %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	result, err := app.dispatch(ctx, model.Actor{UserLogin: "alice@example.com"}, commandRequest{args: []string{"fsck", inst.Name}})
+	if err != nil {
+		t.Fatalf("dispatch(fsck): %v", err)
+	}
+	if result.exitCode != 0 || result.stdout != "checked: alpha\nstate: stopped\n" {
+		t.Fatalf("dispatch(fsck) result = %#v", result)
+	}
+	jsonResult, err := app.dispatch(ctx, model.Actor{UserLogin: "alice@example.com"}, commandRequest{
+		args:   []string{"fsck", inst.Name},
+		format: outputFormatJSON,
+	})
+	if err != nil {
+		t.Fatalf("dispatch(fsck --json): %v", err)
+	}
+	var payload commandActionJSON
+	if err := json.Unmarshal([]byte(jsonResult.stdout), &payload); err != nil {
+		t.Fatalf("Unmarshal(fsck JSON): %v", err)
+	}
+	if payload.Action != "checked" || payload.Instance.Name != inst.Name || payload.Instance.State != model.StateStopped {
+		t.Fatalf("fsck JSON payload = %#v", payload)
+	}
+	if strings.Contains(jsonResult.stdout, `"connect"`) {
+		t.Fatalf("fsck JSON unexpectedly includes connect: %s", jsonResult.stdout)
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(calls): %v", err)
+	}
+	wantCalls := fmt.Sprintf("e2fsck -f -p %s\ne2fsck -f -p %s\n", inst.RootFSPath, inst.RootFSPath)
+	if string(calls) != wantCalls {
+		t.Fatalf("fsck calls = %q, want %q", string(calls), wantCalls)
+	}
+}
+
+func TestCmdFSCKDeniesOtherUsers(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.Config{Hostname: "srv"}
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatalf("provision.New(): %v", err)
+	}
+	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+
+	inst := serviceTestInstance("alpha", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	result, err := app.cmdFSCK(ctx, model.Actor{UserLogin: "bob@example.com"}, []string{"fsck", inst.Name}, outputFormatText)
+	if err == nil || !strings.Contains(err.Error(), `instance "alpha" does not exist`) {
+		t.Fatalf("cmdFSCK() error = %v, want hidden instance error", err)
+	}
+	if !strings.Contains(result.stderr, `fsck alpha: instance "alpha" does not exist`) {
+		t.Fatalf("cmdFSCK() stderr = %q", result.stderr)
 	}
 }
 

@@ -623,6 +623,33 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 	return inst, nil
 }
 
+func (p *Provisioner) CheckRootFS(ctx context.Context, name string) (model.Instance, error) {
+	p.admissionMu.Lock()
+	defer p.admissionMu.Unlock()
+
+	inst, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return model.Instance{}, err
+	}
+	if inst.State == model.StateDeleted {
+		return inst, fmt.Errorf("instance %q is deleted", name)
+	}
+	if inst.State != model.StateStopped {
+		return inst, fmt.Errorf("instance %q must be stopped before fsck (current state: %s)", name, inst.State)
+	}
+	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
+		return inst, fmt.Errorf("instance %q must be stopped before fsck", name)
+	}
+	if _, err := exec.LookPath("e2fsck"); err != nil {
+		return inst, errors.New("fsck requires e2fsck on the host")
+	}
+	if err := runRootFSCheck(inst.RootFSPath, "check rootfs filesystem"); err != nil {
+		return inst, err
+	}
+	p.recordEvent(inst.ID, "storage", "rootfs filesystem checked", nil)
+	return inst, nil
+}
+
 func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOptions) (model.Instance, error) {
 	var inst model.Instance
 	err := func() error {
@@ -1377,7 +1404,7 @@ func (p *Provisioner) cloneRootFS(ctx context.Context, dest string) error {
 }
 
 func (p *Provisioner) growRootFS(path string, sizeBytes int64) error {
-	if err := runRootFSCheck(path); err != nil {
+	if err := runRootFSCheck(path, "check rootfs filesystem before resize"); err != nil {
 		return err
 	}
 	if err := os.Truncate(path, sizeBytes); err != nil {
@@ -1400,7 +1427,7 @@ func ensureRootFSResizeTools(context string) error {
 	return nil
 }
 
-func runRootFSCheck(path string) error {
+func runRootFSCheck(path, context string) error {
 	cmd := exec.Command("e2fsck", "-f", "-p", path)
 	output, err := cmd.CombinedOutput()
 	if err == nil {
@@ -1409,7 +1436,7 @@ func runRootFSCheck(path string) error {
 	if exitErr, ok := err.(*exec.ExitError); ok && e2fsckExitCodeAllowsContinue(exitErr.ExitCode()) {
 		return nil
 	}
-	return fmt.Errorf("check rootfs filesystem before resize: %w: %s", err, strings.TrimSpace(string(output)))
+	return fmt.Errorf("%s: %w: %s", context, err, strings.TrimSpace(string(output)))
 }
 
 func e2fsckExitCodeAllowsContinue(code int) bool {

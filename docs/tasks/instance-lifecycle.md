@@ -90,6 +90,15 @@ ssh srv restart <name>
 
 Stops and starts the VM in one command. Also picks up the current kernel and initrd.
 
+## Check the root filesystem
+
+```bash
+ssh srv stop <name>
+ssh srv fsck <name> && ssh srv start <name>
+```
+
+`fsck` runs `e2fsck -f -p` against the stopped VM's ext4 rootfs. It forces a full check and automatically repairs problems that can be fixed safely. Fatal or uncorrected filesystem errors make the command fail and leave the VM stopped.
+
 ## Delete
 
 ```bash

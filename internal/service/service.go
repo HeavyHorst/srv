@@ -759,6 +759,8 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 		return a.cmdIntegration(ctx, actor, req.args, req.format)
 	case "resize":
 		return a.cmdResize(ctx, actor, req.args, req.format)
+	case "fsck":
+		return a.cmdFSCK(ctx, actor, req.args, req.format)
 	case "backup":
 		return a.cmdBackup(ctx, actor, req.args, req.format)
 	case "list":
@@ -882,6 +884,33 @@ func (a *App) cmdResize(ctx context.Context, actor model.Actor, args []string, o
 		return jsonResult(commandActionJSON{Action: "resized", Instance: instanceSummaryPayload(a.cfg, inst, false)})
 	}
 	return commandResult{stdout: stdout, exitCode: 0}, nil
+}
+
+func (a *App) cmdFSCK(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
+	if len(args) != 2 {
+		err := errors.New("usage: fsck <name>")
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+	name := args[1]
+
+	unlock := a.lockInstance(name)
+	defer unlock()
+
+	if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
+		return missingInstanceResult("fsck", name, err)
+	}
+
+	inst, err := a.provisioner.CheckRootFS(ctx, name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = fmt.Errorf("instance %q does not exist", name)
+		}
+		return commandResult{stderr: fmt.Sprintf("fsck %s: %v\n", name, err), exitCode: 1}, err
+	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(commandActionJSON{Action: "checked", Instance: instanceSummaryPayload(a.cfg, inst, false)})
+	}
+	return commandResult{stdout: fmt.Sprintf("checked: %s\nstate: %s\n", inst.Name, inst.State), exitCode: 0}, nil
 }
 
 func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
@@ -2298,6 +2327,7 @@ func helpResult() commandResult {
 				{"stop <name>", "Stop a running instance."},
 				{"restart <name>", "Restart an instance."},
 				{"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
+				{"fsck <name>", "Force-check and repair a stopped instance's rootfs."},
 				{"delete <name>", "Delete an instance."},
 			},
 		},

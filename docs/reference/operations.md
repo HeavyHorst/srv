@@ -22,6 +22,13 @@ Hybrid memory pools are now part of the supported runtime model:
 
 Take backups from a quiesced host so `SRV_DATA_DIR` and the SQLite WAL state are self-consistent.
 
+Include `SRV_JAILER_BASE_DIR/.start-receipts` in the same backup and restore it
+with the database. These runner-owned launch records and tombstones fence delayed
+requests. They can live outside `SRV_DATA_DIR`; a data-directory snapshot alone
+does not capture them. Do not delete receipts to unblock a quarantined launch.
+For the archive command below, add the configured receipt directory as a path
+relative to `/` if it is not already covered by `var/lib/srv`.
+
 If you need a fast host-local point-in-time copy without shutting the control plane down first, use the built-in snapshot barrier instead:
 
 ```bash
@@ -133,6 +140,16 @@ That smoke pass is part of the supported restore workflow now, not an optional e
 
 ### Control Plane And Schema
 
+The launch-outcome protocol requires matching `srv` and `srv-vm-runner` binaries.
+Do not run the new control plane with an old helper or mix lifecycle writers.
+Stopping the runner can stop its guests: use an approved maintenance window.
+
+Cold enrollment also requires a rebuilt golden rootfs containing the updated
+`srv-bootstrap` script. It reports the guest's stable Tailscale node ID with a
+per-launch nonce over the serial channel. An old base image will leave new guests
+pending rather than accepting an unrelated same-name Tailscale record. Existing
+enrolled guests do not need an in-place rootfs update for warm starts.
+
 1. Take the quiesced backup above before starting the upgraded `srv` binary for the first time.
 2. Build and install the new `srv`, `srv-net-helper`, and `srv-vm-runner` binaries.
 3. If you also refreshed Firecracker, use the matching official static `firecracker` and `jailer` pair and verify `/etc/srv/srv.env` still points at those paths.
@@ -152,9 +169,15 @@ sudo ./contrib/smoke/host-smoke.sh
 
 Rollback for control-plane or schema regressions is restore-based:
 
+If rolling back from a version that records `stopping`, first finish pending
+stops with `ssh srv stop <name>` under that version. Older versions do not
+recognize the state and may automatically start those guests. Never mix old and
+new control-plane writers against the same database. Swapping only the binary
+is not a substitute for the restore-based procedure below.
+
 1. Stop the services.
 2. Reinstall the previous binaries and previous static Firecracker/jailer pair if those changed.
-3. Restore the pre-upgrade backup of `/etc/srv` and `SRV_DATA_DIR`.
+3. Restore the pre-upgrade backup of `/etc/srv`, `SRV_DATA_DIR`, and the matching runner receipt directory. Confirm no post-backup guest remains running before replacing state; never combine old database rows with newer runtime state.
 4. Restart the services.
 5. Run the same host smoke test again.
 

@@ -336,19 +336,15 @@ func (p *Provisioner) requireStoppedInstance(ctx context.Context, name string) (
 }
 
 func (p *Provisioner) requireExistingInstance(ctx context.Context, name string) (model.Instance, error) {
-	inst, err := p.store.GetInstance(ctx, name)
+	inst, err := p.ReconcileInstanceRuntime(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
 	}
 	if inst.State == model.StateDeleted {
 		return model.Instance{}, fmt.Errorf("instance %q is deleted", name)
 	}
-	if inst.FirecrackerPID != 0 && !processExists(inst.FirecrackerPID) {
-		inst.FirecrackerPID = 0
-		inst.UpdatedAt = time.Now().UTC()
-		if err := p.store.UpdateInstance(ctx, inst); err != nil {
-			return model.Instance{}, fmt.Errorf("clear stale firecracker pid for %q: %w", name, err)
-		}
+	if inst.State == model.StateStopping || inst.State == model.StateDeleting {
+		return model.Instance{}, fmt.Errorf("instance %q has unfinished lifecycle cleanup (%s)", name, inst.State)
 	}
 	if inst.RootFSPath == "" {
 		return model.Instance{}, fmt.Errorf("instance %q is missing a rootfs path", name)

@@ -8,6 +8,7 @@ import (
 const (
 	StateProvisioning    = "provisioning"
 	StateReady           = "ready"
+	StateStopping        = "stopping"
 	StateStopped         = "stopped"
 	StateFailed          = "failed"
 	StateAwaitingTailnet = "awaiting-tailnet"
@@ -58,6 +59,9 @@ type Instance struct {
 	GuestAddr       string
 	GatewayAddr     string
 	FirecrackerPID  int
+	StartRequestID  string
+	StartBootID     string
+	TailnetNodeID   string
 	TailscaleName   string
 	TailscaleIP     string
 	LastError       string

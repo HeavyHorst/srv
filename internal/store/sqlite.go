@@ -60,8 +60,8 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
-			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		inst.ID,
 		inst.Name,
@@ -92,6 +92,7 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 		inst.TailscaleIP,
 		inst.LastError,
 		nullableTime(inst.DeletedAt),
+		inst.StartRequestID, inst.StartBootID, inst.TailnetNodeID,
 	)
 	if err != nil {
 		return fmt.Errorf("insert instance: %w", err)
@@ -107,7 +108,7 @@ func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
 			rootfs_path = ?, kernel_path = ?, initrd_path = ?, socket_path = ?, log_path = ?,
 			serial_log_path = ?, tap_device = ?, guest_mac = ?, network_cidr = ?, host_addr = ?,
 			guest_addr = ?, gateway_addr = ?, firecracker_pid = ?, tailscale_name = ?,
-			tailscale_ip = ?, last_error = ?, deleted_at = ?
+			tailscale_ip = ?, last_error = ?, deleted_at = ?, start_request_id = ?, start_boot_id = ?, tailnet_node_id = ?
 		WHERE name = ?
 	`,
 		inst.State,
@@ -134,10 +135,34 @@ func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
 		inst.TailscaleIP,
 		inst.LastError,
 		nullableTime(inst.DeletedAt),
+		inst.StartRequestID, inst.StartBootID, inst.TailnetNodeID,
 		inst.Name,
 	)
 	if err != nil {
 		return fmt.Errorf("update instance %s: %w", inst.Name, err)
+	}
+	return nil
+}
+
+// UpdateInstanceRuntime changes only runtime fields, provided no lifecycle
+// writer has changed the observed instance. Callers must serialize all lifecycle
+// operations, including runtime reconciliation, for the entire observation.
+func (s *Store) UpdateInstanceRuntime(ctx context.Context, observed, updated model.Instance) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE instances SET state = ?, tailscale_name = ?, tailscale_ip = ?, last_error = ?, updated_at = ?, tailnet_node_id = ?, firecracker_pid = ?
+		WHERE id = ? AND name = ? AND state = ? AND firecracker_pid = ?
+		AND updated_at = ? AND tailscale_name = ? AND tailscale_ip = ? AND start_request_id = ? AND deleted_at IS NULL
+	`, updated.State, updated.TailscaleName, updated.TailscaleIP, updated.LastError, timeString(updated.UpdatedAt), updated.TailnetNodeID, updated.FirecrackerPID, observed.ID, observed.Name,
+		observed.State, observed.FirecrackerPID, timeString(observed.UpdatedAt), observed.TailscaleName, observed.TailscaleIP, observed.StartRequestID)
+	if err != nil {
+		return fmt.Errorf("complete tailnet readiness: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("instance %q changed during readiness verification; retry", observed.Name)
 	}
 	return nil
 }
@@ -148,7 +173,7 @@ func (s *Store) GetInstance(ctx context.Context, name string) (model.Instance, e
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
-			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at
+			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id
 		FROM instances
 		WHERE name = ?
 	`, name)
@@ -196,7 +221,7 @@ func (s *Store) ListInstances(ctx context.Context, includeDeleted bool) ([]model
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
-			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at
+			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id
 		FROM instances
 	`
 	if !includeDeleted {
@@ -651,6 +676,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		{name: "memory_mode", decl: "TEXT NOT NULL DEFAULT 'fixed'"},
 		{name: "memory_pool_id", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "rootfs_size_bytes", decl: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "start_request_id", decl: "TEXT NOT NULL DEFAULT ''"},
+		{name: "start_boot_id", decl: "TEXT NOT NULL DEFAULT ''"},
+		{name: "tailnet_node_id", decl: "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.ensureColumn(ctx, "instances", column.name, column.decl); err != nil {
 			return err
@@ -750,6 +778,7 @@ func scanInstance(scan func(dest ...any) error) (model.Instance, error) {
 		&inst.TailscaleIP,
 		&inst.LastError,
 		&deletedAt,
+		&inst.StartRequestID, &inst.StartBootID, &inst.TailnetNodeID,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Instance{}, err

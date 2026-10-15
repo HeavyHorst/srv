@@ -90,6 +90,7 @@ var errProcessExitTimeout = errors.New("process did not exit before timeout")
 type Bootstrap struct {
 	Version             int      `json:"version"`
 	Hostname            string   `json:"hostname"`
+	EnrollmentNonce     string   `json:"enrollment_nonce,omitempty"`
 	TailscaleAuthKey    string   `json:"tailscale_auth_key,omitempty"`
 	TailscaleControlURL string   `json:"tailscale_control_url,omitempty"`
 	TailscaleTags       []string `json:"tailscale_tags,omitempty"`
@@ -102,6 +103,9 @@ type Metadata struct {
 }
 
 type StartRequest struct {
+	InstanceID          string    `json:"instance_id"`
+	RequestID           string    `json:"request_id"`
+	HostBootID          string    `json:"host_boot_id"`
 	Name                string    `json:"name"`
 	TapDevice           string    `json:"tap_device"`
 	GuestMAC            string    `json:"guest_mac"`
@@ -118,12 +122,17 @@ type StartRequest struct {
 }
 
 type StartResponse struct {
-	PID int `json:"pid"`
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason"`
+	PID     int    `json:"pid"`
 }
 
 type StopRequest struct {
-	Name string `json:"name"`
-	PID  int    `json:"pid"`
+	InstanceID string `json:"instance_id"`
+	RequestID  string `json:"request_id"`
+	HostBootID string `json:"host_boot_id"`
+	Name       string `json:"name"`
+	PID        int    `json:"pid"`
 }
 
 type MetricsRequest struct {
@@ -174,6 +183,11 @@ func (c *Client) StartInstanceVM(ctx context.Context, req StartRequest) (StartRe
 	var resp StartResponse
 	if err := c.post(ctx, "/vm/start", req, &resp); err != nil {
 		return StartResponse{}, err
+	}
+	if req.RequestID != "" {
+		if err := validateStartResponse(resp); err != nil {
+			return StartResponse{}, err
+		}
 	}
 	return resp, nil
 }
@@ -343,6 +357,7 @@ func NewServerWithHandlers(logger *slog.Logger, cfg ServerConfig, start StartFun
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vm/start", s.handleStart)
+	mux.HandleFunc("/vm/start-result", s.handleStartResult)
 	mux.HandleFunc("/vm/stop", s.handleStop)
 	mux.HandleFunc("/vm/metrics", s.handleMetrics)
 	mux.HandleFunc("/pool/delete", s.handleDeleteMemoryPool)
@@ -364,15 +379,28 @@ func (s *Server) ServeUnix(ctx context.Context, socketPath, clientGroup string) 
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
+	shutdownDone := make(chan struct{})
+	var httpShutdownErr error // read only after shutdownDone closes
 	go func() {
-		<-ctx.Done()
+		defer close(shutdownDone)
+		<-workerCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = server.Shutdown(shutdownCtx)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			httpShutdownErr = fmt.Errorf("HTTP shutdown: %w", err)
+			s.log.Warn("HTTP shutdown timed out; closing active connections", "err", err)
+			_ = server.Close()
+		}
 		cancel()
 	}()
-	go s.runBalloonLoop(ctx)
+	balloonDone := make(chan struct{})
+	go func() { defer close(balloonDone); s.runBalloonLoop(workerCtx) }()
 
 	err = server.Serve(listener)
+	cancelWorkers()
+	<-shutdownDone
+	<-balloonDone
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -383,7 +411,7 @@ func (s *Server) ServeUnix(ctx context.Context, socketPath, clientGroup string) 
 			s.log.Warn("shutdown running vms before runner exit", "err", err)
 		}
 	}
-	return nil
+	return httpShutdownErr
 }
 
 func (s *Server) ShutdownRunningVMs(ctx context.Context) error {
@@ -665,7 +693,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
-	resp, err := s.start(r.Context(), req)
+	resp, err := s.receiptStart(r.Context(), req)
 	if err != nil {
 		s.log.Error("start vm", "name", req.Name, "err", err)
 		respondError(w, http.StatusInternalServerError, err)
@@ -691,7 +719,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.stop(r.Context(), req); err != nil {
+	if err := s.receiptStop(r.Context(), req); err != nil {
 		s.log.Error("stop vm", "name", req.Name, "pid", req.PID, "err", err)
 		respondError(w, http.StatusInternalServerError, err)
 		return
@@ -845,6 +873,10 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	if err != nil {
 		return StartResponse{}, fmt.Errorf("create firecracker machine: %w", err)
 	}
+	// The SDK's launcher registers an unconditional socket unlink on both
+	// initialization failure and process exit, outside our lifecycle lock. Own
+	// launch/reaping instead; only locked, identity-checked stop removes paths.
+	machine.Handlers.FcInit = machine.Handlers.FcInit.Swap(preserveRuntimeLaunchHandler(processRunner))
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Swap(prepareJailedRuntimeHandler(paths, jailerPaths, s.config.JailerGID))
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.NewSetMetadataHandler(Metadata{SRV: req.Bootstrap}))
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.Handler{
@@ -857,7 +889,12 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 		},
 	})
 
-	if err := machine.Start(vmCtx); err != nil {
+	// The SDK can launch before returning an error. Preserve all runtime paths
+	// from this point onward; an accepted receipt quarantines uncertain launches.
+	cleanupRuntime = false
+	initCtx, cancelInit := context.WithTimeout(ctx, launchInitializationTimeout)
+	defer cancelInit()
+	if err := machine.Start(initCtx); err != nil {
 		return StartResponse{}, fmt.Errorf("start firecracker machine: %w", err)
 	}
 	pid, err := machine.PID()
@@ -995,29 +1032,7 @@ func (s *Server) doFirecrackerAPIRequest(ctx context.Context, socketPath, method
 }
 
 func (s *Server) stopVM(ctx context.Context, req StopRequest) error {
-	var errs []error
-	if req.PID > 0 {
-		stoppedGracefully, err := s.tryGracefulStop(ctx, req)
-		if err != nil {
-			s.log.Warn("graceful guest shutdown failed; falling back to forced stop", "name", req.Name, "pid", req.PID, "err", err)
-		}
-		if !stoppedGracefully {
-			stop := forceStopProcess
-			if errors.Is(err, errProcessExitTimeout) {
-				stop = killProcessNow
-			}
-			if err := stop(req.PID); err != nil {
-				errs = append(errs, err)
-			}
-		}
-	}
-	if err := s.cleanupFirecrackerCgroup(req.Name); err != nil {
-		errs = append(errs, err)
-	}
-	if err := s.cleanupVMRuntime(req.Name); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return s.stopLegacyLocked(ctx, req.Name, req.PID)
 }
 
 func (s *Server) tryGracefulStop(ctx context.Context, req StopRequest) (bool, error) {
@@ -1094,32 +1109,20 @@ drainLoop:
 }
 
 func (s *Server) shutdownRunningVM(ctx context.Context, vm runningVM) error {
-	var errs []error
-	if stoppedGracefully, err := tryGracefulStopRunningVM(ctx, vm); err != nil {
-		s.log.Warn("graceful guest shutdown failed during runner exit; falling back to forced stop", "name", vm.Name, "pids", vm.PIDs, "err", err)
-		stop := forceStopProcess
-		if errors.Is(err, errProcessExitTimeout) {
-			stop = killProcessNow
-		}
-		for _, pid := range vm.PIDs {
-			if err := stop(pid); err != nil {
-				errs = append(errs, err)
-			}
-		}
-	} else if !stoppedGracefully {
-		for _, pid := range vm.PIDs {
-			if err := forceStopProcess(pid); err != nil {
-				errs = append(errs, err)
-			}
-		}
+	unlock, err := s.lockNameContext(ctx, vm.Name)
+	if err != nil {
+		return err
 	}
-	if err := cleanupFirecrackerCgroupPath(vm.Name, vm.CgroupPath); err != nil {
-		errs = append(errs, err)
+	defer unlock()
+	active, err := s.activeReceipt(vm.Name)
+	if err != nil {
+		return err
 	}
-	if err := s.cleanupVMRuntime(vm.Name); err != nil {
-		errs = append(errs, err)
+	if active != nil {
+		return s.stopReceiptLocked(ctx, *active)
 	}
-	return errors.Join(errs...)
+	// Enumeration predates the lock: never use its PIDs or cgroup path.
+	return s.stopLegacyLocked(ctx, vm.Name, 0)
 }
 
 func tryGracefulStopRunningVM(ctx context.Context, vm runningVM) (bool, error) {
@@ -1167,6 +1170,11 @@ func liveProcessPIDs(pids []int) []int {
 }
 
 func (r StartRequest) Validate() error {
+	if r.RequestID != "" {
+		if err := (StartResultRequest{r.Name, r.InstanceID, r.RequestID, r.HostBootID}).Validate(); err != nil {
+			return err
+		}
+	}
 	if !validName.MatchString(strings.TrimSpace(r.Name)) {
 		return fmt.Errorf("invalid instance name %q", r.Name)
 	}
@@ -1534,6 +1542,11 @@ func (s *Server) cleanupVMRuntime(name string) error {
 }
 
 func (r StopRequest) Validate() error {
+	if r.RequestID != "" {
+		if err := (StartResultRequest{r.Name, r.InstanceID, r.RequestID, r.HostBootID}).Validate(); err != nil {
+			return err
+		}
+	}
 	if !validName.MatchString(strings.TrimSpace(r.Name)) {
 		return fmt.Errorf("invalid instance name %q", r.Name)
 	}
@@ -1974,7 +1987,7 @@ func (s *Server) appendRunningVMsFromRoot(vms *[]runningVM, parent string) error
 		}
 		pids, err := readCgroupPIDs(filepath.Join(cgroupPath, "cgroup.procs"))
 		if err != nil {
-			if os.IsNotExist(err) {
+			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
 			return err

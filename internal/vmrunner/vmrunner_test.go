@@ -714,9 +714,10 @@ func TestVMContextForRequestIsDetached(t *testing.T) {
 	}
 }
 
-func TestStopVMUsesGracefulGuestShutdown(t *testing.T) {
+func TestStopVMRejectsUnverifiedLegacyPID(t *testing.T) {
 	server := newStopVMTestServer(t)
 	pid := startStopVMTestProcess(t)
+	writeRunningVMCgroup(t, filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service"), filepath.Join(firecrackerVMRootCgroupName, "demo"), pid)
 
 	oldRequest := requestGuestShutdown
 	oldWait := waitForProcessExit
@@ -751,20 +752,21 @@ func TestStopVMUsesGracefulGuestShutdown(t *testing.T) {
 		return nil
 	}
 
-	if err := server.stopVM(context.Background(), StopRequest{Name: "demo", PID: pid}); err != nil {
-		t.Fatalf("stopVM(): %v", err)
+	if err := server.stopVM(context.Background(), StopRequest{Name: "demo", PID: pid}); err == nil {
+		t.Fatal("unverified legacy stop succeeded")
 	}
-	if gotSocket != filepath.Join(server.config.InstancesDir, "demo", "firecracker.sock") {
-		t.Fatalf("requestGuestShutdown socket = %q", gotSocket)
+	if gotSocket != "" {
+		t.Fatalf("unverified socket contacted: %q", gotSocket)
 	}
-	if gotPID != pid {
-		t.Fatalf("waitForProcessExit pid = %d, want %d", gotPID, pid)
+	if gotPID != 0 || !processExists(pid) {
+		t.Fatal("unverified process touched")
 	}
 }
 
-func TestStopVMKillsImmediatelyAfterGracefulTimeout(t *testing.T) {
+func TestStopVMDoesNotForceUnverifiedLegacyPID(t *testing.T) {
 	server := newStopVMTestServer(t)
 	pid := startStopVMTestProcess(t)
+	writeRunningVMCgroup(t, filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service"), filepath.Join(firecrackerVMRootCgroupName, "demo"), pid)
 
 	oldRequest := requestGuestShutdown
 	oldWait := waitForProcessExit
@@ -793,11 +795,11 @@ func TestStopVMKillsImmediatelyAfterGracefulTimeout(t *testing.T) {
 		return nil
 	}
 
-	if err := server.stopVM(context.Background(), StopRequest{Name: "demo", PID: pid}); err != nil {
-		t.Fatalf("stopVM(): %v", err)
+	if err := server.stopVM(context.Background(), StopRequest{Name: "demo", PID: pid}); err == nil {
+		t.Fatal("unverified legacy stop succeeded")
 	}
-	if killedPID != pid {
-		t.Fatalf("killProcessNow pid = %d, want %d", killedPID, pid)
+	if killedPID != 0 || !processExists(pid) {
+		t.Fatal("unverified process signaled")
 	}
 }
 
@@ -835,12 +837,14 @@ func TestListRunningVMsEnumeratesFixedAndPooledCgroups(t *testing.T) {
 
 func TestShutdownRunningVMsDrainsInParallelWithConcurrencyLimit(t *testing.T) {
 	server, _, serviceCgroup := newRunnerShutdownTestServer(t)
+	server.config.InstancesDir = shortReceiptDir(t)
+	pids := make(map[string]int)
 	const vmCount = runnerShutdownConcurrency + 4
 	for i := range vmCount {
 		name := "vm-" + strconv.Itoa(i)
-		pid := startStopVMTestProcess(t)
+		pid := startReceiptSocketProcess(t, server.config, name)
+		pids[filepath.Join(server.config.InstancesDir, name, "firecracker.sock")] = pid
 		writeRunningVMCgroup(t, serviceCgroup, filepath.Join(firecrackerVMRootCgroupName, name), pid)
-		writeInstanceDir(t, server.config.InstancesDir, name)
 	}
 
 	oldRequest := requestGuestShutdown
@@ -861,7 +865,7 @@ func TestShutdownRunningVMsDrainsInParallelWithConcurrencyLimit(t *testing.T) {
 	var mu sync.Mutex
 	active := 0
 	maxActive := 0
-	requestGuestShutdown = func(context.Context, string) error {
+	requestGuestShutdown = func(_ context.Context, path string) error {
 		mu.Lock()
 		active++
 		if active > maxActive {
@@ -873,7 +877,7 @@ func TestShutdownRunningVMsDrainsInParallelWithConcurrencyLimit(t *testing.T) {
 		mu.Lock()
 		active--
 		mu.Unlock()
-		return nil
+		return syscall.Kill(pids[path], syscall.SIGKILL)
 	}
 	waitForProcessExit = func(int, time.Duration) error { return nil }
 	forceStopProcess = func(pid int) error {
@@ -886,10 +890,9 @@ func TestShutdownRunningVMsDrainsInParallelWithConcurrencyLimit(t *testing.T) {
 	}
 	removePath = func(path string) error { return os.RemoveAll(path) }
 
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		server.shutdownRunningVMs(context.Background())
-		close(done)
+		done <- server.shutdownRunningVMs(context.Background())
 	}()
 	for range runnerShutdownConcurrency {
 		select {
@@ -905,7 +908,10 @@ func TestShutdownRunningVMsDrainsInParallelWithConcurrencyLimit(t *testing.T) {
 	}
 	close(release)
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdownRunningVMs(): %v", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("shutdownRunningVMs() did not finish")
 	}
@@ -914,7 +920,7 @@ func TestShutdownRunningVMsDrainsInParallelWithConcurrencyLimit(t *testing.T) {
 	}
 }
 
-func TestShutdownRunningVMKillsImmediatelyAfterGracefulTimeout(t *testing.T) {
+func TestShutdownRunningVMRejectsUnverifiedRuntime(t *testing.T) {
 	server, _, serviceCgroup := newRunnerShutdownTestServer(t)
 	pid := startStopVMTestProcess(t)
 	writeRunningVMCgroup(t, serviceCgroup, filepath.Join(firecrackerVMRootCgroupName, "demo"), pid)
@@ -951,15 +957,15 @@ func TestShutdownRunningVMKillsImmediatelyAfterGracefulTimeout(t *testing.T) {
 		CgroupPath: filepath.Join(serviceCgroup, firecrackerVMRootCgroupName, "demo"),
 		SocketPath: filepath.Join(server.config.InstancesDir, "demo", "firecracker.sock"),
 		PIDs:       []int{pid},
-	}); err != nil {
-		t.Fatalf("shutdownRunningVM(): %v", err)
+	}); err == nil {
+		t.Fatal("unverified drain succeeded")
 	}
-	if killedPID != pid {
-		t.Fatalf("killProcessNow pid = %d, want %d", killedPID, pid)
+	if killedPID != 0 || !processExists(pid) {
+		t.Fatal("unverified process signaled")
 	}
 }
 
-func TestShutdownRunningVMCleansDiscoveredCgroupPath(t *testing.T) {
+func TestShutdownRunningVMPreservesUnverifiedCgroupPath(t *testing.T) {
 	server, _, serviceCgroup := newRunnerShutdownTestServer(t)
 	pid := startStopVMTestProcess(t)
 	fixedCgroup := filepath.Join(serviceCgroup, firecrackerVMRootCgroupName, "demo")
@@ -1002,11 +1008,11 @@ func TestShutdownRunningVMCleansDiscoveredCgroupPath(t *testing.T) {
 		CgroupPath: pooledCgroup,
 		SocketPath: filepath.Join(server.config.InstancesDir, "demo", "firecracker.sock"),
 		PIDs:       []int{pid},
-	}); err != nil {
-		t.Fatalf("shutdownRunningVM(): %v", err)
+	}); err == nil {
+		t.Fatal("unverified drain succeeded")
 	}
-	if !reflect.DeepEqual(removed, []string{pooledCgroup}) {
-		t.Fatalf("removed cgroups = %#v, want only discovered pooled cgroup %q", removed, pooledCgroup)
+	if len(removed) != 0 {
+		t.Fatalf("removed unverified cgroups: %#v", removed)
 	}
 	if _, err := os.Stat(fixedCgroup); err != nil {
 		t.Fatalf("stale fixed cgroup should not be removed: %v", err)

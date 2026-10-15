@@ -450,11 +450,19 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 }
 
 func (a *App) lockInstance(name string) func() {
+	return a.acquireInstance(name, true)
+}
+
+func (a *App) acquireInstance(name string, wait bool) func() {
 	a.lockMu.Lock()
 	if a.locks == nil {
 		a.locks = make(map[string]*instanceLockEntry)
 	}
 	entry := a.locks[name]
+	if entry != nil && !wait {
+		a.lockMu.Unlock()
+		return nil
+	}
 	if entry == nil {
 		entry = &instanceLockEntry{}
 		a.locks[name] = entry
@@ -509,6 +517,7 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("open tailscale local api client: %w", err)
 	}
+	a.provisioner.SetLocalClient(a.localAPI)
 
 	listener, err := a.tailscale.Listen("tcp", a.cfg.ListenAddr)
 	if err != nil {
@@ -525,6 +534,11 @@ func (a *App) Run(ctx context.Context) error {
 		},
 	}
 
+	// Admit startup mutations before SSH can admit a snapshot command.
+	startupLease, err := a.beginCommand()
+	if err != nil {
+		return err
+	}
 	g, groupCtx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		err := a.sshServer.Serve(listener)
@@ -535,6 +549,8 @@ func (a *App) Run(ctx context.Context) error {
 	})
 	g.Go(func() error {
 		a.restoreInstances(groupCtx)
+		startupLease.Release()
+		a.runReconciliation(groupCtx)
 		return nil
 	})
 	g.Go(func() error {
@@ -573,12 +589,70 @@ func (a *App) Run(ctx context.Context) error {
 
 func (a *App) restoreInstances(ctx context.Context) {
 	a.mu.Lock()
-	err := a.provisioner.RestoreInstances(ctx)
+	instances, err := a.store.ListInstances(ctx, false)
+	if err == nil {
+		for _, inst := range instances {
+			if ctx.Err() != nil {
+				break
+			}
+			unlock := a.lockInstance(inst.Name)
+			restoreErr := a.provisioner.RestoreInstance(ctx, inst.Name)
+			unlock()
+			if restoreErr != nil {
+				a.log.Error("restore instance on startup", "name", inst.Name, "err", restoreErr)
+			}
+		}
+	}
 	a.mu.Unlock()
 	a.syncManagedGatewaysBestEffort()
 	if err != nil && ctx.Err() == nil {
 		a.log.Error("restore instances on startup", "err", err)
 	}
+}
+
+// Background work participates in the snapshot barrier and never queues behind
+// a busy instance. Each guest gets a bounded attempt, then yields to commands.
+func (a *App) runReconciliation(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.reconcileInstances(ctx)
+		}
+	}
+}
+
+func (a *App) reconcileInstances(ctx context.Context) {
+	instances, err := a.store.ListInstances(ctx, false)
+	if err != nil {
+		return
+	}
+	for _, candidate := range instances {
+		if ctx.Err() != nil {
+			return
+		}
+		lease, err := a.beginCommand()
+		if err != nil {
+			return
+		} // A snapshot owns the mutation barrier.
+		unlock := a.acquireInstance(candidate.Name, false)
+		if unlock == nil {
+			lease.Release()
+			continue
+		}
+		attempt, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err = a.provisioner.ReconcileInstance(attempt, candidate.Name)
+		cancel()
+		unlock()
+		lease.Release()
+		if err != nil && ctx.Err() == nil {
+			a.log.Warn("background instance reconciliation", "name", candidate.Name, "err", err)
+		}
+	}
+	a.syncManagedGatewaysBestEffort()
 }
 
 func (a *App) handleSession(sess gssh.Session) {
@@ -811,6 +885,8 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string, outF
 		a.syncManagedGatewaysBestEffort()
 	}()
 
+	unlock := a.lockInstance(name)
+	defer unlock()
 	inst, err := a.provisioner.Create(ctx, name, actor, opts)
 	if err != nil {
 		stderr := fmt.Sprintf("create %s: %v\n", name, err)
@@ -1010,8 +1086,20 @@ func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string, o
 
 func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFormat) (commandResult, error) {
 	if a.provisioner != nil {
-		if err := a.provisioner.ReconcileInstancesRuntime(ctx); err != nil {
+		candidates, err := a.store.ListInstances(ctx, false)
+		if err != nil {
 			return commandResult{stderr: fmt.Sprintf("reconcile instances: %v\n", err), exitCode: 1}, err
+		}
+		for _, inst := range candidates {
+			if err := ctx.Err(); err != nil {
+				return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
+			}
+			unlock := a.lockInstance(inst.Name)
+			_, err := a.provisioner.ReconcileInstanceRuntime(ctx, inst.Name)
+			unlock()
+			if err != nil {
+				a.log.Warn("reconcile instance runtime", "name", inst.Name, "err", err)
+			}
 		}
 	}
 	instances, err := a.store.ListInstances(ctx, false)
@@ -1075,6 +1163,8 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
+	unlock := a.lockInstance(args[1])
+	defer unlock()
 	inst, err := a.lookupVisibleInstance(ctx, actor, args[1])
 	if err != nil {
 		return missingInstanceResult("inspect", args[1], err)
@@ -1693,7 +1783,7 @@ func buildTopSummary(snapshot topSnapshot, prev *topSnapshot) string {
 			running++
 		case model.StateStopped:
 			stopped++
-		case model.StateProvisioning, model.StateAwaitingTailnet, model.StateDeleting:
+		case model.StateProvisioning, model.StateAwaitingTailnet, model.StateDeleting, model.StateStopping:
 			transition++
 		case model.StateFailed:
 			failed++
@@ -2323,7 +2413,7 @@ func helpResult() commandResult {
 				{"new <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]", "Create a new microvm instance."},
 				{"list", "List all instances."},
 				{"inspect <name>", "Show instance details and recent events."},
-				{"start <name>", "Start a stopped instance."},
+				{"start <name>", "Start a stopped instance or recheck a running awaiting-tailnet instance."},
 				{"stop <name>", "Stop a running instance."},
 				{"restart <name>", "Restart an instance."},
 				{"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
@@ -3302,7 +3392,7 @@ func missingInstanceResult(command, name string, err error) (commandResult, erro
 
 func inspectDebugHint(inst model.Instance) string {
 	if inst.State == model.StateAwaitingTailnet {
-		return "guest has not finished initial tailnet bootstrap; start with the serial log"
+		return "tailnet readiness is unconfirmed; check the serial log, then retry start to verify the existing guest"
 	}
 	if inst.State == model.StateFailed || inst.LastError != "" {
 		return "boot and runtime failures usually show up first in the serial log, then in the Firecracker log"

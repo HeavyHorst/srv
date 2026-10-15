@@ -23,6 +23,7 @@ func TestStoreInstanceRoundTripAndListFiltering(t *testing.T) {
 	deletedAt := createdAt.Add(10 * time.Minute)
 
 	ready := testInstance("alpha", model.StateReady, createdAt)
+	ready.StartRequestID, ready.StartBootID, ready.TailnetNodeID = "attempt-one", "boot-one", "node-one"
 	deleted := testInstance("beta", model.StateDeleted, createdAt.Add(time.Minute))
 	deleted.UpdatedAt = updatedAt
 	deleted.DeletedAt = &deletedAt
@@ -67,6 +68,7 @@ func TestStoreInstanceRoundTripAndListFiltering(t *testing.T) {
 	ready.FirecrackerPID = 1234
 	ready.TailscaleName = "alpha.tailnet"
 	ready.TailscaleIP = "100.64.0.10"
+	ready.StartRequestID, ready.StartBootID, ready.TailnetNodeID = "attempt-two", "boot-two", "node-two"
 	if err := s.UpdateInstance(ctx, ready); err != nil {
 		t.Fatalf("UpdateInstance(%q): %v", ready.Name, err)
 	}
@@ -77,6 +79,57 @@ func TestStoreInstanceRoundTripAndListFiltering(t *testing.T) {
 	}
 	if !reflect.DeepEqual(updated, ready) {
 		t.Fatalf("updated instance mismatch\nwant: %#v\n got: %#v", ready, updated)
+	}
+}
+
+func TestReadinessUpdateRejectsChangedRuntime(t *testing.T) {
+	for _, change := range []string{"none", "stopped", "new-pid", "new-incarnation", "new-attempt", "new-address", "deleted"} {
+		t.Run(change, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			observed := testInstance("alpha", model.StateAwaitingTailnet, time.Now().UTC())
+			observed.FirecrackerPID = 123
+			observed.TailscaleIP = "100.64.0.10"
+			if err := s.CreateInstance(ctx, observed); err != nil {
+				t.Fatal(err)
+			}
+			current := observed
+			switch change {
+			case "stopped":
+				current.State, current.FirecrackerPID = model.StateStopped, 0
+			case "new-pid":
+				current.FirecrackerPID = 456
+			case "new-attempt":
+				current.StartRequestID = "another-attempt"
+			case "new-incarnation":
+				current.UpdatedAt = current.UpdatedAt.Add(time.Nanosecond)
+			case "new-address":
+				current.TailscaleIP = "100.64.0.20"
+			case "deleted":
+				current.State, current.DeletedAt = model.StateDeleted, &current.UpdatedAt
+			}
+			if err := s.UpdateInstance(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			updated := observed
+			updated.State, updated.LastError = model.StateReady, ""
+			updated.UpdatedAt = observed.UpdatedAt.Add(time.Second)
+			updated.KernelPath = "must-not-overwrite-unrelated-fields"
+			err := s.UpdateInstanceRuntime(ctx, observed, updated)
+			if (err == nil) != (change == "none") {
+				t.Fatalf("unexpected CAS result: %v", err)
+			}
+			got, err := s.GetInstance(ctx, observed.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if change == "none" {
+				current.State, current.UpdatedAt, current.LastError = updated.State, updated.UpdatedAt, ""
+			}
+			if !reflect.DeepEqual(got, current) {
+				t.Fatalf("readiness changed unexpected fields: got %#v, want %#v", got, current)
+			}
+		})
 	}
 }
 

@@ -12,6 +12,8 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,6 +25,9 @@ import (
 
 	"hegel.dev/go/hegel"
 	"tailscale.com/client/tailscale/v2"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 
 	"srv/internal/config"
 	"srv/internal/format"
@@ -1518,7 +1523,7 @@ func TestWaitForTailnetJoinFailsFastWhenGuestProcessExits(t *testing.T) {
 	})
 	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 
-	_, _, err := p.waitForTailnetJoin(context.Background(), "demo", math.MaxInt32)
+	_, _, err := p.waitForTailnetJoinAfter(context.Background(), "demo", math.MaxInt32, tailnetDeviceSnapshot{}, false)
 	if !errors.Is(err, errGuestExited) {
 		t.Fatalf("waitForTailnetJoin() error = %v, want %v", err, errGuestExited)
 	}
@@ -2034,6 +2039,7 @@ func TestStartReconcilesLateTailnetJoinForRunningInstance(t *testing.T) {
 	t.Cleanup(func() { listTailnetDevices = oldListTailnetDevices })
 	listTailnetDevices = func(context.Context, *tailscale.Client) ([]tailscale.Device, error) {
 		return []tailscale.Device{{
+			NodeID:    "node-demo",
 			Hostname:  "demo",
 			Name:      "demo.tailnet.ts.net",
 			Addresses: []string{"100.64.0.10"},
@@ -2043,14 +2049,28 @@ func TestStartReconcilesLateTailnetJoinForRunningInstance(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st, tsClient: &tailscale.Client{}}
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st, tsClient: &tailscale.Client{}, localClient: &readinessTestClient{}, vmRunner: panicVMRunner{t}}
 	inst := provisionTestInstance(cfg, "demo", model.StateAwaitingTailnet, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.SocketPath = readinessTestSocket(t)
 	inst.FirecrackerPID = os.Getpid()
+	inst.TailscaleName = "demo"
+	inst.TailscaleIP = "100.64.0.10"
 	inst.LastError = errGuestNotReady.Error()
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
+	wrongRuntime := inst
+	wrongRuntime.FirecrackerPID = os.Getppid()
+	if err := st.UpdateInstance(ctx, wrongRuntime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Start(ctx, "demo"); err == nil {
+		t.Fatal("accepted an API socket belonging to a different runtime")
+	}
+	if err := st.UpdateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
 	got, err := p.Start(ctx, "demo")
 	if err != nil {
 		t.Fatalf("Start(): %v", err)
@@ -2074,6 +2094,401 @@ func TestStartReconcilesLateTailnetJoinForRunningInstance(t *testing.T) {
 	}
 	if stored.State != model.StateReady || stored.TailscaleName != "demo" || stored.TailscaleIP != "100.64.0.10" {
 		t.Fatalf("stored instance = %#v", stored)
+	}
+}
+
+func TestWarmStartReadinessAndRecovery(t *testing.T) {
+	for _, scenario := range []string{"unchanged-last-seen", "lost-start-response", "unknown-start", "probe-timeout", "cancel-after-boot", "cancel-node-only-start", "cancel-node-only-reconcile", "cancel-during-probe", "api-error", "wrong-node", "duplicate-name", "ping-error-result", "wrong-peer", "address-mismatch", "key-change"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cfg := loadProvisionTestConfig(t, map[string]string{"SRV_GUEST_READY_TIMEOUT": "40ms"})
+			cfg.OutboundInterface = "eth0"
+			st := newProvisionTestStore(t, cfg)
+			inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Now().UTC())
+			inst.TailscaleName, inst.TailscaleIP = "demo", "100.64.0.10"
+			if strings.HasPrefix(scenario, "cancel-node-only") {
+				inst.TailscaleName, inst.TailscaleIP = "", ""
+			}
+			inst.InitrdPath = ""
+			inst.SocketPath = readinessTestSocket(t)
+			for _, path := range []string{inst.RootFSPath, inst.KernelPath} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("fixture"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			booted, recover := false, false
+			oldList := listTailnetDevices
+			t.Cleanup(func() { listTailnetDevices = oldList })
+			listTailnetDevices = func(context.Context, *tailscale.Client) ([]tailscale.Device, error) {
+				if booted && !recover && scenario == "api-error" {
+					return nil, errors.New("control API unavailable")
+				}
+				device := tailscale.Device{NodeID: "node-demo", Hostname: "demo", Addresses: []string{"100.64.0.10"}, LastSeen: &tailscale.Time{Time: time.Unix(123, 0)}}
+				if booted && scenario != "unchanged-last-seen" {
+					device.LastSeen = &tailscale.Time{Time: time.Unix(456, 0)}
+				}
+				if booted && !recover && scenario == "duplicate-name" {
+					return []tailscale.Device{device, device}, nil
+				}
+				if booted && !recover && scenario == "wrong-node" {
+					device.NodeID = "another-node"
+				}
+				return []tailscale.Device{device}, nil
+			}
+			client := &readinessTestClient{}
+			if scenario == "ping-error-result" {
+				client.ping = func(context.Context, netip.Addr) (*ipnstate.PingResult, error) {
+					return &ipnstate.PingResult{IP: "100.64.0.10", NodeIP: "100.64.0.10", Err: "no matching peer"}, nil
+				}
+			}
+			if scenario == "wrong-peer" || scenario == "address-mismatch" || scenario == "key-change" {
+				calls := 0
+				client.status = func() (*ipnstate.Status, error) {
+					status, _ := (&readinessTestClient{}).Status(context.Background())
+					calls++
+					for _, peer := range status.Peer {
+						switch scenario {
+						case "wrong-peer":
+							peer.ID = "another-node"
+						case "address-mismatch":
+							peer.TailscaleIPs = []netip.Addr{netip.MustParseAddr("100.64.0.11")}
+						case "key-change":
+							if calls > 1 {
+								peer.PublicKey = key.NewNode().Public()
+							}
+						}
+					}
+					return status, nil
+				}
+			}
+			if scenario == "probe-timeout" || scenario == "cancel-during-probe" {
+				client.ping = func(probeCtx context.Context, _ netip.Addr) (*ipnstate.PingResult, error) {
+					if scenario == "cancel-during-probe" {
+						cancel()
+					}
+					<-probeCtx.Done()
+					return nil, probeCtx.Err()
+				}
+			}
+			runner := readinessStartRunner{panicVMRunner: panicVMRunner{t}, lostResponse: scenario == "lost-start-response" || scenario == "unknown-start", unknown: func() bool { return scenario == "unknown-start" && !recover }, start: func() {
+				if booted {
+					t.Fatal("recovery attempted a second boot")
+				}
+				booted = true
+				if scenario == "cancel-after-boot" || strings.HasPrefix(scenario, "cancel-node-only") {
+					cancel()
+				}
+			}}
+			p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st, tsClient: &tailscale.Client{}, localClient: client, networkHelper: noopNetworkHelper{}, vmRunner: runner, readHostMemoryBytes: func() (int64, error) { return 64 << 30, nil }}
+			_, err := p.Start(ctx, inst.Name)
+			if scenario == "unchanged-last-seen" || scenario == "lost-start-response" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("unverified guest was marked ready")
+				}
+				if strings.HasPrefix(scenario, "cancel-") && !errors.Is(err, context.Canceled) {
+					t.Fatalf("lost cancellation cause: %v", err)
+				}
+				pending, readErr := st.GetInstance(context.Background(), inst.Name)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				wantState, wantPID := model.StateAwaitingTailnet, os.Getpid()
+				if scenario == "unknown-start" {
+					wantState, wantPID = model.StateProvisioning, 0
+				}
+				if pending.State != wantState || pending.FirecrackerPID != wantPID || pending.LastError == "" || pending.StartRequestID == "" || pending.StartBootID == "" {
+					t.Fatalf("lost pending runtime: %#v", pending)
+				}
+				if _, err := os.Stat(inst.RootFSPath); err != nil {
+					t.Fatalf("lost guest disk: %v", err)
+				}
+				recover = true
+				client.ping = nil
+				client.status = nil
+				var recovered model.Instance
+				if scenario == "cancel-node-only-reconcile" {
+					recovered, err = p.ReconcileInstance(context.Background(), inst.Name)
+				} else {
+					recovered, err = p.Start(context.Background(), inst.Name)
+				}
+				if err != nil {
+					t.Fatalf("recover: %v", err)
+				}
+				if recovered.StartRequestID != pending.StartRequestID {
+					t.Fatal("recovery replaced the launch attempt")
+				}
+			}
+			ready, err := st.GetInstance(context.Background(), inst.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ready.State != model.StateReady || ready.FirecrackerPID != os.Getpid() || ready.LastError != "" || ready.TailscaleIP != "100.64.0.10" {
+				t.Fatalf("unexpected ready state: %#v", ready)
+			}
+		})
+	}
+}
+
+func TestColdReadinessRequiresThisGuestsEnrollment(t *testing.T) {
+	oldList := listTailnetDevices
+	t.Cleanup(func() { listTailnetDevices = oldList })
+	listTailnetDevices = func(context.Context, *tailscale.Client) ([]tailscale.Device, error) {
+		return []tailscale.Device{{NodeID: "node-demo", Hostname: "demo", Addresses: []string{"100.64.0.10"}}}, nil
+	}
+	for _, scenario := range []string{"matching", "old-nonce", "wrong-node", "missing", "conflicting"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := loadProvisionTestConfig(t, map[string]string{"SRV_GUEST_READY_TIMEOUT": "20ms"})
+			st := newProvisionTestStore(t, cfg)
+			inst := provisionTestInstance(cfg, "demo", model.StateAwaitingTailnet, time.Now().UTC())
+			inst.SocketPath, inst.FirecrackerPID = readinessTestSocket(t), os.Getpid()
+			inst.StartRequestID, inst.StartBootID = "this-attempt", "test-boot"
+			inst.TailscaleName, inst.TailscaleIP = "", ""
+			inst.SerialLogPath = filepath.Join(t.TempDir(), "serial.log")
+			nonce, node := "this-attempt", "node-demo"
+			if scenario == "old-nonce" {
+				nonce = "old-attempt"
+			}
+			if scenario == "wrong-node" {
+				node = "other-node"
+			}
+			report := fmt.Sprintf("srv-enrollment: {\"nonce\":%q,\"node_id\":%q}\n", nonce, node)
+			if scenario == "missing" {
+				report = "guest booted\n"
+			}
+			if scenario == "conflicting" {
+				report += "srv-enrollment: {\"nonce\":\"this-attempt\",\"node_id\":\"other-node\"}\n"
+			}
+			if err := os.WriteFile(inst.SerialLogPath, []byte(report), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			runner := readinessStartRunner{panicVMRunner: panicVMRunner{t}, start: func() { t.Fatal("pending cold guest rebooted") }}
+			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: runner, tsClient: &tailscale.Client{}, localClient: &readinessTestClient{}}
+			_, err := p.ReconcileInstance(ctx, inst.Name)
+			if (err == nil) != (scenario == "matching") {
+				t.Fatalf("unexpected readiness: %v", err)
+			}
+			got, err := st.GetInstance(ctx, inst.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := model.StateAwaitingTailnet
+			if scenario == "matching" {
+				want = model.StateReady
+			}
+			if got.State != want || got.FirecrackerPID != os.Getpid() {
+				t.Fatalf("unexpected state: %#v", got)
+			}
+			if scenario == "matching" && got.TailnetNodeID != "node-demo" {
+				t.Fatal("enrollment identity was not saved")
+			}
+		})
+	}
+}
+
+func TestFailedShutdownPreservesGuestOnDeleteAndRestore(t *testing.T) {
+	for _, operation := range []string{"delete", "restore"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := loadProvisionTestConfig(t, nil)
+			st := newProvisionTestStore(t, cfg)
+			inst := provisionTestInstance(cfg, "demo", model.StateReady, time.Now().UTC())
+			inst.FirecrackerPID = os.Getpid()
+			if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(inst.RootFSPath, []byte("guest-data"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(inst.SerialLogPath, []byte("reboot: Power off not available: System halted instead\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: readinessStopRunner{panicVMRunner{t}}, networkHelper: panicNetworkHelper{t}}
+			var err error
+			if operation == "delete" {
+				_, err = p.Delete(ctx, inst.Name)
+			} else {
+				err = p.RestoreInstance(ctx, inst.Name)
+			}
+			if err == nil {
+				t.Fatal("failed shutdown reported success")
+			}
+			got, err := st.GetInstance(ctx, inst.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := model.StateStopping
+			if operation == "delete" {
+				want = model.StateDeleting
+			}
+			if got.State != want || got.FirecrackerPID != inst.FirecrackerPID {
+				t.Fatalf("runtime forgotten: %#v", got)
+			}
+			data, err := os.ReadFile(inst.RootFSPath)
+			if err != nil || string(data) != "guest-data" {
+				t.Fatalf("guest disk changed: %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestReconciliationRetriesCleanupWithoutReleasingGuest(t *testing.T) {
+	for _, intent := range []string{model.StateReady, model.StateStopping, model.StateDeleting} {
+		t.Run(intent, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := loadProvisionTestConfig(t, nil)
+			st := newProvisionTestStore(t, cfg)
+			inst := provisionTestInstance(cfg, "demo", intent, time.Now().UTC())
+			inst.FirecrackerPID = math.MaxInt32
+			if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(inst.RootFSPath, []byte("preserve-me"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: noopVMRunner{}, networkHelper: failingCleanupNetworkHelper{}}
+			if _, err := p.ReconcileInstance(ctx, inst.Name); err == nil {
+				t.Fatal("failed cleanup reported success")
+			}
+			pending, err := st.GetInstance(ctx, inst.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantPending := model.StateStopping
+			if intent == model.StateDeleting {
+				wantPending = intent
+			}
+			if pending.State != wantPending || pending.FirecrackerPID != inst.FirecrackerPID {
+				t.Fatalf("cleanup intent lost: %#v", pending)
+			}
+			if _, err := p.CreateBackup(ctx, inst.Name); err == nil {
+				t.Fatal("backup bypassed incomplete lifecycle cleanup")
+			}
+			if data, err := os.ReadFile(inst.RootFSPath); err != nil || string(data) != "preserve-me" {
+				t.Fatalf("disk changed: %q %v", data, err)
+			}
+			p.networkHelper = noopNetworkHelper{}
+			got, err := p.ReconcileInstance(ctx, inst.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := model.StateStopped
+			if intent == model.StateDeleting {
+				want = model.StateDeleted
+			}
+			if got.State != want || got.FirecrackerPID != 0 {
+				t.Fatalf("cleanup not completed: %#v", got)
+			}
+			if _, err := p.ReconcileInstance(ctx, inst.Name); err != nil {
+				t.Fatalf("repeat reconcile: %v", err)
+			}
+		})
+	}
+}
+
+type failingCleanupNetworkHelper struct{ noopNetworkHelper }
+
+func (failingCleanupNetworkHelper) CleanupInstanceNetwork(context.Context, nethelper.CleanupRequest) error {
+	return errors.New("network helper unavailable")
+}
+
+func TestInterruptedStopCannotBePromotedOrAutoStarted(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	inst := provisionTestInstance(cfg, "demo", model.StateAwaitingTailnet, time.Now().UTC())
+	inst.FirecrackerPID = os.Getpid()
+	inst.TailscaleName, inst.TailscaleIP = "demo", "100.64.0.10"
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: readinessStopRunner{panicVMRunner{t}}, networkHelper: panicNetworkHelper{t}}
+	if _, err := p.Stop(ctx, inst.Name); err == nil {
+		t.Fatal("failed shutdown reported success")
+	}
+	pending, err := st.GetInstance(ctx, inst.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.State != model.StateStopping || pending.FirecrackerPID != inst.FirecrackerPID || pending.LastError == "" {
+		t.Fatalf("lost stop intent/runtime: %#v", pending)
+	}
+	p.vmRunner = panicVMRunner{t}
+	if _, err := p.Start(ctx, inst.Name); err == nil {
+		t.Fatal("start overrode stop intent")
+	}
+	// Even after the old process exits, inspect and startup must leave the
+	// unfinished helper cleanup for an explicit stop retry.
+	pending.FirecrackerPID = 1 << 30
+	if err := st.UpdateInstance(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ReconcileInstanceRuntime(ctx, inst.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RestoreInstance(ctx, inst.Name); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Start(ctx, inst.Name); err == nil {
+		t.Fatal("exited runtime erased stop intent")
+	}
+	got, err := st.GetInstance(ctx, inst.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, pending) {
+		t.Fatalf("stop intent changed: %#v", got)
+	}
+	allocatedMemory := func() int64 {
+		t.Helper()
+		summary, err := p.CapacitySummary(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, resource := range summary.Capacity {
+			if resource.Resource == "memory" {
+				return resource.Allocated
+			}
+		}
+		t.Fatal("capacity summary omitted memory")
+		return 0
+	}
+	if allocatedMemory() == 0 {
+		t.Fatal("unfinished stop released its memory reservation")
+	}
+	p.vmRunner, p.networkHelper = noopVMRunner{}, noopNetworkHelper{}
+	if _, err := p.Stop(ctx, inst.Name); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetInstance(ctx, inst.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.StateStopped || got.FirecrackerPID != 0 || got.LastError != "" {
+		t.Fatalf("stop retry did not finish: %#v", got)
+	}
+	if allocatedMemory() != 0 {
+		t.Fatal("completed stop retained its memory reservation")
 	}
 }
 
@@ -2732,31 +3147,6 @@ func TestEnsureHostDiskCapacityCountsDeletedInstancesStillPresentInStore(t *test
 	}
 }
 
-func TestDeviceUpdatedSince(t *testing.T) {
-	tsTime := func(value string) *tailscale.Time {
-		t.Helper()
-		parsed, err := time.Parse(time.RFC3339, value)
-		if err != nil {
-			t.Fatalf("time.Parse(%q): %v", value, err)
-		}
-		return &tailscale.Time{Time: parsed}
-	}
-
-	previous := tailnetDeviceSnapshot{DeviceID: "device-1", LastSeen: "2026-03-29T12:00:00Z"}
-	if deviceUpdatedSince(tailscale.Device{NodeID: "device-1", LastSeen: tsTime(previous.LastSeen)}, previous, true) {
-		t.Fatalf("deviceUpdatedSince() reported unchanged device as updated")
-	}
-	if !deviceUpdatedSince(tailscale.Device{NodeID: "device-1", LastSeen: tsTime("2026-03-29T12:01:00Z")}, previous, true) {
-		t.Fatalf("deviceUpdatedSince() should treat newer last-seen as updated")
-	}
-	if !deviceUpdatedSince(tailscale.Device{NodeID: "device-2", LastSeen: tsTime(previous.LastSeen)}, previous, true) {
-		t.Fatalf("deviceUpdatedSince() should treat a new device ID as updated")
-	}
-	if !deviceUpdatedSince(tailscale.Device{NodeID: "device-1"}, tailnetDeviceSnapshot{}, false) {
-		t.Fatalf("deviceUpdatedSince() should accept the first matching device when no previous snapshot exists")
-	}
-}
-
 func TestProcessExistsTreatsPermissionDeniedAsRunning(t *testing.T) {
 	oldSignalProcess := signalProcess
 	t.Cleanup(func() {
@@ -2838,6 +3228,7 @@ func TestRestoreInstancesAutoStartsReadyInstanceWithStaleRuntime(t *testing.T) {
 			return nil, nil
 		}
 		return []tailscale.Device{{
+			NodeID:    "node-demo",
 			Hostname:  "demo",
 			Name:      "demo.tailnet.ts.net",
 			Addresses: []string{"100.64.0.10"},
@@ -2854,6 +3245,7 @@ func TestRestoreInstancesAutoStartsReadyInstanceWithStaleRuntime(t *testing.T) {
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
 		tsClient:            &tailscale.Client{},
+		localClient:         &readinessTestClient{},
 		networkHelper:       noopNetworkHelper{},
 		vmRunner:            runner,
 		readHostMemoryBytes: func() (int64, error) { return 64 << 30, nil },
@@ -2862,7 +3254,9 @@ func TestRestoreInstancesAutoStartsReadyInstanceWithStaleRuntime(t *testing.T) {
 	inst.FirecrackerPID = 4321
 	inst.TailscaleName = "demo"
 	inst.TailscaleIP = "100.64.0.9"
+	inst.TailnetNodeID = "node-demo"
 	inst.InitrdPath = ""
+	inst.SocketPath = readinessTestSocket(t)
 	for _, path := range []string{inst.RootFSPath, inst.KernelPath} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("MkdirAll(%q): %v", filepath.Dir(path), err)
@@ -3092,6 +3486,84 @@ func (noopNetworkHelper) CleanupInstanceNetwork(context.Context, nethelper.Clean
 	return nil
 }
 
+type readinessTestClient struct {
+	ping   func(context.Context, netip.Addr) (*ipnstate.PingResult, error)
+	status func() (*ipnstate.Status, error)
+}
+
+type readinessStartRunner struct {
+	panicVMRunner
+	start        func()
+	lostResponse bool
+	unknown      func() bool
+}
+
+type readinessStopRunner struct{ panicVMRunner }
+
+func (readinessStopRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {
+	return context.DeadlineExceeded
+}
+
+func (r readinessStartRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (vmrunner.StartResponse, error) {
+	r.start()
+	if r.lostResponse {
+		return vmrunner.StartResponse{}, context.DeadlineExceeded
+	}
+	return vmrunner.StartResponse{Outcome: vmrunner.StartRunning, PID: os.Getpid()}, nil
+}
+
+func (r readinessStartRunner) ResolveInstanceStart(context.Context, vmrunner.StartResultRequest) (vmrunner.StartResponse, error) {
+	if r.unknown != nil && r.unknown() {
+		return vmrunner.StartResponse{Outcome: vmrunner.StartUnknown, Reason: "launch quarantined"}, nil
+	}
+	return vmrunner.StartResponse{Outcome: vmrunner.StartRunning, PID: os.Getpid()}, nil
+}
+
+func (c *readinessTestClient) Status(context.Context) (*ipnstate.Status, error) {
+	if c.status != nil {
+		return c.status()
+	}
+	return &ipnstate.Status{Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+		{}: {ID: "node-demo", HostName: "demo", TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.10")}},
+	}}, nil
+}
+
+func (c *readinessTestClient) Ping(ctx context.Context, ip netip.Addr, kind tailcfg.PingType) (*ipnstate.PingResult, error) {
+	if kind != tailcfg.PingTSMP {
+		return nil, errors.New("expected TSMP")
+	}
+	if c.ping != nil {
+		return c.ping(ctx, ip)
+	}
+	return &ipnstate.PingResult{IP: ip.String(), NodeIP: ip.String()}, nil
+}
+
+func readinessTestSocket(t *testing.T) string {
+	t.Helper()
+	// Keep the UNIX socket below Linux's path-length limit.
+	dir, err := os.MkdirTemp("", "srv-readiness-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "api.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	return path
+}
+
 type panicVMRunner struct {
 	t *testing.T
 }
@@ -3143,7 +3615,7 @@ type recordingVMRunner struct {
 
 func (r *recordingVMRunner) StartInstanceVM(_ context.Context, req vmrunner.StartRequest) (vmrunner.StartResponse, error) {
 	r.started = append(r.started, req)
-	return vmrunner.StartResponse{PID: r.startPID}, nil
+	return vmrunner.StartResponse{Outcome: vmrunner.StartRunning, PID: r.startPID}, nil
 }
 
 func (*recordingVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {

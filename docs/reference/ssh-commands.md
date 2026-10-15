@@ -38,7 +38,7 @@ ssh srv -- --json status
 
 | Command | Description |
 |---------|-------------|
-| `start <name>` | Start a stopped VM |
+| `start <name>` | Start a stopped VM, or recheck a running VM left in `awaiting-tailnet` |
 | `stop <name>` | Stop a running VM (graceful shutdown) |
 | `restart <name>` | Stop and start a VM |
 | `fsck <name>` | Force-check and repair the rootfs of a stopped VM |

@@ -271,6 +271,7 @@ fi
 
 hostname_value="$(jq -er '.srv.hostname' "${METADATA_FILE}")"
 auth_key="$(jq -r '.srv.tailscale_auth_key // empty' "${METADATA_FILE}")"
+enrollment_nonce="$(jq -r '.srv.enrollment_nonce // empty' "${METADATA_FILE}")"
 control_url="$(jq -r '.srv.tailscale_control_url // empty' "${METADATA_FILE}")"
 zen_gateway_port="$(jq -r '.srv.zen_gateway_port // empty' "${METADATA_FILE}")"
 deepseek_gateway_port="$(jq -r '.srv.deepseek_gateway_port // empty' "${METADATA_FILE}")"
@@ -331,6 +332,13 @@ if [[ -n "${auth_key}" ]]; then
 	# The DNS map arrives during the first authenticated join. Enable it only
 	# afterwards so tailscaled applies MagicDNS to systemd-resolved immediately.
 	tailscale set --accept-dns=true
+fi
+
+if [[ -n "${enrollment_nonce}" ]]; then
+	# The host binds this serial-channel report to this launch attempt. Neither
+	# a same-name API entry nor LastSeen proves which node this guest enrolled.
+	node_id="$(tailscale status --json | jq -er 'select(.BackendState == "Running") | .Self.ID | select(type == "string" and length > 0)')"
+	printf 'srv-enrollment: %s\n' "$(jq -cn --arg nonce "${enrollment_nonce}" --arg node_id "${node_id}" '{nonce:$nonce,node_id:$node_id}')" >/dev/ttyS0
 fi
 
 date --iso-8601=seconds >"${DONE_FILE}"

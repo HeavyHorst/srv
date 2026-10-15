@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/v2"
 
 	"srv/internal/config"
@@ -43,10 +44,11 @@ const (
 )
 
 var (
-	errGuestNotReady = errors.New("guest never joined the tailnet before timeout")
-	errGuestExited   = errors.New("guest exited before joining the tailnet")
-	validName        = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
-	signalProcess    = syscall.Kill
+	errGuestNotReady  = errors.New("guest never joined the tailnet before timeout")
+	errGuestExited    = errors.New("guest exited before joining the tailnet")
+	errStartUncertain = errors.New("VM start outcome is unknown; resources retained")
+	validName         = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	signalProcess     = syscall.Kill
 
 	listTailnetDevices = func(ctx context.Context, client *tailscale.Client) ([]tailscale.Device, error) {
 		return client.Devices().List(ctx)
@@ -73,6 +75,7 @@ type Provisioner struct {
 	log                 *slog.Logger
 	store               *store.Store
 	tsClient            *tailscale.Client
+	localClient         tailnetLocalClient
 	networkHelper       networkHelper
 	vmRunner            vmRunner
 	readHostMemoryBytes func() (int64, error)
@@ -98,7 +101,6 @@ type guestMetadata = vmrunner.Metadata
 
 type tailnetDeviceSnapshot struct {
 	DeviceID string
-	LastSeen string
 }
 
 type CreateOptions struct {
@@ -137,6 +139,11 @@ func New(cfg config.Config, logger *slog.Logger, st *store.Store) (*Provisioner,
 		p.tsClient = client
 	}
 	return p, nil
+}
+
+// SetLocalClient must be called before serving lifecycle commands.
+func (p *Provisioner) SetLocalClient(client *local.Client) {
+	p.localClient = client
 }
 
 func (p *Provisioner) CreateMemoryPool(ctx context.Context, name string, actor model.Actor, sizeBytes int64) (model.MemoryPool, error) {
@@ -303,13 +310,12 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	p.recordEvent(inst.ID, "create", "instance record created", nil)
 
 	cleanup := true
-	startedMachine := false
 	var mintedKeyID string
 	defer func() {
+		if errors.Is(err, errStartUncertain) {
+			cleanup = false
+		}
 		if cleanup {
-			if startedMachine {
-				_ = p.stopFirecracker(context.Background(), inst)
-			}
 			_ = p.cleanupNetworking(inst)
 			_ = p.removeInstanceDir(inst.Name)
 			if mintedKeyID != "" {
@@ -376,44 +382,41 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	}
 	p.recordEvent(inst.ID, "bootstrap", "guest bootstrap metadata written", map[string]any{"tailscale_tags": guestAuthTags})
 
-	pid, err := p.startFirecracker(ctx, inst, pool, bootstrap)
+	pid, err := p.startFirecracker(ctx, &inst, pool, bootstrap)
 	if err != nil {
 		inst.LastError = err.Error()
 		return inst, err
 	}
-	startedMachine = true
+	cleanup = false
 	inst.FirecrackerPID = pid
+	inst.State = model.StateAwaitingTailnet
 	inst.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, inst); err != nil {
+	if err := p.persistInstance(inst); err != nil {
 		inst.LastError = err.Error()
 		return inst, err
 	}
 	p.recordEvent(inst.ID, "firecracker", "microVM started", map[string]any{"pid": pid})
 
-	tailscaleName, tailscaleIP, err := p.waitForTailnetJoin(ctx, inst.Name, inst.FirecrackerPID)
+	observed := inst
+	device, tailscaleIP, err := p.waitForEnrollment(ctx, inst)
 	if err != nil {
 		inst.LastError = err.Error()
 		inst.UpdatedAt = time.Now().UTC()
-		if errors.Is(err, errGuestNotReady) {
-			cleanup = false
-			inst.State = model.StateAwaitingTailnet
-			_ = p.store.UpdateInstance(context.Background(), inst)
-			p.recordEvent(inst.ID, "tailnet", "guest readiness timed out; instance left intact for debugging", nil)
-			return inst, err
-		}
+		err = errors.Join(err, p.persistInstance(inst))
 		return inst, err
 	}
 
 	inst.State = model.StateReady
-	inst.TailscaleName = tailscaleName
+	inst.TailscaleName = firstNonEmpty(device.Hostname, device.Name, inst.Name)
+	inst.TailnetNodeID = device.NodeID
 	inst.TailscaleIP = tailscaleIP
 	inst.LastError = ""
 	inst.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, inst); err != nil {
+	if err := p.store.UpdateInstanceRuntime(ctx, observed, inst); err != nil {
 		inst.LastError = err.Error()
 		return inst, err
 	}
-	p.recordEvent(inst.ID, "tailnet", "guest joined the tailnet", map[string]any{"tailscale_name": tailscaleName, "tailscale_ip": tailscaleIP})
+	p.recordEvent(inst.ID, "tailnet", "guest joined the tailnet", map[string]any{"tailscale_name": inst.TailscaleName, "tailscale_ip": tailscaleIP})
 
 	cleanup = false
 	if mintedKeyID != "" {
@@ -437,12 +440,30 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 		return inst, err
 	}
 	p.recordEvent(inst.ID, "delete", "delete requested", nil)
+	if err := p.resolveRuntime(ctx, &inst); err != nil {
+		return inst, err
+	}
 
 	if err := p.stopFirecracker(ctx, inst); err != nil {
-		p.log.Warn("stop firecracker", "name", inst.Name, "pid", inst.FirecrackerPID, "err", err)
+		return inst, fmt.Errorf("delete requires a confirmed stop: %w", err)
 	}
 	if err := p.cleanupNetworking(inst); err != nil {
-		p.log.Warn("cleanup networking", "name", inst.Name, "err", err)
+		return inst, fmt.Errorf("delete network cleanup: %w", err)
+	}
+	// Never delete a same-name device belonging to another incarnation. Keep
+	// the disk and deleting intent when API cleanup needs a retry.
+	if p.tsClient != nil && inst.TailnetNodeID != "" {
+		devices, err := listTailnetDevices(ctx, p.tsClient)
+		if err != nil {
+			return inst, err
+		}
+		for _, device := range devices {
+			if device.NodeID == inst.TailnetNodeID {
+				if err := p.tsClient.Devices().Delete(ctx, deviceIdentifier(device)); err != nil {
+					return inst, err
+				}
+			}
+		}
 	}
 	if err := p.removeInstanceDir(inst.Name); err != nil {
 		inst.LastError = fmt.Sprintf("delete failed: %v", err)
@@ -453,19 +474,12 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 		p.recordEvent(inst.ID, "delete", "instance delete failed before disk cleanup completed", map[string]any{"error": err.Error()})
 		return inst, fmt.Errorf("remove instance directory for %q: %w", name, err)
 	}
-	if p.tsClient != nil {
-		if device, ok, err := p.findDevice(ctx, inst.Name); err == nil && ok {
-			if err := p.tsClient.Devices().Delete(ctx, deviceIdentifier(device)); err != nil {
-				p.log.Warn("delete tailscale device", "name", inst.Name, "err", err)
-			}
-		}
-	}
-
 	now := time.Now().UTC()
 	inst.State = model.StateDeleted
 	inst.FirecrackerPID = 0
 	inst.TailscaleName = ""
 	inst.TailscaleIP = ""
+	inst.TailnetNodeID = ""
 	inst.LastError = ""
 	inst.UpdatedAt = now
 	inst.DeletedAt = &now
@@ -485,28 +499,38 @@ func (p *Provisioner) RestoreInstances(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := p.restoreInstance(ctx, inst); err != nil {
+		if err := p.RestoreInstance(ctx, inst.Name); err != nil {
 			p.log.Error("restore instance after startup", "name", inst.Name, "state", inst.State, "err", err)
 		}
 	}
 	return nil
 }
 
+// RestoreInstance reloads state after the caller acquires the instance lock.
+func (p *Provisioner) RestoreInstance(ctx context.Context, name string) error {
+	inst, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return err
+	}
+	return p.restoreInstance(ctx, inst)
+}
+
 func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) error {
 	shouldAutoStart := shouldAutoStartAfterStartup(inst)
+	if err := p.resolveRuntime(ctx, &inst); err != nil {
+		return err
+	}
+	if inst.State == model.StateStopping || inst.State == model.StateDeleting {
+		return nil // Reconciliation resumes shutdown intent without auto-starting.
+	}
 	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) && !serialLogShowsGuestHalted(inst.SerialLogPath) {
 		return nil
 	}
 	if inst.FirecrackerPID != 0 {
-		if processExists(inst.FirecrackerPID) {
-			if err := p.stopFirecracker(ctx, inst); err != nil {
-				p.log.Warn("cleanup stale firecracker state", "name", inst.Name, "err", err)
-			}
-		}
-		inst.FirecrackerPID = 0
-		inst.UpdatedAt = time.Now().UTC()
-		if err := p.store.UpdateInstance(ctx, inst); err != nil {
-			return err
+		var err error
+		inst, err = p.Stop(ctx, inst.Name)
+		if err != nil {
+			return fmt.Errorf("stop stale runtime before restore: %w", err)
 		}
 	}
 	if !shouldAutoStart {
@@ -536,6 +560,24 @@ func (p *Provisioner) ReconcileInstanceRuntime(ctx context.Context, name string)
 	return p.store.GetInstance(ctx, name)
 }
 
+// ReconcileInstance resumes durable intent, but never creates new start intent.
+// The caller must hold the same instance lock as interactive lifecycle commands.
+func (p *Provisioner) ReconcileInstance(ctx context.Context, name string) (model.Instance, error) {
+	inst, err := p.ReconcileInstanceRuntime(ctx, name)
+	if err != nil {
+		return inst, err
+	}
+	switch inst.State {
+	case model.StateStopping:
+		return p.Stop(ctx, name)
+	case model.StateDeleting:
+		return p.Delete(ctx, name)
+	case model.StateAwaitingTailnet:
+		_, err = p.reconcileLateTailnetJoin(ctx, &inst)
+	}
+	return inst, err
+}
+
 func (p *Provisioner) ReconcileInstancesRuntime(ctx context.Context) error {
 	instances, err := p.store.ListInstances(ctx, false)
 	if err != nil {
@@ -553,7 +595,12 @@ func (p *Provisioner) ReconcileInstancesRuntime(ctx context.Context) error {
 }
 
 func (p *Provisioner) reconcileRuntime(ctx context.Context, inst model.Instance) (bool, error) {
-	if inst.State == model.StateStopped || inst.State == model.StateDeleted || inst.State == model.StateDeleting || inst.State == model.StateFailed {
+	if inst.StartRequestID != "" {
+		if err := p.resolveRuntime(ctx, &inst); err != nil {
+			return false, err
+		}
+	}
+	if inst.State == model.StateStopping || inst.State == model.StateStopped || inst.State == model.StateDeleted || inst.State == model.StateDeleting || inst.State == model.StateFailed {
 		return false, nil
 	}
 	if inst.FirecrackerPID <= 0 {
@@ -568,34 +615,32 @@ func (p *Provisioner) reconcileRuntime(ctx context.Context, inst model.Instance)
 	if !runtimeExited && !guestHalted {
 		return false, nil
 	}
+	if inst.StartRequestID != "" && runtimeExited {
+		// The process can exit just after resolution. Let the runner confirm
+		// absence and clean its owned runtime before releasing the network.
+		if err := p.resolveRuntime(ctx, &inst); err != nil {
+			return false, err
+		}
+		return inst.FirecrackerPID == 0, nil
+	}
 
 	if runtimeExited {
 		p.recordEvent(inst.ID, "runtime", "firecracker process exited outside srv stop", map[string]any{"pid": inst.FirecrackerPID})
 	} else {
 		p.recordEvent(inst.ID, "runtime", "guest halted; stopping firecracker runtime", map[string]any{"pid": inst.FirecrackerPID})
-		if err := p.stopFirecracker(ctx, inst); err != nil {
-			return false, err
-		}
 	}
-	if err := p.cleanupNetworking(inst); err != nil {
-		p.log.Warn("cleanup networking after runtime reconciliation", "name", inst.Name, "err", err)
-	}
-
-	inst.State = model.StateStopped
-	inst.FirecrackerPID = 0
-	inst.LastError = ""
-	inst.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, inst); err != nil {
-		return false, err
-	}
-	p.recordEvent(inst.ID, "stop", "instance marked stopped after runtime reconciliation", nil)
-	return true, nil
+	// Stop persists cleanup intent first and retains it on either helper failure.
+	_, err := p.Stop(ctx, inst.Name)
+	return err == nil, err
 }
 
 func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, error) {
 	inst, err := p.store.GetInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
+	}
+	if inst.State == model.StateDeleting {
+		return inst, fmt.Errorf("instance %q is being deleted; stop cannot cancel deletion", name)
 	}
 	if inst.State == model.StateDeleted {
 		return inst, fmt.Errorf("instance %q is already deleted", name)
@@ -604,7 +649,18 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 		return inst, fmt.Errorf("instance %q is already stopped", name)
 	}
 
+	// Persist intent before calling the helper: a timed-out helper request may
+	// still be shutting the guest down. Readiness must not override that intent.
+	inst.State = model.StateStopping
+	inst.LastError = "stop has not completed; retry stop if interrupted"
+	inst.UpdatedAt = time.Now().UTC()
+	if err := p.store.UpdateInstance(ctx, inst); err != nil {
+		return inst, err
+	}
 	p.recordEvent(inst.ID, "stop", "stop requested", nil)
+	if err := p.resolveRuntime(ctx, &inst); err != nil {
+		return inst, err
+	}
 	if err := p.stopFirecracker(ctx, inst); err != nil {
 		return inst, err
 	}
@@ -616,7 +672,9 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 	inst.FirecrackerPID = 0
 	inst.LastError = ""
 	inst.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, inst); err != nil {
+	persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.store.UpdateInstance(persistCtx, inst); err != nil {
 		return inst, err
 	}
 	p.recordEvent(inst.ID, "stop", "instance stopped", nil)
@@ -742,7 +800,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		return model.Instance{}, err
 	}
 	p.applyConfiguredBootArtifacts(&inst)
-	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) && !hasTailnetIdentity(inst) {
+	if inst.State == model.StateAwaitingTailnet && inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
 		reconciled, err := p.reconcileLateTailnetJoin(ctx, &inst)
 		if err != nil {
 			return inst, err
@@ -814,12 +872,11 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		return inst, err
 	}
 	cleanup := true
-	startedMachine := false
 	defer func() {
+		if errors.Is(err, errStartUncertain) {
+			cleanup = false
+		}
 		if cleanup {
-			if startedMachine {
-				_ = p.stopFirecracker(context.Background(), inst)
-			}
 			_ = p.cleanupNetworking(inst)
 			inst.State = model.StateStopped
 			inst.FirecrackerPID = 0
@@ -832,8 +889,18 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 	if err != nil {
 		return inst, err
 	}
+	if inst.TailnetNodeID != "" {
+		if hadPreviousDevice && previousDevice.DeviceID != inst.TailnetNodeID {
+			return inst, errors.New("stored tailnet node identity changed")
+		}
+		previousDevice.DeviceID, hadPreviousDevice = inst.TailnetNodeID, true
+	}
+	if !hadPreviousDevice {
+		return inst, errors.New("warm start requires an existing tailnet device identity")
+	}
+	inst.TailnetNodeID = previousDevice.DeviceID
 	if err := p.cleanupNetworking(inst); err != nil {
-		p.log.Warn("cleanup stale networking before start", "name", inst.Name, "err", err)
+		return inst, fmt.Errorf("cleanup stale networking before start: %w", err)
 	}
 	if err := p.ensureInstanceRuntimePermissions(inst); err != nil {
 		return inst, err
@@ -862,42 +929,60 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		ZenGatewayPort:      zenGatewayPort,
 		DeepSeekGatewayPort: deepseekGatewayPort,
 	}
-	pid, err := p.startFirecracker(ctx, inst, pool, bootstrap)
+	pid, err := p.startFirecracker(ctx, &inst, pool, bootstrap)
 	if err != nil {
 		inst.LastError = err.Error()
 		return inst, err
 	}
-	startedMachine = true
-	inst.State = model.StateProvisioning
+	// Once booted, a caller disconnect or persistence failure must not tear down
+	// a guest that may already be serving traffic. Readiness can be retried.
+	cleanup = false
+	inst.State = model.StateAwaitingTailnet
 	inst.FirecrackerPID = pid
 	inst.LastError = ""
 	inst.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, inst); err != nil {
+	persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.store.UpdateInstance(persistCtx, inst); err != nil {
 		inst.LastError = err.Error()
 		return inst, err
 	}
 	p.recordEvent(inst.ID, "firecracker", "microVM started", map[string]any{"pid": pid})
 
-	tailscaleName, tailscaleIP, err := p.waitForTailnetJoinAfter(ctx, inst.Name, inst.FirecrackerPID, previousDevice, hadPreviousDevice)
+	observed := inst
+	runtimeIdentity, err := instanceRuntimeIdentity(ctx, inst)
+	var tailscaleName, tailscaleIP string
+	if err == nil {
+		tailscaleName, tailscaleIP, err = p.waitForTailnetJoinAfter(ctx, inst.Name, inst.FirecrackerPID, previousDevice, hadPreviousDevice)
+	}
+	if err == nil {
+		currentRuntime, runtimeErr := instanceRuntimeIdentity(ctx, inst)
+		if runtimeErr != nil || currentRuntime != runtimeIdentity {
+			err = errors.Join(errors.New("guest runtime changed during readiness check"), runtimeErr)
+		}
+	}
 	if err != nil {
 		inst.LastError = err.Error()
 		inst.UpdatedAt = time.Now().UTC()
-		if errors.Is(err, errGuestNotReady) {
-			cleanup = false
-			inst.State = model.StateAwaitingTailnet
-			_ = p.store.UpdateInstance(context.Background(), inst)
-			p.recordEvent(inst.ID, "tailnet", "guest readiness timed out after start; instance left intact for debugging", nil)
-			return inst, err
+		persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if persistErr := p.store.UpdateInstanceRuntime(persistCtx, observed, inst); persistErr != nil {
+			return inst, errors.Join(err, persistErr)
 		}
+		p.recordEvent(inst.ID, "tailnet", "guest readiness incomplete after start; retry start to check the existing guest", map[string]any{"error": err.Error()})
 		return inst, err
 	}
 
 	inst.State = model.StateReady
 	inst.TailscaleName = tailscaleName
+	if hadPreviousDevice {
+		inst.TailnetNodeID = previousDevice.DeviceID
+	}
 	inst.TailscaleIP = tailscaleIP
 	inst.LastError = ""
 	inst.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, inst); err != nil {
+	if err := p.store.UpdateInstanceRuntime(ctx, observed, inst); err != nil {
+		inst = observed
 		inst.LastError = err.Error()
 		return inst, err
 	}
@@ -908,25 +993,52 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 }
 
 func (p *Provisioner) reconcileLateTailnetJoin(ctx context.Context, inst *model.Instance) (bool, error) {
-	if inst == nil || hasTailnetIdentity(*inst) {
+	if inst == nil || inst.State != model.StateAwaitingTailnet {
 		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, p.cfg.GuestReadyTimeout)
+	defer cancel()
+	runtime, err := instanceRuntimeIdentity(ctx, *inst)
+	if err != nil {
+		return false, err
 	}
 	device, ok, err := p.findDevice(ctx, inst.Name)
 	if err != nil {
 		return false, err
 	}
-	if !ok {
-		return false, nil
+	var ip string
+	if !hasTailnetIdentity(*inst) {
+		device, ip, err = p.waitForEnrollment(ctx, *inst)
+		if err != nil {
+			return false, err
+		}
+	} else if !ok {
+		return false, errors.New("guest is not present in the tailnet; instance left intact")
+	} else {
+		if inst.TailnetNodeID != "" && inst.TailnetNodeID != device.NodeID {
+			return false, errors.New("stored tailnet node identity changed")
+		}
+		ip, err = p.verifyLivePeer(ctx, device, inst.TailscaleIP)
+		if err != nil {
+			return false, err
+		}
 	}
-	inst.State = model.StateReady
-	inst.TailscaleName = firstNonEmpty(device.Hostname, device.Name, inst.Name)
-	inst.TailscaleIP = ""
-	if len(device.Addresses) > 0 {
-		inst.TailscaleIP = device.Addresses[0]
+	currentRuntime, err := instanceRuntimeIdentity(ctx, *inst)
+	if err != nil || currentRuntime != runtime {
+		return false, fmt.Errorf("guest runtime changed during readiness check: %w", errors.Join(err, errGuestNotReady))
 	}
-	inst.LastError = ""
-	inst.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, *inst); err != nil {
+	tailnetName := firstNonEmpty(device.Hostname, device.Name, inst.Name)
+	updated := *inst
+	updated.State = model.StateReady
+	updated.TailnetNodeID = device.NodeID
+	updated.TailscaleName, updated.TailscaleIP = tailnetName, ip
+	updated.LastError = ""
+	updated.UpdatedAt = time.Now().UTC()
+	if err := p.store.UpdateInstanceRuntime(ctx, *inst, updated); err != nil {
+		return false, err
+	}
+	*inst, err = p.store.GetInstance(ctx, inst.Name)
+	if err != nil {
 		return false, err
 	}
 	p.recordEvent(inst.ID, "tailnet", "guest joined the tailnet after readiness timeout; state reconciled on demand", map[string]any{"tailscale_name": inst.TailscaleName, "tailscale_ip": inst.TailscaleIP})
@@ -943,10 +1055,16 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 	} else if found {
 		switch existing.State {
 		case model.StateFailed, model.StateDeleted:
-			if err := p.store.DeleteInstance(ctx, name); err != nil {
+			if err := p.resolveRuntime(ctx, &existing); err != nil {
 				return "", err
 			}
+			if existing.FirecrackerPID != 0 {
+				return "", errors.New("existing runtime must be stopped before reuse")
+			}
 			if err := p.removeInstanceDir(name); err != nil {
+				return "", err
+			}
+			if err := p.store.DeleteInstance(ctx, name); err != nil {
 				return "", err
 			}
 		default:
@@ -1038,6 +1156,9 @@ func (p *Provisioner) applyConfiguredBootArtifacts(inst *model.Instance) {
 }
 
 func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
+	if inst.State == model.StateStopping {
+		return fmt.Errorf("instance %q has an incomplete stop; retry stop before starting", inst.Name)
+	}
 	if inst.State == model.StateDeleted {
 		return fmt.Errorf("instance %q is deleted", inst.Name)
 	}
@@ -1332,7 +1453,16 @@ func instanceHasActiveRuntime(inst model.Instance) bool {
 }
 
 func instanceReservesFixedHostMemory(inst model.Instance) bool {
-	return inst.NormalizedMemoryMode() == model.MemoryModeFixed && instanceHasActiveRuntime(inst)
+	if inst.NormalizedMemoryMode() != model.MemoryModeFixed {
+		return false
+	}
+	if inst.State == model.StateStopping || inst.State == model.StateDeleting {
+		return true
+	}
+	if inst.StartRequestID != "" && (inst.State == model.StateProvisioning || inst.State == model.StateAwaitingTailnet || inst.State == model.StateReady) {
+		return true
+	}
+	return instanceHasActiveRuntime(inst)
 }
 
 func reservedInstanceRootFSBytes(inst model.Instance) int64 {
@@ -1584,19 +1714,32 @@ func (p *Provisioner) writeMetadataFile(inst model.Instance, bootstrap guestBoot
 	return nil
 }
 
-func (p *Provisioner) startFirecracker(ctx context.Context, inst model.Instance, pool model.MemoryPool, bootstrap guestBootstrap) (int, error) {
+func (p *Provisioner) startFirecracker(ctx context.Context, inst *model.Instance, pool model.MemoryPool, bootstrap guestBootstrap) (int, error) {
 	if p.vmRunner == nil {
 		return 0, errors.New("vm runner client is unavailable")
 	}
+	bootID, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return 0, err
+	}
+	inst.StartRequestID, inst.StartBootID = uuid.NewString(), strings.TrimSpace(string(bootID))
+	inst.UpdatedAt = time.Now().UTC()
+	if err := p.store.UpdateInstance(ctx, *inst); err != nil {
+		return 0, err
+	}
+	if bootstrap.TailscaleAuthKey != "" {
+		bootstrap.EnrollmentNonce = inst.StartRequestID
+	}
 	resp, err := p.vmRunner.StartInstanceVM(ctx, vmrunner.StartRequest{
+		InstanceID: inst.ID, RequestID: inst.StartRequestID, HostBootID: inst.StartBootID,
 		Name:                inst.Name,
 		TapDevice:           inst.TapDevice,
 		GuestMAC:            inst.GuestMAC,
 		GuestAddr:           inst.GuestAddr,
 		GatewayAddr:         inst.GatewayAddr,
 		Nameservers:         p.cfg.VMDNSServers,
-		VCPUCount:           p.effectiveVCPUCount(inst),
-		MemoryMiB:           p.effectiveMemoryMiB(inst),
+		VCPUCount:           p.effectiveVCPUCount(*inst),
+		MemoryMiB:           p.effectiveMemoryMiB(*inst),
 		MemoryMode:          inst.NormalizedMemoryMode(),
 		MemoryPoolName:      pool.Name,
 		MemoryPoolSizeBytes: pool.ReservedBytes,
@@ -1604,9 +1747,23 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst model.Instance,
 		Bootstrap:           bootstrap,
 	})
 	if err != nil {
-		return 0, err
+		recoverCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var resolveErr error
+		resp, resolveErr = p.startResult(recoverCtx, *inst)
+		if resolveErr != nil {
+			err = errors.Join(err, resolveErr)
+		}
 	}
-	return resp.PID, nil
+	if resp.Outcome == vmrunner.StartRunning && resp.PID > 0 {
+		return resp.PID, nil
+	}
+	if resp.Outcome == vmrunner.StartAbsent {
+		return 0, fmt.Errorf("start was fenced without a runtime: %s", resp.Reason)
+	}
+	err = errors.Join(errStartUncertain, err, errors.New(resp.Reason))
+	inst.LastError = err.Error()
+	return 0, errors.Join(err, p.persistInstance(*inst))
 }
 
 func (p *Provisioner) instanceDir(name string) (string, error) {
@@ -1708,10 +1865,6 @@ func (p *Provisioner) capacityStorageDetails(ctx context.Context, path string) [
 	return result
 }
 
-func (p *Provisioner) waitForTailnetJoin(ctx context.Context, name string, firecrackerPID int) (string, string, error) {
-	return p.waitForTailnetJoinAfter(ctx, name, firecrackerPID, tailnetDeviceSnapshot{}, false)
-}
-
 func (p *Provisioner) waitForTailnetJoinAfter(ctx context.Context, name string, firecrackerPID int, previous tailnetDeviceSnapshot, hadPrevious bool) (string, string, error) {
 	deadlineCtx, cancel := context.WithTimeout(ctx, p.cfg.GuestReadyTimeout)
 	defer cancel()
@@ -1719,21 +1872,30 @@ func (p *Provisioner) waitForTailnetJoinAfter(ctx context.Context, name string, 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	var lastErr error
 	for {
+		if err := deadlineCtx.Err(); err != nil {
+			return "", "", errors.Join(errGuestNotReady, err, lastErr)
+		}
 		if firecrackerPID > 0 && !processExists(firecrackerPID) {
 			return "", "", errGuestExited
 		}
 		device, ok, err := p.findDevice(deadlineCtx, name)
-		if err == nil && ok && deviceUpdatedSince(device, previous, hadPrevious) {
+		if err == nil && ok {
 			ip := ""
-			if len(device.Addresses) > 0 {
-				ip = device.Addresses[0]
+			if !hadPrevious || deviceIdentifier(device) != previous.DeviceID {
+				err = errors.New("tailnet device identity changed during warm start")
+			} else {
+				ip, err = p.verifyLivePeer(deadlineCtx, device, "")
 			}
-			return firstNonEmpty(device.Hostname, device.Name, name), ip, nil
+			if err == nil {
+				return firstNonEmpty(device.Hostname, device.Name, name), ip, nil
+			}
 		}
+		lastErr = err
 		select {
 		case <-deadlineCtx.Done():
-			return "", "", errGuestNotReady
+			return "", "", errors.Join(errGuestNotReady, deadlineCtx.Err(), lastErr)
 		case <-ticker.C:
 		}
 	}
@@ -1747,12 +1909,17 @@ func (p *Provisioner) findDevice(ctx context.Context, name string) (tailscale.De
 	if err != nil {
 		return tailscale.Device{}, false, fmt.Errorf("list tailscale devices: %w", err)
 	}
+	var match tailscale.Device
+	found := false
 	for _, device := range devices {
 		if strings.EqualFold(device.Hostname, name) || strings.EqualFold(trimDot(prefixBeforeDot(device.Name)), name) {
-			return device, true, nil
+			if found {
+				return tailscale.Device{}, false, fmt.Errorf("ambiguous tailnet hostname %q", name)
+			}
+			match, found = device, true
 		}
 	}
-	return tailscale.Device{}, false, nil
+	return match, found, nil
 }
 
 func (p *Provisioner) currentDeviceSnapshot(ctx context.Context, name string) (tailnetDeviceSnapshot, bool, error) {
@@ -1763,7 +1930,7 @@ func (p *Provisioner) currentDeviceSnapshot(ctx context.Context, name string) (t
 	if !ok {
 		return tailnetDeviceSnapshot{}, false, nil
 	}
-	return tailnetDeviceSnapshot{DeviceID: deviceIdentifier(device), LastSeen: deviceLastSeen(device)}, true, nil
+	return tailnetDeviceSnapshot{DeviceID: deviceIdentifier(device)}, true, nil
 }
 
 func deviceIdentifier(device tailscale.Device) string {
@@ -1773,13 +1940,6 @@ func deviceIdentifier(device tailscale.Device) string {
 	return device.ID
 }
 
-func deviceLastSeen(device tailscale.Device) string {
-	if device.LastSeen == nil || device.LastSeen.IsZero() {
-		return ""
-	}
-	return device.LastSeen.UTC().Format(time.RFC3339)
-}
-
 func (p *Provisioner) stopFirecracker(_ context.Context, inst model.Instance) error {
 	if p.vmRunner == nil {
 		return errors.New("vm runner client is unavailable")
@@ -1787,6 +1947,7 @@ func (p *Provisioner) stopFirecracker(_ context.Context, inst model.Instance) er
 	stopCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := p.vmRunner.StopInstanceVM(stopCtx, vmrunner.StopRequest{
+		InstanceID: inst.ID, RequestID: inst.StartRequestID, HostBootID: inst.StartBootID,
 		Name: inst.Name,
 		PID:  inst.FirecrackerPID,
 	}); err != nil {
@@ -1842,28 +2003,16 @@ func (p *Provisioner) recordEvent(instanceID, eventType, message string, payload
 }
 
 func hasTailnetIdentity(inst model.Instance) bool {
-	return strings.TrimSpace(inst.TailscaleName) != "" || strings.TrimSpace(inst.TailscaleIP) != ""
+	return strings.TrimSpace(inst.TailnetNodeID) != "" || strings.TrimSpace(inst.TailscaleName) != "" || strings.TrimSpace(inst.TailscaleIP) != ""
 }
 
 func shouldAutoStartAfterStartup(inst model.Instance) bool {
 	switch inst.State {
-	case model.StateDeleted, model.StateDeleting, model.StateFailed, model.StateStopped:
+	case model.StateDeleted, model.StateDeleting, model.StateFailed, model.StateStopped, model.StateStopping:
 		return false
 	default:
 		return true
 	}
-}
-
-func deviceUpdatedSince(device tailscale.Device, previous tailnetDeviceSnapshot, hadPrevious bool) bool {
-	if !hadPrevious {
-		return true
-	}
-	deviceID := deviceIdentifier(device)
-	if previous.DeviceID != "" && deviceID != "" && deviceID != previous.DeviceID {
-		return true
-	}
-	lastSeen := deviceLastSeen(device)
-	return strings.TrimSpace(lastSeen) != "" && lastSeen != previous.LastSeen
 }
 
 func directChildPath(base, name string) (string, error) {

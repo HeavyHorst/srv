@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -36,6 +37,120 @@ import (
 )
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func TestBackgroundReconciliationHonorsSnapshotAndBusyInstance(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	inst := serviceTestInstance("busy", model.StateAwaitingTailnet, time.Now().UTC())
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	// A nil provisioner deliberately makes any attempt to touch the protected
+	// instance fail. The sweep must skip it before invoking lifecycle code.
+	app := &App{store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	lease, err := app.beginCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.PromoteToSnapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	app.reconcileInstances(ctx)
+	lease.Release()
+	unlock := app.lockInstance(inst.Name)
+	done := make(chan struct{})
+	go func() { defer close(done); app.reconcileInstances(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		unlock()
+		<-done
+		t.Fatal("background sweep blocked behind interactive command")
+	}
+	unlock()
+	if app.inFlight != 0 {
+		t.Fatalf("background leaked snapshot lease: %d", app.inFlight)
+	}
+	got, err := st.GetInstance(ctx, inst.Name)
+	if err != nil || !reflect.DeepEqual(got, inst) {
+		t.Fatalf("protected instance changed: %#v %v", got, err)
+	}
+
+	// Exercise the sweep through the real provisioner and HTTP clients, using
+	// a disposable helper socket rather than any host service.
+	dir, err := os.MkdirTemp("", "srv-reconcile-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "helper.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failCleanup atomic.Bool
+	failCleanup.Store(true)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/vm/stop":
+		case "/network/cleanup":
+			if failCleanup.Load() {
+				http.Error(w, "temporarily unavailable", 503)
+				return
+			}
+		default:
+			t.Errorf("unexpected background operation: %s", r.URL.Path)
+			http.Error(w, "unexpected operation", 400)
+			return
+		}
+		_, _ = io.WriteString(w, "{}")
+	})}
+	served := make(chan struct{})
+	go func() { defer close(served); _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close(); <-served })
+	cfg := loadServiceTestConfig(t, nil)
+	cfg.VMRunnerSocketPath, cfg.NetHelperSocketPath, cfg.OutboundInterface = socket, socket, "fixture0"
+	app.provisioner, err = provision.New(cfg, app.log, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst.State = model.StateStopping
+	if err := st.UpdateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	app.reconcileInstances(ctx)
+	got, err = st.GetInstance(ctx, inst.Name)
+	if err != nil || got.State != model.StateStopping {
+		t.Fatalf("cleanup failure lost intent: %#v %v", got, err)
+	}
+	failCleanup.Store(false)
+	app.reconcileInstances(ctx)
+	got, err = st.GetInstance(ctx, inst.Name)
+	if err != nil || got.State != model.StateStopped || got.LastError != "" {
+		t.Fatalf("background retry did not converge: %#v %v", got, err)
+	}
+	inst = got
+	inst.State = model.StateDeleting
+	if err := st.UpdateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	actor := model.Actor{UserLogin: inst.CreatedByUser}
+	for _, command := range []string{"stop", "restart"} {
+		var err error
+		if command == "stop" {
+			_, err = app.cmdStop(ctx, actor, []string{command, inst.Name}, outputFormatJSON)
+		} else {
+			_, err = app.cmdRestart(ctx, actor, []string{command, inst.Name}, outputFormatJSON)
+		}
+		if err == nil || !strings.Contains(err.Error(), "cannot cancel deletion") {
+			t.Fatalf("%s did not preserve deletion: %v", command, err)
+		}
+		current, err := st.GetInstance(ctx, inst.Name)
+		if err != nil || !reflect.DeepEqual(current, inst) {
+			t.Fatalf("%s changed deletion intent: %#v %v", command, current, err)
+		}
+	}
+}
 
 func stripAnsi(s string) string {
 	return ansiRe.ReplaceAllString(s, "")
@@ -460,7 +575,9 @@ func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
 		t.Fatalf("cpu status = %#v", cpu)
 	}
 	memory := resources["memory"]
-	if memory.Allocated != vmrunner.FixedMemoryLimitBytes(2048) || memory.Reserve != 512*mib || memory.Budget != max(memory.Total-memory.Reserve, int64(0)) || memory.Left != memory.Budget-memory.Allocated {
+	// Both the ready VM and unfinished deletion retain 2 GiB plus 256 MiB
+	// VMM overhead. An absent PID alone cannot complete an interrupted delete.
+	if memory.Allocated != 2*(2048+256)*mib || memory.Reserve != 512*mib || memory.Budget != max(memory.Total-memory.Reserve, int64(0)) || memory.Left != memory.Budget-memory.Allocated {
 		t.Fatalf("memory status = %#v", memory)
 	}
 	disk := resources["disk"]
@@ -961,8 +1078,96 @@ func TestCmdInspectAwaitingTailnetPointsToSerialLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cmdInspect(): %v", err)
 	}
-	if !strings.Contains(result.stdout, "debug-hint: guest has not finished initial tailnet bootstrap; start with the serial log\n") {
+	if !strings.Contains(result.stdout, "debug-hint: tailnet readiness is unconfirmed; check the serial log, then retry start to verify the existing guest\n") {
 		t.Fatalf("cmdInspect() stdout = %q", result.stdout)
+	}
+}
+
+func TestRuntimeReadersReloadAfterConcurrentLifecycleChange(t *testing.T) {
+	for _, command := range []string{"inspect", "list", "startup"} {
+		t.Run(command, func(t *testing.T) {
+			ctx := context.Background()
+			st := newServiceTestStore(t)
+			cfg := loadServiceTestConfig(t, nil)
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			prov, err := provision.New(cfg, logger, st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+			inst := serviceTestInstance("alpha", model.StateAwaitingTailnet, time.Now().UTC())
+			inst.FirecrackerPID = 1 << 30 // An exited older runtime.
+			inst.TailscaleName, inst.TailscaleIP = "alpha", "100.64.0.20"
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			unlock := app.lockInstance(inst.Name)
+			released := false
+			defer func() {
+				if !released {
+					unlock()
+				}
+			}()
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				switch command {
+				case "inspect":
+					_, err = app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name}, outputFormatJSON)
+				case "list":
+					_, err = app.cmdList(ctx, model.Actor{UserLogin: "alice@example.com"}, outputFormatJSON)
+				case "startup":
+					app.restoreInstances(ctx)
+				}
+				done <- err
+			}()
+			// Wait for the reader to queue behind the lifecycle operation, rather
+			// than relying on a sleep to guess when it has listed the old record.
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				app.lockMu.Lock()
+				waiting := app.locks[inst.Name].refs > 1
+				app.lockMu.Unlock()
+				if waiting {
+					break
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("reader bypassed lifecycle serialization: %v", err)
+				default:
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("reader did not reach instance lock")
+				}
+				runtime.Gosched()
+			}
+			if command == "startup" {
+				inst.State, inst.FirecrackerPID = model.StateStopped, 0
+			} else {
+				inst.State, inst.FirecrackerPID = model.StateReady, os.Getpid()
+			}
+			inst.UpdatedAt = time.Now().UTC()
+			if err := st.UpdateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			unlock()
+			released = true
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("reader did not finish")
+			}
+			got, err := st.GetInstance(ctx, inst.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, inst) {
+				t.Fatalf("reader overwrote newer lifecycle state: got %#v, want %#v", got, inst)
+			}
+		})
 	}
 }
 

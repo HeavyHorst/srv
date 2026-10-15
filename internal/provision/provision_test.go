@@ -2111,7 +2111,9 @@ func TestWarmStartReadinessAndRecovery(t *testing.T) {
 				inst.TailscaleName, inst.TailscaleIP = "", ""
 			}
 			inst.InitrdPath = ""
-			inst.SocketPath = readinessTestSocket(t)
+			// Managed readiness must use the privileged runner's attestation;
+			// the control plane cannot access the jailed API socket.
+			inst.SocketPath = filepath.Join(t.TempDir(), "inaccessible.sock")
 			for _, path := range []string{inst.RootFSPath, inst.KernelPath} {
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 					t.Fatal(err)
@@ -3620,6 +3622,10 @@ func (r *recordingVMRunner) StartInstanceVM(_ context.Context, req vmrunner.Star
 
 func (*recordingVMRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {
 	return nil
+}
+
+func (r *recordingVMRunner) ResolveInstanceStart(context.Context, vmrunner.StartResultRequest) (vmrunner.StartResponse, error) {
+	return vmrunner.StartResponse{Outcome: vmrunner.StartRunning, PID: r.startPID}, nil
 }
 
 func (*recordingVMRunner) ReadInstanceMetrics(context.Context, vmrunner.MetricsRequest) (vmrunner.MetricsResponse, error) {

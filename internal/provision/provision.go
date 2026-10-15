@@ -950,13 +950,13 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 	p.recordEvent(inst.ID, "firecracker", "microVM started", map[string]any{"pid": pid})
 
 	observed := inst
-	runtimeIdentity, err := instanceRuntimeIdentity(ctx, inst)
+	runtimeIdentity, err := p.instanceRuntimeIdentity(ctx, inst)
 	var tailscaleName, tailscaleIP string
 	if err == nil {
 		tailscaleName, tailscaleIP, err = p.waitForTailnetJoinAfter(ctx, inst.Name, inst.FirecrackerPID, previousDevice, hadPreviousDevice)
 	}
 	if err == nil {
-		currentRuntime, runtimeErr := instanceRuntimeIdentity(ctx, inst)
+		currentRuntime, runtimeErr := p.instanceRuntimeIdentity(ctx, inst)
 		if runtimeErr != nil || currentRuntime != runtimeIdentity {
 			err = errors.Join(errors.New("guest runtime changed during readiness check"), runtimeErr)
 		}
@@ -998,7 +998,7 @@ func (p *Provisioner) reconcileLateTailnetJoin(ctx context.Context, inst *model.
 	}
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.GuestReadyTimeout)
 	defer cancel()
-	runtime, err := instanceRuntimeIdentity(ctx, *inst)
+	runtime, err := p.instanceRuntimeIdentity(ctx, *inst)
 	if err != nil {
 		return false, err
 	}
@@ -1023,7 +1023,7 @@ func (p *Provisioner) reconcileLateTailnetJoin(ctx context.Context, inst *model.
 			return false, err
 		}
 	}
-	currentRuntime, err := instanceRuntimeIdentity(ctx, *inst)
+	currentRuntime, err := p.instanceRuntimeIdentity(ctx, *inst)
 	if err != nil || currentRuntime != runtime {
 		return false, fmt.Errorf("guest runtime changed during readiness check: %w", errors.Join(err, errGuestNotReady))
 	}

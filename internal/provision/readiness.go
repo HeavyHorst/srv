@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"srv/internal/model"
+	"srv/internal/vmrunner"
 
 	"tailscale.com/client/tailscale/v2"
 	"tailscale.com/ipn/ipnstate"
@@ -32,7 +33,7 @@ type tailnetLocalClient interface {
 func (p *Provisioner) waitForEnrollment(ctx context.Context, inst model.Instance) (tailscale.Device, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.GuestReadyTimeout)
 	defer cancel()
-	runtime, err := instanceRuntimeIdentity(ctx, inst)
+	runtime, err := p.instanceRuntimeIdentity(ctx, inst)
 	if err != nil {
 		return tailscale.Device{}, "", err
 	}
@@ -47,7 +48,7 @@ func (p *Provisioner) waitForEnrollment(ctx context.Context, inst model.Instance
 				ip, probeErr := p.verifyLivePeer(ctx, device, "")
 				err = probeErr
 				if err == nil {
-					current, runtimeErr := instanceRuntimeIdentity(ctx, inst)
+					current, runtimeErr := p.instanceRuntimeIdentity(ctx, inst)
 					if runtimeErr != nil || current != runtime {
 						return tailscale.Device{}, "", errors.Join(errGuestExited, runtimeErr)
 					}
@@ -181,9 +182,23 @@ func matchingPeer(status *ipnstate.Status, device tailscale.Device, expectedIP s
 // Bind the recorded PID to the instance's actual API socket, then include Linux
 // process start time to detect PID reuse across a readiness observation. This
 // attests the current runtime; it does not establish historical boot provenance.
-func instanceRuntimeIdentity(ctx context.Context, inst model.Instance) (string, error) {
+func (p *Provisioner) instanceRuntimeIdentity(ctx context.Context, inst model.Instance) (string, error) {
 	if inst.FirecrackerPID <= 0 || serialLogShowsGuestHalted(inst.SerialLogPath) {
 		return "", errors.New("guest runtime is not running")
+	}
+	if inst.StartRequestID != "" {
+		// Only the privileged runner may access jailed Firecracker sockets. Its
+		// receipt binds this attempt to boot ID, PID, start ticks and socket peer.
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		result, err := p.startResult(ctx, inst)
+		if err != nil {
+			return "", err
+		}
+		if result.Outcome != vmrunner.StartRunning || result.PID != inst.FirecrackerPID {
+			return "", errors.New("runner cannot attest the recorded runtime")
+		}
+		return inst.StartRequestID, nil
 	}
 	dialer := net.Dialer{Timeout: 2 * time.Second}
 	conn, err := dialer.DialContext(ctx, "unix", inst.SocketPath)

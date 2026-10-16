@@ -8,6 +8,17 @@ This page covers the full lifecycle of a srv VM from creation to deletion.
 ssh srv new <name>
 ```
 
+Arch is the default. To select a configured image at creation:
+
+```bash
+ssh srv new debian-vm --image debian-13
+```
+
+The image stays with the VM; `start` does not change its operating system.
+See [image configuration](../reference/configuration.md#guest-artifacts) for the
+host-side catalog and [the Debian builder](../../images/debian-base/README.md)
+for the basic Debian 13 rootfs without Arch's optional developer/agent tools.
+
 With custom sizing:
 
 ```bash

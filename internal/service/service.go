@@ -94,6 +94,7 @@ type commandActionJSON struct {
 
 type instanceSummaryJSON struct {
 	Name            string `json:"name"`
+	Image           string `json:"image"`
 	State           string `json:"state"`
 	VCPUCount       int64  `json:"vcpu_count,omitempty"`
 	MemoryMiB       int64  `json:"memory_mib,omitempty"`
@@ -113,6 +114,7 @@ type inspectResponseJSON struct {
 
 type inspectInstanceJSON struct {
 	Name              string          `json:"name"`
+	Image             string          `json:"image"`
 	State             string          `json:"state"`
 	CreatedByUser     string          `json:"created_by_user,omitempty"`
 	CreatedByNode     string          `json:"created_by_node,omitempty"`
@@ -327,6 +329,7 @@ func maybeUnsupportedJSONCommand(command string, format outputFormat) (commandRe
 func instanceSummaryPayload(cfg config.Config, inst model.Instance, includeConnect bool) instanceSummaryJSON {
 	payload := instanceSummaryJSON{
 		Name:            inst.Name,
+		Image:           inst.ImageName(),
 		State:           inst.State,
 		VCPUCount:       effectiveInstanceVCPUCount(inst, cfg),
 		MemoryMiB:       effectiveInstanceMemoryMiB(inst, cfg),
@@ -365,6 +368,7 @@ func (a *App) inspectPayload(inst model.Instance, poolName string, integrations 
 	payload := inspectResponseJSON{
 		Instance: inspectInstanceJSON{
 			Name:              inst.Name,
+			Image:             inst.ImageName(),
 			State:             inst.State,
 			CreatedByUser:     inst.CreatedByUser,
 			CreatedByNode:     inst.CreatedByNode,
@@ -1195,6 +1199,7 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "name: %s\n", inst.Name)
+	fmt.Fprintf(&b, "image: %s\n", inst.ImageName())
 	fmt.Fprintf(&b, "state: %s\n", inst.State)
 	fmt.Fprintf(&b, "created-by: %s via %s\n", inst.CreatedByUser, inst.CreatedByNode)
 	fmt.Fprintf(&b, "created-at: %s\n", inst.CreatedAt.Format(time.RFC3339))
@@ -2410,7 +2415,7 @@ func helpResult() commandResult {
 		{
 			header: "INSTANCE COMMANDS",
 			entries: []helpEntry{
-				{"new <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]", "Create a new microvm instance."},
+				{"new <name> [--image NAME] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]", "Create a new microvm instance (default image: arch)."},
 				{"list", "List all instances."},
 				{"inspect <name>", "Show instance details and recent events."},
 				{"start <name>", "Start a stopped instance or recheck a running awaiting-tailnet instance."},
@@ -2485,6 +2490,8 @@ func helpResult() commandResult {
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "NEW AND RESIZE OPTIONS")
 	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "    --image NAME")
+	fmt.Fprintln(&b, "        Select a configured image during create (default: arch).")
 	fmt.Fprintln(&b, "    --cpus N")
 	fmt.Fprintln(&b, "        Number of vCPUs.")
 	fmt.Fprintln(&b, "    --ram SIZE")
@@ -3188,7 +3195,7 @@ func importUsage() string {
 }
 
 func newUsage() string {
-	return "usage: new <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]"
+	return "usage: new <name> [--image NAME] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]"
 }
 
 func resizeUsage() string {

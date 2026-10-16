@@ -453,6 +453,7 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 	}
 
 	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.Image = "debian-13"
 	inst.TailscaleName = "demo.tailnet"
 	inst.TailscaleIP = "100.64.0.10"
 	inst.RootFSSizeBytes = 12 << 20
@@ -492,6 +493,8 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 	}
 
 	mutated := inst
+	mutated.Image = "arch"
+	mutated.KernelPath = "/another/kernel"
 	mutated.VCPUCount = 4
 	mutated.MemoryMiB = 4096
 	mutated.RootFSSizeBytes = 20 << 20
@@ -518,6 +521,9 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 	}
 	if restored.State != model.StateStopped {
 		t.Fatalf("RestoreBackup() state = %q, want %q", restored.State, model.StateStopped)
+	}
+	if restored.Image != "debian-13" || restored.KernelPath != inst.KernelPath || restored.InitrdPath != inst.InitrdPath {
+		t.Fatalf("RestoreBackup() did not restore the image and boot paths: %#v", restored)
 	}
 	if restored.VCPUCount != inst.VCPUCount || restored.MemoryMiB != inst.MemoryMiB || restored.RootFSSizeBytes != inst.RootFSSizeBytes {
 		t.Fatalf("RestoreBackup() restored instance = %#v, want original sizing %#v", restored, inst)
@@ -637,6 +643,10 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 		"SRV_BASE_INITRD":     destInitrd,
 		"SRV_VM_NETWORK_CIDR": "10.1.0.0/29",
 	})
+	// The destination has an unrelated Arch default and a local Debian kernel.
+	destCfg.Images = map[string]config.Image{"debian-13": {Kernel: destKernel, Initrd: destInitrd}}
+	destCfg.BaseKernelPath = "/unrelated/arch/vmlinux"
+	destCfg.BaseInitrdPath = "/unrelated/arch/initrd"
 	sourceStore := newProvisionTestStore(t, sourceCfg)
 	destStore := newProvisionTestStore(t, destCfg)
 	source := &Provisioner{
@@ -661,6 +671,7 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 	serialPayload := []byte("serial-data\n")
 	fcPayload := []byte("firecracker-data\n")
 	sourceInst := provisionTestInstance(sourceCfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	sourceInst.Image = "debian-13"
 	sourceInst.VCPUCount = 4
 	sourceInst.MemoryMiB = 4096
 	sourceInst.RootFSSizeBytes = int64(len(rootfsPayload))
@@ -690,6 +701,15 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 	if exportedInfo.Name != sourceInst.Name {
 		t.Fatalf("ExportInstance() name = %q, want %q", exportedInfo.Name, sourceInst.Name)
 	}
+	tr, zr, err := newPortableArtifactTarReader(bytes.NewReader(stream.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := readPortableManifest(tr)
+	zr.Close()
+	if err != nil || manifest.Version != 2 || manifest.Instance.Image != "debian-13" {
+		t.Fatalf("Debian export must require an image-aware reader: %#v, %v", manifest, err)
+	}
 
 	progressByFile := make(map[string]ImportProgress)
 	imported, importedInfo, err := dest.ImportInstance(
@@ -711,6 +731,9 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 	}
 	if imported.ID != sourceInst.ID {
 		t.Fatalf("ImportInstance() id = %q, want %q", imported.ID, sourceInst.ID)
+	}
+	if imported.Image != "debian-13" {
+		t.Fatalf("ImportInstance() image = %q, want debian-13", imported.Image)
 	}
 	if imported.State != model.StateStopped {
 		t.Fatalf("ImportInstance() state = %q, want %q", imported.State, model.StateStopped)
@@ -808,7 +831,7 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 func TestPeekPortableArtifactInfoReplaysStream(t *testing.T) {
 	exportedAt := time.Date(2026, time.April, 5, 10, 30, 0, 0, time.UTC)
 	manifest := portableManifest{
-		Version:    portableManifestVersion,
+		Version:    1,
 		ExportedAt: exportedAt,
 		Instance: portableInstance{
 			Name:      "demo",
@@ -1544,7 +1567,7 @@ func TestBaseRootFSInUse(t *testing.T) {
 		}
 		return "/dev/loop7", nil
 	}
-	inUse, err := p.baseRootFSInUse()
+	inUse, err := p.baseRootFSInUse(cfg.BaseRootFSPath)
 	if err != nil {
 		t.Fatalf("baseRootFSInUse() error = %v", err)
 	}
@@ -1555,7 +1578,7 @@ func TestBaseRootFSInUse(t *testing.T) {
 	loopDevicesForPath = func(string) (string, error) {
 		return "", nil
 	}
-	inUse, err = p.baseRootFSInUse()
+	inUse, err = p.baseRootFSInUse(cfg.BaseRootFSPath)
 	if err != nil {
 		t.Fatalf("baseRootFSInUse() error = %v", err)
 	}
@@ -1602,7 +1625,7 @@ func TestEnsureCreatePrereqsChecksReflinkCloneability(t *testing.T) {
 			return nil
 		}
 		p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
-		if err := p.ensureCreatePrereqs(context.Background(), false); err != nil {
+		if err := p.ensureCreatePrereqs(context.Background(), false, config.Image{Kernel: kernelPath, RootFS: rootfsPath}); err != nil {
 			t.Fatalf("ensureCreatePrereqs() error = %v", err)
 		}
 		if src != cfg.BaseRootFSPath {
@@ -1642,7 +1665,7 @@ func TestEnsureCreatePrereqsChecksReflinkCloneability(t *testing.T) {
 		}
 
 		p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
-		if err := p.ensureCreatePrereqs(context.Background(), false); err != nil {
+		if err := p.ensureCreatePrereqs(context.Background(), false, config.Image{Kernel: kernelPath, RootFS: rootfsPath}); err != nil {
 			t.Fatalf("ensureCreatePrereqs() with installer-style permissions error = %v", err)
 		}
 		if !strings.HasPrefix(dest, cfg.InstancesDir()+string(os.PathSeparator)) {
@@ -1655,7 +1678,7 @@ func TestEnsureCreatePrereqsChecksReflinkCloneability(t *testing.T) {
 			return errors.New("operation not supported")
 		}
 		p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
-		err := p.ensureCreatePrereqs(context.Background(), false)
+		err := p.ensureCreatePrereqs(context.Background(), false, config.Image{Kernel: kernelPath, RootFS: rootfsPath})
 		if err == nil || !strings.Contains(err.Error(), "must be reflink-cloneable into data dir") {
 			t.Fatalf("ensureCreatePrereqs() error = %v", err)
 		}
@@ -1889,6 +1912,14 @@ func TestCreateRejectsWhenHostDiskSpaceIsLow(t *testing.T) {
 	if _, err := p.Create(context.Background(), "demo", model.Actor{UserLogin: "alice@example.com"}, CreateOptions{}); err == nil || !strings.Contains(err.Error(), "insufficient host disk") {
 		t.Fatalf("Create() disk capacity error = %v", err)
 	}
+	p.cfg.Images = map[string]config.Image{"debian-13": {Kernel: baseKernel, RootFS: baseRootFS}}
+	p.cfg.BaseRootFSPath = "/unavailable/arch/rootfs.img"
+	if _, err := p.Create(context.Background(), "demo", model.Actor{UserLogin: "alice@example.com"}, CreateOptions{Image: "debian-13"}); err == nil || !strings.Contains(err.Error(), "insufficient host disk") {
+		t.Fatalf("Create() must use the selected rootfs for admission, not the Arch default: %v", err)
+	}
+	if _, err := p.Create(context.Background(), "demo", model.Actor{}, CreateOptions{Image: "unknown"}); err == nil || !strings.Contains(err.Error(), "unknown image") {
+		t.Fatalf("Create() must reject an unknown image before touching storage: %v", err)
+	}
 	if _, found, err := st.FindInstance(context.Background(), "demo"); err != nil {
 		t.Fatalf("FindInstance(): %v", err)
 	} else if found {
@@ -2100,7 +2131,7 @@ func TestStartReconcilesLateTailnetJoinForRunningInstance(t *testing.T) {
 }
 
 func TestWarmStartReadinessAndRecovery(t *testing.T) {
-	for _, scenario := range []string{"unchanged-last-seen", "lost-start-response", "unknown-start", "probe-timeout", "cancel-after-boot", "cancel-node-only-start", "cancel-node-only-reconcile", "cancel-during-probe", "api-error", "wrong-node", "duplicate-name", "ping-error-result", "wrong-peer", "address-mismatch", "key-change"} {
+	for _, scenario := range []string{"debian-image", "unchanged-last-seen", "lost-start-response", "unknown-start", "probe-timeout", "cancel-after-boot", "cancel-node-only-start", "cancel-node-only-reconcile", "cancel-during-probe", "api-error", "wrong-node", "duplicate-name", "ping-error-result", "wrong-peer", "address-mismatch", "key-change"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -2113,6 +2144,11 @@ func TestWarmStartReadinessAndRecovery(t *testing.T) {
 				inst.TailscaleName, inst.TailscaleIP = "", ""
 			}
 			inst.InitrdPath = ""
+			if scenario == "debian-image" {
+				inst.Image = "debian-13"
+				cfg.BaseKernelPath = "/unrelated/arch/vmlinux"
+				cfg.BaseInitrdPath = "/unrelated/arch/initrd"
+			}
 			// Managed readiness must use the privileged runner's attestation;
 			// the control plane cannot access the jailed API socket.
 			inst.SocketPath = filepath.Join(t.TempDir(), "inaccessible.sock")
@@ -2192,7 +2228,7 @@ func TestWarmStartReadinessAndRecovery(t *testing.T) {
 			}}
 			p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st, tsClient: &tailscale.Client{}, localClient: client, networkHelper: noopNetworkHelper{}, vmRunner: runner, readHostMemoryBytes: func() (int64, error) { return 64 << 30, nil }}
 			_, err := p.Start(ctx, inst.Name)
-			if scenario == "unchanged-last-seen" || scenario == "lost-start-response" {
+			if scenario == "debian-image" || scenario == "unchanged-last-seen" || scenario == "lost-start-response" {
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2239,6 +2275,9 @@ func TestWarmStartReadinessAndRecovery(t *testing.T) {
 			}
 			if ready.State != model.StateReady || ready.FirecrackerPID != os.Getpid() || ready.LastError != "" || ready.TailscaleIP != "100.64.0.10" {
 				t.Fatalf("unexpected ready state: %#v", ready)
+			}
+			if ready.Image != inst.Image || ready.KernelPath != inst.KernelPath || ready.InitrdPath != inst.InitrdPath {
+				t.Fatalf("start changed the selected image or boot artifacts: %#v", ready)
 			}
 		})
 	}

@@ -104,6 +104,7 @@ type tailnetDeviceSnapshot struct {
 }
 
 type CreateOptions struct {
+	Image           string
 	VCPUCount       int64
 	MemoryMiB       int64
 	MemoryPoolName  string
@@ -222,7 +223,15 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if !validName.MatchString(name) {
 		return model.Instance{}, fmt.Errorf("invalid instance name %q", name)
 	}
-	baseRootFSSize, err := p.baseRootFSSize()
+	imageName := opts.Image
+	if imageName == "" {
+		imageName = "arch"
+	}
+	image, err := p.cfg.ResolveImage(imageName)
+	if err != nil {
+		return model.Instance{}, err
+	}
+	baseRootFSSize, err := p.rootFSSize(image.RootFS)
 	if err != nil {
 		return model.Instance{}, err
 	}
@@ -230,7 +239,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if err != nil {
 		return model.Instance{}, err
 	}
-	if err := p.ensureCreatePrereqs(ctx, needsResize); err != nil {
+	if err := p.ensureCreatePrereqs(ctx, needsResize, image); err != nil {
 		return model.Instance{}, err
 	}
 	var pool model.MemoryPool
@@ -271,6 +280,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		inst = model.Instance{
 			ID:              uuid.NewString(),
 			Name:            name,
+			Image:           imageName,
 			State:           model.StateProvisioning,
 			CreatedAt:       now,
 			UpdatedAt:       now,
@@ -281,8 +291,8 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 			MemoryMode:      model.MemoryModeFixed,
 			RootFSSizeBytes: resolved.RootFSSizeBytes,
 			RootFSPath:      filepath.Join(instanceDir, "rootfs.img"),
-			KernelPath:      p.cfg.BaseKernelPath,
-			InitrdPath:      p.cfg.BaseInitrdPath,
+			KernelPath:      image.Kernel,
+			InitrdPath:      image.Initrd,
 			SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
 			LogPath:         filepath.Join(instanceDir, "firecracker.log"),
 			SerialLogPath:   filepath.Join(instanceDir, "serial.log"),
@@ -328,7 +338,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		}
 	}()
 
-	if err := p.cloneRootFS(ctx, inst.RootFSPath); err != nil {
+	if err := p.cloneRootFS(ctx, image.RootFS, inst.RootFSPath); err != nil {
 		inst.LastError = err.Error()
 		return inst, err
 	}
@@ -1083,21 +1093,26 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 	return instanceDir, nil
 }
 
-func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool) error {
-	for _, path := range []string{p.cfg.BaseKernelPath, p.cfg.BaseRootFSPath} {
+func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool, image config.Image) error {
+	for _, path := range []string{image.Kernel, image.RootFS} {
 		if path == "" {
-			return errors.New("create requires SRV_BASE_KERNEL and SRV_BASE_ROOTFS")
+			return errors.New("create requires kernel and rootfs paths (SRV_BASE_KERNEL/SRV_BASE_ROOTFS or SRV_IMAGES_FILE)")
 		}
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("required file %s: %w", path, err)
 		}
 	}
-	inUse, err := p.baseRootFSInUse()
+	if image.Initrd != "" {
+		if _, err := os.Stat(image.Initrd); err != nil {
+			return fmt.Errorf("required file %s: %w", image.Initrd, err)
+		}
+	}
+	inUse, err := p.baseRootFSInUse(image.RootFS)
 	if err != nil {
 		return err
 	}
 	if inUse {
-		return fmt.Errorf("base rootfs image %s is still attached to a loop device; wait for the image build or mount to finish before creating instances", p.cfg.BaseRootFSPath)
+		return fmt.Errorf("base rootfs image %s is still attached to a loop device; wait for the image build or mount to finish before creating instances", image.RootFS)
 	}
 	if needsResize {
 		if err := ensureRootFSResizeTools("create with a custom rootfs size"); err != nil {
@@ -1110,13 +1125,13 @@ func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool)
 	if len(p.cfg.GuestAuthTags) == 0 {
 		return errors.New("create requires SRV_GUEST_AUTH_TAGS so minted guest auth keys carry an allowed tag")
 	}
-	if err := p.ensureRootFSReflinkSupport(ctx); err != nil {
+	if err := p.ensureRootFSReflinkSupport(ctx, image.RootFS); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (p *Provisioner) ensureRootFSReflinkSupport(ctx context.Context) error {
+func (p *Provisioner) ensureRootFSReflinkSupport(ctx context.Context, rootfs string) error {
 	probeParent := p.cfg.InstancesDir()
 	probeDir, err := os.MkdirTemp(probeParent, ".srv-reflink-check-")
 	if err != nil {
@@ -1126,22 +1141,30 @@ func (p *Provisioner) ensureRootFSReflinkSupport(ctx context.Context) error {
 		_ = os.RemoveAll(probeDir)
 	}()
 
-	probePath := filepath.Join(probeDir, filepath.Base(p.cfg.BaseRootFSPath))
-	if err := reflinkCloneFile(ctx, p.cfg.BaseRootFSPath, probePath); err != nil {
-		return fmt.Errorf("base rootfs %s must be reflink-cloneable into data dir %s on the same reflink-capable filesystem: %w", p.cfg.BaseRootFSPath, p.cfg.DataDirAbs(), err)
+	probePath := filepath.Join(probeDir, filepath.Base(rootfs))
+	if err := reflinkCloneFile(ctx, rootfs, probePath); err != nil {
+		return fmt.Errorf("base rootfs %s must be reflink-cloneable into data dir %s on the same reflink-capable filesystem: %w", rootfs, p.cfg.DataDirAbs(), err)
 	}
 	return nil
 }
 
 func (p *Provisioner) configuredKernelPath(inst model.Instance) string {
-	if path := strings.TrimSpace(p.cfg.BaseKernelPath); path != "" {
+	if inst.ImageName() != "arch" {
+		return inst.KernelPath
+	}
+	image, _ := p.cfg.ResolveImage("arch")
+	if path := strings.TrimSpace(image.Kernel); path != "" {
 		return path
 	}
 	return strings.TrimSpace(inst.KernelPath)
 }
 
 func (p *Provisioner) configuredInitrdPath(inst model.Instance) string {
-	if path := strings.TrimSpace(p.cfg.BaseInitrdPath); path != "" {
+	if inst.ImageName() != "arch" {
+		return inst.InitrdPath
+	}
+	image, _ := p.cfg.ResolveImage("arch")
+	if path := strings.TrimSpace(image.Initrd); path != "" {
 		return path
 	}
 	return strings.TrimSpace(inst.InitrdPath)
@@ -1184,20 +1207,12 @@ func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
 	return nil
 }
 
-func (p *Provisioner) baseRootFSInUse() (bool, error) {
-	loops, err := loopDevicesForPath(p.cfg.BaseRootFSPath)
+func (p *Provisioner) baseRootFSInUse(rootfs string) (bool, error) {
+	loops, err := loopDevicesForPath(rootfs)
 	if err != nil {
 		return false, err
 	}
 	return loops != "", nil
-}
-
-func (p *Provisioner) baseRootFSSize() (int64, error) {
-	info, err := os.Stat(p.cfg.BaseRootFSPath)
-	if err != nil {
-		return 0, fmt.Errorf("stat base rootfs %s: %w", p.cfg.BaseRootFSPath, err)
-	}
-	return info.Size(), nil
 }
 
 func (p *Provisioner) rootFSSize(path string) (int64, error) {
@@ -1523,8 +1538,8 @@ func (p *Provisioner) resolveCreateOptions(opts CreateOptions, baseRootFSSize in
 	return resolved, resolved.RootFSSizeBytes > baseRootFSSize, nil
 }
 
-func (p *Provisioner) cloneRootFS(ctx context.Context, dest string) error {
-	if err := reflinkCloneFile(ctx, p.cfg.BaseRootFSPath, dest); err != nil {
+func (p *Provisioner) cloneRootFS(ctx context.Context, source, dest string) error {
+	if err := reflinkCloneFile(ctx, source, dest); err != nil {
 		return fmt.Errorf("reflink rootfs clone: %w", err)
 	}
 	if err := os.Chmod(dest, 0o660); err != nil {
@@ -1732,6 +1747,8 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst *model.Instance
 	}
 	resp, err := p.vmRunner.StartInstanceVM(ctx, vmrunner.StartRequest{
 		InstanceID: inst.ID, RequestID: inst.StartRequestID, HostBootID: inst.StartBootID,
+		KernelPath:          inst.KernelPath,
+		InitrdPath:          inst.InitrdPath,
 		Name:                inst.Name,
 		TapDevice:           inst.TapDevice,
 		GuestMAC:            inst.GuestMAC,

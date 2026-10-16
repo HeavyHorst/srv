@@ -121,6 +121,52 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	}
 }
 
+func TestLoadImageCatalog(t *testing.T) {
+	for _, tc := range []struct {
+		name, catalog, wantErr string
+	}{
+		{"valid", `{"debian-13":{"kernel":"/images/debian/vmlinux","rootfs":"/images/debian/rootfs.img"}}`, ""},
+		{"invalid JSON", `{`, "parse images file"},
+		{"missing rootfs", `{"debian-13":{"kernel":"/images/vmlinux"}}`, "absolute kernel and rootfs"},
+		{"relative initrd", `{"debian-13":{"kernel":"/kernel","rootfs":"/rootfs","initrd":"relative.img"}}`, "absolute initrd"},
+		{"invalid name", `{"../debian":{"kernel":"/kernel","rootfs":"/rootfs"}}`, "invalid image name"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetFlagsForTest(t, []string{"srv.test"})
+			path := filepath.Join(t.TempDir(), "images.json")
+			if err := os.WriteFile(path, []byte(tc.catalog), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("SRV_IMAGES_FILE", path)
+			t.Setenv("SRV_BASE_KERNEL", "/images/arch/vmlinux")
+			t.Setenv("SRV_BASE_ROOTFS", "/images/arch/rootfs.img")
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load() error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			debian, err := cfg.ResolveImage("debian-13")
+			if err != nil || debian != (Image{Kernel: "/images/debian/vmlinux", RootFS: "/images/debian/rootfs.img"}) {
+				t.Fatalf("Debian image = %#v, %v", debian, err)
+			}
+			for _, name := range []string{"", "arch"} {
+				arch, err := cfg.ResolveImage(name)
+				if err != nil || arch != (Image{Kernel: "/images/arch/vmlinux", RootFS: "/images/arch/rootfs.img"}) {
+					t.Fatalf("default image = %#v, %v", arch, err)
+				}
+			}
+			if _, err := cfg.ResolveImage("ubuntu"); err == nil {
+				t.Fatal("unconfigured image accepted")
+			}
+		})
+	}
+}
+
 func TestValidateRejectsInvalidConfig(t *testing.T) {
 	tests := []struct {
 		name    string

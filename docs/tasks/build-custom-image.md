@@ -2,6 +2,12 @@
 
 The default guest image is an Arch Linux rootfs with Docker, Go, Neovim, OpenCode, Pi, and common development tools. You can customize it by modifying the overlay or building a completely different rootfs.
 
+For a basic Debian 13 guest without the Arch developer/agent tools, use the
+[Debian builder](../../images/debian-base/README.md). It reuses the custom
+Firecracker kernel and matching modules, plus the existing srv bootstrap.
+Register its artifacts in the [image catalog](../reference/configuration.md#guest-artifacts)
+and select it with `ssh srv new demo --image debian-13`.
+
 ## Default image builder
 
 The `images/arch-base/` directory contains the official builder:

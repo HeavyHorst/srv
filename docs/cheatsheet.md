@@ -13,6 +13,7 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | Command | Description |
 |---------|-------------|
 | `new <name>` | Create new VM with optional `--cpus`, `--ram`, `--rootfs-size` |
+| `new <name> --image debian-13` | Create with a registered image (default: `arch`) |
 | `new <name> --pool <pool> --ram <size>` | Create a pooled VM with elastic memory; idle guest RAM may be reclaimed |
 | `new <name> --integration <name>` | Create a VM and enable one or more existing integrations (admin only) |
 | `list` | Show visible VMs (all for admins, own for regular users) |

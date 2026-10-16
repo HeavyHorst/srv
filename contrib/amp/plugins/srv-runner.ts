@@ -750,7 +750,20 @@ command -v ssh >/dev/null 2>&1 || packages+=(openssh)
 command -v jq >/dev/null 2>&1 || packages+=(jq)
 command -v tmux >/dev/null 2>&1 || packages+=(tmux)
 if (( \${#packages[@]} > 0 )); then
-  pacman -Sy --noconfirm --needed "\${packages[@]}"
+  if command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm --needed "\${packages[@]}"
+  elif command -v apt-get >/dev/null 2>&1; then
+    for index in "\${!packages[@]}"; do
+      if [[ "\${packages[$index]}" == openssh ]]; then
+        packages[$index]=openssh-client
+      fi
+    done
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "\${packages[@]}"
+  else
+    echo "Cannot install missing runner dependencies (\${packages[*]}): supported package managers are pacman and apt-get" >&2
+    exit 1
+  fi
 fi
 
 curl -fsSL https://ampcode.com/install.sh | bash

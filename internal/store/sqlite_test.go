@@ -23,6 +23,7 @@ func TestStoreInstanceRoundTripAndListFiltering(t *testing.T) {
 	deletedAt := createdAt.Add(10 * time.Minute)
 
 	ready := testInstance("alpha", model.StateReady, createdAt)
+	ready.Image = "debian-13"
 	ready.StartRequestID, ready.StartBootID, ready.TailnetNodeID = "attempt-one", "boot-one", "node-one"
 	deleted := testInstance("beta", model.StateDeleted, createdAt.Add(time.Minute))
 	deleted.UpdatedAt = updatedAt
@@ -496,7 +497,7 @@ func TestOpenMigratesExistingInstancesTable(t *testing.T) {
 		}
 		columns[name] = true
 	}
-	for _, want := range []string{"vcpu_count", "memory_mib", "memory_mode", "memory_pool_id", "rootfs_size_bytes"} {
+	for _, want := range []string{"vcpu_count", "memory_mib", "memory_mode", "memory_pool_id", "rootfs_size_bytes", "image"} {
 		if !columns[want] {
 			t.Fatalf("missing migrated column %q in %#v", want, columns)
 		}

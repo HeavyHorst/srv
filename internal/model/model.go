@@ -37,6 +37,7 @@ func NormalizeMemoryMode(mode string) string {
 type Instance struct {
 	ID              string
 	Name            string
+	Image           string
 	State           string
 	CreatedAt       time.Time
 	CreatedByUser   string
@@ -71,6 +72,13 @@ type Instance struct {
 
 func (i Instance) NormalizedMemoryMode() string {
 	return NormalizeMemoryMode(i.MemoryMode)
+}
+
+func (i Instance) ImageName() string {
+	if i.Image == "" {
+		return "arch"
+	}
+	return i.Image
 }
 
 func (i Instance) UsesMemoryPool() bool {

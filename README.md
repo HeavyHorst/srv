@@ -153,6 +153,7 @@ Core environment variables live in [`contrib/systemd/srv.env.example`](contrib/s
 - `SRV_BASE_KERNEL`: Firecracker guest kernel image
 - `SRV_BASE_INITRD`: optional initrd image
 - `SRV_BASE_ROOTFS`: base guest rootfs image stored on the same reflink-capable filesystem as `SRV_DATA_DIR` such as `btrfs` or reflink-enabled `xfs`
+- `SRV_IMAGES_FILE`: optional JSON image catalog for `new --image NAME`; Arch remains the default. See [image configuration](docs/reference/configuration.md#guest-artifacts) and the [Debian 13 basic image builder](images/debian-base/README.md).
 - `SRV_GUEST_AUTH_TAGS`: comma-separated tags applied to guest auth keys
 - `SRV_GUEST_USER_AUTH_TAGS`: optional comma-separated `tailscale-login=tag:name` mappings that replace the default tags based on the verified VM creator
 - `SRV_DATA_DIR`: host state directory, default `/var/lib/srv`

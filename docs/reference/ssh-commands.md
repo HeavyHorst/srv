@@ -21,6 +21,7 @@ ssh srv -- --json status
 | Command | Description |
 |---------|-------------|
 | `new <name>` | Create a new VM |
+| `new <name> --image <name>` | Select a configured guest image, e.g. `debian-13` (default: `arch`) |
 | `new <name> --integration <name>` | Create and enable one or more existing integrations (admin only) |
 | `new <name> --cpus <n>` | Create with custom vCPU count |
 | `new <name> --ram <size>` | Create with custom memory (`2G`, `512M`, or MiB integer) |

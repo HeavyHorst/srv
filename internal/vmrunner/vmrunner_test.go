@@ -91,6 +91,7 @@ func TestNewRootDriveUsesWritebackCache(t *testing.T) {
 
 func TestClientAndServerOverUnixSocket(t *testing.T) {
 	valid := StartRequest{
+		KernelPath:  "/var/lib/srv/images/debian-base/vmlinux",
 		Name:        "demo",
 		TapDevice:   "tap-demo",
 		GuestMAC:    "02:fc:aa:bb:cc:dd",
@@ -192,6 +193,33 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 	}
 	if !reflect.DeepEqual(pools, []MemoryPoolRequest{{Name: "pool-a"}}) {
 		t.Fatalf("pools = %#v", pools)
+	}
+}
+
+func TestImageAwareStartRejectsUntrustedBootFiles(t *testing.T) {
+	images := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "host-secret")
+	if err := os.WriteFile(outside, []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	escape := filepath.Join(images, "symlink")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(nil, ServerConfig{
+		FirecrackerBinary: "/usr/bin/firecracker", JailerBinary: "/usr/bin/jailer",
+		JailerBaseDir: t.TempDir(), InstancesDir: t.TempDir(), ImagesDir: images,
+	})
+	client := receiptHTTPClient(t, s.Handler())
+	for _, path := range []string{outside, escape} {
+		req := StartRequest{
+			KernelPath: path, Name: "demo", TapDevice: "tap-demo", GuestMAC: "02:fc:aa:bb:cc:dd",
+			GuestAddr: "10.0.0.2/30", GatewayAddr: "10.0.0.1", VCPUCount: 1, MemoryMiB: 512,
+			Bootstrap: Bootstrap{Hostname: "demo"},
+		}
+		if _, err := client.StartInstanceVM(context.Background(), req); err == nil || !strings.Contains(err.Error(), "outside images directory") {
+			t.Fatalf("untrusted boot artifact %q was not rejected: %v", path, err)
+		}
 	}
 }
 

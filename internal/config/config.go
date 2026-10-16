@@ -1,12 +1,14 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +51,7 @@ type Config struct {
 	BaseKernelPath           string
 	BaseInitrdPath           string
 	BaseRootFSPath           string
+	Images                   map[string]Image
 	NetHelperSocketPath      string
 	VMRunnerSocketPath       string
 	FirecrackerBinary        string
@@ -78,8 +81,30 @@ type Config struct {
 	dataDirAbs string
 }
 
+type Image struct {
+	Kernel string `json:"kernel"`
+	Initrd string `json:"initrd,omitempty"`
+	RootFS string `json:"rootfs"`
+}
+
+var imageName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
+
+func (c Config) ResolveImage(name string) (Image, error) {
+	if name == "" {
+		name = "arch"
+	}
+	if image, ok := c.Images[name]; ok {
+		return image, nil
+	}
+	if name == "arch" {
+		return Image{Kernel: c.BaseKernelPath, Initrd: c.BaseInitrdPath, RootFS: c.BaseRootFSPath}, nil
+	}
+	return Image{}, fmt.Errorf("unknown image %q; configure it in SRV_IMAGES_FILE", name)
+}
+
 func Load() (Config, error) {
 	var cfg Config
+	imagesFile := flag.String("images-file", os.Getenv("SRV_IMAGES_FILE"), "JSON file mapping image names to kernel, initrd and rootfs paths")
 
 	flag.StringVar(&cfg.DataDir, "data-dir", getenv("SRV_DATA_DIR", defaultDataDir), "service state directory")
 	flag.StringVar(&cfg.Hostname, "hostname", getenv("SRV_HOSTNAME", defaultHostname), "tailscale hostname for the control plane")
@@ -131,6 +156,15 @@ func Load() (Config, error) {
 	cfg.GuestTailscaleAuthOnce = true
 
 	var err error
+	if *imagesFile != "" {
+		data, err := os.ReadFile(*imagesFile)
+		if err != nil {
+			return Config{}, fmt.Errorf("read images file: %w", err)
+		}
+		if err := json.Unmarshal(data, &cfg.Images); err != nil {
+			return Config{}, fmt.Errorf("parse images file: %w", err)
+		}
+	}
 	if cfg.GuestUserAuthTags, err = parseGuestUserAuthTags(*guestUserTags); err != nil {
 		return Config{}, err
 	}
@@ -154,6 +188,14 @@ func Load() (Config, error) {
 }
 
 func (c Config) Validate() error {
+	for name, image := range c.Images {
+		if !imageName.MatchString(name) {
+			return fmt.Errorf("invalid image name %q", name)
+		}
+		if !filepath.IsAbs(image.Kernel) || !filepath.IsAbs(image.RootFS) || (image.Initrd != "" && !filepath.IsAbs(image.Initrd)) {
+			return fmt.Errorf("image %q requires absolute kernel and rootfs paths and an optional absolute initrd path", name)
+		}
+	}
 	if c.Hostname == "" {
 		return errors.New("hostname is required")
 	}

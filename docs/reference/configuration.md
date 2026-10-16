@@ -32,6 +32,50 @@ Use either `TS_AUTHKEY` or `TS_CLIENT_ID`/`TS_CLIENT_SECRET` for the control-pla
 | `SRV_BASE_KERNEL` | (required) | Path to the Firecracker guest kernel image |
 | `SRV_BASE_ROOTFS` | (required) | Path to the base rootfs image. Must be on the same reflink-capable filesystem as `SRV_DATA_DIR`. |
 | `SRV_BASE_INITRD` | (empty) | Optional initrd image path |
+| `SRV_IMAGES_FILE` | (empty) | JSON image catalog; also available as `--images-file`. Read at service startup. |
+| `SRV_IMAGES_DIR` | `SRV_DATA_DIR/images` | Runner's trusted boot-artifact directory; also available as runner `--images-dir`. |
+
+For example, `/etc/srv/images.json` can register Debian alongside the existing
+Arch defaults:
+
+```json
+{
+  "debian-13": {
+    "kernel": "/var/lib/srv/images/debian-base/vmlinux",
+    "rootfs": "/var/lib/srv/images/debian-base/rootfs-base.img"
+  }
+}
+```
+
+Set `SRV_IMAGES_FILE=/etc/srv/images.json` in the service environment. Upgrade
+both `srv` and `srv-vm-runner`, then restart both services; an old runner rejects
+image-aware starts rather than silently using its global kernel. Paths must be
+absolute; `initrd` is optional. Selected kernels/initrds must resolve within
+`SRV_IMAGES_DIR` (except the exact legacy configured kernel/initrd pair).
+Keep this tree and its ancestors root-owned and not writable by the srv service
+or guests; do not store secrets in it. Symlinks escaping the tree are rejected.
+Every base rootfs must be reflink-cloneable into `SRV_DATA_DIR`. Names use lowercase letters,
+digits, dots, underscores and hyphens, starting with a letter or digit. Unknown
+names are rejected before creating a VM.
+
+`ssh srv new demo --image debian-13` selects Debian; omitting `--image` selects
+`arch`. The `arch` entry falls back to `SRV_BASE_KERNEL`, `SRV_BASE_INITRD` and
+`SRV_BASE_ROOTFS` unless explicitly defined in the catalog. These legacy variables
+are not needed when all required paths are supplied by catalog entries.
+
+The selected image and boot paths are stored with the VM. Non-Arch guests keep
+their saved kernel/initrd paths across starts, even if the catalog changes or
+the entry is removed. Keep those artifacts available and use versioned paths
+when replacing kernels. Arch retains its existing behavior: current configured
+Arch boot paths are picked up on start/restart. No existing writable rootfs is
+replaced by changing the catalog. `inspect` and JSON responses expose `image`;
+older VM records are treated as `arch`.
+
+Portable exports preserve the image name. To import a named image on another
+host, register that name with a compatible kernel/module build first; imports
+use the destination's boot paths. Older exports without an image name use Arch.
+Non-Arch exports use format version 2, so older servers reject them instead of
+importing them as Arch; Arch exports remain compatible with format version 1.
 
 ## Guest defaults
 

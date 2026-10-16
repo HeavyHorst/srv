@@ -1208,7 +1208,7 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
 	for _, want := range []string{
 		"ssh srv [--json] <command>",
-		"new <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]",
+		"new <name> [--image NAME] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]",
 		"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]",
 		"backup create <name>",
 		"backup list <name>",
@@ -2140,6 +2140,22 @@ func TestParseNewArgs(t *testing.T) {
 		wantInts []string
 		wantErr  string
 	}{
+		{
+			name:     "selects image alongside sizing",
+			args:     []string{"new", "--image=debian-13", "demo", "--ram", "1G"},
+			wantName: "demo",
+			wantOpts: provision.CreateOptions{Image: "debian-13", MemoryMiB: 1024},
+		},
+		{
+			name:    "rejects duplicate images",
+			args:    []string{"new", "demo", "--image", "arch", "--image", "debian-13"},
+			wantErr: "--image requires one non-empty image name",
+		},
+		{
+			name:    "rejects empty image",
+			args:    []string{"new", "demo", "--image="},
+			wantErr: "--image requires one non-empty image name",
+		},
 		{
 			name:     "parses name before flags",
 			args:     []string{"new", "demo", "--cpus", "2", "--ram", "4G", "--rootfs-size", "12G"},

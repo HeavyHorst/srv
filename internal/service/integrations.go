@@ -503,6 +503,7 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, []string, err
 		seenRAM        bool
 		seenPool       bool
 		seenRootFSSize bool
+		seenImage      bool
 	)
 
 	for i := 1; i < len(args); i++ {
@@ -525,6 +526,12 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, []string, err
 		}
 
 		switch key {
+		case "--image":
+			if seenImage || strings.TrimSpace(value) == "" {
+				return "", provision.CreateOptions{}, nil, fmt.Errorf("--image requires one non-empty image name\n%s", newUsage())
+			}
+			seenImage = true
+			opts.Image = value
 		case "--cpus":
 			if seenCPUs {
 				return "", provision.CreateOptions{}, nil, fmt.Errorf("%s specified more than once\n%s", key, newUsage())

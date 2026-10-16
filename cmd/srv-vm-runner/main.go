@@ -23,6 +23,7 @@ func main() {
 		instancesDir      string
 		kernelPath        string
 		initrdPath        string
+		imagesDir         string
 		firecrackerBinary string
 		jailerBinary      string
 		jailerBaseDir     string
@@ -39,6 +40,7 @@ func main() {
 	flag.StringVar(&instancesDir, "instances-dir", filepath.Join(defaultDataDir, "instances"), "base directory containing per-instance runtime artifacts")
 	flag.StringVar(&kernelPath, "base-kernel", getenv("SRV_BASE_KERNEL", ""), "path to the Firecracker kernel image")
 	flag.StringVar(&initrdPath, "base-initrd", getenv("SRV_BASE_INITRD", ""), "path to the optional initrd image")
+	flag.StringVar(&imagesDir, "images-dir", getenv("SRV_IMAGES_DIR", filepath.Join(defaultDataDir, "images")), "administrator-managed directory containing allowed boot artifacts")
 	flag.StringVar(&firecrackerBinary, "firecracker-bin", getenv("SRV_FIRECRACKER_BIN", "/usr/bin/firecracker"), "firecracker binary path")
 	flag.StringVar(&jailerBinary, "jailer-bin", getenv("SRV_JAILER_BIN", "/usr/bin/jailer"), "path to the Firecracker jailer binary")
 	flag.StringVar(&jailerBaseDir, "jailer-base-dir", getenv("SRV_JAILER_BASE_DIR", filepath.Join(defaultDataDir, "jailer")), "base directory where Firecracker jailer workspaces are created")
@@ -81,6 +83,7 @@ func main() {
 		InstancesDir:      instancesDir,
 		KernelPath:        kernelPath,
 		InitrdPath:        initrdPath,
+		ImagesDir:         imagesDir,
 		VMPIDsMax:         vmPIDsMax,
 		CgroupRoot:        cgroupRoot,
 	}

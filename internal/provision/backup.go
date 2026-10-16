@@ -22,7 +22,7 @@ import (
 
 const (
 	backupManifestVersion   = 1
-	portableManifestVersion = 1
+	portableManifestVersion = 2
 	portableManifestMaxSize = 1 << 20
 	portableLogMaxSize      = 256 << 20
 	backupManifestName      = "manifest.json"
@@ -83,6 +83,7 @@ type portableManifest struct {
 type portableInstance struct {
 	ID              string    `json:"id,omitempty"`
 	Name            string    `json:"name"`
+	Image           string    `json:"image,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	CreatedByUser   string    `json:"created_by_user,omitempty"`
 	CreatedByNode   string    `json:"created_by_node,omitempty"`
@@ -290,6 +291,9 @@ func (p *Provisioner) RestoreBackup(ctx context.Context, name, backupID string) 
 	}
 
 	restored := inst
+	restored.Image = manifest.Instance.Image
+	restored.KernelPath = manifest.Instance.KernelPath
+	restored.InitrdPath = manifest.Instance.InitrdPath
 	restored.VCPUCount = manifest.Instance.VCPUCount
 	restored.MemoryMiB = manifest.Instance.MemoryMiB
 	restored.RootFSSizeBytes = manifest.Instance.RootFSSizeBytes
@@ -522,6 +526,10 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 	if manifest.Instance.RootFSSizeBytes <= 0 {
 		return model.Instance{}, PortableArtifactInfo{}, errors.New("portable artifact manifest is missing rootfs_size_bytes")
 	}
+	image, err := p.cfg.ResolveImage(manifest.Instance.Image)
+	if err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, err
+	}
 	resolvedVCPUCount := p.effectiveVCPUCount(model.Instance{VCPUCount: manifest.Instance.VCPUCount})
 	resolvedMemoryMiB := p.effectiveMemoryMiB(model.Instance{MemoryMiB: manifest.Instance.MemoryMiB})
 	if err := validateMachineShape(resolvedVCPUCount, resolvedMemoryMiB); err != nil {
@@ -555,6 +563,7 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 		imported = model.Instance{
 			ID:              firstNonEmpty(manifest.Instance.ID, uuid.NewString()),
 			Name:            targetName,
+			Image:           manifest.Instance.Image,
 			State:           model.StateProvisioning,
 			CreatedAt:       manifest.Instance.CreatedAt,
 			UpdatedAt:       now,
@@ -564,8 +573,8 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 			MemoryMiB:       resolvedMemoryMiB,
 			RootFSSizeBytes: manifest.Instance.RootFSSizeBytes,
 			RootFSPath:      filepath.Join(instanceDir, backupRootFSName),
-			KernelPath:      p.cfg.BaseKernelPath,
-			InitrdPath:      p.cfg.BaseInitrdPath,
+			KernelPath:      image.Kernel,
+			InitrdPath:      image.Initrd,
 			SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
 			LogPath:         filepath.Join(instanceDir, backupFirecrackerName),
 			SerialLogPath:   filepath.Join(instanceDir, backupSerialLogName),
@@ -711,12 +720,17 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 }
 
 func portableManifestFromInstance(exportedAt time.Time, inst model.Instance) portableManifest {
+	version := portableManifestVersion
+	if inst.ImageName() == "arch" {
+		version = 1
+	}
 	return portableManifest{
-		Version:    portableManifestVersion,
+		Version:    version,
 		ExportedAt: exportedAt,
 		Instance: portableInstance{
 			ID:              inst.ID,
 			Name:            inst.Name,
+			Image:           inst.Image,
 			CreatedAt:       inst.CreatedAt,
 			CreatedByUser:   inst.CreatedByUser,
 			CreatedByNode:   inst.CreatedByNode,
@@ -777,8 +791,11 @@ func readPortableManifest(tr *tar.Reader) (portableManifest, error) {
 }
 
 func (m portableManifest) validate() error {
-	if m.Version != portableManifestVersion {
+	if m.Version != 1 && m.Version != portableManifestVersion {
 		return fmt.Errorf("portable artifact uses unsupported manifest version %d", m.Version)
+	}
+	if m.Version == 1 && m.Instance.Image != "" && m.Instance.Image != "arch" {
+		return errors.New("non-Arch images require portable manifest version 2")
 	}
 	if m.ExportedAt.IsZero() {
 		return errors.New("portable artifact manifest is missing exported_at")

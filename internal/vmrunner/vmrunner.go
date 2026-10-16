@@ -103,6 +103,8 @@ type Metadata struct {
 }
 
 type StartRequest struct {
+	KernelPath          string    `json:"kernel_path,omitempty"`
+	InitrdPath          string    `json:"initrd_path,omitempty"`
 	InstanceID          string    `json:"instance_id"`
 	RequestID           string    `json:"request_id"`
 	HostBootID          string    `json:"host_boot_id"`
@@ -181,7 +183,12 @@ func (c *Client) StartInstanceVM(ctx context.Context, req StartRequest) (StartRe
 		return StartResponse{}, err
 	}
 	var resp StartResponse
-	if err := c.post(ctx, "/vm/start", req, &resp); err != nil {
+	endpoint := "/vm/start"
+	if req.KernelPath != "" {
+		// Old runners must reject image-aware starts, not silently use Arch.
+		endpoint = "/vm/start-v2"
+	}
+	if err := c.post(ctx, endpoint, req, &resp); err != nil {
 		return StartResponse{}, err
 	}
 	if req.RequestID != "" {
@@ -271,6 +278,7 @@ type ServerConfig struct {
 	InstancesDir      string
 	KernelPath        string
 	InitrdPath        string
+	ImagesDir         string
 	VMPIDsMax         int64
 	CgroupRoot        string
 }
@@ -357,6 +365,7 @@ func NewServerWithHandlers(logger *slog.Logger, cfg ServerConfig, start StartFun
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vm/start", s.handleStart)
+	mux.HandleFunc("/vm/start-v2", s.handleStart)
 	mux.HandleFunc("/vm/start-result", s.handleStartResult)
 	mux.HandleFunc("/vm/stop", s.handleStop)
 	mux.HandleFunc("/vm/metrics", s.handleMetrics)
@@ -693,6 +702,10 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
+	if r.URL.Path == "/vm/start-v2" && req.KernelPath == "" {
+		respondError(w, http.StatusBadRequest, errors.New("image-aware start requires a kernel path"))
+		return
+	}
 	resp, err := s.receiptStart(r.Context(), req)
 	if err != nil {
 		s.log.Error("start vm", "name", req.Name, "err", err)
@@ -783,6 +796,10 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	if err := s.config.Validate(); err != nil {
 		return StartResponse{}, err
 	}
+	bootConfig, err := s.config.bootConfig(req)
+	if err != nil {
+		return StartResponse{}, err
+	}
 	paths, err := resolveInstanceRuntimePaths(s.config.InstancesDir, req.Name)
 	if err != nil {
 		return StartResponse{}, err
@@ -791,7 +808,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	if err != nil {
 		return StartResponse{}, err
 	}
-	if err := validateStartRuntimeFiles(s.config, paths); err != nil {
+	if err := validateStartRuntimeFiles(bootConfig, paths); err != nil {
 		return StartResponse{}, err
 	}
 	if err := os.MkdirAll(s.config.JailerBaseDir, 0o755); err != nil {
@@ -828,8 +845,8 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	fcCfg := firecracker.Config{
 		SocketPath:      filepath.Base(paths.SocketPath),
 		LogPath:         filepath.Base(paths.LogPath),
-		KernelImagePath: s.config.KernelPath,
-		InitrdPath:      s.config.InitrdPath,
+		KernelImagePath: bootConfig.KernelPath,
+		InitrdPath:      bootConfig.InitrdPath,
 		KernelArgs:      req.KernelArgs,
 		Drives:          []models.Drive{newRootDrive(paths.RootFSPath)},
 		NetworkInterfaces: firecracker.NetworkInterfaces{{
@@ -856,7 +873,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 			ExecFile:       s.config.FirecrackerBinary,
 			JailerBinary:   s.config.JailerBinary,
 			ChrootBaseDir:  s.config.JailerBaseDir,
-			ChrootStrategy: firecracker.NewNaiveChrootStrategy(s.config.KernelPath),
+			ChrootStrategy: firecracker.NewNaiveChrootStrategy(bootConfig.KernelPath),
 			CgroupVersion:  detectJailerCgroupVersion(),
 			Stdout:         serialLog,
 			Stderr:         serialLog,
@@ -1170,6 +1187,12 @@ func liveProcessPIDs(pids []int) []int {
 }
 
 func (r StartRequest) Validate() error {
+	if err := validateAbsolutePath("kernel path", r.KernelPath, true); err != nil {
+		return err
+	}
+	if err := validateAbsolutePath("initrd path", r.InitrdPath, true); err != nil {
+		return err
+	}
 	if r.RequestID != "" {
 		if err := (StartResultRequest{r.Name, r.InstanceID, r.RequestID, r.HostBootID}).Validate(); err != nil {
 			return err
@@ -1321,6 +1344,7 @@ func (c ServerConfig) normalized() ServerConfig {
 		InstancesDir:      strings.TrimSpace(c.InstancesDir),
 		KernelPath:        strings.TrimSpace(c.KernelPath),
 		InitrdPath:        strings.TrimSpace(c.InitrdPath),
+		ImagesDir:         strings.TrimSpace(c.ImagesDir),
 		VMPIDsMax:         pidsMax,
 		CgroupRoot:        strings.TrimSpace(c.CgroupRoot),
 	}
@@ -1333,11 +1357,16 @@ func (c ServerConfig) Validate() error {
 		"jailer binary path":      c.JailerBinary,
 		"jailer base dir":         c.JailerBaseDir,
 		"instances dir":           c.InstancesDir,
-		"kernel path":             c.KernelPath,
 	} {
 		if err := validateAbsolutePath(label, path, false); err != nil {
 			return err
 		}
+	}
+	if err := validateAbsolutePath("kernel path", c.KernelPath, c.ImagesDir != ""); err != nil {
+		return err
+	}
+	if err := validateAbsolutePath("images directory", c.ImagesDir, true); err != nil {
+		return err
 	}
 	if err := validateAbsolutePath("initrd path", c.InitrdPath, true); err != nil {
 		return err
@@ -1355,6 +1384,43 @@ func (c ServerConfig) Validate() error {
 		return fmt.Errorf("cgroup root %q is not absolute", c.CgroupRoot)
 	}
 	return nil
+}
+
+// Requests may select boot files only from the administrator-managed images
+// tree, or use the exact legacy pair configured by the administrator. Resolve
+// symlinks before checking containment so guests cannot expose other host files.
+func (c ServerConfig) bootConfig(req StartRequest) (ServerConfig, error) {
+	if req.KernelPath == "" {
+		return c, nil
+	}
+	if req.KernelPath == c.KernelPath && req.InitrdPath == c.InitrdPath {
+		return c, nil
+	}
+	root, err := filepath.EvalSymlinks(c.ImagesDir)
+	if err != nil || !filepath.IsAbs(root) {
+		return ServerConfig{}, errors.New("selected boot artifacts require a configured images directory")
+	}
+	paths := []*string{&req.KernelPath, &req.InitrdPath}
+	for _, path := range paths {
+		if *path == "" {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(*path)
+		if err != nil {
+			return ServerConfig{}, fmt.Errorf("resolve boot artifact: %w", err)
+		}
+		rel, err := filepath.Rel(root, resolved)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return ServerConfig{}, fmt.Errorf("boot artifact %q is outside images directory %q", *path, root)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || !info.Mode().IsRegular() {
+			return ServerConfig{}, fmt.Errorf("boot artifact %q must be a regular file", *path)
+		}
+		*path = resolved
+	}
+	c.KernelPath, c.InitrdPath = req.KernelPath, req.InitrdPath
+	return c, nil
 }
 
 func resolveInstanceRuntimePaths(instancesDir, name string) (instanceRuntimePaths, error) {

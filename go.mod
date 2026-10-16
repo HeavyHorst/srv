@@ -12,7 +12,7 @@ require (
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.48.0
-	hegel.dev/go/hegel v0.1.3
+	hegel.dev/go/hegel v0.9.25
 	modernc.org/sqlite v1.48.0
 	tailscale.com v1.104.1
 	tailscale.com/client/tailscale/v2 v2.10.1
@@ -34,6 +34,7 @@ require (
 	github.com/creachadair/msync v0.10.1 // indirect
 	github.com/dblohm7/wingoes v0.0.0-20260526185140-fb298caac7ca // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/ebitengine/purego v0.12.0-alpha.1.0.20261015130536-d456b1bb95e8 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.3 // indirect
 	github.com/gaissmai/bart v0.29.0 // indirect

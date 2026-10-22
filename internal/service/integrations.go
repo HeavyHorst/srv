@@ -220,9 +220,18 @@ func (a *App) cmdIntegration(ctx context.Context, actor model.Actor, args []stri
 		if err != nil {
 			return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 		}
+		unlock := a.lockInstance(vmName)
+		defer unlock()
 		inst, err := a.lookupVisibleInstance(ctx, actor, vmName)
 		if err != nil {
 			return missingInstanceResult("integration enable", vmName, err)
+		}
+		migration, err := a.store.GetMigration(ctx, inst.ID)
+		if err == nil && migration.Phase != "aborted" {
+			err = fmt.Errorf("instance %q is fenced by migration (%s)", vmName, migration.Phase)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
 		}
 		integration, err := a.store.GetIntegrationByName(ctx, integrationName)
 		if err != nil {

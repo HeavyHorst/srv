@@ -3,6 +3,7 @@ package provision
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -436,6 +437,14 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 }
 
 func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, error) {
+	migration, migrationErr := p.MigrationStatus(ctx, name)
+	if migrationErr != nil && !errors.Is(migrationErr, sql.ErrNoRows) {
+		return model.Instance{}, migrationErr
+	}
+	moved := migrationErr == nil && migration.Phase == "completed"
+	if migrationErr == nil && !moved && migration.Phase != "aborted" {
+		return model.Instance{}, fmt.Errorf("instance %q is fenced by migration (%s)", name, migration.Phase)
+	}
 	inst, err := p.store.GetInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
@@ -443,6 +452,13 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 	if inst.State == model.StateDeleted {
 		return inst, fmt.Errorf("instance %q is already deleted", name)
 	}
+	// An interrupted destination import can be explicitly discarded under the
+	// instance lock, but its copied identity must not revoke the live source.
+	receipt, receiptErr := p.store.GetImportReceipt(ctx, inst.ID)
+	if receiptErr != nil && !errors.Is(receiptErr, sql.ErrNoRows) {
+		return inst, receiptErr
+	}
+	partialImport := receiptErr == nil && receipt.Phase == "importing"
 
 	inst.State = model.StateDeleting
 	inst.UpdatedAt = time.Now().UTC()
@@ -462,7 +478,7 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 	}
 	// Never delete a same-name device belonging to another incarnation. Keep
 	// the disk and deleting intent when API cleanup needs a retry.
-	if p.tsClient != nil && inst.TailnetNodeID != "" {
+	if !moved && !partialImport && p.tsClient != nil && inst.TailnetNodeID != "" {
 		devices, err := listTailnetDevices(ctx, p.tsClient)
 		if err != nil {
 			return inst, err
@@ -526,6 +542,10 @@ func (p *Provisioner) RestoreInstance(ctx context.Context, name string) error {
 }
 
 func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) error {
+	if err := p.migrationFence(ctx, inst.Name); err != nil {
+		// Even a preparing transfer must not resurrect a previous runtime.
+		return err
+	}
 	shouldAutoStart := shouldAutoStartAfterStartup(inst)
 	if err := p.resolveRuntime(ctx, &inst); err != nil {
 		return err
@@ -695,6 +715,9 @@ func (p *Provisioner) CheckRootFS(ctx context.Context, name string) (model.Insta
 	p.admissionMu.Lock()
 	defer p.admissionMu.Unlock()
 
+	if err := p.migrationFence(ctx, name); err != nil {
+		return model.Instance{}, err
+	}
 	inst, err := p.store.GetInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
@@ -719,6 +742,9 @@ func (p *Provisioner) CheckRootFS(ctx context.Context, name string) (model.Insta
 }
 
 func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOptions) (model.Instance, error) {
+	if err := p.migrationFence(ctx, name); err != nil {
+		return model.Instance{}, err
+	}
 	var inst model.Instance
 	err := func() error {
 		p.admissionMu.Lock()
@@ -805,6 +831,9 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 }
 
 func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instance, err error) {
+	if err := p.migrationFence(ctx, name); err != nil {
+		return inst, err
+	}
 	inst, err = p.ReconcileInstanceRuntime(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
@@ -831,6 +860,9 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		p.admissionMu.Lock()
 		defer p.admissionMu.Unlock()
 
+		if err := p.migrationFence(ctx, name); err != nil {
+			return err
+		}
 		current, err := p.store.GetInstance(ctx, name)
 		if err != nil {
 			return err
@@ -1063,8 +1095,22 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 	if existing, found, err := p.store.FindInstance(ctx, name); err != nil {
 		return "", err
 	} else if found {
+		// Only an explicitly deleted completed source may be replaced. A
+		// failed incarnation is not permission to remove its durable fence.
+		migration, err := p.store.GetMigration(ctx, existing.ID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		if err == nil && migration.Phase != "aborted" && !(existing.State == model.StateDeleted && migration.Phase == "completed") {
+			return "", fmt.Errorf("instance %q is fenced by migration (%s)", name, migration.Phase)
+		}
 		switch existing.State {
 		case model.StateFailed, model.StateDeleted:
+			if existing.State != model.StateDeleted {
+				if err := p.migrationFence(ctx, name); err != nil {
+					return "", err
+				}
+			}
 			if err := p.resolveRuntime(ctx, &existing); err != nil {
 				return "", err
 			}

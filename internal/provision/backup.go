@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,7 +45,10 @@ type BackupInfo struct {
 }
 
 type PortableArtifactInfo struct {
+	CreatedByUser     string
+	MemoryMode        string
 	Name              string
+	MigrationToken    string
 	ExportedAt        time.Time
 	RootFSSizeBytes   int64
 	VCPUCount         int64
@@ -74,13 +78,15 @@ type backupFiles struct {
 }
 
 type portableManifest struct {
-	Version    int              `json:"version"`
-	ExportedAt time.Time        `json:"exported_at"`
-	Instance   portableInstance `json:"instance"`
-	Files      backupFiles      `json:"files"`
+	Version        int              `json:"version"`
+	MigrationToken string           `json:"migration_token,omitempty"`
+	ExportedAt     time.Time        `json:"exported_at"`
+	Instance       portableInstance `json:"instance"`
+	Files          backupFiles      `json:"files"`
 }
 
 type portableInstance struct {
+	MemoryMode      string    `json:"memory_mode,omitempty"`
 	ID              string    `json:"id,omitempty"`
 	Name            string    `json:"name"`
 	Image           string    `json:"image,omitempty"`
@@ -247,6 +253,9 @@ func (p *Provisioner) DeleteBackup(ctx context.Context, name, backupID string) (
 }
 
 func (p *Provisioner) RestoreBackup(ctx context.Context, name, backupID string) (model.Instance, BackupInfo, error) {
+	if err := p.migrationFence(ctx, name); err != nil {
+		return model.Instance{}, BackupInfo{}, err
+	}
 	inst, err := p.requireStoppedInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, BackupInfo{}, err
@@ -329,6 +338,13 @@ func (p *Provisioner) requireStoppedInstance(ctx context.Context, name string) (
 	inst, err := p.requireExistingInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
+	}
+	receipt, receiptErr := p.store.GetImportReceipt(ctx, inst.ID)
+	if receiptErr != nil && !errors.Is(receiptErr, sql.ErrNoRows) {
+		return model.Instance{}, receiptErr
+	}
+	if receiptErr == nil && receipt.Phase != "imported" {
+		return model.Instance{}, fmt.Errorf("instance %q is fenced by incomplete import", name)
 	}
 	if inst.FirecrackerPID > 0 {
 		return model.Instance{}, fmt.Errorf("instance %q must be stopped before backup or restore", name)
@@ -423,6 +439,16 @@ func (p *Provisioner) ExportInstance(ctx context.Context, name string, w io.Writ
 
 	exportedAt := time.Now().UTC()
 	manifest := portableManifestFromInstance(exportedAt, inst)
+	migration, migrationErr := p.store.GetMigration(ctx, inst.ID)
+	if migrationErr != nil && !errors.Is(migrationErr, sql.ErrNoRows) {
+		return PortableArtifactInfo{}, migrationErr
+	}
+	if migrationErr == nil && migration.Phase != "aborted" {
+		if migration.Phase != "prepared" {
+			return PortableArtifactInfo{}, fmt.Errorf("export requires a prepared migration, not %s", migration.Phase)
+		}
+		manifest.MigrationToken = migration.Token
+	}
 	serialPresent, err := regularFileExists(inst.SerialLogPath)
 	if err != nil {
 		return PortableArtifactInfo{}, fmt.Errorf("stat serial log for %q: %w", name, err)
@@ -504,6 +530,25 @@ func PeekPortableArtifactInfo(r io.Reader) (PortableArtifactInfo, io.Reader, err
 }
 
 func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r io.Reader, progressFns ...func(ImportProgress)) (model.Instance, PortableArtifactInfo, error) {
+	return p.ImportInstanceWithOptions(ctx, actor, r, ImportOptions{}, progressFns...)
+}
+
+type ImportOptions struct {
+	MemoryPoolName string
+	FixedMemory    bool
+}
+
+func (opts ImportOptions) Validate(pooledSource bool) error {
+	if opts.MemoryPoolName != "" && opts.FixedMemory {
+		return errors.New("--pool and --fixed-memory are mutually exclusive")
+	}
+	if pooledSource && opts.MemoryPoolName == "" && !opts.FixedMemory {
+		return errors.New("pooled source requires --pool TARGET_POOL or --fixed-memory")
+	}
+	return nil
+}
+
+func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model.Actor, r io.Reader, opts ImportOptions, progressFns ...func(ImportProgress)) (model.Instance, PortableArtifactInfo, error) {
 	tr, zr, err := newPortableArtifactTarReader(r)
 	if err != nil {
 		return model.Instance{}, PortableArtifactInfo{}, err
@@ -518,6 +563,9 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 		progress = progressFns[0]
 	}
 	info := portableArtifactInfoFromManifest(manifest)
+	if err := opts.Validate(manifest.Instance.MemoryMode == "pool"); err != nil {
+		return model.Instance{}, info, err
+	}
 
 	targetName := manifest.Instance.Name
 	if !validName.MatchString(targetName) {
@@ -544,6 +592,17 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 		p.admissionMu.Lock()
 		defer p.admissionMu.Unlock()
 
+		memoryMode, poolID := "fixed", ""
+		if opts.MemoryPoolName != "" {
+			pool, err := p.requireMemoryPoolByName(ctx, opts.MemoryPoolName)
+			if err != nil {
+				return err
+			}
+			if err := ensureMemoryPoolSupportsGuestMemory(pool, resolvedMemoryMiB); err != nil {
+				return err
+			}
+			memoryMode, poolID = "pool", pool.ID
+		}
 		if err := p.ensureHostDiskCapacity(ctx, "", manifest.Instance.RootFSSizeBytes); err != nil {
 			return err
 		}
@@ -561,6 +620,8 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 
 		now := time.Now().UTC()
 		imported = model.Instance{
+			MemoryMode:      memoryMode,
+			MemoryPoolID:    poolID,
 			ID:              firstNonEmpty(manifest.Instance.ID, uuid.NewString()),
 			Name:            targetName,
 			Image:           manifest.Instance.Image,
@@ -586,6 +647,12 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 			GatewayAddr:     gateway,
 			TailscaleName:   manifest.Instance.TailscaleName,
 			TailscaleIP:     manifest.Instance.TailscaleIP,
+		}
+		// Persist a destination fence before making the reservation visible.
+		// Crash recovery must never boot a partially imported rootfs.
+		if err := p.store.ReserveImportReceipt(ctx, model.ImportReceipt{InstanceID: imported.ID, Token: info.MigrationToken, SourceInstanceID: manifest.Instance.ID, ExportedAt: info.ExportedAt.Format(time.RFC3339Nano), Phase: "importing"}); err != nil {
+			_ = os.RemoveAll(instanceDir)
+			return err
 		}
 		if err := p.store.CreateInstance(ctx, imported); err != nil {
 			_ = os.RemoveAll(instanceDir)
@@ -699,12 +766,36 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 	if _, err := commitStagedRestoreFiles(staged); err != nil {
 		return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("commit portable artifact files for %q: %w", targetName, err)
 	}
+	// The SQLite receipt must not become durable before the disk payload and
+	// renamed directory entries it certifies.
+	for _, file := range staged {
+		f, err := os.Open(file.dest)
+		if err != nil {
+			return model.Instance{}, PortableArtifactInfo{}, err
+		}
+		err = f.Sync()
+		closeErr := f.Close()
+		if err != nil || closeErr != nil {
+			return model.Instance{}, PortableArtifactInfo{}, errors.Join(err, closeErr)
+		}
+	}
+	for _, path := range []string{instanceDir, filepath.Dir(instanceDir)} {
+		dir, err := os.Open(path)
+		if err != nil {
+			return model.Instance{}, PortableArtifactInfo{}, err
+		}
+		syncErr := dir.Sync()
+		closeErr := dir.Close()
+		if syncErr != nil || closeErr != nil {
+			return model.Instance{}, PortableArtifactInfo{}, errors.Join(syncErr, closeErr)
+		}
+	}
 	imported.State = model.StateStopped
 	imported.FirecrackerPID = 0
 	imported.LastError = ""
 	imported.DeletedAt = nil
 	imported.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, imported); err != nil {
+	if err := p.store.FinalizeImport(ctx, imported.ID, imported.UpdatedAt); err != nil {
 		return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("finalize imported instance %q: %w", targetName, err)
 	}
 
@@ -724,10 +815,14 @@ func portableManifestFromInstance(exportedAt time.Time, inst model.Instance) por
 	if inst.ImageName() == "arch" {
 		version = 1
 	}
+	if inst.UsesMemoryPool() {
+		version = 3
+	}
 	return portableManifest{
 		Version:    version,
 		ExportedAt: exportedAt,
 		Instance: portableInstance{
+			MemoryMode:      inst.MemoryMode,
 			ID:              inst.ID,
 			Name:            inst.Name,
 			Image:           inst.Image,
@@ -746,7 +841,10 @@ func portableManifestFromInstance(exportedAt time.Time, inst model.Instance) por
 
 func portableArtifactInfoFromManifest(manifest portableManifest) PortableArtifactInfo {
 	return PortableArtifactInfo{
+		CreatedByUser:     manifest.Instance.CreatedByUser,
+		MemoryMode:        manifest.Instance.MemoryMode,
 		Name:              manifest.Instance.Name,
+		MigrationToken:    manifest.MigrationToken,
 		ExportedAt:        manifest.ExportedAt,
 		RootFSSizeBytes:   manifest.Instance.RootFSSizeBytes,
 		VCPUCount:         manifest.Instance.VCPUCount,
@@ -791,8 +889,14 @@ func readPortableManifest(tr *tar.Reader) (portableManifest, error) {
 }
 
 func (m portableManifest) validate() error {
-	if m.Version != 1 && m.Version != portableManifestVersion {
+	if m.Version != 1 && m.Version != portableManifestVersion && m.Version != 3 {
 		return fmt.Errorf("portable artifact uses unsupported manifest version %d", m.Version)
+	}
+	if m.Instance.MemoryMode != "" && m.Instance.MemoryMode != "fixed" && m.Instance.MemoryMode != "pool" {
+		return errors.New("invalid portable memory mode")
+	}
+	if m.Instance.MemoryMode == "pool" && m.Version < 3 {
+		return errors.New("pooled artifacts require portable manifest version 3")
 	}
 	if m.Version == 1 && m.Instance.Image != "" && m.Instance.Image != "arch" {
 		return errors.New("non-Arch images require portable manifest version 2")

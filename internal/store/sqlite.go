@@ -203,16 +203,26 @@ func (s *Store) DeleteInstance(ctx context.Context, name string) error {
 	if !found {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM instance_integrations WHERE instance_id = ?`, inst.ID); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM instance_integrations WHERE instance_id = ?`, inst.ID); err != nil {
 		return fmt.Errorf("delete instance integrations for %s: %w", name, err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM instance_events WHERE instance_id = ?`, inst.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM instance_events WHERE instance_id = ?`, inst.ID); err != nil {
 		return fmt.Errorf("delete instance events for %s: %w", name, err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM instances WHERE name = ?`, name); err != nil {
+	for _, table := range []string{"migrations", "import_receipts"} {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE instance_id = ?", inst.ID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM instances WHERE name = ?`, name); err != nil {
 		return fmt.Errorf("delete instance %s: %w", name, err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) ListInstances(ctx context.Context, includeDeleted bool) ([]model.Instance, error) {
@@ -563,6 +573,8 @@ func (s *Store) ListInstanceIntegrations(ctx context.Context, instanceID string)
 func (s *Store) migrate(ctx context.Context) error {
 	stmts := []string{
 		`PRAGMA journal_mode = WAL;`,
+		`CREATE TABLE IF NOT EXISTS migrations (instance_id TEXT PRIMARY KEY, token TEXT NOT NULL, target TEXT NOT NULL, was_running INTEGER NOT NULL, phase TEXT NOT NULL);`,
+		`CREATE TABLE IF NOT EXISTS import_receipts (instance_id TEXT PRIMARY KEY, token TEXT NOT NULL DEFAULT '', source_instance_id TEXT NOT NULL, exported_at TEXT NOT NULL, phase TEXT NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS instances (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL UNIQUE,
@@ -665,6 +677,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("run migration %q: %w", stmt, err)
+		}
+	}
+	for name, decl := range map[string]string{"memory_pool_name": "TEXT NOT NULL DEFAULT ''", "fixed_memory": "INTEGER NOT NULL DEFAULT 0"} {
+		if err := s.ensureColumn(ctx, "migrations", name, decl); err != nil {
+			return err
 		}
 	}
 	for _, column := range []struct {

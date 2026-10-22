@@ -96,6 +96,8 @@ type instanceSummaryJSON struct {
 	Name            string `json:"name"`
 	Image           string `json:"image"`
 	State           string `json:"state"`
+	MigrationPhase  string `json:"migration_phase,omitempty"`
+	MigrationTarget string `json:"migration_target,omitempty"`
 	VCPUCount       int64  `json:"vcpu_count,omitempty"`
 	MemoryMiB       int64  `json:"memory_mib,omitempty"`
 	MemoryMode      string `json:"memory_mode,omitempty"`
@@ -116,6 +118,8 @@ type inspectInstanceJSON struct {
 	Name              string          `json:"name"`
 	Image             string          `json:"image"`
 	State             string          `json:"state"`
+	MigrationPhase    string          `json:"migration_phase,omitempty"`
+	MigrationTarget   string          `json:"migration_target,omitempty"`
 	CreatedByUser     string          `json:"created_by_user,omitempty"`
 	CreatedByNode     string          `json:"created_by_node,omitempty"`
 	CreatedAt         time.Time       `json:"created_at"`
@@ -497,6 +501,7 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("ensure host signer: %w", err)
 	}
+	a.log.Info("ssh host key", "public_key", strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostSigner.PublicKey()))))
 
 	a.tailscale = &tsnet.Server{
 		Dir:           a.cfg.TSNetDir(),
@@ -707,7 +712,7 @@ func (a *App) handleSession(sess gssh.Session) {
 		return
 	}
 
-	actor, err := a.resolveActor(sess.Context(), sess)
+	actor, forwardedArgs, via, err := a.resolveCommandActor(sess.Context(), sess, rawArgs)
 	if err != nil {
 		_, _ = io.WriteString(sess.Stderr(), fmt.Sprintf("resolve tailscale identity: %v\n", err))
 		finalize(model.Actor{SSHUser: sess.User(), RemoteAddr: sess.RemoteAddr().String()}, false, "whois failed", err)
@@ -715,7 +720,7 @@ func (a *App) handleSession(sess gssh.Session) {
 		return
 	}
 
-	req, err := parseCommandRequest(rawArgs)
+	req, err := parseCommandRequest(forwardedArgs)
 	if err != nil {
 		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
 		finalize(actor, false, "invalid request", err)
@@ -726,6 +731,9 @@ func (a *App) handleSession(sess gssh.Session) {
 	audit.Command = command
 
 	allowed, reason := a.authorize(actor, command)
+	if via != "" {
+		reason += "; forwarded by " + via
+	}
 	if err := a.store.RecordAuthz(context.Background(), model.AuthzDecision{
 		CreatedAt:  started,
 		ActorUser:  actor.UserLogin,
@@ -831,6 +839,10 @@ func (a *App) handleSession(sess gssh.Session) {
 
 func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandRequest) (commandResult, error) {
 	switch req.args[0] {
+	case "placement", "import-placement":
+		return a.cmdPlacement(ctx, actor, req.args)
+	case "migration":
+		return a.cmdMigration(ctx, actor, req.args, req.format)
 	case "new":
 		return a.cmdNew(ctx, actor, req.args, req.format)
 	case "integration":
@@ -891,6 +903,9 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string, outF
 
 	unlock := a.lockInstance(name)
 	defer unlock()
+	if err := a.authorizeReplacement(ctx, actor, name, ""); err != nil {
+		return commandResult{stderr: fmt.Sprintf("create %s: %v\n", name, err), exitCode: 1}, err
+	}
 	inst, err := a.provisioner.Create(ctx, name, actor, opts)
 	if err != nil {
 		stderr := fmt.Sprintf("create %s: %v\n", name, err)
@@ -1116,7 +1131,13 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFo
 			Instances []instanceSummaryJSON `json:"instances"`
 		}{Instances: make([]instanceSummaryJSON, 0, len(instances))}
 		for _, inst := range instances {
-			payload.Instances = append(payload.Instances, instanceSummaryPayload(a.cfg, inst, false))
+			item := instanceSummaryPayload(a.cfg, inst, false)
+			migration, err := a.store.GetMigration(ctx, inst.ID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
+			}
+			item.MigrationPhase, item.MigrationTarget = migration.Phase, migration.Target
+			payload.Instances = append(payload.Instances, item)
 		}
 		return jsonResult(payload)
 	}
@@ -1193,14 +1214,23 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("load events: %v\n", err), exitCode: 1}, err
 	}
+	migration, err := a.store.GetMigration(ctx, inst.ID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
+	}
 	if outFormat == outputFormatJSON {
-		return jsonResult(a.inspectPayload(inst, poolName, integrations, events))
+		payload := a.inspectPayload(inst, poolName, integrations, events)
+		payload.Instance.MigrationPhase, payload.Instance.MigrationTarget = migration.Phase, migration.Target
+		return jsonResult(payload)
 	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "name: %s\n", inst.Name)
 	fmt.Fprintf(&b, "image: %s\n", inst.ImageName())
 	fmt.Fprintf(&b, "state: %s\n", inst.State)
+	if migration.Phase != "" {
+		fmt.Fprintf(&b, "migration: %s\nmigration-target: %s\n", migration.Phase, migration.Target)
+	}
 	fmt.Fprintf(&b, "created-by: %s via %s\n", inst.CreatedByUser, inst.CreatedByNode)
 	fmt.Fprintf(&b, "created-at: %s\n", inst.CreatedAt.Format(time.RFC3339))
 	fmt.Fprintf(&b, "updated-at: %s\n", inst.UpdatedAt.Format(time.RFC3339))
@@ -2228,7 +2258,8 @@ func (a *App) handleExportSession(sess gssh.Session, actor model.Actor, args []s
 }
 
 func (a *App) handleImportSession(sess gssh.Session, actor model.Actor, args []string) (int, error) {
-	if err := parseImportArgs(args); err != nil {
+	opts, err := parseImportOptions(args)
+	if err != nil {
 		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
 		return 2, err
 	}
@@ -2249,9 +2280,14 @@ func (a *App) handleImportSession(sess gssh.Session, actor model.Actor, args []s
 		unlock()
 		a.syncManagedGatewaysBestEffort()
 	}()
+	if err := a.authorizeReplacement(sess.Context(), actor, artifactInfo.Name, artifactInfo.CreatedByUser); err != nil {
+		wrapped := fmt.Errorf("import: %w", err)
+		_, _ = io.WriteString(sess.Stderr(), wrapped.Error()+"\n")
+		return 1, wrapped
+	}
 
 	reporter := newImportProgressReporter(sess.Stderr(), 350*time.Millisecond)
-	inst, info, err := a.provisioner.ImportInstance(sess.Context(), actor, stream, reporter.Update)
+	inst, info, err := a.provisioner.ImportInstanceWithOptions(sess.Context(), actor, stream, opts, reporter.Update)
 	reporter.Close(err == nil)
 	if err != nil {
 		wrapped := fmt.Errorf("import: %w", err)
@@ -2966,24 +3002,6 @@ func lifecycleReadyResult(action string, inst model.Instance) commandResult {
 	return commandResult{stdout: stdout, exitCode: 0}
 }
 
-func (a *App) resolveActor(ctx context.Context, sess gssh.Session) (model.Actor, error) {
-	remote := sess.RemoteAddr().String()
-	who, err := a.localAPI.WhoIs(ctx, remote)
-	if err != nil {
-		return model.Actor{}, err
-	}
-	if who == nil || who.Node == nil || who.UserProfile == nil {
-		return model.Actor{}, errors.New("tailscale whois response was incomplete")
-	}
-	return model.Actor{
-		UserLogin:   who.UserProfile.LoginName,
-		DisplayName: who.UserProfile.DisplayName,
-		NodeName:    trimNodeName(who.Node.ComputedName, who.Node.Name),
-		RemoteAddr:  remote,
-		SSHUser:     sess.User(),
-	}, nil
-}
-
 func (a *App) authorize(actor model.Actor, command string) (bool, string) {
 	if command == "snapshot" || command == "status" || command == "integration" || command == "pool" {
 		if !a.isAdmin(actor) {
@@ -3106,10 +3124,8 @@ func parseExportArgs(args []string) (string, error) {
 }
 
 func parseImportArgs(args []string) error {
-	if len(args) != 1 {
-		return errors.New(importUsage())
-	}
-	return nil
+	_, err := parseImportOptions(args)
+	return err
 }
 
 func parseSizedInstanceArgs(args []string, usage string) (string, provision.CreateOptions, error) {
@@ -3191,7 +3207,7 @@ func exportUsage() string {
 }
 
 func importUsage() string {
-	return "usage: import"
+	return "usage: import [--pool TARGET_POOL | --fixed-memory]"
 }
 
 func newUsage() string {

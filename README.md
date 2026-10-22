@@ -196,6 +196,7 @@ The current Arch guest image expects a boot-time service that reads MMDS, sets t
 
 ## Docs
 
+- [`docs/getting-started/multi-host.md`](docs/getting-started/multi-host.md): a small `srv-front` server for combined listings, automatic placement, and cold migration across independent hosts
 - [`docs/reference/operations.md`](docs/reference/operations.md): backup, restore, rebuild, upgrade, rollback, and host hardening
 - [`contrib/smoke/README.md`](contrib/smoke/README.md): smoke-test prerequisites, behavior, overrides, and artifacts
 - [`docs/cheatsheet.md`](docs/cheatsheet.md): operator command reference
@@ -222,8 +223,8 @@ For local manual generation, `make manual` writes `manual.html` in the repo root
 
 ## Non-Goals For Now
 
-- `srv` is intentionally a single-host control plane for this phase of the project.
-- Clustering or multi-host scheduling is out of scope for now.
+- Each `srv` remains a single-host control plane; optional `srv-front` routes commands and selects a host for new VMs.
+- Distributed scheduling, automatic rebalancing, and shared VM storage are out of scope.
 - High availability or control-plane replication is out of scope for now.
 - A web UI is out of scope for now; SSH remains the control interface.
 - Live migration is out of scope for now.

@@ -692,6 +692,9 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 	if err := sourceStore.CreateInstance(ctx, sourceInst); err != nil {
 		t.Fatalf("CreateInstance(source): %v", err)
 	}
+	if _, err := source.PrepareMigration(ctx, sourceInst.Name, "destination", "portable-transfer"); err != nil {
+		t.Fatalf("PrepareMigration(): %v", err)
+	}
 
 	var stream bytes.Buffer
 	exportedInfo, err := source.ExportInstance(ctx, sourceInst.Name, &stream)
@@ -797,6 +800,36 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 	}
 	if stored.ID != imported.ID || stored.RootFSPath != imported.RootFSPath || stored.NetworkCIDR != imported.NetworkCIDR {
 		t.Fatalf("stored imported instance = %#v, want %#v", stored, imported)
+	}
+	receipt, err := destStore.GetImportReceipt(ctx, imported.ID)
+	if err != nil || receipt.Token != "portable-transfer" || receipt.Phase != "imported" || exportedInfo.MigrationToken != receipt.Token {
+		t.Fatalf("destination receipt = %+v, %v", receipt, err)
+	}
+	if err := dest.migrationFence(ctx, imported.Name); err != nil {
+		t.Fatalf("destination inherited source fence: %v", err)
+	}
+	if _, err := source.FinishMigration(ctx, sourceInst.Name, "portable-transfer", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.ExportInstance(ctx, sourceInst.Name, io.Discard); err == nil {
+		t.Fatal("completed source exported a second identity copy")
+	}
+	// A failed source must not be silently replaced by an import, which would
+	// otherwise delete its disk and durable migration fence as "failed" reuse.
+	// Simulate the persisted state of an interrupted stop.
+	if err := sourceStore.PutMigration(ctx, model.Migration{InstanceID: sourceInst.ID, Token: "portable-transfer", Target: "destination", Phase: "preparing"}); err != nil {
+		t.Fatal(err)
+	}
+	source.cfg.Images = map[string]config.Image{"debian-13": {Kernel: sourceKernel, Initrd: sourceInitrd}}
+	sourceInst.State = model.StateFailed
+	if err := sourceStore.UpdateInstance(ctx, sourceInst); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.ImportInstance(ctx, model.Actor{}, bytes.NewReader(stream.Bytes())); err == nil || !strings.Contains(err.Error(), "fenced") {
+		t.Fatalf("import reused fenced failed source: %v", err)
+	}
+	if m, err := source.MigrationStatus(ctx, sourceInst.Name); err != nil || m.Phase != "preparing" {
+		t.Fatalf("import removed source fence: %+v, %v", m, err)
 	}
 
 	sourceEvents, err := sourceStore.ListEvents(ctx, sourceInst.ID, 10)

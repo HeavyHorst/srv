@@ -3,6 +3,7 @@ images/arch-base/out/
 /.config
 /.opencode
 /srv
+/srv-front
 /srv-net-helper
 /srv-vm-runner
 /srv-manual

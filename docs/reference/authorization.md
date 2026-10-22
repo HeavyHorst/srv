@@ -37,6 +37,7 @@ Users listed in `SRV_ADMIN_USERS` can additionally:
 |----------|-------------|
 | `SRV_ALLOWED_USERS` | Comma-separated Tailscale login allowlist. Empty means allow all tailnet users. |
 | `SRV_ADMIN_USERS` | Comma-separated Tailscale logins with cross-instance visibility and admin rights. |
+| `SRV_TRUSTED_FRONTENDS` | Stable Tailscale node IDs allowed to forward user identities. Empty disables delegation. |
 | `SRV_GUEST_USER_AUTH_TAGS` | Optional `tailscale-login=tag:name` mappings used to replace the default tags on new VM auth keys. |
 
 Example `/etc/srv/srv.env`:
@@ -48,6 +49,13 @@ SRV_GUEST_USER_AUTH_TAGS=alice@example.com=tag:alice,bob@example.com=tag:bob
 ```
 
 Creator-specific guest tags are selected only from this operator-controlled mapping after `WhoIs` succeeds. The `new` command does not accept caller-supplied tags.
+
+For the optional [multi-host frontend](../getting-started/multi-host.md), delegation
+is bound to the frontend's stable node ID, not its SSH username or display name.
+Backends still enforce the forwarded user's allowlist, admin role, and ownership.
+Trusted frontends can assert any user identity; protect their credentials and state
+like administrative access. Tagged nodes must use this explicit delegation path
+rather than being treated as human users.
 
 ## Audit trail
 

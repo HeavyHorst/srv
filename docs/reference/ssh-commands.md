@@ -72,8 +72,14 @@ For pooled VMs, `resize --ram` keeps the VM in the same pool. In v1 it is allowe
 |---------|-------------|
 | `export <name>` | Stream a stopped VM as a tar artifact to stdout |
 | `import` | Read a tar artifact from stdin and recreate the VM |
+| `import --pool <name>` | Import into an existing destination memory pool |
+| `import --fixed-memory` | Explicitly import with fixed memory, including pooled exports |
 
 Usage: `ssh srv-a export demo | ssh srv-b import`
+
+Pooled exports require an explicit destination memory policy. For coordinated
+cold migration, host-qualified names, and `node list` across servers, see the
+[multi-host frontend](../getting-started/multi-host.md).
 
 ## Admin and host commands
 

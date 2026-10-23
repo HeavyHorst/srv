@@ -106,7 +106,7 @@ func (r *Router) resolve(ctx context.Context, a model.Actor, name string) (Host,
 		return host, n, err
 	}
 	var matches []Host
-	for _, res := range r.all(ctx, a, []string{"--json", "list"}) {
+	for _, res := range r.all(ctx, a, []string{"--json", "list", "--all"}) {
 		if res.Error != "" {
 			return Host{}, "", fmt.Errorf("cannot resolve %s: host %s: %s", name, res.Host, res.Error)
 		}
@@ -207,6 +207,17 @@ func (r *Router) Run(ctx context.Context, a model.Actor, args []string, in io.Re
 		return fmt.Errorf("command required")
 	}
 	cmd := args[0]
+	orb := cmd == "orb"
+	if orb {
+		if len(args) < 2 || (args[1] != "new" && args[1] != "list" && args[1] != "bootstrap") {
+			return fmt.Errorf("usage: orb new NAME [options] | orb list | orb bootstrap NAME")
+		}
+		args = args[1:]
+		cmd = args[0]
+		if cmd == "bootstrap" && (len(args) != 2 || asJSON) {
+			return fmt.Errorf("usage: orb bootstrap NAME (without --json)")
+		}
+	}
 	if cmd == "help" && hostName == "" {
 		if asJSON {
 			return fmt.Errorf("help does not support --json")
@@ -224,6 +235,7 @@ backup delete NAME ID / restore NAME ID
 export NAME / import --host HOST      Stream portable VM artifacts
 migrate NAME --to HOST                Cold migration (no --json)
 pool / integration / snapshot         Require --host
+project-template create|delete        Require --host
 migration status|receipt NAME         Require --host
 
 Use HOST/NAME when a name is ambiguous or another host is unavailable.
@@ -242,6 +254,9 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 	}
 	if ((cmd == "list" || cmd == "status") && hostName == "") || cmd == "node" {
 		queryArgs := append([]string{"--json"}, args...)
+		if orb {
+			queryArgs = append([]string{"--json", "orb"}, args...)
+		}
 		queryRouter := *r
 		if cmd == "node" {
 			if len(args) != 2 || args[1] != "list" {
@@ -283,6 +298,11 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 	var err error
 	switch cmd {
 	case "new":
+		for _, arg := range args[1:] {
+			if (arg == "--template" || strings.HasPrefix(arg, "--template=")) && hostName == "" {
+				return fmt.Errorf("new --template requires --host; templates are host-local")
+			}
+		}
 		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
 			return fmt.Errorf("new requires NAME before its options")
 		}
@@ -299,7 +319,10 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 		} else if hostName == "" {
 			h, err = r.choose(ctx, a, args[1:])
 		}
-	case "inspect", "start", "stop", "restart", "delete", "resize", "fsck", "restore", "backup", "logs", "export":
+	case "inspect", "start", "stop", "restart", "delete", "resize", "fsck", "restore", "backup", "logs", "export", "bootstrap":
+		if cmd == "bootstrap" && !orb {
+			return fmt.Errorf("use orb bootstrap NAME")
+		}
 		nameIndex := 1
 		if cmd == "backup" {
 			nameIndex = 2
@@ -322,7 +345,7 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 				return fmt.Errorf("conflicting host")
 			}
 		}
-	case "list", "status", "pool", "integration", "snapshot", "migration", "import", "help":
+	case "list", "status", "pool", "integration", "snapshot", "migration", "import", "project-template", "help":
 		if hostName == "" {
 			return fmt.Errorf("%s requires --host", cmd)
 		}
@@ -338,13 +361,16 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 			return err
 		}
 	}
+	if orb {
+		args = append([]string{"orb"}, args...)
+	}
 	if asJSON {
 		args = append([]string{"--json"}, args...)
 	}
 	if cmd == "new" {
 		fmt.Fprintf(stderr, "host: %s\n", h.Name)
 	}
-	if cmd != "import" {
+	if cmd != "import" && !(orb && cmd == "bootstrap") {
 		in = nil
 	}
 	if err = r.Transport.Run(ctx, h, a, args, in, out, stderr); err != nil {
@@ -550,7 +576,7 @@ func renderAggregate(out io.Writer, cmd string, results []Result) error {
 		return nil
 	}
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "HOST\tNAME\tSTATE\tCPU\tRAM\tDISK\tMIGRATION")
+	fmt.Fprintln(w, "HOST\tNAME\tKIND\tSTATE\tCPU\tRAM\tDISK\tMIGRATION")
 	for _, res := range results {
 		if res.Error != "" {
 			fmt.Fprintf(w, "%s\tERROR: %s\n", res.Host, res.Error)
@@ -559,6 +585,7 @@ func renderAggregate(out io.Writer, cmd string, results []Result) error {
 		var p struct {
 			Instances []struct {
 				Name            string `json:"name"`
+				Kind            string `json:"kind"`
 				State           string `json:"state"`
 				CPU             int64  `json:"vcpu_count"`
 				RAM             int64  `json:"memory_mib"`
@@ -575,7 +602,8 @@ func renderAggregate(out io.Writer, cmd string, results []Result) error {
 			if v.MigrationPhase != "" {
 				migration = v.MigrationPhase + " -> " + v.MigrationTarget
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", res.Host, v.Name, v.State, v.CPU, format.BinarySize(v.RAM*format.MiB), format.BinarySize(v.Disk), migration)
+			kind := (model.Instance{Kind: v.Kind}).KindName()
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", res.Host, v.Name, kind, v.State, v.CPU, format.BinarySize(v.RAM*format.MiB), format.BinarySize(v.Disk), migration)
 		}
 	}
 	return w.Flush()
@@ -583,7 +611,7 @@ func renderAggregate(out io.Writer, cmd string, results []Result) error {
 
 func renderNodes(out io.Writer, results []Result) error {
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "HOST\tSTATE\tVMs (running/total)\tCPU (vCPU/budget)\tLOAD (1m)\tRAM (reserved/budget)\tDISK (reserved/budget)\tDISK AVAILABLE")
+	fmt.Fprintln(w, "HOST\tSTATE\tINSTANCES (running/total)\tCPU (vCPU/budget)\tLOAD (1m)\tRAM (reserved/budget)\tDISK (reserved/budget)\tDISK AVAILABLE")
 	for _, res := range results {
 		if res.Error != "" {
 			fmt.Fprintf(w, "%s\tERROR: %s\t-\t-\t-\t-\t-\t-\n", res.Host, res.Error)

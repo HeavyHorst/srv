@@ -541,6 +541,11 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, []string, err
 			}
 			seenImage = true
 			opts.Image = value
+		case "--template":
+			if opts.Template != "" || !validIntegrationName.MatchString(value) {
+				return "", provision.CreateOptions{}, nil, errors.New("--template requires one valid project template ID")
+			}
+			opts.Template = value
 		case "--cpus":
 			if seenCPUs {
 				return "", provision.CreateOptions{}, nil, fmt.Errorf("%s specified more than once\n%s", key, newUsage())

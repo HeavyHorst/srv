@@ -1208,7 +1208,9 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 	result := helpResult()
 	for _, want := range []string{
 		"ssh srv [--json] <command>",
-		"new <name> [--image NAME] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]",
+		"new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]",
+		"project-template create <name> <id>",
+		"project-template delete <id>",
 		"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]",
 		"backup create <name>",
 		"backup list <name>",
@@ -2161,6 +2163,20 @@ func TestParseNewArgs(t *testing.T) {
 			args:     []string{"new", "demo", "--cpus", "2", "--ram", "4G", "--rootfs-size", "12G"},
 			wantName: "demo",
 			wantOpts: provision.CreateOptions{VCPUCount: 2, MemoryMiB: 4096, RootFSSizeBytes: 12 << 30},
+		},
+		{
+			name:     "parses project template",
+			args:     []string{"new", "demo", "--image", "amp-orb", "--template", "prepared"},
+			wantName: "demo",
+			wantOpts: provision.CreateOptions{Image: "amp-orb", Template: "prepared"},
+		},
+		{
+			name: "rejects template traversal", args: []string{"new", "demo", "--template", "../other"},
+			wantErr: "--template requires",
+		},
+		{
+			name: "rejects duplicate template", args: []string{"new", "demo", "--template", "a", "--template", "b"},
+			wantErr: "--template requires",
 		},
 		{
 			name:     "parses flags before name and plain mib values",

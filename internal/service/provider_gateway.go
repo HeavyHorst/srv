@@ -217,7 +217,7 @@ func desiredProviderGatewayInstances(instances []model.Instance) map[string]prov
 
 func shouldExposeGateway(inst model.Instance) bool {
 	switch inst.State {
-	case model.StateProvisioning, model.StateReady, model.StateAwaitingTailnet:
+	case model.StateProvisioning, model.StateReady, model.StateAwaitingTailnet, model.StateAwaitingGuest:
 		return true
 	default:
 		return false

@@ -94,6 +94,7 @@ type commandActionJSON struct {
 
 type instanceSummaryJSON struct {
 	Name            string `json:"name"`
+	Kind            string `json:"kind"`
 	Image           string `json:"image"`
 	State           string `json:"state"`
 	MigrationPhase  string `json:"migration_phase,omitempty"`
@@ -116,6 +117,7 @@ type inspectResponseJSON struct {
 
 type inspectInstanceJSON struct {
 	Name              string          `json:"name"`
+	Kind              string          `json:"kind"`
 	Image             string          `json:"image"`
 	State             string          `json:"state"`
 	MigrationPhase    string          `json:"migration_phase,omitempty"`
@@ -333,6 +335,7 @@ func maybeUnsupportedJSONCommand(command string, format outputFormat) (commandRe
 func instanceSummaryPayload(cfg config.Config, inst model.Instance, includeConnect bool) instanceSummaryJSON {
 	payload := instanceSummaryJSON{
 		Name:            inst.Name,
+		Kind:            inst.KindName(),
 		Image:           inst.ImageName(),
 		State:           inst.State,
 		VCPUCount:       effectiveInstanceVCPUCount(inst, cfg),
@@ -343,7 +346,7 @@ func instanceSummaryPayload(cfg config.Config, inst model.Instance, includeConne
 		TailscaleName:   inst.TailscaleName,
 		TailscaleIP:     inst.TailscaleIP,
 	}
-	if includeConnect {
+	if includeConnect && inst.KindName() == model.KindVM {
 		payload.Connect = fmt.Sprintf("ssh root@%s", inst.Name)
 	}
 	return payload
@@ -372,6 +375,7 @@ func (a *App) inspectPayload(inst model.Instance, poolName string, integrations 
 	payload := inspectResponseJSON{
 		Instance: inspectInstanceJSON{
 			Name:              inst.Name,
+			Kind:              inst.KindName(),
 			Image:             inst.ImageName(),
 			State:             inst.State,
 			CreatedByUser:     inst.CreatedByUser,
@@ -760,6 +764,19 @@ func (a *App) handleSession(sess gssh.Session) {
 		_ = sess.Exit(result.exitCode)
 		return
 	}
+	if len(req.args) >= 2 && req.args[0] == "orb" && req.args[1] == "bootstrap" {
+		if req.format == outputFormatJSON {
+			result, err := unsupportedJSONResult("orb bootstrap")
+			_, _ = io.WriteString(sess.Stderr(), result.stderr)
+			finalize(actor, true, reason, err)
+			_ = sess.Exit(result.exitCode)
+			return
+		}
+		code, err := a.handleOrbBootstrapSession(sess, actor, req.args)
+		finalize(actor, true, reason, err)
+		_ = sess.Exit(code)
+		return
+	}
 	if req.args[0] == "logs" {
 		logsReq, err := parseLogsArgs(req.args)
 		if err != nil {
@@ -839,12 +856,27 @@ func (a *App) handleSession(sess gssh.Session) {
 
 func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandRequest) (commandResult, error) {
 	switch req.args[0] {
+	case "project-template":
+		return a.cmdProjectTemplate(ctx, actor, req.args)
 	case "placement", "import-placement":
 		return a.cmdPlacement(ctx, actor, req.args)
 	case "migration":
 		return a.cmdMigration(ctx, actor, req.args, req.format)
 	case "new":
 		return a.cmdNew(ctx, actor, req.args, req.format)
+	case "orb":
+		if len(req.args) >= 2 {
+			switch req.args[1] {
+			case "new":
+				return a.cmdNew(ctx, actor, req.args, req.format)
+			case "list":
+				if len(req.args) == 2 {
+					return a.cmdList(ctx, actor, req.format, model.KindOrb)
+				}
+			}
+		}
+		err := errors.New("usage: orb new NAME [options] | orb list | orb bootstrap NAME")
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	case "integration":
 		return a.cmdIntegration(ctx, actor, req.args, req.format)
 	case "resize":
@@ -854,6 +886,13 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 	case "backup":
 		return a.cmdBackup(ctx, actor, req.args, req.format)
 	case "list":
+		if len(req.args) == 2 && req.args[1] == "--all" {
+			return a.cmdList(ctx, actor, req.format, "all")
+		}
+		if len(req.args) != 1 {
+			err := errors.New("usage: list [--all]")
+			return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+		}
 		return a.cmdList(ctx, actor, req.format)
 	case "inspect":
 		return a.cmdInspect(ctx, actor, req.args, req.format)
@@ -882,7 +921,13 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 }
 
 func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
+	kind := model.KindVM
+	if len(args) >= 2 && args[0] == "orb" && args[1] == "new" {
+		kind = model.KindOrb
+		args = args[1:]
+	}
 	name, opts, integrations, err := parseNewArgs(args)
+	opts.Kind = kind
 	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
@@ -1103,7 +1148,11 @@ func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string, o
 	}
 }
 
-func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFormat) (commandResult, error) {
+func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFormat, kinds ...string) (commandResult, error) {
+	kind := model.KindVM
+	if len(kinds) > 0 {
+		kind = kinds[0]
+	}
 	if a.provisioner != nil {
 		candidates, err := a.store.ListInstances(ctx, false)
 		if err != nil {
@@ -1126,6 +1175,13 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFo
 		return commandResult{stderr: fmt.Sprintf("list instances: %v\n", err), exitCode: 1}, err
 	}
 	instances = a.visibleInstances(actor, instances)
+	filtered := make([]model.Instance, 0, len(instances))
+	for _, inst := range instances {
+		if kind == "all" || inst.KindName() == kind {
+			filtered = append(filtered, inst)
+		}
+	}
+	instances = filtered
 	if outFormat == outputFormatJSON {
 		payload := struct {
 			Instances []instanceSummaryJSON `json:"instances"`
@@ -1147,7 +1203,7 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFo
 
 	rows := make([][]string, 0, len(instances))
 	for _, inst := range instances {
-		rows = append(rows, []string{
+		row := []string{
 			inst.Name,
 			string(inst.State),
 			fmt.Sprintf("%d", effectiveInstanceVCPUCount(inst, a.cfg)),
@@ -1155,10 +1211,18 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFo
 			format.BinarySize(effectiveInstanceRootFSSizeBytes(inst)),
 			inst.TailscaleIP,
 			inst.TailscaleName,
-		})
+		}
+		if kind == "all" {
+			row = append(row, inst.KindName())
+		}
+		rows = append(rows, row)
 	}
 
-	tableOutput, err := renderTextTable([]string{"Name", "State", "VCPUs", "Memory", "RootFS Size", "Tailscale IP", "Tailscale Name"}, rows)
+	headers := []string{"Name", "State", "VCPUs", "Memory", "RootFS Size", "Tailscale IP", "Tailscale Name"}
+	if kind == "all" {
+		headers = append(headers, "Kind")
+	}
+	tableOutput, err := renderTextTable(headers, rows)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("render instance list: %v\n", err), exitCode: 1}, err
 	}
@@ -1228,6 +1292,7 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	fmt.Fprintf(&b, "name: %s\n", inst.Name)
 	fmt.Fprintf(&b, "image: %s\n", inst.ImageName())
 	fmt.Fprintf(&b, "state: %s\n", inst.State)
+	fmt.Fprintf(&b, "kind: %s\n", inst.KindName())
 	if migration.Phase != "" {
 		fmt.Fprintf(&b, "migration: %s\nmigration-target: %s\n", migration.Phase, migration.Target)
 	}
@@ -1818,7 +1883,7 @@ func buildTopSummary(snapshot topSnapshot, prev *topSnapshot) string {
 			running++
 		case model.StateStopped:
 			stopped++
-		case model.StateProvisioning, model.StateAwaitingTailnet, model.StateDeleting, model.StateStopping:
+		case model.StateProvisioning, model.StateAwaitingTailnet, model.StateAwaitingGuest, model.StateDeleting, model.StateStopping:
 			transition++
 		case model.StateFailed:
 			failed++
@@ -2031,7 +2096,7 @@ func formatTopStatus(inst topInstanceSnapshot) (string, topCellStyle) {
 	switch inst.State {
 	case model.StateReady:
 		return "running", topCellStyleOK
-	case model.StateProvisioning, model.StateAwaitingTailnet:
+	case model.StateProvisioning, model.StateAwaitingTailnet, model.StateAwaitingGuest:
 		return inst.State, topCellStyleWarning
 	case model.StateFailed, model.StateDeleting:
 		return inst.State, topCellStyleCritical
@@ -2451,8 +2516,11 @@ func helpResult() commandResult {
 		{
 			header: "INSTANCE COMMANDS",
 			entries: []helpEntry{
-				{"new <name> [--image NAME] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]", "Create a new microvm instance (default image: arch)."},
-				{"list", "List all instances."},
+				{"new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]", "Create a new microvm instance (default image: arch)."},
+				{"list [--all]", "List VMs; --all includes Orb workloads."},
+				{"orb new <name> [options]", "Create an Orb workload using the new command options."},
+				{"orb list", "List Orb workloads."},
+				{"orb bootstrap <name>", "Bootstrap an Orb workload using a request on stdin."},
 				{"inspect <name>", "Show instance details and recent events."},
 				{"start <name>", "Start a stopped instance or recheck a running awaiting-tailnet instance."},
 				{"stop <name>", "Stop a running instance."},
@@ -2465,6 +2533,8 @@ func helpResult() commandResult {
 		{
 			header: "BACKUP COMMANDS",
 			entries: []helpEntry{
+				{"project-template create <name> <id>", "Save an immutable sanitized template of a stopped instance."},
+				{"project-template delete <id>", "Delete a project template in your owner namespace."},
 				{"backup create <name>", "Create a backup of an instance (stopped VM recommended for safety)."},
 				{"backup list <name>", "List backups for an instance."},
 				{"backup delete <name> <backup-id>", "Delete a backup of an instance."},
@@ -2528,6 +2598,8 @@ func helpResult() commandResult {
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "    --image NAME")
 	fmt.Fprintln(&b, "        Select a configured image during create (default: arch).")
+	fmt.Fprintln(&b, "    --template ID")
+	fmt.Fprintln(&b, "        Clone an owner-scoped project template during create.")
 	fmt.Fprintln(&b, "    --cpus N")
 	fmt.Fprintln(&b, "        Number of vCPUs.")
 	fmt.Fprintln(&b, "    --ram SIZE")
@@ -2998,6 +3070,9 @@ func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string, o
 }
 
 func lifecycleReadyResult(action string, inst model.Instance) commandResult {
+	if inst.KindName() == model.KindOrb {
+		return commandResult{stdout: fmt.Sprintf("%s: %s\nkind: orb\nstate: %s\n", action, inst.Name, inst.State)}
+	}
 	stdout := fmt.Sprintf("%s: %s\nstate: %s\ntailscale-name: %s\ntailscale-ip: %s\nconnect: ssh root@%s\n", action, inst.Name, inst.State, inst.TailscaleName, inst.TailscaleIP, inst.Name)
 	return commandResult{stdout: stdout, exitCode: 0}
 }
@@ -3211,7 +3286,7 @@ func importUsage() string {
 }
 
 func newUsage() string {
-	return "usage: new <name> [--image NAME] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]"
+	return "usage: new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]"
 }
 
 func resizeUsage() string {
@@ -3414,6 +3489,9 @@ func missingInstanceResult(command, name string, err error) (commandResult, erro
 }
 
 func inspectDebugHint(inst model.Instance) string {
+	if inst.State == model.StateAwaitingGuest {
+		return "guest readiness is unconfirmed; check the serial log, then retry start to verify the existing guest"
+	}
 	if inst.State == model.StateAwaitingTailnet {
 		return "tailnet readiness is unconfirmed; check the serial log, then retry start to verify the existing guest"
 	}

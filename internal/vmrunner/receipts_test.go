@@ -755,7 +755,7 @@ func TestManagedOldBootAcceptedReceiptCloses(t *testing.T) {
 	}
 }
 
-func startReceiptSocketProcess(t *testing.T, cfg ServerConfig, name string) int {
+func startReceiptSocketProcess(t *testing.T, cfg ServerConfig, name string) (int, <-chan struct{}) {
 	t.Helper()
 	dir := filepath.Join(cfg.InstancesDir, name)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -773,7 +773,7 @@ func startReceiptSocketProcess(t *testing.T, cfg ServerConfig, name string) int 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, err := os.Stat(path); err == nil {
-			return cmd.Process.Pid
+			return cmd.Process.Pid, done
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("fixture socket timeout")
@@ -984,14 +984,28 @@ func TestServeUnixReportsHTTPShutdownTimeout(t *testing.T) {
 func TestLegacyOwnedStopCleansFreshlyDiscoveredPooledCgroup(t *testing.T) {
 	s, _, service := newRunnerShutdownTestServer(t)
 	s.config.InstancesDir = shortReceiptDir(t)
-	pid := startReceiptSocketProcess(t, s.config, "demo")
+	pid, exited := startReceiptSocketProcess(t, s.config, "demo")
 	fixed := filepath.Join(service, firecrackerVMRootCgroupName, "demo")
 	pooled := filepath.Join(service, firecrackerPoolRootCgroupName, "pool-a", "demo")
 	writeRunningVMCgroup(t, service, filepath.Join(firecrackerVMRootCgroupName, "demo"))
 	writeRunningVMCgroup(t, service, filepath.Join(firecrackerPoolRootCgroupName, "pool-a", "demo"), pid)
 	old := removePath
-	t.Cleanup(func() { removePath = old })
+	oldRequest := requestGuestShutdown
+	t.Cleanup(func() { removePath = old; requestGuestShutdown = oldRequest })
 	removePath = os.RemoveAll // fake cgroup files are ordinary files
+	requestGuestShutdown = func(ctx context.Context, path string) error {
+		if err := oldRequest(ctx, path); err != nil {
+			return err
+		}
+		// Unlike real cgroup.procs, the fixture retains zombie PIDs. Reap the
+		// child before the runner checks that no live runtime occupies its name.
+		select {
+		case <-exited:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	c := receiptHTTPClient(t, s.Handler())
 	if err := c.StopInstanceVM(context.Background(), StopRequest{Name: "demo", PID: pid}); err != nil {
 		t.Fatal(err)

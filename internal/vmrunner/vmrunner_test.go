@@ -867,22 +867,22 @@ func TestShutdownRunningVMsDrainsInParallelWithConcurrencyLimit(t *testing.T) {
 	server, _, serviceCgroup := newRunnerShutdownTestServer(t)
 	server.config.InstancesDir = shortReceiptDir(t)
 	pids := make(map[string]int)
+	exited := make(map[string]<-chan struct{})
 	const vmCount = runnerShutdownConcurrency + 4
 	for i := range vmCount {
 		name := "vm-" + strconv.Itoa(i)
-		pid := startReceiptSocketProcess(t, server.config, name)
-		pids[filepath.Join(server.config.InstancesDir, name, "firecracker.sock")] = pid
+		pid, done := startReceiptSocketProcess(t, server.config, name)
+		path := filepath.Join(server.config.InstancesDir, name, "firecracker.sock")
+		pids[path], exited[path] = pid, done
 		writeRunningVMCgroup(t, serviceCgroup, filepath.Join(firecrackerVMRootCgroupName, name), pid)
 	}
 
 	oldRequest := requestGuestShutdown
-	oldWait := waitForProcessExit
 	oldForce := forceStopProcess
 	oldKillNow := killProcessNow
 	oldRemove := removePath
 	t.Cleanup(func() {
 		requestGuestShutdown = oldRequest
-		waitForProcessExit = oldWait
 		forceStopProcess = oldForce
 		killProcessNow = oldKillNow
 		removePath = oldRemove
@@ -893,7 +893,7 @@ func TestShutdownRunningVMsDrainsInParallelWithConcurrencyLimit(t *testing.T) {
 	var mu sync.Mutex
 	active := 0
 	maxActive := 0
-	requestGuestShutdown = func(_ context.Context, path string) error {
+	requestGuestShutdown = func(ctx context.Context, path string) error {
 		mu.Lock()
 		active++
 		if active > maxActive {
@@ -905,9 +905,18 @@ func TestShutdownRunningVMsDrainsInParallelWithConcurrencyLimit(t *testing.T) {
 		mu.Lock()
 		active--
 		mu.Unlock()
-		return syscall.Kill(pids[path], syscall.SIGKILL)
+		if err := syscall.Kill(pids[path], syscall.SIGKILL); err != nil {
+			return err
+		}
+		// The fake cgroup retains its PID; wait for reaping so a zombie cannot
+		// be mistaken for a live runtime during the runner's cleanup checks.
+		select {
+		case <-exited[path]:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	waitForProcessExit = func(int, time.Duration) error { return nil }
 	forceStopProcess = func(pid int) error {
 		t.Fatalf("forceStopProcess(%d) should not be called after graceful runner shutdown", pid)
 		return nil

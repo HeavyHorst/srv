@@ -77,6 +77,56 @@ To write directly into the service's expected runtime image directory:
 sudo OUTPUT_DIR=/var/lib/srv/images/arch-base ./images/arch-base/build.sh
 ```
 
+## Optional native Amp orb preparation
+
+The default build is unchanged. Opt in at build time:
+
+```bash
+sudo env SRV_AMP_ORB=1 ./images/arch-base/build.sh
+```
+
+For containerized builds, pass `-e SRV_AMP_ORB=1` to `podman run`.
+The shared [`prepare-guest.sh`](../../contrib/amp/orbs/prepare-guest.sh) runs
+as root **inside the guest chroot**, before DNS rewriting and package cleanup.
+It installs the [custom-image prerequisites](https://ampcode.com/docs/orbs/self-hosted):
+Bash/coreutils/util-linux, CA certificates, glibc, git, Node.js (checked to be
+18 or later), tmux, curl, passwordless sudo, and recommended ripgrep, gh and
+OpenSSH tools. It creates user/group `user` with writable `/home/user` and
+installs Amp as that user under `/home/user/.amp`, with `/usr/local/bin/amp`
+symlinked to the writable CLI so runtime self-updates can replace it.
+The manifest gains `srv_amp_orb=1`; the Arch `packages` field still lists the
+base package set, not this additional preparation's packages.
+
+This fetches the current Amp installer and CLI from ampcode.com/static.ampcode.com;
+it is not version-pinned. No login, token, repository checkout or project setup
+is baked in. Orb builds omit Tailscale and disable native srv enrollment. A
+host-only vsock agent configures DNS and launches `/usr/local/bin/amp orb bootstrap`
+through systemd as user/group `user`, with `HOME=/home/user` and runtime-only
+credentials. Preparation does not start bootstrap. Ordinary builds retain native
+MMDS/Tailscale behavior. Projects may install optional Tailscale in `.agents/setup`
+and authenticate it in `.agents/resume`; see the [Orb guide](../../docs/examples/amp-orbs.md).
+
+Desktop is included alongside Portal and Terminal dependencies. Preparation
+downloads only `/opt/amp-wayland` from a SHA-256-pinned layer of the official
+Linux amd64 Amp image, verifies it before extraction, and installs Xwayland,
+D-Bus, PulseAudio, FFmpeg, fonts, foot, swaybg and the required graphics libraries.
+Arch also needs `libxml2-legacy` for the upstream compositor's `libxml2.so.2` ABI.
+Allow build-time access to `us-central1-docker.pkg.dev` and its blob redirects.
+No Docker daemon or container-image tooling is required for this download.
+
+`/etc/amp-orb.env` supplies the bundled program paths to the dispatcher and
+login shells. Private RPATHs keep the bundle's older libraries confined to its
+binaries, rather than breaking newer Arch apps with a global `LD_LIBRARY_PATH`.
+`/opt/amp-wayland/srv-layer.sha256` records the source layer.
+Preparation checks library resolution and executable versions before completing.
+For a different catalog name such as `amp-orb-desktop`, set both `ORB_IMAGE` and
+`SRV_ORB_IMAGE` to that name in the provider configuration. Normal srv clients
+can select it with `orb new NAME --image amp-orb-desktop` (not plain `new`).
+
+Real srv/KVM registration, CLI updates, Desktop/Tunnel operation and wake-up
+still require host validation. A pause stops desktop processes; they are not
+saved in RAM.
+
 ## Podman Build On Non-Arch Linux Hosts
 
 If your host is not Arch and does not provide `pacstrap`, run the existing builder inside a privileged Arch Linux container instead of trying to recreate the Arch packaging environment on the host.

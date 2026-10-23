@@ -63,6 +63,7 @@ mount --rbind /dev "$ROOT/dev"
 mount --make-rslave "$ROOT/dev"
 chroot "$ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
 chroot "$ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PACKAGES[@]}"
+if [[ "${SRV_AMP_ORB:-0}" != 1 ]]; then
 install -d "$ROOT/usr/share/keyrings" "$ROOT/etc/apt/sources.list.d"
 curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
   -o "$ROOT/usr/share/keyrings/tailscale-archive-keyring.gpg"
@@ -70,6 +71,16 @@ echo 'deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://
   > "$ROOT/etc/apt/sources.list.d/tailscale.list"
 chroot "$ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
 chroot "$ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tailscale
+fi
+
+if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
+  (
+    guest_script="$(mktemp "$ROOT/root/prepare-amp.XXXXXX")"
+    trap 'rm -f "$guest_script"' EXIT
+    install -o root -g root -m 0700 "$SCRIPT_DIR/../../contrib/amp/orbs/prepare-guest.sh" "$guest_script"
+    chroot "$ROOT" /bin/bash "${guest_script#"$ROOT"}"
+  )
+fi
 
 install -d "$ROOT/lib/modules/$KERNEL_RELEASE"
 cp -a "$KERNEL_MODULES_DIR/." "$ROOT/lib/modules/$KERNEL_RELEASE/"
@@ -79,7 +90,16 @@ chroot "$ROOT" depmod "$KERNEL_RELEASE"
 cp -a "$OVERLAY/etc/." "$ROOT/etc/"
 install -D -m 0755 "$OVERLAY/usr/local/lib/srv/bootstrap.sh" "$ROOT/usr/local/lib/srv/bootstrap.sh"
 install -d "$ROOT/var/lib/srv"
-systemctl --root="$ROOT" enable systemd-resolved tailscaled srv-bootstrap docker.socket
+systemctl --root="$ROOT" enable systemd-resolved docker.socket
+if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
+  install -D -m 0755 "$SCRIPT_DIR/../../contrib/amp/orbs/guest-agent.py" "$ROOT/usr/local/lib/srv/orb-guest.py"
+  install -D -m 0644 "$SCRIPT_DIR/../../contrib/amp/orbs/srv-orb-guest.service" "$ROOT/etc/systemd/system/srv-orb-guest.service"
+  rm -f "$ROOT/etc/systemd/system/srv-bootstrap.service"
+  systemctl --root="$ROOT" mask srv-bootstrap.service
+  systemctl --root="$ROOT" enable srv-orb-guest.service
+else
+  systemctl --root="$ROOT" enable tailscaled srv-bootstrap
+fi
 systemctl --root="$ROOT" disable docker.service containerd.service
 systemctl --root="$ROOT" mask getty.target getty@.service serial-getty@.service \
   systemd-udevd.service systemd-udevd-control.socket systemd-udevd-kernel.socket \
@@ -106,6 +126,9 @@ cp "$KERNEL_IMAGE" "$WORK/vmlinux"
   echo "kernel_release=$KERNEL_RELEASE"
   echo "debian_mirror=$DEBIAN_MIRROR"
   echo "rootfs_size=$ROOTFS_SIZE"
+  if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
+    echo 'srv_amp_orb=1'
+  fi
   (cd "$WORK" && sha256sum vmlinux rootfs-base.img)
   cat "$WORK/packages.txt"
 } > "$WORK/manifest.txt"

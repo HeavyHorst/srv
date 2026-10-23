@@ -55,10 +55,12 @@ ROOTFS_PACKAGES=(
 	ripgrep
 	shfmt
 	stylua
-	tailscale
 	tree-sitter-cli
 	valgrind
 )
+if [[ "${SRV_AMP_ORB:-0}" != 1 ]]; then
+	ROOTFS_PACKAGES+=(tailscale)
+fi
 
 LOOP_DEVICE=""
 
@@ -381,9 +383,16 @@ configure_rootfs() {
 	arch-chroot "${ROOTFS_MOUNT_DIR}" chromium --version
 	systemctl --root="${ROOTFS_MOUNT_DIR}" enable \
 		docker.socket \
-		systemd-resolved.service \
-		tailscaled.service \
-		srv-bootstrap.service >/dev/null
+		systemd-resolved.service >/dev/null
+	if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
+		install -D -m 0755 "${SCRIPT_DIR}/../../contrib/amp/orbs/guest-agent.py" "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/orb-guest.py"
+		install -D -m 0644 "${SCRIPT_DIR}/../../contrib/amp/orbs/srv-orb-guest.service" "${ROOTFS_MOUNT_DIR}/etc/systemd/system/srv-orb-guest.service"
+		rm -f "${ROOTFS_MOUNT_DIR}/etc/systemd/system/srv-bootstrap.service"
+		systemctl --root="${ROOTFS_MOUNT_DIR}" mask srv-bootstrap.service >/dev/null
+		systemctl --root="${ROOTFS_MOUNT_DIR}" enable srv-orb-guest.service >/dev/null
+	else
+		systemctl --root="${ROOTFS_MOUNT_DIR}" enable tailscaled.service srv-bootstrap.service >/dev/null
+	fi
 	systemctl --root="${ROOTFS_MOUNT_DIR}" disable \
 		docker.service \
 		containerd.service \
@@ -425,6 +434,14 @@ build_rootfs() {
 	install_pi
 	install_agent_browser
 	bootstrap_lazyvim
+	if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
+		(
+			guest_script="$(mktemp "${ROOTFS_MOUNT_DIR}/root/prepare-amp.XXXXXX")"
+			trap 'rm -f "${guest_script}"' EXIT
+			install -o root -g root -m 0700 "${SCRIPT_DIR}/../../contrib/amp/orbs/prepare-guest.sh" "${guest_script}"
+			arch-chroot "${ROOTFS_MOUNT_DIR}" /bin/bash "${guest_script#"${ROOTFS_MOUNT_DIR}"}"
+		)
+	fi
 	configure_rootfs
 	detach_rootfs
 }
@@ -442,6 +459,9 @@ rootfs_size=${ROOTFS_SIZE}
 packages=$(IFS=,; echo "${ROOTFS_PACKAGES[*]}")
 artifacts=$(basename -- "${VMLINUX_OUTPUT}"),$(basename -- "${ROOTFS_OUTPUT}")
 EOF
+	if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
+		echo 'srv_amp_orb=1' >>"${MANIFEST_OUTPUT}"
+	fi
 }
 
 main() {

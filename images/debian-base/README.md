@@ -10,7 +10,8 @@ Tailscale, Docker (Debian's docker.io/docker-cli), git, curl, jq, tmux,
 openssh-client, iproute2, iptables, kmod and basic shell utilities. It does **not**
 include Arch's language toolchains, editors, Chromium, agent-browser, Pi or
 OpenCode. Install project-specific tools with apt or `.agents/setup`; the Amp
-runner installs Amp separately. SSH access uses Tailscale SSH, not an sshd.
+runner installs Amp separately unless you opt into native Amp orb preparation
+below. SSH access uses Tailscale SSH, not an sshd.
 
 ## Host requirements
 
@@ -84,6 +85,55 @@ sudo env KERNEL_IMAGE="$PWD/images/arch-base/out/vmlinux" \
   KERNEL_MODULES_DIR="$PWD/images/debian-base/out/shared-kernel/lib/modules/6.12.79" \
   ./images/debian-base/build.sh
 ```
+
+## Optional native Amp orb preparation
+
+Set `SRV_AMP_ORB=1` alongside the required kernel inputs:
+
+```bash
+sudo env SRV_AMP_ORB=1 KERNEL_IMAGE="$kernel_work/vmlinux" \
+  KERNEL_MODULES_DIR="$module_stage/lib/modules/$kernel_release" \
+  ./images/debian-base/build.sh
+```
+
+Defaults are unchanged. The shared
+[`prepare-guest.sh`](../../contrib/amp/orbs/prepare-guest.sh) runs as root inside
+the chroot before DNS rewriting and cleanup. It installs the
+[custom-image prerequisites](https://ampcode.com/docs/orbs/self-hosted):
+Bash/coreutils/util-linux, CA certificates, glibc, git, Node.js (checked to be
+18 or later), tmux, curl, sudo, ripgrep, gh and openssh-client. User/group `user`
+gets writable `/home/user` and passwordless sudo. Amp is installed as that user
+under `/home/user/.amp`; `/usr/local/bin/amp` links to the writable CLI so runtime
+self-updates can replace it. The manifest gains `srv_amp_orb=1`, and its package
+inventory includes the extra Debian packages.
+
+Allow build-time access to ampcode.com/static.ampcode.com for the current,
+unpinned installer and CLI. No login, tokens, repository checkout or project
+setup is baked in. Orb builds omit Tailscale and disable native srv enrollment.
+A host-only vsock agent configures DNS and starts `/usr/local/bin/amp orb bootstrap`
+through systemd as user/group `user`, with `HOME=/home/user` and runtime-only
+credentials. Preparation does not start bootstrap. Ordinary builds retain native
+MMDS/Tailscale behavior. Projects may install optional Tailscale in `.agents/setup`
+and authenticate it in `.agents/resume`; see the [Orb guide](../../docs/examples/amp-orbs.md).
+
+Desktop is included alongside Portal and Terminal dependencies. Preparation
+fetches `/opt/amp-wayland` from a SHA-256-pinned layer of the official Linux amd64
+Amp image and verifies it before extraction. It installs Xwayland, D-Bus,
+PulseAudio, FFmpeg, fonts, foot, swaybg and the graphics libraries needed by the
+bundle. Allow build-time access to `us-central1-docker.pkg.dev` and its blob
+redirects; no Docker daemon or image tooling is needed. This increases the image's
+installed size; raise `ROOTFS_SIZE` if adding further tools exceeds the default.
+
+`/etc/amp-orb.env` supplies program paths to bootstrap and login shells. Private
+RPATHs resolve bundled libraries without changing other applications' libraries.
+The layer digest is saved in `/opt/amp-wayland/srv-layer.sha256`; preparation
+checks runtime libraries and executable versions. Register the resulting image
+under any srv catalog name (for example `amp-orb-desktop`) and set the provider's
+`ORB_IMAGE` and `SRV_ORB_IMAGE` to that name, or use
+`orb new NAME --image amp-orb-desktop` directly (not plain `new`).
+
+Real srv/KVM boot, registration, CLI self-updates, Desktop/Tunnel operation and
+wake-up still need host validation. Stop/start does not preserve desktop sessions.
 
 ## Install and configure
 

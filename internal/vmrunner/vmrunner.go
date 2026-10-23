@@ -103,6 +103,7 @@ type Metadata struct {
 }
 
 type StartRequest struct {
+	Kind                string    `json:"kind,omitempty"`
 	KernelPath          string    `json:"kernel_path,omitempty"`
 	InitrdPath          string    `json:"initrd_path,omitempty"`
 	InstanceID          string    `json:"instance_id"`
@@ -859,7 +860,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 					Nameservers: req.Nameservers,
 				},
 			},
-			AllowMMDS: true,
+			AllowMMDS: req.Kind != "orb",
 		}},
 		MachineCfg: models.MachineConfiguration{
 			VcpuCount:  &vcpus,
@@ -880,6 +881,9 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 		},
 		MmdsAddress: net.ParseIP("169.254.169.254"),
 	}
+	if req.Kind == "orb" {
+		fcCfg.VsockDevices = []firecracker.VsockDevice{{ID: "orb", Path: "orb.vsock", CID: 3}}
+	}
 
 	vmCtx := vmContextForRequest(ctx)
 	processRunner, err := s.processRunnerForStart(vmCtx, req, fcCfg.SocketPath, serialLog)
@@ -895,7 +899,9 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	// launch/reaping instead; only locked, identity-checked stop removes paths.
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Swap(preserveRuntimeLaunchHandler(processRunner))
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Swap(prepareJailedRuntimeHandler(paths, jailerPaths, s.config.JailerGID))
-	machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.NewSetMetadataHandler(Metadata{SRV: req.Bootstrap}))
+	if req.Kind != "orb" {
+		machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.NewSetMetadataHandler(Metadata{SRV: req.Bootstrap}))
+	}
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.Handler{
 		Name: "srv.CreateBalloonDevice",
 		Fn: func(ctx context.Context, _ *firecracker.Machine) error {
@@ -913,6 +919,13 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	defer cancelInit()
 	if err := machine.Start(initCtx); err != nil {
 		return StartResponse{}, fmt.Errorf("start firecracker machine: %w", err)
+	}
+	// Firecracker instantiates device backends during InstanceStart, not PUT
+	// /vsock. Only expose the socket after the SDK has started the machine.
+	if req.Kind == "orb" {
+		if err := exposeOrbSocket(filepath.Dir(paths.SocketPath), jailerPaths.RootDir); err != nil {
+			return StartResponse{}, fmt.Errorf("expose orb transport: %w", err)
+		}
 	}
 	pid, err := machine.PID()
 	if err != nil {
@@ -1187,6 +1200,9 @@ func liveProcessPIDs(pids []int) []int {
 }
 
 func (r StartRequest) Validate() error {
+	if r.Kind != "" && r.Kind != "vm" && r.Kind != "orb" {
+		return errors.New("invalid instance kind")
+	}
 	if err := validateAbsolutePath("kernel path", r.KernelPath, true); err != nil {
 		return err
 	}
@@ -1232,7 +1248,7 @@ func (r StartRequest) Validate() error {
 			return errors.New("memory pool size bytes must be >= 1")
 		}
 	}
-	if strings.TrimSpace(r.Bootstrap.Hostname) == "" {
+	if r.Kind != "orb" && strings.TrimSpace(r.Bootstrap.Hostname) == "" {
 		return errors.New("bootstrap hostname is required")
 	}
 	return nil
@@ -1585,6 +1601,9 @@ func exposeJailedSocket(hostSocketPath, jailedSocketPath string) error {
 
 func cleanupJailedRuntimePaths(hostPaths instanceRuntimePaths, jailerPaths jailerRuntimePaths) error {
 	var errs []error
+	if err := os.Remove(filepath.Join(filepath.Dir(hostPaths.SocketPath), "orb.vsock")); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("remove orb socket: %w", err))
+	}
 	if err := os.Remove(hostPaths.SocketPath); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Errorf("remove firecracker socket alias %s: %w", hostPaths.SocketPath, err))
 	}

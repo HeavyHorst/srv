@@ -525,6 +525,7 @@ func testInstance(name, state string, createdAt time.Time) model.Instance {
 	return model.Instance{
 		ID:              name + "-id",
 		Name:            name,
+		Kind:            model.KindVM,
 		State:           state,
 		CreatedAt:       createdAt,
 		UpdatedAt:       updatedAt,

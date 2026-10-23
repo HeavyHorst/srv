@@ -60,8 +60,8 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
-			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image, kind
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		inst.ID,
 		inst.Name,
@@ -92,7 +92,7 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 		inst.TailscaleIP,
 		inst.LastError,
 		nullableTime(inst.DeletedAt),
-		inst.StartRequestID, inst.StartBootID, inst.TailnetNodeID, inst.Image,
+		inst.StartRequestID, inst.StartBootID, inst.TailnetNodeID, inst.Image, inst.KindName(),
 	)
 	if err != nil {
 		return fmt.Errorf("insert instance: %w", err)
@@ -108,7 +108,7 @@ func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
 			rootfs_path = ?, kernel_path = ?, initrd_path = ?, socket_path = ?, log_path = ?,
 			serial_log_path = ?, tap_device = ?, guest_mac = ?, network_cidr = ?, host_addr = ?,
 			guest_addr = ?, gateway_addr = ?, firecracker_pid = ?, tailscale_name = ?,
-			tailscale_ip = ?, last_error = ?, deleted_at = ?, start_request_id = ?, start_boot_id = ?, tailnet_node_id = ?, image = ?
+			tailscale_ip = ?, last_error = ?, deleted_at = ?, start_request_id = ?, start_boot_id = ?, tailnet_node_id = ?, image = ?, kind = ?
 		WHERE name = ?
 	`,
 		inst.State,
@@ -135,7 +135,7 @@ func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
 		inst.TailscaleIP,
 		inst.LastError,
 		nullableTime(inst.DeletedAt),
-		inst.StartRequestID, inst.StartBootID, inst.TailnetNodeID, inst.Image,
+		inst.StartRequestID, inst.StartBootID, inst.TailnetNodeID, inst.Image, inst.KindName(),
 		inst.Name,
 	)
 	if err != nil {
@@ -173,7 +173,7 @@ func (s *Store) GetInstance(ctx context.Context, name string) (model.Instance, e
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
-			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image
+			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image, kind
 		FROM instances
 		WHERE name = ?
 	`, name)
@@ -231,7 +231,7 @@ func (s *Store) ListInstances(ctx context.Context, includeDeleted bool) ([]model
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
-			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image
+			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image, kind
 		FROM instances
 	`
 	if !includeDeleted {
@@ -697,6 +697,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{name: "start_boot_id", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "tailnet_node_id", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "image", decl: "TEXT NOT NULL DEFAULT ''"},
+		{name: "kind", decl: "TEXT NOT NULL DEFAULT 'vm' CHECK (kind IN ('vm', 'orb'))"},
 	} {
 		if err := s.ensureColumn(ctx, "instances", column.name, column.decl); err != nil {
 			return err
@@ -796,7 +797,7 @@ func scanInstance(scan func(dest ...any) error) (model.Instance, error) {
 		&inst.TailscaleIP,
 		&inst.LastError,
 		&deletedAt,
-		&inst.StartRequestID, &inst.StartBootID, &inst.TailnetNodeID, &inst.Image,
+		&inst.StartRequestID, &inst.StartBootID, &inst.TailnetNodeID, &inst.Image, &inst.Kind,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Instance{}, err

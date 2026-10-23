@@ -6,12 +6,16 @@ import (
 )
 
 const (
+	KindVM  = "vm"
+	KindOrb = "orb"
+
 	StateProvisioning    = "provisioning"
 	StateReady           = "ready"
 	StateStopping        = "stopping"
 	StateStopped         = "stopped"
 	StateFailed          = "failed"
 	StateAwaitingTailnet = "awaiting-tailnet"
+	StateAwaitingGuest   = "awaiting-guest"
 	StateDeleting        = "deleting"
 	StateDeleted         = "deleted"
 
@@ -37,6 +41,7 @@ func NormalizeMemoryMode(mode string) string {
 type Instance struct {
 	ID              string
 	Name            string
+	Kind            string
 	Image           string
 	State           string
 	CreatedAt       time.Time
@@ -68,6 +73,14 @@ type Instance struct {
 	LastError       string
 	DeletedAt       *time.Time
 	UpdatedAt       time.Time
+}
+
+// KindName treats records created before workload kinds existed as VMs.
+func (i Instance) KindName() string {
+	if i.Kind == "" {
+		return KindVM
+	}
+	return i.Kind
 }
 
 func (i Instance) NormalizedMemoryMode() string {

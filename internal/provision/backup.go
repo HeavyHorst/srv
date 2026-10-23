@@ -86,6 +86,7 @@ type portableManifest struct {
 }
 
 type portableInstance struct {
+	Kind            string    `json:"kind,omitempty"`
 	MemoryMode      string    `json:"memory_mode,omitempty"`
 	ID              string    `json:"id,omitempty"`
 	Name            string    `json:"name"`
@@ -300,6 +301,7 @@ func (p *Provisioner) RestoreBackup(ctx context.Context, name, backupID string) 
 	}
 
 	restored := inst
+	restored.Kind = manifest.Instance.Kind
 	restored.Image = manifest.Instance.Image
 	restored.KernelPath = manifest.Instance.KernelPath
 	restored.InitrdPath = manifest.Instance.InitrdPath
@@ -623,6 +625,7 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 			MemoryMode:      memoryMode,
 			MemoryPoolID:    poolID,
 			ID:              firstNonEmpty(manifest.Instance.ID, uuid.NewString()),
+			Kind:            manifest.Instance.Kind,
 			Name:            targetName,
 			Image:           manifest.Instance.Image,
 			State:           model.StateProvisioning,
@@ -818,10 +821,14 @@ func portableManifestFromInstance(exportedAt time.Time, inst model.Instance) por
 	if inst.UsesMemoryPool() {
 		version = 3
 	}
+	if inst.KindName() == model.KindOrb {
+		version = 4 // Older servers must not silently import an orb as a Tailscale VM.
+	}
 	return portableManifest{
 		Version:    version,
 		ExportedAt: exportedAt,
 		Instance: portableInstance{
+			Kind:            inst.Kind,
 			MemoryMode:      inst.MemoryMode,
 			ID:              inst.ID,
 			Name:            inst.Name,
@@ -889,8 +896,14 @@ func readPortableManifest(tr *tar.Reader) (portableManifest, error) {
 }
 
 func (m portableManifest) validate() error {
-	if m.Version != 1 && m.Version != portableManifestVersion && m.Version != 3 {
+	if m.Version != 1 && m.Version != portableManifestVersion && m.Version != 3 && m.Version != 4 {
 		return fmt.Errorf("portable artifact uses unsupported manifest version %d", m.Version)
+	}
+	if m.Instance.Kind != "" && m.Instance.Kind != model.KindVM && m.Instance.Kind != model.KindOrb {
+		return errors.New("invalid portable workload kind")
+	}
+	if m.Instance.Kind == model.KindOrb && m.Version < 4 {
+		return errors.New("orb artifacts require portable manifest version 4")
 	}
 	if m.Instance.MemoryMode != "" && m.Instance.MemoryMode != "fixed" && m.Instance.MemoryMode != "pool" {
 		return errors.New("invalid portable memory mode")

@@ -25,6 +25,9 @@ import (
 )
 
 func (c Config) Validate() error {
+	if err := c.ProviderNodes.Validate(nil); err != nil {
+		return err
+	}
 	if c.Hostname == "" || c.DataDir == "" || c.ListenAddr == "" || len(c.AllowedUsers) == 0 || len(c.Hosts) == 0 {
 		return fmt.Errorf("hostname, data_dir, listen_addr, nonempty allowed_users and hosts required")
 	}
@@ -213,14 +216,20 @@ func Serve(ctx context.Context, c Config) error {
 		return requestType != "shell" && requestType != "subsystem"
 	}, Handler: func(s gssh.Session) {
 		who, err := local.WhoIs(s.Context(), s.RemoteAddr().String())
-		if err != nil || who == nil || who.Node == nil || who.UserProfile == nil || len(who.Node.Tags) > 0 || who.UserProfile.LoginName == "" {
-			fmt.Fprintln(s.Stderr(), "user identity required; tagged nodes rejected")
+		if err != nil {
+			fmt.Fprintln(s.Stderr(), "tailscale identity lookup failed")
+			s.Exit(1)
+			return
+		}
+		actor, err := c.ProviderNodes.Resolve(who, s.RemoteAddr().String(), s.User())
+		if err != nil {
+			fmt.Fprintln(s.Stderr(), err)
 			s.Exit(1)
 			return
 		}
 		allowed := false
 		for _, u := range c.AllowedUsers {
-			if strings.EqualFold(u, who.UserProfile.LoginName) {
+			if strings.EqualFold(u, actor.UserLogin) {
 				allowed = true
 			}
 		}
@@ -229,7 +238,6 @@ func Serve(ctx context.Context, c Config) error {
 			s.Exit(1)
 			return
 		}
-		actor := model.Actor{UserLogin: who.UserProfile.LoginName, DisplayName: who.UserProfile.DisplayName, NodeName: who.Node.Name, RemoteAddr: s.RemoteAddr().String(), SSHUser: s.User()}
 		ctx, cancel := context.WithCancel(s.Context())
 		defer cancel()
 		go func() {

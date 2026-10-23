@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"srv/internal/identity"
 )
 
 const (
@@ -48,6 +50,7 @@ type Config struct {
 	AllowedUsers           []string
 	AdminUsers             []string
 	TrustedFrontends       []string
+	ProviderNodes          identity.Providers
 
 	BaseKernelPath           string
 	BaseInitrdPath           string
@@ -105,6 +108,7 @@ func (c Config) ResolveImage(name string) (Image, error) {
 
 func Load() (Config, error) {
 	var cfg Config
+	providerNodes := flag.String("provider-nodes", os.Getenv("SRV_PROVIDER_NODES"), "JSON object mapping stable Tailscale node IDs to service owner names")
 	imagesFile := flag.String("images-file", os.Getenv("SRV_IMAGES_FILE"), "JSON file mapping image names to kernel, initrd and rootfs paths")
 
 	flag.StringVar(&cfg.DataDir, "data-dir", getenv("SRV_DATA_DIR", defaultDataDir), "service state directory")
@@ -159,6 +163,11 @@ func Load() (Config, error) {
 	cfg.GuestTailscaleAuthOnce = true
 
 	var err error
+	if *providerNodes != "" {
+		if err := json.Unmarshal([]byte(*providerNodes), &cfg.ProviderNodes); err != nil {
+			return Config{}, fmt.Errorf("parse provider nodes: %w", err)
+		}
+	}
 	if *imagesFile != "" {
 		data, err := os.ReadFile(*imagesFile)
 		if err != nil {
@@ -191,6 +200,14 @@ func Load() (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if err := c.ProviderNodes.Validate(c.AdminUsers); err != nil {
+		return err
+	}
+	for _, node := range c.TrustedFrontends {
+		if _, provider := c.ProviderNodes[node]; provider {
+			return errors.New("provider nodes cannot also be trusted frontends")
+		}
+	}
 	for name, image := range c.Images {
 		if !imageName.MatchString(name) {
 			return fmt.Errorf("invalid image name %q", name)

@@ -10,6 +10,7 @@ import (
 
 	gssh "github.com/gliderlabs/ssh"
 
+	"srv/internal/identity"
 	"srv/internal/model"
 )
 
@@ -37,6 +38,9 @@ func (a *App) resolveCommandActor(ctx context.Context, sess gssh.Session, args [
 		if err != nil || json.Unmarshal(data, &actor) != nil || strings.TrimSpace(actor.UserLogin) == "" {
 			return model.Actor{}, nil, "", errors.New("invalid forwarded actor")
 		}
+		if identity.IsService(actor.UserLogin) && !a.cfg.ProviderNodes.AllowsForwarded(actor.UserLogin) {
+			return model.Actor{}, nil, "", errors.New("forwarded service owner is not configured on this backend")
+		}
 		if args[2] == "forward" || (args[2] == "--json" && (len(args) < 4 || args[3] == "forward")) {
 			return model.Actor{}, nil, "", errors.New("nested identity forwarding is not allowed")
 		}
@@ -44,12 +48,6 @@ func (a *App) resolveCommandActor(ctx context.Context, sess gssh.Session, args [
 		actor.SSHUser = sess.User()
 		return actor, args[2:], nodeID, nil
 	}
-	if who.UserProfile == nil || who.UserProfile.LoginName == "" || len(who.Node.Tags) != 0 {
-		return model.Actor{}, nil, "", errors.New("command requires a Tailscale user identity or trusted frontend forwarding")
-	}
-	return model.Actor{
-		UserLogin: who.UserProfile.LoginName, DisplayName: who.UserProfile.DisplayName,
-		NodeName:   trimNodeName(who.Node.ComputedName, who.Node.Name),
-		RemoteAddr: remote, SSHUser: sess.User(),
-	}, args, "", nil
+	actor, err := a.cfg.ProviderNodes.Resolve(who, remote, sess.User())
+	return actor, args, "", err
 }

@@ -17,6 +17,7 @@ import (
 
 	"srv/internal/format"
 	"srv/internal/host"
+	"srv/internal/identity"
 	"srv/internal/model"
 )
 
@@ -26,11 +27,12 @@ type Host struct {
 	HostKey string `json:"host_key"`
 }
 type Config struct {
-	Hostname     string   `json:"hostname"`
-	DataDir      string   `json:"data_dir"`
-	ListenAddr   string   `json:"listen_addr"`
-	AllowedUsers []string `json:"allowed_users"`
-	Hosts        []Host   `json:"hosts"`
+	Hostname      string             `json:"hostname"`
+	DataDir       string             `json:"data_dir"`
+	ListenAddr    string             `json:"listen_addr"`
+	AllowedUsers  []string           `json:"allowed_users"`
+	Hosts         []Host             `json:"hosts"`
+	ProviderNodes identity.Providers `json:"provider_nodes,omitempty"`
 }
 
 // Transport must terminate streams when ctx is cancelled and report remote exit failures.

@@ -4,6 +4,7 @@ images/arch-base/out/
 /.opencode
 /srv
 /srv-front
+/srv-orb-dispatch
 /srv-net-helper
 /srv-vm-runner
 /srv-manual

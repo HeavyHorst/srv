@@ -1,0 +1,24 @@
+[Unit]
+Description=Amp self-hosted orbs on srv
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=srv-orbs
+Group=srv-orbs
+StateDirectory=srv-orbs
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/srv-orbs
+EnvironmentFile=/etc/srv-orbs.env
+ExecStart=/usr/local/bin/amp orb provider /usr/local/bin/srv-orb-dispatch
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

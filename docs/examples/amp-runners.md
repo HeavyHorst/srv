@@ -2,6 +2,10 @@
 
 Run Amp threads in dedicated, self-hosted Firecracker microVMs without giving up Amp's remote experience.
 
+This page describes the CLI runner plugin, not the native Orb integration.
+For Amp-managed pause/wake on srv, see [Self-hosted Amp orbs](amp-orbs.md).
+Comparisons below refer to Amp-hosted orbs; self-hosted providers can have different lifecycle capabilities.
+
 Each **New isolated thread** action creates a VM with a fresh repository clone, its own resource limits and Tailscale identity, and a dedicated Amp runner. The resulting thread is still a normal Amp thread: open it from the web or your phone, review its conversation and changes, and use its remote terminal while srv provides the machine underneath.
 
 ## One action creates the whole environment

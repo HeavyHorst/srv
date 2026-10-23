@@ -72,6 +72,7 @@ srv runs on Linux with the following requirements:
 - [Install srv](getting-started/install.md)
 - [Multi-host frontend](getting-started/multi-host.md)
 - [Walkthrough](getting-started/walkthrough.md)
+- [Self-hosted Amp orbs](examples/amp-orbs.md)
 - [Amp runners on srv](examples/amp-runners.md)
 - [Sandboxed AI coding agent](examples/ai-coding-agent.md)
 - [Architecture](reference/architecture.md)

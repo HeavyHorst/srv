@@ -2,6 +2,55 @@
 
 srv is configured through environment variables, read from `/etc/srv/srv.env` by the systemd units.
 
+## Provider service owners
+
+Provider nodes can have a fixed, non-human owner identity, including tagged
+Tailscale nodes. This is opt-in and uses **stable Tailscale node IDs**, never
+hostnames, tags, SSH usernames, Dispatch parameters or Amp member IDs.
+
+```sh
+SRV_PROVIDER_NODES='{"nPROVIDER1":"amp-dispatch","nPROVIDER2":"amp-dispatch"}'
+SRV_ALLOWED_USERS='alice@example.com,service:amp-dispatch'
+```
+
+`srv --provider-nodes '{"nPROVIDER1":"amp-dispatch"}'` overrides the environment
+value. The JSON object maps each node ID to a service name matching
+`[a-z0-9][a-z0-9_-]{0,63}`. The resulting owner is `service:amp-dispatch`;
+values cannot be human logins. Configured nodes use this owner even if their
+WhoIs profile belongs to a human/admin. Unconfigured tagged nodes remain denied;
+unconfigured ordinary user nodes keep normal user authentication.
+
+For `srv-front`, add the same mapping to its static `--config` JSON:
+
+```json
+{
+  "provider_nodes": {"nPROVIDER1": "amp-dispatch", "nPROVIDER2": "amp-dispatch"},
+  "allowed_users": ["alice@example.com", "service:amp-dispatch"]
+}
+```
+
+These are additional fields, not a complete frontend config. Configure the
+mapping on each backend too: forwarded service owners must be explicitly known
+there. Existing frontend trust (`SRV_TRUSTED_FRONTENDS`) still applies, and
+frontend and backend allowlists still apply. Provider nodes must **not** be
+trusted frontends; backend configuration rejects overlap. Trust only the actual
+srv-front node, which authenticates the original peer and forwards its owner.
+As before, a trusted frontend is a security boundary that can assert identities.
+
+The `service:` namespace is reserved: direct human profiles cannot claim it and
+`SRV_ADMIN_USERS` cannot contain it (startup fails). Service owners receive normal
+owner-scoped operations, never admin privileges or another user's instances.
+Multiple nodes mapped to the same name intentionally share ownership; use separate
+names for isolation. Dispatch supplies no Amp member ID, so this provides **no
+per-human Amp ownership**. Removing a mapping revokes that node's service identity
+after restart, but does not delete or reassign existing instances. Rotate node IDs
+explicitly; do not grant a tag-wide wildcard. Protect configuration as admin-owned.
+
+Host-local `project-template create NAME ID`, `project-template delete ID`, and
+`new NAME --template ID` require explicit `--host HOST` through srv-front. Template
+creation and use must target the same backend; automatic template placement is
+rejected.
+
 ## Tailscale credentials
 
 | Variable | Required | Description |

@@ -22,12 +22,16 @@ ssh srv -- --json status
 |---------|-------------|
 | `new <name>` | Create a new VM |
 | `new <name> --image <name>` | Select a configured guest image, e.g. `debian-13` (default: `arch`) |
+| `new <name> --image <name> --template <id>` | Clone an owner-scoped prepared project template; requires explicit `--host` through srv-front |
 | `new <name> --integration <name>` | Create and enable one or more existing integrations (admin only) |
 | `new <name> --cpus <n>` | Create with custom vCPU count |
 | `new <name> --ram <size>` | Create with custom memory (`2G`, `512M`, or MiB integer) |
 | `new <name> --pool <name> --ram <size>` | Create a pooled-memory VM in an existing memory pool |
 | `new <name> --rootfs-size <size>` | Create with custom rootfs size |
 | `list` | Show visible VMs (all for admins, own for regular users) |
+| `orb list` | Show visible Orbs only |
+| `list --all` | Show both workload kinds, still subject to ownership rules |
+| `orb new <name> --image <name>` | Create an Orb with a prepared Orb image; uses host vsock instead of guest Tailscale enrollment |
 | `inspect <name>` | Show VM details and event history |
 | `logs <name>` | View serial log (default) |
 | `logs <name> serial` | View serial log |
@@ -37,9 +41,15 @@ ssh srv -- --json status
 
 ## Lifecycle commands
 
+Lifecycle commands work for both VMs and Orbs. Names share one namespace per
+backend; the image name does not determine the workload kind. Existing instances
+remain VMs. See [Amp orbs](../examples/amp-orbs.md) for bootstrap and optional
+project networking. `orb bootstrap <name>` is a streaming provider command:
+credentials are JSON on stdin, never command arguments; it does not accept `--json`.
+
 | Command | Description |
 |---------|-------------|
-| `start <name>` | Start a stopped VM, or recheck a running VM left in `awaiting-tailnet` |
+| `start <name>` | Start a stopped instance, or recheck readiness in `awaiting-tailnet` / `awaiting-guest` |
 | `stop <name>` | Stop a running VM (graceful shutdown) |
 | `restart <name>` | Stop and start a VM |
 | `fsck <name>` | Force-check and repair the rootfs of a stopped VM |
@@ -65,6 +75,19 @@ For pooled VMs, `resize --ram` keeps the VM in the same pool. In v1 it is allowe
 | `backup list <name>` | List backups for a VM |
 | `backup delete <name> <backup-id>` | Permanently delete a backup |
 | `restore <name> <backup-id>` | Restore a stopped VM from a backup |
+
+## Project templates
+
+| Command | Description |
+|---------|-------------|
+| `project-template create <name> <id>` | Save an immutable, identity-cleaned copy of your stopped VM |
+| `project-template verify <name> <id>` | Verify an existing template belongs to the stopped source; never recreate a missing template |
+| `project-template delete <id>` | Delete a template in your owner namespace; does not delete VMs created from it |
+
+These commands support `--json` and require explicit `--host` through srv-front.
+Unlike backups, templates create new identities rather than restore an existing
+VM. Templates outlive their source VM. See [Amp orbs](../examples/amp-orbs.md#project-snapshots)
+for storage, security and retention requirements.
 
 ## Transfer commands
 

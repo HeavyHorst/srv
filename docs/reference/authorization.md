@@ -22,6 +22,15 @@ If `SRV_ALLOWED_USERS` is unset or empty, any authenticated tailnet user can inv
 - Resize their own VMs
 - Export their own VMs
 
+### Provider services
+
+`SRV_PROVIDER_NODES` maps explicit stable Tailscale node IDs to non-human owners
+such as `service:amp-orbs`. Configured tagged nodes can use this path; they do not
+become human users or admins. Existing allowlists and VM ownership checks still
+apply. See [provider identity configuration](configuration.md#provider-service-owners).
+Project templates are owner-scoped too. A provider does not distinguish the Amp
+members who submit jobs; use separate identities for separate trust domains.
+
 ### Admin users
 
 Users listed in `SRV_ADMIN_USERS` can additionally:
@@ -38,6 +47,7 @@ Users listed in `SRV_ADMIN_USERS` can additionally:
 | `SRV_ALLOWED_USERS` | Comma-separated Tailscale login allowlist. Empty means allow all tailnet users. |
 | `SRV_ADMIN_USERS` | Comma-separated Tailscale logins with cross-instance visibility and admin rights. |
 | `SRV_TRUSTED_FRONTENDS` | Stable Tailscale node IDs allowed to forward user identities. Empty disables delegation. |
+| `SRV_PROVIDER_NODES` | JSON mapping of stable node IDs to service names; grants fixed `service:NAME` ownership, not forwarding privileges. |
 | `SRV_GUEST_USER_AUTH_TAGS` | Optional `tailscale-login=tag:name` mappings used to replace the default tags on new VM auth keys. |
 
 Example `/etc/srv/srv.env`:
@@ -54,8 +64,8 @@ For the optional [multi-host frontend](../getting-started/multi-host.md), delega
 is bound to the frontend's stable node ID, not its SSH username or display name.
 Backends still enforce the forwarded user's allowlist, admin role, and ownership.
 Trusted frontends can assert any user identity; protect their credentials and state
-like administrative access. Tagged nodes must use this explicit delegation path
-rather than being treated as human users.
+like administrative access. Tagged nodes need explicit provider-node mapping or
+trusted-frontend delegation rather than being treated as human users.
 
 ## Audit trail
 

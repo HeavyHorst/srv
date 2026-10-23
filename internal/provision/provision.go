@@ -106,6 +106,8 @@ type tailnetDeviceSnapshot struct {
 
 type CreateOptions struct {
 	Image           string
+	Template        string
+	Kind            string
 	VCPUCount       int64
 	MemoryMiB       int64
 	MemoryPoolName  string
@@ -224,6 +226,12 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if !validName.MatchString(name) {
 		return model.Instance{}, fmt.Errorf("invalid instance name %q", name)
 	}
+	if opts.Kind == "" {
+		opts.Kind = model.KindVM
+	}
+	if opts.Kind != model.KindVM && opts.Kind != model.KindOrb {
+		return model.Instance{}, errors.New("invalid instance kind")
+	}
 	imageName := opts.Image
 	if imageName == "" {
 		imageName = "arch"
@@ -231,6 +239,19 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	image, err := p.cfg.ResolveImage(imageName)
 	if err != nil {
 		return model.Instance{}, err
+	}
+	if opts.Template != "" {
+		dir, manifest, err := p.readTemplate(opts.Template, actor)
+		if err != nil {
+			return model.Instance{}, err
+		}
+		if (model.Instance{Kind: manifest.Kind}).KindName() != opts.Kind {
+			return model.Instance{}, errors.New("template workload kind does not match requested instance")
+		}
+		if manifest.Image != imageName {
+			return model.Instance{}, fmt.Errorf("template image %q does not match requested image %q", manifest.Image, imageName)
+		}
+		image.RootFS = filepath.Join(dir, "rootfs.img")
 	}
 	baseRootFSSize, err := p.rootFSSize(image.RootFS)
 	if err != nil {
@@ -240,7 +261,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if err != nil {
 		return model.Instance{}, err
 	}
-	if err := p.ensureCreatePrereqs(ctx, needsResize, image); err != nil {
+	if err := p.ensureCreatePrereqs(ctx, needsResize, image, opts.Kind); err != nil {
 		return model.Instance{}, err
 	}
 	var pool model.MemoryPool
@@ -280,6 +301,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		now := time.Now().UTC()
 		inst = model.Instance{
 			ID:              uuid.NewString(),
+			Kind:            opts.Kind,
 			Name:            name,
 			Image:           imageName,
 			State:           model.StateProvisioning,
@@ -363,12 +385,18 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	p.recordEvent(inst.ID, "network", "tap device and NAT configured", map[string]any{"tap": inst.TapDevice, "network": inst.NetworkCIDR})
 
 	guestAuthTags := p.guestAuthTagsForUser(actor.UserLogin)
-	authKey, keyID, err := p.mintGuestAuthKey(ctx, guestAuthTags)
-	if err != nil {
-		inst.LastError = err.Error()
-		return inst, err
+	var authKey string
+	if inst.KindName() != model.KindOrb {
+		var keyID string
+		authKey, keyID, err = p.mintGuestAuthKey(ctx, guestAuthTags)
+		if err != nil {
+			inst.LastError = err.Error()
+			return inst, err
+		}
+		mintedKeyID = keyID
+	} else {
+		guestAuthTags = nil
 	}
-	mintedKeyID = keyID
 	zenGatewayPort := 0
 	if strings.TrimSpace(p.cfg.ZenAPIKey) != "" {
 		zenGatewayPort = p.cfg.ZenGatewayPort
@@ -400,7 +428,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	}
 	cleanup = false
 	inst.FirecrackerPID = pid
-	inst.State = model.StateAwaitingTailnet
+	inst.State = awaitingState(inst)
 	inst.UpdatedAt = time.Now().UTC()
 	if err := p.persistInstance(inst); err != nil {
 		inst.LastError = err.Error()
@@ -408,6 +436,9 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	}
 	p.recordEvent(inst.ID, "firecracker", "microVM started", map[string]any{"pid": pid})
 
+	if inst.KindName() == model.KindOrb {
+		return p.waitForOrb(ctx, inst)
+	}
 	observed := inst
 	device, tailscaleIP, err := p.waitForEnrollment(ctx, inst)
 	if err != nil {
@@ -566,7 +597,7 @@ func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) 
 	if !shouldAutoStart {
 		return nil
 	}
-	if !hasTailnetIdentity(inst) {
+	if inst.KindName() != model.KindOrb && !hasTailnetIdentity(inst) {
 		p.recordEvent(inst.ID, "startup", "instance was left offline after control-plane startup because it never completed initial tailnet bootstrap", nil)
 		return nil
 	}
@@ -604,6 +635,8 @@ func (p *Provisioner) ReconcileInstance(ctx context.Context, name string) (model
 		return p.Delete(ctx, name)
 	case model.StateAwaitingTailnet:
 		_, err = p.reconcileLateTailnetJoin(ctx, &inst)
+	case model.StateAwaitingGuest:
+		return p.waitForOrb(ctx, inst)
 	}
 	return inst, err
 }
@@ -839,6 +872,9 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		return model.Instance{}, err
 	}
 	p.applyConfiguredBootArtifacts(&inst)
+	if inst.KindName() == model.KindOrb && inst.State == model.StateAwaitingGuest && inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
+		return p.waitForOrb(ctx, inst)
+	}
 	if inst.State == model.StateAwaitingTailnet && inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
 		reconciled, err := p.reconcileLateTailnetJoin(ctx, &inst)
 		if err != nil {
@@ -927,20 +963,24 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 			_ = p.store.UpdateInstance(context.Background(), inst)
 		}
 	}()
-	previousDevice, hadPreviousDevice, err := p.currentDeviceSnapshot(ctx, inst.Name)
-	if err != nil {
-		return inst, err
-	}
-	if inst.TailnetNodeID != "" {
-		if hadPreviousDevice && previousDevice.DeviceID != inst.TailnetNodeID {
-			return inst, errors.New("stored tailnet node identity changed")
+	var previousDevice tailnetDeviceSnapshot
+	var hadPreviousDevice bool
+	if inst.KindName() != model.KindOrb {
+		previousDevice, hadPreviousDevice, err = p.currentDeviceSnapshot(ctx, inst.Name)
+		if err != nil {
+			return inst, err
 		}
-		previousDevice.DeviceID, hadPreviousDevice = inst.TailnetNodeID, true
+		if inst.TailnetNodeID != "" {
+			if hadPreviousDevice && previousDevice.DeviceID != inst.TailnetNodeID {
+				return inst, errors.New("stored tailnet node identity changed")
+			}
+			previousDevice.DeviceID, hadPreviousDevice = inst.TailnetNodeID, true
+		}
+		if !hadPreviousDevice {
+			return inst, errors.New("warm start requires an existing tailnet device identity")
+		}
+		inst.TailnetNodeID = previousDevice.DeviceID
 	}
-	if !hadPreviousDevice {
-		return inst, errors.New("warm start requires an existing tailnet device identity")
-	}
-	inst.TailnetNodeID = previousDevice.DeviceID
 	if err := p.cleanupNetworking(inst); err != nil {
 		return inst, fmt.Errorf("cleanup stale networking before start: %w", err)
 	}
@@ -979,7 +1019,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 	// Once booted, a caller disconnect or persistence failure must not tear down
 	// a guest that may already be serving traffic. Readiness can be retried.
 	cleanup = false
-	inst.State = model.StateAwaitingTailnet
+	inst.State = awaitingState(inst)
 	inst.FirecrackerPID = pid
 	inst.LastError = ""
 	inst.UpdatedAt = time.Now().UTC()
@@ -991,6 +1031,9 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 	}
 	p.recordEvent(inst.ID, "firecracker", "microVM started", map[string]any{"pid": pid})
 
+	if inst.KindName() == model.KindOrb {
+		return p.waitForOrb(ctx, inst)
+	}
 	observed := inst
 	runtimeIdentity, err := p.instanceRuntimeIdentity(ctx, inst)
 	var tailscaleName, tailscaleIP string
@@ -1139,7 +1182,7 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 	return instanceDir, nil
 }
 
-func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool, image config.Image) error {
+func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool, image config.Image, kind string) error {
 	for _, path := range []string{image.Kernel, image.RootFS} {
 		if path == "" {
 			return errors.New("create requires kernel and rootfs paths (SRV_BASE_KERNEL/SRV_BASE_ROOTFS or SRV_IMAGES_FILE)")
@@ -1165,10 +1208,10 @@ func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool,
 			return err
 		}
 	}
-	if p.tsClient == nil {
+	if kind != model.KindOrb && p.tsClient == nil {
 		return errors.New("create requires TS_TAILNET and TS_CLIENT_SECRET so the control plane can mint one-off guest auth keys")
 	}
-	if len(p.cfg.GuestAuthTags) == 0 {
+	if kind != model.KindOrb && len(p.cfg.GuestAuthTags) == 0 {
 		return errors.New("create requires SRV_GUEST_AUTH_TAGS so minted guest auth keys carry an allowed tag")
 	}
 	if err := p.ensureRootFSReflinkSupport(ctx, image.RootFS); err != nil {
@@ -1234,7 +1277,7 @@ func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
 	if inst.State == model.StateDeleting {
 		return fmt.Errorf("instance %q is being deleted", inst.Name)
 	}
-	if p.tsClient == nil {
+	if inst.KindName() != model.KindOrb && p.tsClient == nil {
 		return errors.New("start requires TS_TAILNET and TS_CLIENT_SECRET so the control plane can observe guest tailnet readiness")
 	}
 	for _, path := range []string{inst.KernelPath, inst.RootFSPath} {
@@ -1520,7 +1563,7 @@ func instanceReservesFixedHostMemory(inst model.Instance) bool {
 	if inst.State == model.StateStopping || inst.State == model.StateDeleting {
 		return true
 	}
-	if inst.StartRequestID != "" && (inst.State == model.StateProvisioning || inst.State == model.StateAwaitingTailnet || inst.State == model.StateReady) {
+	if inst.StartRequestID != "" && (inst.State == model.StateProvisioning || inst.State == model.StateAwaitingTailnet || inst.State == model.StateAwaitingGuest || inst.State == model.StateReady) {
 		return true
 	}
 	return instanceHasActiveRuntime(inst)
@@ -1618,16 +1661,23 @@ func ensureRootFSResizeTools(context string) error {
 	return nil
 }
 
-func runRootFSCheck(path, context string) error {
-	cmd := exec.Command("e2fsck", "-f", "-p", path)
+func runRootFSCheck(path, label string) error {
+	return runRootFSCheckContext(context.Background(), path, label)
+}
+
+func runRootFSCheckContext(ctx context.Context, path, label string) error {
+	cmd := exec.CommandContext(ctx, "e2fsck", "-f", "-p", path)
 	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err == nil {
 		return nil
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok && e2fsckExitCodeAllowsContinue(exitErr.ExitCode()) {
 		return nil
 	}
-	return fmt.Errorf("%s: %w: %s", context, err, strings.TrimSpace(string(output)))
+	return fmt.Errorf("%s: %w: %s", label, err, strings.TrimSpace(string(output)))
 }
 
 func e2fsckExitCodeAllowsContinue(code int) bool {
@@ -1793,6 +1843,7 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst *model.Instance
 	}
 	resp, err := p.vmRunner.StartInstanceVM(ctx, vmrunner.StartRequest{
 		InstanceID: inst.ID, RequestID: inst.StartRequestID, HostBootID: inst.StartBootID,
+		Kind:                inst.KindName(),
 		KernelPath:          inst.KernelPath,
 		InitrdPath:          inst.InitrdPath,
 		Name:                inst.Name,

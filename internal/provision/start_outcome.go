@@ -53,17 +53,17 @@ func (p *Provisioner) resolveRuntime(ctx context.Context, inst *model.Instance) 
 		}
 		inst.FirecrackerPID = result.PID
 		if inst.State == model.StateProvisioning {
-			inst.State = model.StateAwaitingTailnet
+			inst.State = awaitingState(*inst)
 		}
 	case vmrunner.StartAbsent:
-		if inst.FirecrackerPID != 0 || inst.State == model.StateProvisioning || inst.State == model.StateAwaitingTailnet || inst.State == model.StateReady {
+		if inst.FirecrackerPID != 0 || inst.State == model.StateProvisioning || inst.State == model.StateAwaitingTailnet || inst.State == model.StateAwaitingGuest || inst.State == model.StateReady {
 			if err := p.cleanupNetworking(*inst); err != nil {
 				return err
 			}
 			inst.FirecrackerPID = 0
 			if inst.State != model.StateStopping && inst.State != model.StateDeleting {
 				inst.State = model.StateStopped
-				if !hasTailnetIdentity(*inst) {
+				if inst.KindName() != model.KindOrb && !hasTailnetIdentity(*inst) {
 					inst.State = model.StateFailed
 				}
 			}

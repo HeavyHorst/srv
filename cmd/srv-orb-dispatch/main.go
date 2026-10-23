@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
@@ -25,25 +26,39 @@ type config struct {
 
 type job struct {
 	operation, id, image, token, ampURL, snapshot string
+	expected                                      string
 }
 
 // A creating record is written BEFORE sending new. An uncertain create is never
 // retried on another host, even if the VM is not yet visible in list.
 type record struct {
-	OrbID    string `json:"orb_id"`
-	Endpoint string `json:"endpoint"`
-	Name     string `json:"name"`
-	Host     string `json:"host,omitempty"`
-	Phase    string `json:"phase"`
+	OrbID               string `json:"orb_id"`
+	Endpoint            string `json:"endpoint"`
+	Name                string `json:"name"`
+	Host                string `json:"host,omitempty"`
+	Phase               string `json:"phase"`
+	InstanceID          string `json:"instance_id,omitempty"`
+	CreatedAt           string `json:"created_at,omitempty"`
+	BackendID           string `json:"backend_id,omitempty"`
+	Image               string `json:"image,omitempty"`
+	Pending             string `json:"pending,omitempty"`
+	RequestID           string `json:"request_id,omitempty"`
+	BootstrapGeneration *int64 `json:"bootstrap_generation"`
+	BootstrapFloor      int64  `json:"bootstrap_floor"`
 }
 
 type instance struct {
-	Name      string `json:"name"`
-	Kind      string `json:"kind"`
-	Image     string `json:"image"`
-	State     string `json:"state"`
-	Migration string `json:"migration_phase"`
-	Proxy     string `json:"amp_connect_gateway"`
+	ID                  string `json:"id"`
+	CreatedAt           string `json:"created_at"`
+	BackendID           string `json:"backend_id"`
+	BootstrapGeneration *int64 `json:"bootstrap_generation"`
+	Imported            string `json:"import_phase"`
+	Name                string `json:"name"`
+	Kind                string `json:"kind"`
+	Image               string `json:"image"`
+	State               string `json:"state"`
+	Migration           string `json:"migration_phase"`
+	Proxy               string `json:"amp_connect_gateway"`
 }
 
 func main() {
@@ -53,11 +68,25 @@ func main() {
 		cpus: envDefault("SRV_ORB_CPUS", "2"), ram: envDefault("SRV_ORB_RAM", "4G"),
 		disk: envDefault("SRV_ORB_DISK", "20G"), ssh: "ssh",
 	}
-	j := job{os.Getenv("ORB_OPERATION"), os.Getenv("ORB_ID"), os.Getenv("ORB_IMAGE"), os.Getenv("ORB_TOKEN"), os.Getenv("AMP_URL"), os.Getenv("ORB_SNAPSHOT_ID")}
+	j := job{operation: os.Getenv("ORB_OPERATION"), id: os.Getenv("ORB_ID"), image: os.Getenv("ORB_IMAGE"), token: os.Getenv("ORB_TOKEN"), ampURL: os.Getenv("AMP_URL"), snapshot: os.Getenv("ORB_SNAPSHOT_ID")}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, 270*time.Second)
 	defer cancel()
+	if len(os.Args) == 4 && (os.Args[1] == "bind" || os.Args[1] == "cancel") {
+		j = job{operation: os.Args[1], id: os.Args[2], expected: os.Args[3]}
+	}
+	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+		fmt.Fprintln(os.Stderr, "srv-orb: disable core dumps:", err)
+		os.Exit(1)
+	}
+	if len(os.Args) == 2 && os.Args[1] == "init" {
+		if err := initialize(c); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := dispatch(ctx, c, j); err != nil {
 		fmt.Fprintln(os.Stderr, "srv-orb:", err)
 		os.Exit(1)
@@ -72,7 +101,7 @@ func envDefault(key, fallback string) string {
 }
 
 func dispatch(ctx context.Context, c config, j job) error {
-	if j.id == "" || (j.operation != "spawn" && j.operation != "pause" && j.operation != "delete") {
+	if j.id == "" || (j.operation != "spawn" && j.operation != "pause" && j.operation != "delete" && j.operation != "bind" && j.operation != "cancel") {
 		return errors.New("ORB_ID and ORB_OPERATION=spawn|pause|delete are required")
 	}
 	if !filepath.IsAbs(c.directory) || c.endpoint == "" || strings.HasPrefix(c.endpoint, "-") {
@@ -84,12 +113,14 @@ func dispatch(ctx context.Context, c config, j job) error {
 	if strings.ContainsAny(j.token+j.ampURL, "\x00\r\n") {
 		return errors.New("invalid bootstrap environment")
 	}
-	if err := os.MkdirAll(c.directory, 0700); err != nil {
-		return err
+	marker, err := os.ReadFile(filepath.Join(c.directory, "provider.json"))
+	if err != nil || string(marker) != c.endpoint {
+		return errors.New("provider state missing or endpoint changed; restore state, or explicitly init a new provider")
 	}
 	// Hashing keeps arbitrary upstream IDs out of paths and within srv's name limit.
 	name := fmt.Sprintf("orb-%x", sha256.Sum256([]byte(j.id)))[:60]
 	path := filepath.Join(c.directory, name+".json")
+	_, lockErr := os.Stat(path + ".lock")
 	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
@@ -118,12 +149,20 @@ func dispatch(ctx context.Context, c config, j job) error {
 			return errors.New("state identity/endpoint mismatch; restore the original provider configuration")
 		}
 		switch r.Phase {
-		case "creating", "managed", "deleting", "deleted":
+		case "new", "creating", "managed", "deleting", "deleted":
 		default:
 			return errors.New("invalid dispatch record phase")
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
+	} else {
+		if lockErr == nil || !errors.Is(lockErr, os.ErrNotExist) {
+			return errors.New("dispatch record lost; restore it rather than recreating the orb")
+		}
+		r.Phase = "new"
+		if err := save(path, r); err != nil {
+			return err
+		}
 	}
 	// Lock ordering is always orb, then snapshot. Different orbs may refer to
 	// one template; publication and selection must not race across hosts.
@@ -145,10 +184,36 @@ func dispatch(ctx context.Context, c config, j job) error {
 		}
 		return nil
 	}
-	if r.Phase == "deleting" && j.operation != "delete" {
-		return errors.New("deletion is pending; repeat delete before any other operation")
+	if r.Phase == "deleting" {
+		if j.operation != "delete" {
+			return errors.New("deletion pending; query it with delete")
+		}
+		return finishDelete(ctx, c, path, r)
 	}
-	if r.Phase == "" && j.operation == "spawn" && snapshot != nil {
+	if r.Pending != "" {
+		if j.operation == "cancel" {
+			if j.expected != r.RequestID {
+				return errors.New("pending request ID mismatch")
+			}
+			args := append([]string{"operation-cancel", r.RequestID, r.Name, r.Pending}, identity(r)...)
+			if _, err := control(ctx, c, r, args...); err != nil {
+				return err
+			}
+		}
+		if err := resolveOperation(ctx, c, path, &r); err != nil {
+			// Only bootstrap has a downstream generation fence. A fresh spawn
+			// may supersede it; start/stop never infer completion from state.
+			if r.Pending != "bootstrap" || (j.operation != "spawn" && j.operation != "delete") {
+				return err
+			}
+		}
+		if j.operation == "cancel" {
+			return nil
+		}
+	} else if j.operation == "cancel" {
+		return errors.New("no pending operation")
+	}
+	if r.Phase == "new" && j.operation == "spawn" && snapshot != nil {
 		if snapshot.Phase != "ready" || snapshot.Image != c.image {
 			return errors.New("snapshot is incomplete or belongs to a different image; repair or retire its mapping")
 		}
@@ -158,7 +223,7 @@ func dispatch(ctx context.Context, c config, j job) error {
 	if err != nil {
 		return err // An unreachable host is never evidence of absence.
 	}
-	if v != nil && r.Phase == "" {
+	if v != nil && r.Phase == "new" {
 		return errors.New("VM already exists without a dispatch record; refusing to adopt it")
 	}
 	if v == nil {
@@ -166,9 +231,10 @@ func dispatch(ctx context.Context, c config, j job) error {
 		case "creating":
 			return errors.New("create outcome is unknown; inspect all backends before repairing the dispatch record; new was not retried")
 		case "managed", "deleting":
-			if j.operation != "delete" {
-				return errors.New("recorded VM is missing; refusing to replace its disk")
-			}
+			return errors.New("recorded VM is missing; absence is not a cleanup receipt")
+		}
+		if j.operation == "bind" {
+			return errors.New("cannot bind an absent orb")
 		}
 		if j.operation == "delete" {
 			r.Phase = "deleted"
@@ -199,25 +265,56 @@ func dispatch(ctx context.Context, c config, j job) error {
 		if v == nil {
 			return errors.New("created VM not visible yet; repeat the job to reconcile")
 		}
+		// Only a successful new reply may establish a binding automatically.
+		j.expected = "created"
+	}
+	if j.operation == "bind" && host != r.Host {
+		return errors.New("binding requires the original recorded host; ambiguous front allocation cannot be adopted")
+	}
+	r.Host = host
+	v, err = inspect(ctx, c, r)
+	if err != nil {
+		return err
 	}
 	if v.Kind != "orb" {
 		return errors.New("recorded instance is not an orb; legacy Tailscale VMs require explicit operator migration")
 	}
-	if v.Migration != "" && v.Migration != "aborted" {
+	if v.Imported != "" || v.Migration != "" && v.Migration != "aborted" {
 		return errors.New("orb has migration state; resolve migration and host mapping manually")
 	}
-	r.Host = host
+	if r.InstanceID == "" {
+		if j.expected != "created" && (j.operation != "bind" || j.expected != v.ID) {
+			return errors.New("orb has no incarnation binding; use explicit bind after reconciling the original create")
+		}
+		if _, err := uuid.Parse(v.ID); err != nil || v.CreatedAt == "" || v.BackendID == "" || v.Image != c.image {
+			return errors.New("incomplete orb identity")
+		}
+		r.InstanceID, r.CreatedAt, r.BackendID, r.Image = v.ID, v.CreatedAt, v.BackendID, v.Image
+		if v.BootstrapGeneration == nil || *v.BootstrapGeneration != 0 {
+			return errors.New("cannot initialize a missing bootstrap counter from a used orb")
+		}
+		r.BootstrapGeneration = new(int64)
+	}
+	if err := matches(r, v); err != nil {
+		return err
+	}
+	if r.Pending == "bootstrap" && j.operation == "spawn" && v.State != "ready" {
+		return errors.New("uncertain bootstrap requires the same running orb; stop/start remains fenced")
+	}
 	if r.Phase != "deleting" {
 		r.Phase = "managed"
 	}
 	if err := save(path, r); err != nil {
 		return err
 	}
+	if j.operation == "bind" {
+		return nil
+	}
 	fmt.Fprintf(os.Stderr, "srv-orb: %s %s (host %q)\n", j.operation, r.Name, r.Host)
 	switch j.operation {
 	case "pause":
 		if v.State != "stopped" {
-			if _, err = control(ctx, c, r, "stop", r.Name); err != nil {
+			if err = operate(ctx, c, path, &r, "stop"); err != nil {
 				return err
 			}
 		}
@@ -227,40 +324,45 @@ func dispatch(ctx context.Context, c config, j job) error {
 		return nil
 	case "delete":
 		r.Phase = "deleting"
+		r.RequestID = uuid.NewString()
 		if err := save(path, r); err != nil {
 			return err
 		}
-		if _, err := control(ctx, c, r, "delete", r.Name); err != nil {
+		args := append([]string{"delete-proof", r.RequestID, r.Name}, identity(r)...)
+		if _, err := control(ctx, c, r, args...); err != nil {
 			return err
 		}
-		r.Phase = "deleted"
-		return save(path, r)
+		return finishDelete(ctx, c, path, r)
 	}
 	if v.State == "stopped" {
-		if _, err := control(ctx, c, r, "start", r.Name); err != nil {
+		if err := operate(ctx, c, path, &r, "start"); err != nil {
 			return err
 		}
 	}
 	for {
-		data, err := control(ctx, c, r, "inspect", r.Name)
+		v, err = inspect(ctx, c, r)
 		if err != nil {
 			return err
 		}
-		var response struct{ Instance instance }
-		if err := json.Unmarshal(data, &response); err != nil {
+		if err := matches(r, v); err != nil {
 			return err
-		}
-		v = &response.Instance
-		if v.Name != r.Name {
-			return errors.New("inspect returned a different instance")
 		}
 		switch v.State {
 		case "ready":
-			payload, err := json.Marshal(map[string]string{"token": j.token, "amp_url": j.ampURL, "proxy": v.Proxy})
+			if *r.BootstrapGeneration == int64(^uint64(0)>>1) {
+				return errors.New("bootstrap generation exhausted")
+			}
+			r.BootstrapFloor = *v.BootstrapGeneration
+			*r.BootstrapGeneration++
+			payload, err := json.Marshal(map[string]any{"token": j.token, "amp_url": j.ampURL, "proxy": v.Proxy, "generation": *r.BootstrapGeneration})
 			if err != nil {
 				return err
 			}
-			args := []string{"orb", "bootstrap", r.Name}
+			r.Pending, r.RequestID = "bootstrap", uuid.NewString()
+			if err := save(path, r); err != nil {
+				return err
+			}
+			args := append([]string{"orb", "bootstrap", r.Name, "--expect", r.RequestID}, identity(r)...)
 			if r.Host != "" {
 				args = append(args, "--host", r.Host)
 			}
@@ -270,7 +372,7 @@ func dispatch(ctx context.Context, c config, j job) error {
 			if _, err := ssh(ctx, c, c.endpoint, strings.Join(args, " "), strings.NewReader(string(payload))); err != nil {
 				return errors.New("orb bootstrap failed; inspect the backend and guest bootstrap service")
 			}
-			return nil
+			return resolveOperation(ctx, c, path, &r)
 		case "provisioning", "awaiting-guest":
 		default:
 			return fmt.Errorf("VM is %q; inspect and repair it before retrying spawn", v.State)

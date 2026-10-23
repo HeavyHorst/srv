@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -34,29 +35,37 @@ func TestMain(m *testing.M) {
 
 // Keep the server's wire schema independent of the dispatcher's response types.
 type testVM struct {
-	Name      string `json:"name"`
-	Kind      string `json:"kind"`
-	Image     string `json:"image"`
-	State     string `json:"state"`
-	Proxy     string `json:"amp_connect_gateway"`
-	Migration string `json:"migration_phase"`
+	ID         string `json:"id"`
+	CreatedAt  string `json:"created_at"`
+	BackendID  string `json:"backend_id"`
+	Generation int64  `json:"bootstrap_generation"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	Image      string `json:"image"`
+	State      string `json:"state"`
+	Proxy      string `json:"amp_connect_gateway"`
+	Migration  string `json:"migration_phase"`
 }
 
 type testServer struct {
-	VM           *testVM
-	Disk         string
-	Templates    map[string]string
-	LoseTemplate bool
-	Environment  string
-	Host         string
-	Unreachable  bool
-	OtherDown    bool
-	LoseCreate   bool
-	RejectCreate bool
-	LoseStop     bool
-	LoseDelete   bool
-	BadInventory bool
-	FailGuest    bool
+	Results       map[string]map[string]any
+	Proof         map[string]any
+	LateStop      bool
+	LoseBootstrap bool
+	VM            *testVM
+	Disk          string
+	Templates     map[string]string
+	LoseTemplate  bool
+	Environment   string
+	Host          string
+	Unreachable   bool
+	OtherDown     bool
+	LoseCreate    bool
+	RejectCreate  bool
+	LoseStop      bool
+	LoseDelete    bool
+	BadInventory  bool
+	FailGuest     bool
 }
 
 func fakeSSH() error {
@@ -113,19 +122,66 @@ func fakeSSH() error {
 		return fmt.Errorf("wrong host")
 	}
 	emit := func(v any) error { return json.NewEncoder(os.Stdout).Encode(v) }
+	finish := func(operation string, generation int64) error {
+		if len(args) != 9 || args[3] != "--expect" || s.VM == nil || args[5] != s.VM.ID || args[6] != s.VM.CreatedAt || args[7] != s.VM.BackendID || args[8] != s.VM.Image {
+			return fmt.Errorf("unbound mutation")
+		}
+		if s.Results == nil {
+			s.Results = map[string]map[string]any{}
+		}
+		if _, ok := s.Results[args[4]]; ok {
+			return fmt.Errorf("duplicate request")
+		}
+		binding := append([]string{operation, s.VM.Name}, args[5:]...)
+		if operation == "bootstrap" {
+			binding = append(binding, strconv.FormatInt(generation, 10))
+		}
+		encoded, _ := json.Marshal(binding)
+		s.Results[args[4]] = map[string]any{"id": args[4], "name": s.VM.Name, "command": operation, "arguments": string(encoded), "phase": "done", "exit_code": 0}
+		return nil
+	}
 	switch args[1] {
+	case "operation-result":
+		result, ok := s.Results[args[2]]
+		if !ok {
+			return fmt.Errorf("request missing")
+		}
+		return emit(result)
+	case "cleanup-receipt":
+		if s.Proof == nil || s.Proof["request_id"] != args[2] {
+			return fmt.Errorf("receipt missing")
+		}
+		return emit(s.Proof)
 	case "bootstrap":
-		var req map[string]string
+		var req struct {
+			Token      string `json:"token"`
+			AMPURL     string `json:"amp_url"`
+			Proxy      string `json:"proxy"`
+			Generation int64  `json:"generation"`
+		}
 		payload, err := io.ReadAll(os.Stdin)
-		if err != nil || json.Unmarshal(payload, &req) != nil || req["token"] == "" || s.VM == nil || args[2] != s.VM.Name {
+		if err != nil || json.Unmarshal(payload, &req) != nil || req.Token == "" || s.VM == nil || args[2] != s.VM.Name || req.Generation <= s.VM.Generation {
 			return fmt.Errorf("invalid bootstrap")
 		}
-		if strings.Contains(command, req["token"]) {
+		if strings.Contains(command, req.Token) {
 			return fmt.Errorf("token leaked in argv")
 		}
-		s.Environment = fmt.Sprintf("ORB_TOKEN=%q\nAMP_URL=%q\nHTTPS_PROXY=%q", req["token"], req["amp_url"], req["proxy"])
+		s.Environment = fmt.Sprintf("ORB_TOKEN=%q\nAMP_URL=%q\nHTTPS_PROXY=%q", req.Token, req.AMPURL, req.Proxy)
+		s.VM.Generation = req.Generation
 		if s.FailGuest {
+			if err := write(); err != nil {
+				return err
+			}
 			return fmt.Errorf("guest accidentally printed %s", s.Environment)
+		}
+		if err := finish("bootstrap", req.Generation); err != nil {
+			return err
+		}
+		if err := write(); err != nil {
+			return err
+		}
+		if s.LoseBootstrap {
+			return fmt.Errorf("lost bootstrap reply")
 		}
 	case "list":
 		if s.BadInventory {
@@ -151,7 +207,7 @@ func fakeSSH() error {
 		if s.VM != nil {
 			return fmt.Errorf("duplicate VM")
 		}
-		s.VM = &testVM{Name: args[2], Kind: "orb", Image: "amp-orb", State: "ready", Proxy: "http://10.0.0.1:8080"}
+		s.VM = &testVM{ID: "12345678-1234-4234-8234-123456789abc", CreatedAt: "2026-01-02T03:04:05Z", BackendID: "backend-one", Name: args[2], Kind: "orb", Image: "amp-orb", State: "ready", Proxy: "http://10.0.0.1:8080"}
 		s.Disk = "fresh disk"
 		for i, arg := range args {
 			if arg == "--template" {
@@ -190,10 +246,16 @@ func fakeSSH() error {
 	case "inspect":
 		return emit(map[string]any{"instance": s.VM})
 	case "stop":
+		if err := finish("stop", 0); err != nil {
+			return err
+		}
 		if s.VM.State == "stopped" {
 			return fmt.Errorf("already stopped")
 		}
 		s.VM.State = "stopped"
+		if s.LateStop {
+			s.Results[args[4]]["phase"] = "executing"
+		}
 		if err := write(); err != nil {
 			return err
 		}
@@ -201,11 +263,18 @@ func fakeSSH() error {
 			return fmt.Errorf("connection lost after stop")
 		}
 	case "start":
+		if err := finish("start", 0); err != nil {
+			return err
+		}
 		if s.VM.State != "stopped" {
 			return fmt.Errorf("already running")
 		}
 		s.VM.State = "ready"
-	case "delete":
+	case "delete-proof":
+		if len(args) != 8 || s.VM == nil || args[4] != s.VM.ID || args[5] != s.VM.CreatedAt || args[6] != s.VM.BackendID || args[7] != s.VM.Image {
+			return fmt.Errorf("unbound delete")
+		}
+		s.Proof = map[string]any{"version": 2, "kind": "orb", "image": s.VM.Image, "backend_id": s.VM.BackendID, "request_id": args[2], "instance_id": s.VM.ID, "name": s.VM.Name, "created_at": s.VM.CreatedAt, "deleted_at": "2026-01-02T04:04:05Z", "auth_key_disposition": "never-minted", "retained_templates": []string{}, "ingress_closed": true, "runtime_absent": true, "jailer_absent": true, "cgroup_absent": true, "network_absent": true, "storage_absent": true, "backups_absent": true, "snapshots_absent": true}
 		s.VM, s.Disk, s.Environment = nil, "", ""
 		if err := write(); err != nil {
 			return err
@@ -232,6 +301,9 @@ func newHarness(t *testing.T, host string) harness {
 		t.Fatal(err)
 	}
 	h := harness{t, t.TempDir(), exe}
+	if err := initialize(config{directory: filepath.Join(h.dir, "state"), endpoint: "srv"}); err != nil {
+		t.Fatal(err)
+	}
 	h.write(testServer{Host: host})
 	// ssh is the only external transport. Run our standalone server fixture.
 	if err := os.WriteFile(filepath.Join(h.dir, "ssh"), []byte("#!/bin/sh\nexport SRV_ORB_TEST_MODE=ssh\nexec "+quote(exe)+" \"$@\"\n"), 0700); err != nil {
@@ -343,13 +415,21 @@ func TestDispatchUncertainOutcomes(t *testing.T) {
 			s := h.read()
 			s.RejectCreate, s.LoseCreate = !accepted, accepted
 			h.write(s)
-			if _, err := h.run("spawn", "token"); err == nil {
+			if _, err := h.run("spawn", "token", "SRV_ORB_HOST=b"); err == nil {
 				t.Fatal("create failure not reported")
 			}
 			s = h.read()
 			s.RejectCreate, s.LoseCreate = false, false
 			h.write(s)
 			if accepted {
+				if _, err := h.run("spawn", "fresh-token"); err == nil {
+					t.Fatal("unknown create adopted automatically")
+				}
+				cmd := exec.Command(h.program, "bind", "amp-thread/with spaces and 'quotes'", s.VM.ID)
+				cmd.Env = append(os.Environ(), "PATH="+h.dir+":"+os.Getenv("PATH"), "SRV_ORB_TEST_MODE=dispatch", "SRV_ORB_TEST_SERVER="+filepath.Join(h.dir, "server.json"), "SRV_ORB_STATE_DIR="+filepath.Join(h.dir, "state"), "SRV_ORB_ENDPOINT=srv", "SRV_ORB_IMAGE=amp-orb")
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatal(err, string(out))
+				}
 				h.must("spawn", "fresh-token")
 				s = h.read()
 				s.Disk = "work saved before pause"
@@ -358,7 +438,7 @@ func TestDispatchUncertainOutcomes(t *testing.T) {
 				if _, err := h.run("pause", ""); err == nil {
 					t.Fatal("lost stop response not reported")
 				}
-				h.must("pause", "") // Confirm stopped state after lost response.
+				h.must("pause", "") // Read terminal request, not stopped-state inference.
 				s = h.read()
 				if s.VM.State != "stopped" || s.Disk != "work saved before pause" {
 					t.Fatal("pause retry did not preserve the stopped VM and its disk")
@@ -368,13 +448,112 @@ func TestDispatchUncertainOutcomes(t *testing.T) {
 				if _, err := h.run("delete", ""); err == nil {
 					t.Fatal("lost delete response not reported")
 				}
-				h.must("delete", "") // Confirm absence after lost response.
+				h.must("delete", "") // Read committed receipt, not inventory absence.
 			} else {
 				if out, err := h.run("spawn", "token"); err == nil || !strings.Contains(out, "unknown") {
 					t.Fatalf("uncertain create was retried: %v %s", err, out)
 				}
 				if h.read().VM != nil {
 					t.Fatal("retry allocated another VM")
+				}
+			}
+		})
+	}
+}
+
+func TestObservedStoppedDoesNotResolveLateOperation(t *testing.T) {
+	h := newHarness(t, "")
+	h.must("spawn", "original")
+	s := h.read()
+	s.LateStop = true
+	h.write(s)
+	if _, err := h.run("pause", ""); err == nil {
+		t.Fatal("unfinished operation succeeded")
+	}
+	s = h.read()
+	if s.VM.State != "stopped" {
+		t.Fatal("fixture must expose stopped before operation completes")
+	}
+	for _, operation := range []string{"spawn", "pause", "delete"} {
+		if _, err := h.run(operation, "premature"); err == nil {
+			t.Fatal("observation cleared pending", operation)
+		}
+	}
+	if h.read().Environment != s.Environment {
+		t.Fatal("fresh token delivered while old stop could still land")
+	}
+	// The old execution completes AFTER those observations. Its exact terminal
+	// receipt, not another inspect, is the first admissible recovery evidence.
+	for _, result := range s.Results {
+		if result["command"] == "stop" {
+			result["phase"] = "done"
+		}
+	}
+	s.LateStop = false
+	h.write(s)
+	h.must("spawn", "after-terminal")
+	if h.read().VM.State != "ready" || !strings.Contains(h.read().Environment, "after-terminal") {
+		t.Fatal("terminal recovery failed")
+	}
+}
+
+func TestBootstrapLostRepliesAndMonotonicRecovery(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		t.Run(fmt.Sprint(terminal), func(t *testing.T) {
+			h := newHarness(t, "")
+			s := h.read()
+			s.FailGuest, s.LoseBootstrap = !terminal, terminal
+			h.write(s)
+			if _, err := h.run("spawn", "old"); err == nil {
+				t.Fatal("lost reply not reported")
+			}
+			s = h.read()
+			if s.VM.Generation != 1 {
+				t.Fatal("first generation not admitted")
+			}
+			s.FailGuest, s.LoseBootstrap = false, false
+			h.write(s)
+			h.must("spawn", "new")
+			if s = h.read(); s.VM.Generation != 2 || !strings.Contains(s.Environment, `ORB_TOKEN="new"`) {
+				t.Fatal("new generation not applied")
+			}
+			path := filepath.Join(h.dir, "state", s.VM.Name+".json")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var state map[string]any
+			if err := json.Unmarshal(data, &state); err != nil {
+				t.Fatal(err)
+			}
+			for _, bad := range []any{nil, float64(1)} {
+				state["bootstrap_generation"] = bad
+				if err := save(path, state); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.run("spawn", "rollback"); err == nil {
+					t.Fatal("provider counter loss/rollback adopted")
+				}
+			}
+			// Crash after fsync of generation 3 but before SSH: no srv row is
+			// evidence of neither execution nor cancellation. Allocate 4, not 3.
+			state["bootstrap_generation"], state["bootstrap_floor"] = 3, 2
+			state["pending"], state["request_id"] = "bootstrap", "12345678-1111-4222-8333-123456789abc"
+			if err := save(path, state); err != nil {
+				t.Fatal(err)
+			}
+			h.must("spawn", "after-crash")
+			s = h.read()
+			if s.VM.Generation != 4 {
+				t.Fatal("unsent generation reused", s.VM.Generation)
+			}
+			// Provider survives another process restart. Lower backend state is
+			// not adopted, and higher backend state is not silently caught up.
+			for _, bad := range []int64{0, 5} {
+				s.VM.Generation = bad
+				h.write(s)
+				if _, err := h.run("spawn", "rollback"); err == nil {
+					t.Fatal("rollback adopted", bad)
 				}
 			}
 		})

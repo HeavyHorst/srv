@@ -22,6 +22,9 @@ func (p *Provisioner) migrationFence(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	if err := p.store.CheckCleanupFence(ctx, inst.ID); err != nil {
+		return err
+	}
 	r, err := p.store.GetImportReceipt(ctx, inst.ID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err

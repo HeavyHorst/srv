@@ -394,6 +394,9 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 			return inst, err
 		}
 		mintedKeyID = keyID
+		if err := p.store.RecordEnrollmentKey(ctx, inst.ID, keyID); err != nil {
+			return inst, fmt.Errorf("persist enrollment key identity: %w", err)
+		}
 	} else {
 		guestAuthTags = nil
 	}
@@ -479,6 +482,9 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 	inst, err := p.store.GetInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
+	}
+	if err := p.store.CheckCleanupFence(ctx, inst.ID); err != nil {
+		return inst, err
 	}
 	if inst.State == model.StateDeleted {
 		return inst, fmt.Errorf("instance %q is already deleted", name)
@@ -658,6 +664,9 @@ func (p *Provisioner) ReconcileInstancesRuntime(ctx context.Context) error {
 }
 
 func (p *Provisioner) reconcileRuntime(ctx context.Context, inst model.Instance) (bool, error) {
+	if err := p.store.CheckCleanupFence(ctx, inst.ID); err != nil {
+		return false, err
+	}
 	if inst.StartRequestID != "" {
 		if err := p.resolveRuntime(ctx, &inst); err != nil {
 			return false, err

@@ -214,7 +214,7 @@ func (r *Router) Run(ctx context.Context, a model.Actor, args []string, in io.Re
 		}
 		args = args[1:]
 		cmd = args[0]
-		if cmd == "bootstrap" && (len(args) != 2 || asJSON) {
+		if cmd == "bootstrap" && ((len(args) != 2 && len(args) != 8) || asJSON) {
 			return fmt.Errorf("usage: orb bootstrap NAME (without --json)")
 		}
 	}
@@ -345,7 +345,7 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 				return fmt.Errorf("conflicting host")
 			}
 		}
-	case "list", "status", "pool", "integration", "snapshot", "migration", "import", "project-template", "help":
+	case "list", "status", "pool", "integration", "snapshot", "migration", "import", "project-template", "help", "delete-proof", "cleanup-receipt", "operation-result", "operation-cancel":
 		if hostName == "" {
 			return fmt.Errorf("%s requires --host", cmd)
 		}

@@ -222,7 +222,9 @@ srv, srv-front (when used), srv-vm-runner, srv-net-helper and the prepared guest
 image together before enabling this protocol. Older components fail closed;
 there is no fallback to ordinary `delete` or unbound bootstrap. Preexisting Orb
 records without a backend bootstrap counter require deliberate retirement and
-recreation, not a counter reset or automatic adoption.
+recreation, not a counter reset or automatic adoption. JSON inspection remains
+available for diagnostics, omitting `bootstrap_generation` when its row is
+missing; this does not initialize a counter or permit managed bootstrap.
 
 Create a provider in **Amp workspace Settings → Orbs → Add Orb Provider**.
 Store its token in `/etc/srv-orbs.env`, owned by root with mode `0600`. Copy the
@@ -286,7 +288,9 @@ systemd starts bootstrap. It remains in the bootstrap process environment;
 root inside the VM is trusted. Guest bootstrap output is not relayed to provider
 logs because it could contain credentials.
 
-The srv daemon and dispatcher disable process dumpability. Both token-bearing
+The srv daemon and dispatcher disable process dumpability. For the daemon this
+also restricts ptrace and changes `/proc` ownership/access; debugging must account
+for those effects. Both token-bearing
 systemd units set `LimitCORE=0`. The example provider unit additionally refuses a
 piped host `core_pattern`: not all external collectors honor the process limit.
 This intentionally excludes a stock systemd-coredump configuration until the
@@ -339,6 +343,8 @@ with request admission. It holds the instance lock through the vsock exchange.
 A new spawn may supersede an uncertain bootstrap with a **higher** generation;
 an equal generation never executes again. Lower/missing/inconsistent provider
 or backend counters fail closed, rather than catching up or resetting.
+Pause remains refused while bootstrap is uncertain. Receipt-based deletion is
+allowed without an intervening spawn, provided the normal cleanup proof succeeds.
 
 The guest serializes generation check, consumption and effects with a lock in
 `/run/srv-orb`. It first records `executing`, installs `KillMode=control-group`,
@@ -371,8 +377,12 @@ srv-front. A failed or lost delete reply is queried by that same request ID,
 never retried with another ID and never downgraded to plain `delete`.
 
 The backend fences ingress, then asks the VM runner to prove runtime/jailer/
-cgroup absence across the name's start attempts and asks nethelper to prove
-network absence. Missing/older helper endpoints and unreadable resources fail
+cgroup absence. The exact recorded start receipt must be closed, and the runner
+scans the entire name's receipt journal for corrupt identities or nonclosed
+attempts. It checks for no live VM with that name, no jailer workspace or runtime
+socket, and no delegated cgroup. This is name-scoped proof, not a separate
+UUID-bound enumeration of every historical runtime path. Nethelper proves
+network absence only. Missing/older helper endpoints and unreadable resources fail
 closed. It removes and fsyncs instance storage, checks backups and local data
 snapshots, and atomically commits the receipt, deleted tombstone and release of
 the cleanup fence. Failed cleanup remains charged by the existing srv capacity

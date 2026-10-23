@@ -1309,10 +1309,12 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 		payload.Instance.ImportPhase = imported.Phase
 		if inst.KindName() == model.KindOrb {
 			generation, err := a.store.BootstrapGeneration(ctx, inst.ID, inst.CreatedAt)
-			if err != nil {
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return cleanupError(err)
 			}
-			payload.Instance.BootstrapGeneration = &generation
+			if err == nil {
+				payload.Instance.BootstrapGeneration = &generation
+			}
 		}
 		return jsonResult(payload)
 	}

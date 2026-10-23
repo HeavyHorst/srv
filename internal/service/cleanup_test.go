@@ -3,7 +3,9 @@ package service
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,7 +19,70 @@ import (
 	"github.com/google/uuid"
 	"srv/internal/model"
 	"srv/internal/provision"
+	"srv/internal/store"
 )
+
+func TestLegacyOrbInspectDoesNotAdoptBootstrapCounter(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	i := serviceTestInstance("legacy-orb", model.StateReady, time.Now().UTC())
+	i.ID, i.Image = uuid.NewString(), "amp-orb"
+	// Build the pre-counter representation using public store operations:
+	// UpdateInstance does not initialize a bootstrap counter.
+	i.Kind = model.KindVM
+	if err := st.CreateInstance(ctx, i); err != nil {
+		t.Fatal(err)
+	}
+	i.Kind = model.KindOrb
+	if err := st.UpdateInstance(ctx, i); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{store: st, cfg: loadServiceTestConfig(t, nil), backendID: "backend-one"}
+	actor := model.Actor{UserLogin: i.CreatedByUser}
+	result, err := a.dispatch(ctx, actor, commandRequest{args: []string{"inspect", i.Name}, format: outputFormatJSON})
+	if err != nil || result.exitCode != 0 {
+		t.Fatal("legacy diagnostics refused", result, err)
+	}
+	var payload struct {
+		Instance map[string]any `json:"instance"`
+	}
+	if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Instance["id"] != i.ID || payload.Instance["kind"] != model.KindOrb || payload.Instance["bootstrap_generation"] != nil {
+		t.Fatal("counter fabricated or identity lost", payload)
+	}
+	id := uuid.NewString()
+	args := []string{"orb", "bootstrap", i.Name, "--expect", id, i.ID, i.CreatedAt.Format(time.RFC3339Nano), a.backendID, i.Image}
+	session := newServiceTestSession(ctx, `{"token":"synthetic","generation":1}`, false, args)
+	if code, err := a.handleOrbBootstrapSession(session, actor, args); err == nil || code == 0 {
+		t.Fatal("legacy bootstrap admitted", code, err)
+	}
+	if _, err := st.BootstrapGeneration(ctx, i.ID, i.CreatedAt); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("missing counter initialized", err)
+	}
+	if _, err := st.GetLifecycleRequest(ctx, id, actor.UserLogin); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("legacy request admitted", err)
+	}
+	// Only ErrNoRows is diagnostic-compatible; schema/I/O errors are not
+	// silently converted into an unknown generation.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DROP TABLE orb_bootstrap`); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := a.dispatch(ctx, actor, commandRequest{args: []string{"inspect", i.Name}, format: outputFormatJSON}); err == nil || result.exitCode == 0 {
+		t.Fatal("database error hidden", result, err)
+	}
+}
 
 func TestBoundOrbMutationsRejectReplacementBeforeEffects(t *testing.T) {
 	for _, change := range []string{"uuid", "created-at", "backend", "image", "legacy-vm"} {

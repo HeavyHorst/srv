@@ -1,11 +1,13 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
 import socket
 import subprocess
 import tempfile
 import threading
 import unittest
+import urllib.request
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("guest", Path(__file__).with_name("guest-agent.py"))
@@ -54,6 +56,11 @@ class GuestTests(unittest.TestCase):
                         self.assertEqual(env.stat().st_mode & 0o777, 0o600)
                         self.assertIn('ORB_TOKEN="fresh-secret"', env.read_text())
                         self.assertIn('HTTPS_PROXY="http://proxy"', env.read_text())
+                        no_proxy = re.search(r'^NO_PROXY="([^"]*)"$', env.read_text(), re.M).group(1)
+                        # Tailnet names bypass the public-only gateway; others still use it.
+                        for host, bypass in [("box.tail1234.ts.net", True), ("localhost", True),
+                                             ("ampcode.com", False), ("evil-ts.net", False)]:
+                            self.assertEqual(bool(urllib.request.proxy_bypass_environment(host, {"no": no_proxy})), bypass, host)
                         if fail:
                             raise subprocess.CalledProcessError(1, args)
                     else:

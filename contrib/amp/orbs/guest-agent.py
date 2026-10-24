@@ -127,7 +127,8 @@ def apply_bootstrap(request):
               "AMP_URL": request.get("amp_url") or "https://ampcode.com",
               "HTTPS_PROXY": request.get("proxy", ""),
               "HTTP_PROXY": request.get("proxy", ""),
-              "NO_PROXY": "localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10"}
+              # Tailscale CIDRs only match IP literals; MagicDNS names need the suffix.
+              "NO_PROXY": "localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10,.ts.net"}
     if not values["ORB_TOKEN"] or any(not isinstance(v, str) or
             any(c in v for c in "\r\n\x00") for v in values.values()):
         raise ValueError("invalid credentials")

@@ -317,6 +317,51 @@ a record is not silently adopted: restore the state backup instead. An unknown
 allocation that cannot satisfy these checks remains unavailable pending a
 separate reconciliation design.
 
+### Retire compute without deleting the thread
+
+An operator can permanently discard an old Orb's compute and workspace without
+requesting deletion of its Amp thread. Run this on the provider machine, using
+the **same account, endpoint and `SRV_ORB_STATE_DIR` as the provider**:
+
+```bash
+srv-orb-dispatch retire ORB_ID EXPECTED_INSTANCE_UUID
+```
+
+Take `orb_id` and `instance_id` from the existing dispatch record and confirm
+that its `name`, `host` and instance identity match the intended Orb in srv
+inspection. The UUID is an explicit confirmation, not a name lookup or force
+option. Unknown, unbound or mismatched instances are rejected. This is an
+operator command, not an additional `ORB_OPERATION` value.
+
+**Retirement destroys the Orb's disk, including uncommitted work.** Save any
+required files first. Unlike `pause`, it is not resumable. Unlike deleting the
+thread in Amp, it makes no Amp API call: conversation history and attachments
+already stored by Amp remain subject to Amp's own access and retention rules.
+They are not a backup of the whole filesystem. Amp's UI may not immediately
+reflect provider-side retirement; subsequent dispatched spawn jobs explicitly
+refuse to resume and direct the user to a new thread for fresh compute.
+
+The command takes the existing per-Orb lock and uses srv's `delete-proof` API,
+including the complete backend identity and v3 gateway/runtime/network/storage
+proof. It records `retiring` before sending the request and `retired` only after
+verifying and saving the exact cleanup receipt. Project templates remain retained
+as listed in the receipt; backup and snapshot exclusions still apply. Ordinary
+Amp deletion records are not relabeled or upgraded to retirement.
+
+If the reply is lost, repeat the **same command and UUID**. A pending retirement
+only queries the original receipt; it does not send a second deletion request.
+A crash before admission, failed preflight or incomplete cleanup stays fenced
+for operator reconciliation rather than reporting success from an absent VM.
+Uncertain start/stop operations still block retirement. Later Amp `delete` may
+finish reading the same retirement receipt; `pause` and `delete` after retirement
+are harmless no-ops. The original identity, receipt and lock files remain.
+
+Do not substitute bare `ssh srv delete NAME`, remove provider records, or reuse
+the managed instance name: those actions do not reconcile provider state.
+Retirement adds no automatic expiry, bulk deletion or fresh-disk recreation.
+Older dispatchers reject the new phases; use the updated dispatcher for this
+provider after retiring any Orb. No new backend receipt version is required.
+
 ### Operation receipts and bootstrap generations
 
 The dispatcher persists a fresh request ID before start, stop, bootstrap or

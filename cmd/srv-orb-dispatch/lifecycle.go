@@ -118,6 +118,12 @@ func resolveOperation(ctx context.Context, c config, path string, r *record) err
 }
 
 func finishDelete(ctx context.Context, c config, path string, r record) error {
+	phase := "deleted"
+	if r.Phase == "retiring" {
+		phase = "retired"
+	} else if r.Phase != "deleting" {
+		return errors.New("cleanup requires pending deletion or retirement")
+	}
 	if r.RequestID == "" || r.InstanceID == "" {
 		return errors.New("delete binding missing; operator reconciliation required")
 	}
@@ -149,6 +155,6 @@ func finishDelete(ctx context.Context, c config, path string, r record) error {
 	if err := save(proofPath, proof); err != nil {
 		return err
 	}
-	r.Phase = "deleted"
+	r.Phase = phase
 	return save(path, r)
 }

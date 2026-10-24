@@ -73,8 +73,11 @@ func main() {
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, 270*time.Second)
 	defer cancel()
-	if len(os.Args) == 4 && (os.Args[1] == "bind" || os.Args[1] == "cancel") {
+	if len(os.Args) == 4 && (os.Args[1] == "bind" || os.Args[1] == "cancel" || os.Args[1] == "retire") {
 		j = job{operation: os.Args[1], id: os.Args[2], expected: os.Args[3]}
+	} else if (len(os.Args) > 1 && !(len(os.Args) == 2 && os.Args[1] == "init")) || j.operation == "retire" {
+		fmt.Fprintln(os.Stderr, "usage: srv-orb-dispatch [init | bind ORB_ID UUID | cancel ORB_ID REQUEST | retire ORB_ID UUID]")
+		os.Exit(2)
 	}
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 		fmt.Fprintln(os.Stderr, "srv-orb: disable core dumps:", err)
@@ -91,6 +94,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "srv-orb:", err)
 		os.Exit(1)
 	}
+	if j.operation == "retire" {
+		fmt.Println("orb compute retired; workspace discarded; no Amp thread deletion requested")
+	}
 }
 
 func envDefault(key, fallback string) string {
@@ -101,8 +107,13 @@ func envDefault(key, fallback string) string {
 }
 
 func dispatch(ctx context.Context, c config, j job) error {
-	if j.id == "" || (j.operation != "spawn" && j.operation != "pause" && j.operation != "delete" && j.operation != "bind" && j.operation != "cancel") {
+	if j.id == "" || (j.operation != "spawn" && j.operation != "pause" && j.operation != "delete" && j.operation != "bind" && j.operation != "cancel" && j.operation != "retire") {
 		return errors.New("ORB_ID and ORB_OPERATION=spawn|pause|delete are required")
+	}
+	if j.operation == "retire" {
+		if _, err := uuid.Parse(j.expected); err != nil {
+			return errors.New("retirement requires the expected instance UUID")
+		}
 	}
 	if !filepath.IsAbs(c.directory) || c.endpoint == "" || strings.HasPrefix(c.endpoint, "-") {
 		return errors.New("set an absolute SRV_ORB_STATE_DIR and a valid SRV_ORB_ENDPOINT")
@@ -121,7 +132,11 @@ func dispatch(ctx context.Context, c config, j job) error {
 	name := fmt.Sprintf("orb-%x", sha256.Sum256([]byte(j.id)))[:60]
 	path := filepath.Join(c.directory, name+".json")
 	_, lockErr := os.Stat(path + ".lock")
-	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	flags := os.O_CREATE | os.O_RDWR
+	if j.operation == "retire" {
+		flags = os.O_RDWR // Unknown IDs must not create lock-only records.
+	}
+	lock, err := os.OpenFile(path+".lock", flags, 0600)
 	if err != nil {
 		return err
 	}
@@ -149,20 +164,43 @@ func dispatch(ctx context.Context, c config, j job) error {
 			return errors.New("state identity/endpoint mismatch; restore the original provider configuration")
 		}
 		switch r.Phase {
-		case "new", "creating", "managed", "deleting", "deleted":
+		case "new", "creating", "managed", "deleting", "deleted", "retiring", "retired":
 		default:
 			return errors.New("invalid dispatch record phase")
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	} else {
-		if lockErr == nil || !errors.Is(lockErr, os.ErrNotExist) {
+		if j.operation == "retire" || lockErr == nil || !errors.Is(lockErr, os.ErrNotExist) {
 			return errors.New("dispatch record lost; restore it rather than recreating the orb")
 		}
 		r.Phase = "new"
 		if err := save(path, r); err != nil {
 			return err
 		}
+	}
+	if j.operation == "retire" {
+		if r.InstanceID != j.expected {
+			return errors.New("retirement instance UUID mismatch")
+		}
+		if r.Phase != "managed" && r.Phase != "retiring" && r.Phase != "retired" {
+			return errors.New("retirement requires a managed orb or an existing retirement; ordinary deletion cannot be relabeled")
+		}
+	}
+	// Retirement is terminal even when a later Amp job names a stale snapshot.
+	if r.Phase == "retired" {
+		switch j.operation {
+		case "retire", "pause", "delete":
+			return nil
+		default:
+			return errors.New("orb workspace was intentionally retired; it cannot be resumed or recreated; start a new thread for fresh compute")
+		}
+	}
+	if r.Phase == "retiring" {
+		if j.operation != "retire" && j.operation != "delete" {
+			return errors.New("retirement pending; repeat the confirmed retire command to query its cleanup receipt")
+		}
+		return finishDelete(ctx, c, path, r)
 	}
 	// Lock ordering is always orb, then snapshot. Different orbs may refer to
 	// one template; publication and selection must not race across hosts.
@@ -203,7 +241,7 @@ func dispatch(ctx context.Context, c config, j job) error {
 		if err := resolveOperation(ctx, c, path, &r); err != nil {
 			// Only bootstrap has a downstream generation fence. A fresh spawn
 			// may supersede it; start/stop never infer completion from state.
-			if r.Pending != "bootstrap" || (j.operation != "spawn" && j.operation != "delete") {
+			if r.Pending != "bootstrap" || (j.operation != "spawn" && j.operation != "delete" && j.operation != "retire") {
 				return err
 			}
 		}
@@ -322,8 +360,11 @@ func dispatch(ctx context.Context, c config, j job) error {
 			return captureSnapshot(ctx, c, j, r, v.Image, snapshot)
 		}
 		return nil
-	case "delete":
+	case "delete", "retire":
 		r.Phase = "deleting"
+		if j.operation == "retire" {
+			r.Phase = "retiring"
+		}
 		r.RequestID = uuid.NewString()
 		if err := save(path, r); err != nil {
 			return err

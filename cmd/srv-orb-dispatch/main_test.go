@@ -337,9 +337,13 @@ func (h harness) write(s testServer) {
 }
 
 func (h harness) run(operation, token string, extra ...string) (string, error) {
+	return h.runArgs(nil, operation, token, extra...)
+}
+
+func (h harness) runArgs(args []string, operation, token string, extra ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, h.program)
+	cmd := exec.CommandContext(ctx, h.program, args...)
 	cmd.Env = append(os.Environ(),
 		"PATH="+h.dir+":"+os.Getenv("PATH"), "SRV_ORB_TEST_MODE=dispatch",
 		"SRV_ORB_TEST_SERVER="+filepath.Join(h.dir, "server.json"),
@@ -620,6 +624,141 @@ func TestDispatchDoesNotReplaceMissingDisk(t *testing.T) {
 	}
 	if h.read().VM != nil {
 		t.Fatal("lost orb was silently replaced with a fresh VM")
+	}
+}
+
+func TestRetireCompute(t *testing.T) {
+	for _, scenario := range []string{"running", "paused", "lost-reply", "amp-delete-recovery", "pending-bootstrap"} {
+		t.Run(scenario, func(t *testing.T) {
+			host := "b"
+			if scenario == "paused" {
+				host = ""
+			}
+			h := newHarness(t, host)
+			if scenario == "pending-bootstrap" {
+				s := h.read()
+				s.FailGuest = true
+				h.write(s)
+			}
+			if out, err := h.run("spawn", "token", "SRV_ORB_HOST="+host); (err != nil) != (scenario == "pending-bootstrap") {
+				t.Fatalf("unexpected bootstrap result: %v %s", err, out)
+			}
+			if scenario == "paused" {
+				h.must("pause", "")
+			}
+			s := h.read()
+			id, name := s.VM.ID, s.VM.Name
+			s.Disk = "work deliberately discarded"
+			s.OtherDown = host != "" // Retirement must stay on the recorded backend.
+			s.LoseDelete = scenario == "lost-reply" || scenario == "amp-delete-recovery"
+			h.write(s)
+			args := []string{"retire", "amp-thread/with spaces and 'quotes'", id}
+			out, err := h.runArgs(args, "spawn", "unrelated-token", "ORB_SNAPSHOT_ID=unrelated")
+			if s.LoseDelete {
+				if err == nil {
+					t.Fatal("lost deletion reply reported success")
+				}
+				if _, err := h.run("spawn", "late"); err == nil {
+					t.Fatal("pending retirement allowed spawn")
+				}
+				if _, err := h.runArgs([]string{"retire", args[1], "22222222-2222-4222-8222-222222222222"}, "", ""); err == nil {
+					t.Fatal("pending retirement accepted wrong identity")
+				}
+				if scenario == "amp-delete-recovery" {
+					h.must("delete", "")
+				}
+				out, err = h.runArgs(args, "", "")
+			}
+			if err != nil || !strings.Contains(out, "compute retired") {
+				t.Fatalf("retirement failed: %v %s", err, out)
+			}
+			if s := h.read(); s.VM != nil || s.Disk != "" || s.Environment != "" {
+				t.Fatal("retirement left compute or disk behind")
+			}
+			proofPath := filepath.Join(h.dir, "state", name+".json.cleanup")
+			before, err := os.ReadFile(proofPath)
+			if err != nil {
+				t.Fatal("no retained cleanup receipt", err)
+			}
+			var proof map[string]any
+			if err := json.Unmarshal(before, &proof); err != nil || proof["instance_id"] != id || proof["version"] != float64(3) || proof["gateways_absent"] != true || proof["storage_absent"] != true {
+				t.Fatal("retirement lacks bound v3 proof", err)
+			}
+			// Retrying the operator command and later Amp jobs cannot recreate
+			// compute or overwrite the retained disposition.
+			if out, err := h.runArgs(args, "", ""); err != nil {
+				t.Fatal(err, out)
+			}
+			if _, err := h.runArgs([]string{"retire", args[1], "22222222-2222-4222-8222-222222222222"}, "", ""); err == nil {
+				t.Fatal("completed retirement accepted wrong identity")
+			}
+			h.must("pause", "")
+			h.must("delete", "")
+			if out, err := h.run("spawn", "later"); err == nil || !strings.Contains(out, "intentionally retired") || !strings.Contains(out, "new thread") {
+				t.Fatalf("resume did not explain retirement: %v %s", err, out)
+			}
+			after, err := os.ReadFile(proofPath)
+			if err != nil || string(before) != string(after) || h.read().VM != nil {
+				t.Fatal("retirement disposition changed", err)
+			}
+		})
+	}
+}
+
+func TestRetireRejectsUnconfirmedCompute(t *testing.T) {
+	for _, scenario := range []string{"wrong-id", "invalid-uuid", "malformed-command", "env-only", "unknown-orb", "missing-vm", "replaced-vm", "pending-stop", "deleted"} {
+		t.Run(scenario, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.must("spawn", "token")
+			s := h.read()
+			args := []string{"retire", "amp-thread/with spaces and 'quotes'", s.VM.ID}
+			operation := "delete"
+			switch scenario {
+			case "wrong-id":
+				args[2] = "22222222-2222-4222-8222-222222222222"
+			case "invalid-uuid":
+				args[2] = "not-a-uuid"
+			case "malformed-command":
+				args = args[:2]
+			case "env-only":
+				args, operation = nil, "retire"
+			case "unknown-orb":
+				args[1] = "unknown-orb"
+			case "missing-vm":
+				s.VM, s.Disk = nil, ""
+				h.write(s)
+			case "replaced-vm":
+				s.VM.ID = "22222222-2222-4222-8222-222222222222"
+				h.write(s)
+			case "pending-stop":
+				s.LateStop = true
+				h.write(s)
+				if _, err := h.run("pause", ""); err == nil {
+					t.Fatal("expected pending stop")
+				}
+			case "deleted":
+				h.must("delete", "")
+			}
+			before, err := os.ReadFile(filepath.Join(h.dir, "server.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A malformed operator invocation must not fall back to an Amp
+			// delete job inherited from the environment.
+			if out, err := h.runArgs(args, operation, ""); err == nil {
+				t.Fatal("unconfirmed retirement succeeded", out)
+			}
+			after, err := os.ReadFile(filepath.Join(h.dir, "server.json"))
+			if err != nil || string(before) != string(after) {
+				t.Fatal("rejected retirement changed server state", err)
+			}
+			if scenario == "unknown-orb" {
+				// A typo must not leave a lock-only record that poisons a later
+				// legitimate first spawn for that ID.
+				h.must("delete", "")
+				h.must("spawn", "new-token", "ORB_ID=unknown-orb")
+			}
+		})
 	}
 }
 

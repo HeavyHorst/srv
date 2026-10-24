@@ -87,8 +87,26 @@ func TestRejectResponses(t *testing.T) {
 			t.Fatalf("unsafe result: %v", err)
 		}
 	}
-	if err := Bootstrap(context.Background(), "unused", Request{Token: strings.Repeat("x", MaxMessage)}); err == nil {
-		t.Fatal("oversized request accepted")
+	if err := Bootstrap(context.Background(), "unused", Request{Token: strings.Repeat("x", MaxMessage), Generation: 1}); err == nil || err.Error() != "invalid orb request" {
+		t.Fatalf("oversized request validation: %v", err)
+	}
+}
+
+func TestRejectGenerationAcknowledgment(t *testing.T) {
+	for _, response := range []string{`{"ok":true}`, `{"ok":true,"generation":6}`, `{"ok":true,"generation":8}`} {
+		t.Run(response, func(t *testing.T) {
+			path := serve(t, func(c net.Conn) {
+				r := bufio.NewReader(c)
+				r.ReadString('\n')
+				fmt.Fprint(c, "OK 1\n")
+				r.ReadString('\n')
+				fmt.Fprintln(c, response)
+			})
+			err := Bootstrap(context.Background(), path, Request{Token: "fresh-secret", Generation: 7})
+			if err == nil || err.Error() != "orb guest generation acknowledgment mismatch" {
+				t.Fatalf("generation acknowledgment validation: %v", err)
+			}
+		})
 	}
 }
 

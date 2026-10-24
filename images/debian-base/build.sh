@@ -105,7 +105,8 @@ systemctl --root="$ROOT" mask getty.target getty@.service serial-getty@.service 
   systemd-udevd.service systemd-udevd-control.socket systemd-udevd-kernel.socket \
   systemd-udev-trigger.service systemd-udev-settle.service systemd-hwdb-update.service
 systemctl --root="$ROOT" set-default multi-user.target
-rm -f "$ROOT/usr/sbin/policy-rc.d" "$ROOT/etc/resolv.conf" "$ROOT/var/lib/dbus/machine-id"
+# debootstrap copies the build host's /etc/hostname; guests must not inherit it.
+rm -f "$ROOT/usr/sbin/policy-rc.d" "$ROOT/etc/resolv.conf" "$ROOT/etc/hostname" "$ROOT/var/lib/dbus/machine-id"
 ln -s /run/systemd/resolve/stub-resolv.conf "$ROOT/etc/resolv.conf"
 truncate -s 0 "$ROOT/etc/machine-id"
 chroot "$ROOT" apt-get clean

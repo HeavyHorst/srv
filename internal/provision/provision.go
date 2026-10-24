@@ -1882,7 +1882,7 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst *model.Instance
 		return resp.PID, nil
 	}
 	if resp.Outcome == vmrunner.StartAbsent {
-		return 0, fmt.Errorf("start was fenced without a runtime: %s", resp.Reason)
+		return 0, errors.Join(fmt.Errorf("start was fenced without a runtime: %s", resp.Reason), err)
 	}
 	err = errors.Join(errStartUncertain, err, errors.New(resp.Reason))
 	inst.LastError = err.Error()

@@ -331,6 +331,8 @@ install_data_dirs() {
 	install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/state"
 	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/backups"
 	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/instances"
+	# Project templates are confidential copies of guest disks.
+	install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/templates"
 	chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${data_dir}/state" "${data_dir}/backups" "${data_dir}/instances"
 }
 

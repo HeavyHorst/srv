@@ -567,7 +567,8 @@ func (a *App) Run(ctx context.Context) error {
 	g, groupCtx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		err := a.sshServer.Serve(listener)
-		if err != nil && !errors.Is(err, net.ErrClosed) {
+		// Shutdown on cancellation makes Serve return ErrServerClosed.
+		if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, gssh.ErrServerClosed) {
 			return fmt.Errorf("serve ssh: %w", err)
 		}
 		return nil

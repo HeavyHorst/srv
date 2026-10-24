@@ -15,9 +15,12 @@ MAX_MESSAGE = 65536
 RUNTIME = Path("/run/srv-orb")
 UNIT = Path("/run/systemd/system/srv-orb-bootstrap.service")
 UNIT_NAME = UNIT.name
+# Not ordered after network-online.target: the host only bootstraps after this
+# agent answers, and the agent starts after its --network step configured the
+# kernel-provided address, routes and DNS. Images may still pull in a
+# wait-online that can stall far longer than the host's bootstrap exchange.
 BOOTSTRAP_UNIT = """[Unit]
 Description=Amp orb bootstrap
-After=network-online.target
 [Service]
 Type=exec
 User=user
@@ -127,7 +130,8 @@ def apply_bootstrap(request):
               "AMP_URL": request.get("amp_url") or "https://ampcode.com",
               "HTTPS_PROXY": request.get("proxy", ""),
               "HTTP_PROXY": request.get("proxy", ""),
-              "NO_PROXY": "localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10"}
+              # Tailscale CIDRs only match IP literals; MagicDNS names need the suffix.
+              "NO_PROXY": "localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10,.ts.net"}
     if not values["ORB_TOKEN"] or any(not isinstance(v, str) or
             any(c in v for c in "\r\n\x00") for v in values.values()):
         raise ValueError("invalid credentials")
@@ -149,8 +153,18 @@ def apply_bootstrap(request):
             for key, value in values.items():
                 value = value.replace("\\", "\\\\").replace('"', '\\"')
                 stream.write(f'{key}="{value}"\n')
-        command("systemctl", "start", UNIT_NAME)
-        command("systemctl", "is-active", "--quiet", UNIT_NAME)
+        try:
+            command("systemctl", "start", UNIT_NAME)
+            command("systemctl", "is-active", "--quiet", UNIT_NAME)
+        except BaseException:
+            # A client timeout leaves PID1's start job queued or running; it
+            # could still launch after a failure ack. Remove the credentials,
+            # then cancel and prove quiescence. If that cannot be proven, this
+            # raises instead and the generation stays "executing".
+            credential.unlink(missing_ok=True)
+            command("systemctl", "stop", "--job-mode=replace", UNIT_NAME)
+            stopped()
+            raise
     finally:
         credential.unlink(missing_ok=True)
 

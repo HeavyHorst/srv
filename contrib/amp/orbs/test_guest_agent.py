@@ -1,11 +1,13 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
 import socket
 import subprocess
 import tempfile
 import threading
 import unittest
+import urllib.request
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("guest", Path(__file__).with_name("guest-agent.py"))
@@ -54,6 +56,11 @@ class GuestTests(unittest.TestCase):
                         self.assertEqual(env.stat().st_mode & 0o777, 0o600)
                         self.assertIn('ORB_TOKEN="fresh-secret"', env.read_text())
                         self.assertIn('HTTPS_PROXY="http://proxy"', env.read_text())
+                        no_proxy = re.search(r'^NO_PROXY="([^"]*)"$', env.read_text(), re.M).group(1)
+                        # Tailnet names bypass the public-only gateway; others still use it.
+                        for host, bypass in [("box.tail1234.ts.net", True), ("localhost", True),
+                                             ("ampcode.com", False), ("evil-ts.net", False)]:
+                            self.assertEqual(bool(urllib.request.proxy_bypass_environment(host, {"no": no_proxy})), bypass, host)
                         if fail:
                             raise subprocess.CalledProcessError(1, args)
                     else:
@@ -70,6 +77,38 @@ class GuestTests(unittest.TestCase):
                 self.assertIn("KillMode=control-group", unit.read_text())
                 self.assertIn("EnvironmentFile=-/etc/amp-orb.env", unit.read_text())
                 self.assertTrue(calls)
+
+    def test_failed_start_is_cancelled_before_acknowledgment(self):
+        # A systemctl client timeout leaves PID1's start job queued. The
+        # failure ack must follow credential removal and a proven stop; if the
+        # stop fails, the generation must stay uncertain, never done.
+        for cancel_fails in [False, True]:
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Path(tmp) / "runtime"
+                events = []
+                def command(*args):
+                    started = any(e[0] == "start" for e in events)
+                    events.append((args[1], (runtime / "bootstrap.env").exists()))
+                    if args[1] == "start":
+                        raise subprocess.TimeoutExpired(args, 15)
+                    if args[1] == "stop" and started and cancel_fails:
+                        raise subprocess.TimeoutExpired(args, 15)
+                def stopped():
+                    events.append(("stopped", (runtime / "bootstrap.env").exists()))
+                with patch.object(guest, "RUNTIME", runtime), patch.object(guest, "UNIT", Path(tmp) / "unit.service"), \
+                        patch.object(guest, "command", command), patch.object(guest, "stopped", stopped):
+                    guest.initialize_generation()
+                    request = lambda g: json.dumps({"action": "bootstrap", "token": "t", "generation": g}).encode() + b"\n"
+                    self.assertEqual(json.loads(self.exchange(request(1))), {"ok": False})
+                    after = events[[e[0] for e in events].index("start") + 1:]
+                    self.assertEqual(after[:1], [("stop", False)])
+                    self.assertEqual(after[1:], [] if cancel_fails else [("stopped", False)])
+                    self.assertFalse((runtime / "bootstrap.env").exists())
+                    self.assertEqual(guest.read_generation(), {"generation": 1, "phase": "executing"})
+                    self.assertEqual(json.loads(self.exchange(request(1))), {"ok": False})
+                    with patch.object(guest, "command", lambda *args: None):
+                        self.assertEqual(json.loads(self.exchange(request(2))), {"ok": True, "generation": 2})
+                    self.assertEqual(guest.read_generation(), {"generation": 2, "phase": "done"})
 
     def test_generations_serialize_stale_work_and_survive_agent_restart(self):
         for order in [(1, 2, 1), (2, 1, 2)]:

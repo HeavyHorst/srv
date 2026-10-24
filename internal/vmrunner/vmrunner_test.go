@@ -1835,8 +1835,10 @@ func newRunnerShutdownTestServer(t *testing.T) (*Server, string, string) {
 		currentCgroupPath = oldCurrent
 	})
 
-	instancesDir := filepath.Join(t.TempDir(), "instances")
-	jailerDir := filepath.Join(t.TempDir(), "jailer")
+	// Starts reject socket paths longer than sun_path; keep fixture paths short.
+	base := shortReceiptDir(t)
+	instancesDir := filepath.Join(base, "instances")
+	jailerDir := filepath.Join(base, "jailer")
 	cgroupFSRoot = t.TempDir()
 	serviceRel := "/system.slice/srv-vm-runner.service"
 	currentCgroupPath = func() (string, error) {

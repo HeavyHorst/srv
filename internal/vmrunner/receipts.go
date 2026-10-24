@@ -394,6 +394,9 @@ func (s *Server) receiptStart(ctx context.Context, req StartRequest) (StartRespo
 	if req.RequestID == "" && s.config.JailerBaseDir == "" {
 		return s.start(ctx, req)
 	}
+	if err := validateHostSocketPaths(s.config, req.Name, req.Kind); err != nil {
+		return StartResponse{}, err
+	}
 	unlock, err := s.lockNameContext(ctx, req.Name)
 	if err != nil {
 		return StartResponse{}, err

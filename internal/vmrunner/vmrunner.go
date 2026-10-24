@@ -1475,6 +1475,34 @@ func resolveJailerRuntimePaths(jailerBaseDir, firecrackerBinary, name string) (j
 	}, nil
 }
 
+// sun_path holds 108 bytes including the terminating NUL.
+const maxUnixSocketPathLen = len(syscall.RawSockaddrUnix{}.Path) - 1
+
+// validateHostSocketPaths rejects names whose host-side sockets cannot be
+// dialed by absolute path. The SDK probes the jailed API socket after the
+// jailer has launched, so an over-long path would surface only as an uncertain
+// start; check before any launch effect instead.
+func validateHostSocketPaths(cfg ServerConfig, name, kind string) error {
+	paths, err := resolveInstanceRuntimePaths(cfg.InstancesDir, name)
+	if err != nil {
+		return err
+	}
+	jailerPaths, err := resolveJailerRuntimePaths(cfg.JailerBaseDir, cfg.FirecrackerBinary, name)
+	if err != nil {
+		return err
+	}
+	sockets := []string{jailerPaths.SocketPath, paths.SocketPath}
+	if kind == "orb" {
+		sockets = append(sockets, filepath.Join(filepath.Dir(paths.SocketPath), "orb.vsock"))
+	}
+	for _, path := range sockets {
+		if len(path) > maxUnixSocketPathLen {
+			return fmt.Errorf("unix socket path %s is %d bytes, limit %d; shorten SRV_JAILER_BASE_DIR or SRV_DATA_DIR", path, len(path), maxUnixSocketPathLen)
+		}
+	}
+	return nil
+}
+
 func validateStartRuntimeFiles(cfg ServerConfig, paths instanceRuntimePaths) error {
 	for label, path := range map[string]string{
 		"firecracker binary": cfg.FirecrackerBinary,

@@ -208,3 +208,13 @@ Several paths must share the same reflink-capable filesystem (typically btrfs or
 - `SRV_JAILER_BASE_DIR` — jailer workspaces (hard-links log files into the jail)
 
 Cross-filesystem hard-links fail, so keeping these on the same filesystem is required.
+
+Host-side clients dial `SRV_JAILER_BASE_DIR/<firecracker binary name>/<vm name>/root/firecracker.sock`
+and `SRV_DATA_DIR/instances/<vm name>/firecracker.sock` (plus `orb.vsock` for Orbs) by
+absolute path, and Unix socket paths are limited to 107 bytes. With the binary named
+`firecracker`, the default `SRV_DATA_DIR/jailer` is too long for 60-character Orb names;
+`SRV_JAILER_BASE_DIR` must then be at most 12 bytes (9 bytes for 63-character names), for
+example `/srvj` on the root filesystem when it also holds `SRV_DATA_DIR`. The VM runner
+rejects a start whose socket paths are too long before launching anything. Choose the base
+before the first start: start receipts and lifecycle locks live under it, so moving it later
+abandons the records of existing attempts.

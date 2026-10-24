@@ -1025,3 +1025,46 @@ func TestLegacyOwnedStopCleansFreshlyDiscoveredPooledCgroup(t *testing.T) {
 		}
 	}
 }
+
+// Over-long socket paths must be rejected before acceptance: once accepted, a
+// launch whose API socket cannot be dialed is only ever quarantined as unknown.
+// An over-long instance alias also defeats the vacancy dial, so that rejected
+// name still resolves unknown, but nothing is launched.
+func TestManagedStartRejectsOverlongSocketPathsBeforeAcceptance(t *testing.T) {
+	for _, tc := range []struct {
+		label, jailer, instances string
+		nameLen                  int
+		launches                 int32
+		outcome                  string
+	}{
+		{"jailed API socket", strings.Repeat("j", 20), "i", 60, 0, StartAbsent},
+		{"instance socket alias", "j", strings.Repeat("i", 40), 40, 0, StartUnknown},
+		{"short paths", "j", "i", 40, 1, StartUnknown},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			s, _, _ := newRunnerShutdownTestServer(t)
+			base := shortReceiptDir(t)
+			s.config.JailerBaseDir = filepath.Join(base, tc.jailer)
+			s.config.InstancesDir = filepath.Join(base, tc.instances)
+			var launches atomic.Int32
+			s.start = func(context.Context, StartRequest) (StartResponse, error) {
+				launches.Add(1)
+				return StartResponse{}, errors.New("API socket readiness timed out")
+			}
+			c := receiptHTTPClient(t, s.Handler())
+			r := receiptRequest(t)
+			r.Name, r.Kind = strings.Repeat("a", tc.nameLen), "orb"
+			_, startErr := c.StartInstanceVM(context.Background(), r)
+			if launches.Load() != tc.launches {
+				t.Fatalf("launches = %d, want %d", launches.Load(), tc.launches)
+			}
+			if rejected := startErr != nil && strings.Contains(startErr.Error(), "unix socket path"); rejected != (tc.launches == 0) {
+				t.Fatalf("start error = %v", startErr)
+			}
+			resp, err := c.ResolveInstanceStart(context.Background(), resultRequest(r))
+			if err != nil || resp.Outcome != tc.outcome {
+				t.Fatalf("resolve = %+v %v, want %s", resp, err, tc.outcome)
+			}
+		})
+	}
+}

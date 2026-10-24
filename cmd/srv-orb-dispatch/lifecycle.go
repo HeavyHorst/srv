@@ -118,6 +118,12 @@ func resolveOperation(ctx context.Context, c config, path string, r *record) err
 }
 
 func finishDelete(ctx context.Context, c config, path string, r record) error {
+	phase := "deleted"
+	if r.Phase == "retiring" {
+		phase = "retired"
+	} else if r.Phase != "deleting" {
+		return errors.New("cleanup requires pending deletion or retirement")
+	}
 	if r.RequestID == "" || r.InstanceID == "" {
 		return errors.New("delete binding missing; operator reconciliation required")
 	}
@@ -129,15 +135,11 @@ func finishDelete(ctx context.Context, c config, path string, r record) error {
 	if err := json.Unmarshal(data, &proof); err != nil {
 		return err
 	}
-	created, err := time.Parse(time.RFC3339Nano, r.CreatedAt)
-	if err != nil {
+	if err := validateCleanupReceipt(r, proof); err != nil {
 		return err
 	}
-	if proof.Version != 3 || !proof.GatewaysAbsent || proof.Kind != "orb" || proof.Image != r.Image || proof.BackendID != r.BackendID || proof.RequestID != r.RequestID || proof.InstanceID != r.InstanceID || proof.Name != r.Name || !proof.CreatedAt.Equal(created) || proof.DeletedAt.IsZero() || proof.AuthKeyDisposition != "never-minted" || proof.RetainedTemplates == nil || !proof.IngressClosed || !proof.RuntimeAbsent || !proof.JailerAbsent || !proof.CgroupAbsent || !proof.NetworkAbsent || !proof.StorageAbsent || !proof.BackupsAbsent || !proof.SnapshotsAbsent {
-		return errors.New("incomplete or mismatched cleanup receipt; release remains fenced")
-	}
 	// Retain the exact authoritative disposition alongside the tombstone.
-	proofPath := path + ".cleanup"
+	proofPath := cleanupPath(path, r)
 	if old, err := os.ReadFile(proofPath); err == nil {
 		var prior model.CleanupReceipt
 		if json.Unmarshal(old, &prior) != nil || !reflect.DeepEqual(prior, proof) {
@@ -149,6 +151,24 @@ func finishDelete(ctx context.Context, c config, path string, r record) error {
 	if err := save(proofPath, proof); err != nil {
 		return err
 	}
-	r.Phase = "deleted"
+	r.Phase = phase
 	return save(path, r)
+}
+
+func cleanupPath(path string, r record) string {
+	return filepath.Join(filepath.Dir(path), r.Name+".json.cleanup")
+}
+
+func validateCleanupReceipt(r record, proof model.CleanupReceipt) error {
+	if r.RequestID == "" || r.InstanceID == "" || r.BackendID == "" || r.Image == "" {
+		return errors.New("cleanup identity missing")
+	}
+	created, err := time.Parse(time.RFC3339Nano, r.CreatedAt)
+	if err != nil {
+		return err
+	}
+	if proof.Version != 3 || !proof.GatewaysAbsent || proof.Kind != "orb" || proof.Image != r.Image || proof.BackendID != r.BackendID || proof.RequestID != r.RequestID || proof.InstanceID != r.InstanceID || proof.Name != r.Name || !proof.CreatedAt.Equal(created) || proof.DeletedAt.IsZero() || proof.AuthKeyDisposition != "never-minted" || proof.RetainedTemplates == nil || !proof.IngressClosed || !proof.RuntimeAbsent || !proof.JailerAbsent || !proof.CgroupAbsent || !proof.NetworkAbsent || !proof.StorageAbsent || !proof.BackupsAbsent || !proof.SnapshotsAbsent {
+		return errors.New("incomplete or mismatched cleanup receipt; release remains fenced")
+	}
+	return nil
 }

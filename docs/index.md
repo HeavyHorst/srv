@@ -78,4 +78,5 @@ srv runs on Linux with the following requirements:
 - [Architecture](reference/architecture.md)
 - [SSH command reference](reference/ssh-commands.md)
 - [RFC: Hybrid memory pools](reference/hybrid-memory-pools-rfc.md)
+- [Testing](reference/testing.md)
 - [HTTP integrations](networking/integrations.md)

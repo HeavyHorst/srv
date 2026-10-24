@@ -78,6 +78,38 @@ class GuestTests(unittest.TestCase):
                 self.assertIn("EnvironmentFile=-/etc/amp-orb.env", unit.read_text())
                 self.assertTrue(calls)
 
+    def test_failed_start_is_cancelled_before_acknowledgment(self):
+        # A systemctl client timeout leaves PID1's start job queued. The
+        # failure ack must follow credential removal and a proven stop; if the
+        # stop fails, the generation must stay uncertain, never done.
+        for cancel_fails in [False, True]:
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Path(tmp) / "runtime"
+                events = []
+                def command(*args):
+                    started = any(e[0] == "start" for e in events)
+                    events.append((args[1], (runtime / "bootstrap.env").exists()))
+                    if args[1] == "start":
+                        raise subprocess.TimeoutExpired(args, 15)
+                    if args[1] == "stop" and started and cancel_fails:
+                        raise subprocess.TimeoutExpired(args, 15)
+                def stopped():
+                    events.append(("stopped", (runtime / "bootstrap.env").exists()))
+                with patch.object(guest, "RUNTIME", runtime), patch.object(guest, "UNIT", Path(tmp) / "unit.service"), \
+                        patch.object(guest, "command", command), patch.object(guest, "stopped", stopped):
+                    guest.initialize_generation()
+                    request = lambda g: json.dumps({"action": "bootstrap", "token": "t", "generation": g}).encode() + b"\n"
+                    self.assertEqual(json.loads(self.exchange(request(1))), {"ok": False})
+                    after = events[[e[0] for e in events].index("start") + 1:]
+                    self.assertEqual(after[:1], [("stop", False)])
+                    self.assertEqual(after[1:], [] if cancel_fails else [("stopped", False)])
+                    self.assertFalse((runtime / "bootstrap.env").exists())
+                    self.assertEqual(guest.read_generation(), {"generation": 1, "phase": "executing"})
+                    self.assertEqual(json.loads(self.exchange(request(1))), {"ok": False})
+                    with patch.object(guest, "command", lambda *args: None):
+                        self.assertEqual(json.loads(self.exchange(request(2))), {"ok": True, "generation": 2})
+                    self.assertEqual(guest.read_generation(), {"generation": 2, "phase": "done"})
+
     def test_generations_serialize_stale_work_and_survive_agent_restart(self):
         for order in [(1, 2, 1), (2, 1, 2)]:
             with tempfile.TemporaryDirectory() as tmp, patch.object(guest, "RUNTIME", Path(tmp)):

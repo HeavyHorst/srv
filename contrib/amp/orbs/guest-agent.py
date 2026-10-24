@@ -150,8 +150,18 @@ def apply_bootstrap(request):
             for key, value in values.items():
                 value = value.replace("\\", "\\\\").replace('"', '\\"')
                 stream.write(f'{key}="{value}"\n')
-        command("systemctl", "start", UNIT_NAME)
-        command("systemctl", "is-active", "--quiet", UNIT_NAME)
+        try:
+            command("systemctl", "start", UNIT_NAME)
+            command("systemctl", "is-active", "--quiet", UNIT_NAME)
+        except BaseException:
+            # A client timeout leaves PID1's start job queued or running; it
+            # could still launch after a failure ack. Remove the credentials,
+            # then cancel and prove quiescence. If that cannot be proven, this
+            # raises instead and the generation stays "executing".
+            credential.unlink(missing_ok=True)
+            command("systemctl", "stop", "--job-mode=replace", UNIT_NAME)
+            stopped()
+            raise
     finally:
         credential.unlink(missing_ok=True)
 

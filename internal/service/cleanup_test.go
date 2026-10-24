@@ -2,6 +2,7 @@ package service
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -479,7 +480,7 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 					t.Fatal("deleted/fenced gateway reopened")
 				}
 				if late {
-					assertGatewayClosed(t, lateGuest)
+					assertPendingGatewayClosed(t, lateGuest)
 					assertGatewayClosed(t, latePeer)
 				}
 			}
@@ -530,12 +531,48 @@ func assertGatewayTraffic(t *testing.T, guest, peer net.Conn) {
 
 func assertGatewayClosed(t *testing.T, conn net.Conn) {
 	t.Helper()
+	if data := readGatewayUntilClose(t, conn); len(data) != 0 {
+		t.Fatalf("gateway still forwards data: %q", data)
+	}
+}
+
+// A CONNECT cancelled during dial can receive one implicit HTTP response before
+// the socket closes. Only that pending path may consume a response; an
+// established tunnel must close without any bytes.
+func assertPendingGatewayClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	data := readGatewayUntilClose(t, conn)
+	if len(data) == 0 {
+		return
+	}
+	end := bytes.Index(data, []byte("\r\n\r\n"))
+	if end < 0 {
+		t.Fatalf("pending gateway wrote non-HTTP bytes: %q", data)
+	}
+	if trailing := data[end+4:]; len(trailing) != 0 {
+		t.Fatalf("pending gateway wrote bytes after its response: %q", trailing)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(data[:end+4])), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("pending gateway wrote an invalid HTTP response: %v (%q)", err, data)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.ContentLength > 0 || len(response.TransferEncoding) != 0 {
+		t.Fatalf("pending gateway response = %s content-length %d transfer %v", response.Status, response.ContentLength, response.TransferEncoding)
+	}
+}
+
+func readGatewayUntilClose(t *testing.T, conn net.Conn) []byte {
+	t.Helper()
 	conn.SetReadDeadline(time.Now().Add(time.Second))
-	_, err := conn.Read(make([]byte, 1))
-	if err == nil {
-		t.Fatal("gateway still forwards data")
+	data, err := io.ReadAll(conn)
+	if err != nil {
+		var timeout net.Error
+		if errors.As(err, &timeout) && timeout.Timeout() {
+			t.Fatal("gateway socket remained open")
+		}
+		// A reset or other terminal read error is a closed socket; return any
+		// bytes already observed so the caller can reject them.
 	}
-	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
-		t.Fatal("gateway socket remained open")
-	}
+	return data
 }

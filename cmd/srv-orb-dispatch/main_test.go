@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/anmitsu/go-shlex"
+	"golang.org/x/sys/unix"
 )
 
 // Exercise the executable contract, including process restarts and SSH argv /
@@ -756,6 +757,83 @@ func TestRetireRejectsUnconfirmedCompute(t *testing.T) {
 				// legitimate first spawn for that ID.
 				h.must("delete", "")
 				h.must("spawn", "new-token", "ORB_ID=unknown-orb")
+			}
+		})
+	}
+}
+
+func TestFreshStartRejectsWaitingProviderJobs(t *testing.T) {
+	for _, operation := range []string{"spawn", "pause", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			h := newHarness(t, "b")
+			h.must("spawn", "first-token", "SRV_ORB_HOST=b")
+			old := h.read().VM
+			orbID := "amp-thread/with spaces and 'quotes'"
+			if out, err := h.runArgs([]string{"retire", orbID, old.ID}, "", ""); err != nil {
+				t.Fatal(err, out)
+			}
+			path := filepath.Join(h.dir, "state", old.Name+".json")
+			lock, err := os.OpenFile(path+".lock", os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Close()
+			if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+				t.Fatal(err)
+			}
+			fd, err := unix.InotifyInit1(unix.IN_CLOEXEC)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(fd)
+			if _, err := unix.InotifyAddWatch(fd, path+".lock", unix.IN_OPEN); err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() {
+				out, err := h.run(operation, "stale-token")
+				if err == nil || !strings.Contains(out, "refusing a stale local job") {
+					result <- fmt.Errorf("expected stale-job rejection, got %v: %s", err, out)
+					return
+				}
+				result <- nil
+			}()
+			// Opening the lock follows reading the admitted identity. Observe
+			// that event while holding the lock, rather than guessing with sleeps.
+			poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+			if n, err := unix.Poll(poll, 10000); err != nil || n != 1 {
+				t.Fatalf("provider did not reach the held lock: %d, %v", n, err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var retired record
+			if err := json.Unmarshal(data, &retired); err != nil {
+				t.Fatal(err)
+			}
+			c := config{directory: filepath.Dir(path), endpoint: "srv"}
+			if err := authorizeFreshStart(c, path, job{id: orbID, expected: old.ID}, retired); err != nil {
+				t.Fatal(err)
+			}
+			read := func(path string) string {
+				t.Helper()
+				b, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(b)
+			}
+			serverPath := filepath.Join(h.dir, "server.json")
+			wantState, wantServer := read(path), read(serverPath)
+			if err := unix.Flock(int(lock.Fd()), unix.LOCK_UN); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-result; err != nil {
+				t.Fatal(err)
+			}
+			if read(path) != wantState || read(serverPath) != wantServer {
+				t.Fatal("stale provider job changed successor state or backend")
 			}
 		})
 	}

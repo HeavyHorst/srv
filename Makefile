@@ -1,4 +1,4 @@
-.PHONY: manual pages-build build
+.PHONY: manual pages-build build bench mutation-audit
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
@@ -12,3 +12,9 @@ pages-build:
 
 build:
 	go build -ldflags "-X srv/internal/version.Version=$(VERSION)" ./cmd/srv
+
+bench:
+	go test -run '^$$' -bench . ./internal/store ./internal/service
+
+mutation-audit:
+	python3 test/mutation_audit.py

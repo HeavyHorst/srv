@@ -13,18 +13,25 @@ import (
 	"srv/internal/model"
 )
 
+// cleanupValues builds the fixture without touching the store so crash tests can
+// interleave the individual writes.
+func cleanupValues() (model.Instance, model.CleanupReceipt) {
+	i := testInstance("cleanup", model.StateStopped, time.Date(2026, 10, 22, 1, 2, 3, 4, time.UTC))
+	i.Kind, i.Image, i.TailnetNodeID = model.KindOrb, "amp-orb", ""
+	r := model.CleanupReceipt{Version: 3, BackendID: "backend-one", Kind: i.Kind, Image: i.Image, RetainedTemplates: []string{}, RequestID: "request-one", Actor: "owner", InstanceID: i.ID, Name: i.Name, CreatedAt: i.CreatedAt, CreatedByUser: i.CreatedByUser, CreatedByNode: i.CreatedByNode, AuthKeyDisposition: "never-minted", IngressClosed: true, GatewaysAbsent: true, RuntimeAbsent: true, JailerAbsent: true, CgroupAbsent: true, NetworkAbsent: true, TapDevice: i.TapDevice, NetworkCIDR: i.NetworkCIDR, InstanceDir: filepath.Dir(i.RootFSPath), RootFSPath: i.RootFSPath, BackupsDir: "/backups/cleanup", StorageAbsent: true, BackupsAbsent: true, SnapshotsAbsent: true, DeletedAt: i.CreatedAt.Add(time.Hour)}
+	return i, r
+}
+
 func cleanupFixture(t *testing.T, s *Store) (model.Instance, model.CleanupReceipt) {
 	t.Helper()
 	ctx := context.Background()
-	i := testInstance("cleanup", model.StateStopped, time.Date(2026, 10, 22, 1, 2, 3, 4, time.UTC))
-	i.Kind, i.Image, i.TailnetNodeID = model.KindOrb, "amp-orb", ""
+	i, r := cleanupValues()
 	if err := s.CreateInstance(ctx, i); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := s.AdmitLifecycleRequest(ctx, LifecycleRequest{ID: "request-one", Actor: "owner", Command: "delete-proof", Name: i.Name, Arguments: "bound-arguments"}); err != nil || !ok {
+	if ok, err := s.AdmitLifecycleRequest(ctx, LifecycleRequest{ID: r.RequestID, Actor: r.Actor, Command: "delete-proof", Name: i.Name, Arguments: "bound-arguments"}); err != nil || !ok {
 		t.Fatal(ok, err)
 	}
-	r := model.CleanupReceipt{Version: 3, BackendID: "backend-one", Kind: i.Kind, Image: i.Image, RetainedTemplates: []string{}, RequestID: "request-one", Actor: "owner", InstanceID: i.ID, Name: i.Name, CreatedAt: i.CreatedAt, CreatedByUser: i.CreatedByUser, CreatedByNode: i.CreatedByNode, AuthKeyDisposition: "never-minted", IngressClosed: true, GatewaysAbsent: true, RuntimeAbsent: true, JailerAbsent: true, CgroupAbsent: true, NetworkAbsent: true, TapDevice: i.TapDevice, NetworkCIDR: i.NetworkCIDR, InstanceDir: filepath.Dir(i.RootFSPath), RootFSPath: i.RootFSPath, BackupsDir: "/backups/cleanup", StorageAbsent: true, BackupsAbsent: true, SnapshotsAbsent: true, DeletedAt: i.CreatedAt.Add(time.Hour)}
 	return i, r
 }
 
@@ -161,5 +168,38 @@ func TestHistoricalCleanupReceiptIsNotUpgraded(t *testing.T) {
 	var stored string
 	if err := s.db.QueryRow(`SELECT receipt FROM cleanup_receipts WHERE request_id=?`, receipt.RequestID).Scan(&stored); err != nil || stored != string(data) {
 		t.Fatal("read rewrote receipt", stored, err)
+	}
+}
+
+func TestCleanupCommitRejectsReadyInstanceWithFence(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	inst, receipt := cleanupValues()
+	inst.State = model.StateReady
+	if err := s.CreateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.AdmitLifecycleRequest(ctx, LifecycleRequest{ID: receipt.RequestID, Actor: receipt.Actor, Command: "delete-proof", Name: inst.Name, Arguments: "bound-arguments"}); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	// Reach the instance-state guard without BeginCleanup's deleting update.
+	if _, err := s.db.ExecContext(ctx, `UPDATE lifecycle_requests SET phase='executing' WHERE id=? AND actor=?`, receipt.RequestID, receipt.Actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO cleanup_fences(instance_id,request_id) VALUES(?,?)`, inst.ID, receipt.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitCleanup(ctx, receipt); err == nil {
+		t.Fatal("commit accepted a ready instance with a fence")
+	}
+	stored, err := s.GetInstance(ctx, inst.Name)
+	if err != nil || stored.State != model.StateReady {
+		t.Fatalf("instance after rejected commit = %+v, %v", stored, err)
+	}
+	if _, err := s.CleanupReceipt(ctx, receipt.RequestID, receipt.Actor); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("receipt after rejected commit: %v", err)
+	}
+	if err := s.CheckCleanupFence(ctx, inst.ID); err == nil {
+		t.Fatal("fence cleared after rejected commit")
 	}
 }

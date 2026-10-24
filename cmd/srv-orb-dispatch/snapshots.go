@@ -13,13 +13,14 @@ import (
 )
 
 type snapshotRecord struct {
-	ID       string `json:"snapshot_id"`
-	Name     string `json:"name"`
-	Endpoint string `json:"endpoint"`
-	Host     string `json:"host"`
-	Image    string `json:"image"`
-	Source   string `json:"source_orb"`
-	Phase    string `json:"phase"`
+	ID               string `json:"snapshot_id"`
+	Name             string `json:"name"`
+	Endpoint         string `json:"endpoint"`
+	Host             string `json:"host"`
+	Image            string `json:"image"`
+	Source           string `json:"source_orb"`
+	SourceInstanceID string `json:"source_instance_id,omitempty"`
+	Phase            string `json:"phase"`
 }
 
 func snapshotName(id string) string {
@@ -74,12 +75,17 @@ func captureSnapshot(ctx context.Context, c config, j job, r record, image strin
 		return errors.New("snapshot requires srv inventory with an image name")
 	}
 	if s == nil {
-		s = &snapshotRecord{ID: j.snapshot, Name: snapshotName(j.snapshot), Endpoint: c.endpoint, Host: r.Host, Image: image, Source: j.id, Phase: "creating"}
+		s = &snapshotRecord{ID: j.snapshot, Name: snapshotName(j.snapshot), Endpoint: c.endpoint, Host: r.Host, Image: image, Source: j.id, SourceInstanceID: r.InstanceID, Phase: "creating"}
 		if err := save(snapshotPath(c, j.snapshot), s); err != nil {
 			return err
 		}
 	} else if s.Source != j.id || s.Host != r.Host || s.Image != image {
 		return errors.New("snapshot ID already belongs to another source, host or image")
+	}
+	// Old mappings may be completed only by the original, non-replacement
+	// incarnation. Consuming a ready template is independent of authorship.
+	if s.SourceInstanceID != r.InstanceID && (s.SourceInstanceID != "" || r.PreviousInstanceID != "") {
+		return errors.New("snapshot ID belongs to another source incarnation")
 	}
 	operation := "create"
 	if s.Phase == "ready" {
@@ -88,6 +94,7 @@ func captureSnapshot(ctx context.Context, c config, j job, r record, image strin
 	if _, err := control(ctx, c, r, "project-template", operation, r.Name, s.Name); err != nil {
 		return err
 	}
+	s.SourceInstanceID = r.InstanceID
 	s.Phase = "ready"
 	return save(snapshotPath(c, j.snapshot), s)
 }

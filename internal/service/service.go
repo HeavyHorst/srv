@@ -54,6 +54,7 @@ type App struct {
 	deepseekGateway    *deepseekGatewayManager
 	integrationGateway *integrationGatewayManager
 	ampConnectGateway  *ampConnectGatewayManager
+	gatewayMu          sync.Mutex // Covers inventory reads through reconciliation and cleanup.
 	commandMu          sync.Mutex
 	commandCond        *sync.Cond
 	commandOnce        sync.Once

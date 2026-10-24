@@ -67,7 +67,7 @@ func (s *Store) BeginCleanup(ctx context.Context, requestID, actor string, inst 
 // CommitCleanup never writes a tombstone without the corresponding receipt.
 // A failed or interrupted request cannot be completed by a late worker.
 func (s *Store) CommitCleanup(ctx context.Context, r model.CleanupReceipt) error {
-	if r.Version != 2 || r.Kind != model.KindOrb || r.BackendID == "" || r.Image == "" || r.RetainedTemplates == nil || r.RequestID == "" || r.Actor == "" || r.InstanceID == "" || r.Name == "" || r.CreatedAt.IsZero() || r.CreatedByUser == "" || r.CreatedByNode == "" || r.DeletedAt.IsZero() || !r.IngressClosed || !r.RuntimeAbsent || !r.JailerAbsent || !r.CgroupAbsent || !r.NetworkAbsent || !r.StorageAbsent || !r.BackupsAbsent || !r.SnapshotsAbsent || r.RootFSPath == "" || r.InstanceDir == "" || r.BackupsDir == "" || r.TapDevice == "" || r.NetworkCIDR == "" {
+	if r.Version != 3 || !r.GatewaysAbsent || r.Kind != model.KindOrb || r.BackendID == "" || r.Image == "" || r.RetainedTemplates == nil || r.RequestID == "" || r.Actor == "" || r.InstanceID == "" || r.Name == "" || r.CreatedAt.IsZero() || r.CreatedByUser == "" || r.CreatedByNode == "" || r.DeletedAt.IsZero() || !r.IngressClosed || !r.RuntimeAbsent || !r.JailerAbsent || !r.CgroupAbsent || !r.NetworkAbsent || !r.StorageAbsent || !r.BackupsAbsent || !r.SnapshotsAbsent || r.RootFSPath == "" || r.InstanceDir == "" || r.BackupsDir == "" || r.TapDevice == "" || r.NetworkCIDR == "" {
 		return fmt.Errorf("incomplete cleanup proof")
 	}
 	if r.AuthKeyDisposition != "never-minted" {

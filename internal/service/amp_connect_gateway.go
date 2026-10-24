@@ -141,10 +141,12 @@ func (m *ampConnectGatewayManager) Reconcile(ctx context.Context, instances []mo
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for name, listener := range m.listeners {
-		if spec, ok := desired[name]; ok && listener.spec == spec {
+		if spec, ok := desired[name]; ok && listener.spec == spec && !listener.isClosed() {
 			continue
 		}
-		listener.close()
+		if err := listener.close(ctx); err != nil {
+			return err
+		}
 		delete(m.listeners, name)
 		m.log.Info("Amp CONNECT gateway stopped", "instance", name)
 	}
@@ -162,11 +164,10 @@ func (m *ampConnectGatewayManager) Reconcile(ctx context.Context, instances []mo
 			errs = append(errs, fmt.Errorf("start Amp CONNECT gateway for %s: %w", name, err))
 			continue
 		}
-		server := &http.Server{Handler: m.newHandler(spec), ReadHeaderTimeout: gatewayReadHeaderTimeout}
-		listener := &providerGatewayListener{spec: spec, server: server, ln: ln}
+		listener := newProviderGatewayListener(spec, ln, m.newHandler(spec))
 		m.listeners[name] = listener
 		go func() {
-			if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := listener.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				m.log.Error("serve Amp CONNECT gateway", "instance", spec.name, "listen_addr", addr, "err", err)
 			}
 		}()
@@ -196,6 +197,12 @@ func (m *ampConnectGatewayManager) newHandler(spec providerGatewaySpec) http.Han
 			http.Error(w, "upstream unavailable", http.StatusBadGateway)
 			return
 		}
+		defer upstream.Close()
+		stop := context.AfterFunc(r.Context(), func() { _ = upstream.Close() })
+		defer stop()
+		if r.Context().Err() != nil {
+			return // A dial may finish after listener cancellation.
+		}
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
 			upstream.Close()
@@ -214,7 +221,7 @@ func (m *ampConnectGatewayManager) newHandler(spec providerGatewaySpec) http.Han
 			upstream.Close()
 			return
 		}
-		go tunnelAmpConnections(guest, upstream, rw.Reader)
+		tunnelAmpConnections(guest, upstream, rw.Reader)
 	})
 }
 
@@ -247,7 +254,7 @@ func (m *ampConnectGatewayManager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for name, listener := range m.listeners {
-		listener.close()
+		_ = listener.close(context.Background())
 		delete(m.listeners, name)
 		m.log.Info("Amp CONNECT gateway stopped", "instance", name)
 	}

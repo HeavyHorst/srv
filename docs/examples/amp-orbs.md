@@ -372,12 +372,31 @@ Old guests without the echoed generation acknowledgment are rejected.
 
 `delete-proof REQUEST NAME UUID CREATED_AT BACKEND_ID IMAGE` is native-Orb-only;
 ordinary VM deletion is unchanged. `cleanup-receipt REQUEST` reads the stored
-v2 result without invoking deletion. Both require an explicit `--host` through
+result without invoking deletion. Both require an explicit `--host` through
 srv-front. A failed or lost delete reply is queried by that same request ID,
 never retried with another ID and never downgraded to plain `delete`.
 
-The backend fences ingress, then asks the VM runner to prove runtime/jailer/
-cgroup absence. The exact recorded start receipt must be closed, and the runner
+New deletions publish v3 receipts with `gateways_absent: true`. After preflight
+and durable cleanup admission, srv closes this instance's Amp CONNECT, provider
+and integration listeners, cancels their upstream requests and upgraded streams,
+and waits for admitted handlers (including pending dials) to finish. Gateway
+reconciliation cannot reopen the fenced instance from stale inventory. A timeout
+leaves cleanup fenced without a receipt; a preflight rejection leaves the live
+gateways untouched. Neighboring instances' gateways remain available.
+This proves absence of per-instance listeners and active handlers/streams, not
+absence of every host socket: shared idle upstream transport pools are retained.
+
+Upgrade srv and `srv-orb-dispatch` together: the dispatcher now requires v3 to
+finalize a pending deletion. Stored v2 receipts remain readable, unchanged; they
+do **not** prove gateway quiescence and cannot finalize a `deleting` dispatcher
+record under the new version. Already-finalized `deleted` records still make
+repeat delete a no-op and reject spawn; that no-op does not upgrade the historical
+receipt to v3. Do not rewrite receipts or tombstones to bypass this distinction.
+The existing coordinated runner/nethelper/guest-image protocol requirements still
+apply; this change does not deploy or validate any installed host binary.
+
+The backend fences ingress and drains gateways, then asks the VM runner to prove
+runtime/jailer/cgroup absence. The exact recorded start receipt must be closed, and the runner
 scans the entire name's receipt journal for corrupt identities or nonclosed
 attempts. It checks for no live VM with that name, no jailer workspace or runtime
 socket, and no delegated cgroup. This is name-scoped proof, not a separate

@@ -61,8 +61,11 @@ func (p *Provisioner) recoveryCopiesAbsent(inst model.Instance) (string, error) 
 // DeleteWithProof is only called under the service lifecycle lock. Failure
 // after admission leaves both the request and instance fenced; it is never
 // retried automatically. Only a stored committed receipt is replayable.
-func (p *Provisioner) DeleteWithProof(ctx context.Context, inst model.Instance, requestID, actor, backendID string) (model.CleanupReceipt, error) {
+func (p *Provisioner) DeleteWithProof(ctx context.Context, inst model.Instance, requestID, actor, backendID string, closeGateways func(context.Context, model.Instance) error) (model.CleanupReceipt, error) {
 	var r model.CleanupReceipt
+	if closeGateways == nil {
+		return r, errors.New("gateway quiescence proof unavailable")
+	}
 	if inst.KindName() != model.KindOrb || inst.TailnetNodeID != "" || backendID == "" {
 		return r, errors.New("cleanup proof requires a native orb and backend identity")
 	}
@@ -107,6 +110,11 @@ func (p *Provisioner) DeleteWithProof(ctx context.Context, inst model.Instance, 
 	if err := p.store.BeginCleanup(ctx, requestID, actor, inst); err != nil {
 		return r, err
 	}
+	// Service-owned listeners must drain after admission, never during preflight.
+	// A timeout leaves the durable cleanup fence in place, without a receipt.
+	if err := closeGateways(ctx, inst); err != nil {
+		return r, err
+	}
 	if _, err := p.recoveryCopiesAbsent(inst); err != nil {
 		return r, err
 	}
@@ -138,7 +146,7 @@ func (p *Provisioner) DeleteWithProof(ctx context.Context, inst model.Instance, 
 			return r, err
 		}
 	}
-	r = model.CleanupReceipt{Version: 2, BackendID: backendID, Kind: inst.KindName(), Image: inst.ImageName(), RetainedTemplates: templates, RequestID: requestID, Actor: actor, InstanceID: inst.ID, Name: inst.Name, CreatedAt: inst.CreatedAt, CreatedByUser: inst.CreatedByUser, CreatedByNode: inst.CreatedByNode, AuthKeyDisposition: "never-minted", IngressClosed: true, RuntimeAbsent: true, JailerAbsent: true, CgroupAbsent: true, NetworkAbsent: true, TapDevice: inst.TapDevice, NetworkCIDR: inst.NetworkCIDR, InstanceDir: dir, RootFSPath: inst.RootFSPath, BackupsDir: backups, StorageAbsent: true, BackupsAbsent: true, SnapshotsAbsent: true, DeletedAt: time.Now().UTC()}
+	r = model.CleanupReceipt{Version: 3, BackendID: backendID, Kind: inst.KindName(), Image: inst.ImageName(), RetainedTemplates: templates, RequestID: requestID, Actor: actor, InstanceID: inst.ID, Name: inst.Name, CreatedAt: inst.CreatedAt, CreatedByUser: inst.CreatedByUser, CreatedByNode: inst.CreatedByNode, AuthKeyDisposition: "never-minted", IngressClosed: true, GatewaysAbsent: true, RuntimeAbsent: true, JailerAbsent: true, CgroupAbsent: true, NetworkAbsent: true, TapDevice: inst.TapDevice, NetworkCIDR: inst.NetworkCIDR, InstanceDir: dir, RootFSPath: inst.RootFSPath, BackupsDir: backups, StorageAbsent: true, BackupsAbsent: true, SnapshotsAbsent: true, DeletedAt: time.Now().UTC()}
 	if err := p.store.CommitCleanup(ctx, r); err != nil {
 		return model.CleanupReceipt{}, err
 	}

@@ -3,6 +3,7 @@ package service
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -147,5 +148,69 @@ func TestAmpConnectGatewayURL(t *testing.T) {
 	inst.State = model.StateStopped
 	if got := app.ampConnectGatewayURL(inst); got != "" {
 		t.Fatalf("stopped ampConnectGatewayURL() = %q", got)
+	}
+}
+
+func TestGatewayReconcileRecoversCancelledClose(t *testing.T) {
+	for _, kind := range []string{"amp", "provider", "integration"} {
+		t.Run(kind, func(t *testing.T) {
+			inst := model.Instance{Name: "orb", State: model.StateReady, HostAddr: "127.0.0.1", GuestAddr: "127.0.0.1"}
+			var reconcile func(context.Context, bool) error
+			var address func() string
+			switch kind {
+			case "amp":
+				m := newAmpConnectGatewayManager(config.Config{}, nil)
+				defer m.Close()
+				reconcile = func(ctx context.Context, ready bool) error {
+					if ready {
+						return m.Reconcile(ctx, []model.Instance{inst})
+					}
+					return m.Reconcile(ctx, nil)
+				}
+				address = func() string { return m.listeners[inst.Name].ln.Addr().String() }
+			case "provider":
+				m, err := newProviderGatewayManager(providerGatewayConfig{apiKey: "synthetic", baseURL: "http://127.0.0.1"}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer m.Close()
+				reconcile = func(ctx context.Context, ready bool) error {
+					if ready {
+						return m.Reconcile(ctx, []model.Instance{inst})
+					}
+					return m.Reconcile(ctx, nil)
+				}
+				address = func() string { return m.listeners[inst.Name].ln.Addr().String() }
+			case "integration":
+				m, err := newIntegrationGatewayManager(config.Config{}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer m.Close()
+				reconcile = func(ctx context.Context, ready bool) error {
+					if ready {
+						return m.Reconcile(ctx, map[string]integrationGatewaySpec{inst.Name: {Name: inst.Name, HostIP: inst.HostAddr, GuestIP: inst.GuestAddr}})
+					}
+					return m.Reconcile(ctx, nil)
+				}
+				address = func() string { return m.listeners[inst.Name].ln.Addr().String() }
+			}
+			if err := reconcile(context.Background(), true); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := reconcile(ctx, false); !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			if err := reconcile(context.Background(), true); err != nil {
+				t.Fatal(err)
+			}
+			conn, err := net.DialTimeout("tcp", address(), time.Second)
+			if err != nil {
+				t.Fatal("resume retained a closed gateway", err)
+			}
+			conn.Close()
+		})
 	}
 }

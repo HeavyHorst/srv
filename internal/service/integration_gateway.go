@@ -32,9 +32,8 @@ type integrationGatewayManager struct {
 }
 
 type integrationGatewayListener struct {
-	spec   integrationGatewaySpec
-	server *http.Server
-	ln     net.Listener
+	spec integrationGatewaySpec
+	*providerGatewayListener
 }
 
 type integrationGatewaySpec struct {
@@ -76,10 +75,12 @@ func (m *integrationGatewayManager) Reconcile(ctx context.Context, desired map[s
 
 	for name, listener := range m.listeners {
 		spec, keep := desired[name]
-		if keep && reflect.DeepEqual(listener.spec, spec) {
+		if keep && reflect.DeepEqual(listener.spec, spec) && !listener.isClosed() {
 			continue
 		}
-		listener.close()
+		if err := listener.close(ctx); err != nil {
+			return err
+		}
 		delete(m.listeners, name)
 	}
 
@@ -107,13 +108,10 @@ func (m *integrationGatewayManager) startListener(spec integrationGatewaySpec) (
 	if err != nil {
 		return nil, err
 	}
-	server := &http.Server{
-		Handler:           m.newHandler(spec),
-		ReadHeaderTimeout: gatewayReadHeaderTimeout,
-	}
-	listener := &integrationGatewayListener{spec: spec, server: server, ln: ln}
+	listener := &integrationGatewayListener{spec: spec,
+		providerGatewayListener: newProviderGatewayListener(providerGatewaySpec{name: spec.Name, hostIP: spec.HostIP, guestIP: spec.GuestIP}, ln, m.newHandler(spec))}
 	go func() {
-		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := listener.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			m.log.Error("serve integration gateway", "instance", spec.Name, "listen_addr", addr, "err", err)
 		}
 	}()
@@ -168,18 +166,6 @@ func (m *integrationGatewayManager) newHandler(spec integrationGatewaySpec) http
 	})
 }
 
-func (l *integrationGatewayListener) close() {
-	if l == nil {
-		return
-	}
-	if l.server != nil {
-		_ = l.server.Close()
-	}
-	if l.ln != nil {
-		_ = l.ln.Close()
-	}
-}
-
 func (m *integrationGatewayManager) Close() {
 	if m == nil {
 		return
@@ -187,7 +173,7 @@ func (m *integrationGatewayManager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for name, listener := range m.listeners {
-		listener.close()
+		_ = listener.close(context.Background())
 		delete(m.listeners, name)
 	}
 }

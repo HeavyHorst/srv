@@ -47,12 +47,48 @@ type providerGatewayListener struct {
 	spec   providerGatewaySpec
 	server *http.Server
 	ln     net.Listener
+	mu     sync.Mutex
+	closed bool
+	cancel context.CancelFunc
+	active sync.WaitGroup
+	done   chan struct{}
 }
 
 type providerGatewaySpec struct {
 	name    string
 	hostIP  string
 	guestIP string
+}
+
+type gatewayConnectionKey struct{}
+
+// Handlers own their entire stream lifetime, including HTTP upgrades. Closing
+// the server alone cannot close hijacked connections or wait for a late dial.
+func newProviderGatewayListener(spec providerGatewaySpec, ln net.Listener, handler http.Handler) *providerGatewayListener {
+	ctx, cancel := context.WithCancel(context.Background())
+	l := &providerGatewayListener{spec: spec, ln: ln, cancel: cancel, done: make(chan struct{})}
+	l.server = &http.Server{
+		ReadHeaderTimeout: gatewayReadHeaderTimeout,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+			return context.WithValue(ctx, gatewayConnectionKey{}, conn)
+		},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			l.mu.Lock()
+			if l.closed {
+				l.mu.Unlock()
+				return
+			}
+			l.active.Add(1)
+			l.mu.Unlock()
+			defer l.active.Done()
+			conn := r.Context().Value(gatewayConnectionKey{}).(net.Conn)
+			stop := context.AfterFunc(r.Context(), func() { _ = conn.Close() })
+			defer stop()
+			handler.ServeHTTP(w, r)
+		}),
+	}
+	return l
 }
 
 func newProviderGatewayManager(cfg providerGatewayConfig, logger *slog.Logger) (*providerGatewayManager, error) {
@@ -90,10 +126,12 @@ func (m *providerGatewayManager) Reconcile(ctx context.Context, instances []mode
 
 	for name, listener := range m.listeners {
 		spec, keep := desired[name]
-		if keep && listener.spec == spec {
+		if keep && listener.spec == spec && !listener.isClosed() {
 			continue
 		}
-		listener.close()
+		if err := listener.close(ctx); err != nil {
+			return err
+		}
 		delete(m.listeners, name)
 	}
 
@@ -122,13 +160,9 @@ func (m *providerGatewayManager) startListener(spec providerGatewaySpec) (*provi
 	if err != nil {
 		return nil, err
 	}
-	server := &http.Server{
-		Handler:           m.newHandler(spec),
-		ReadHeaderTimeout: gatewayReadHeaderTimeout,
-	}
-	listener := &providerGatewayListener{spec: spec, server: server, ln: ln}
+	listener := newProviderGatewayListener(spec, ln, m.newHandler(spec))
 	go func() {
-		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := listener.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			m.log.Error("serve "+m.name+" gateway", "instance", spec.name, "listen_addr", addr, "err", err)
 		}
 	}()
@@ -172,15 +206,33 @@ func (m *providerGatewayManager) newHandler(spec providerGatewaySpec) http.Handl
 	})
 }
 
-func (l *providerGatewayListener) close() {
+func (l *providerGatewayListener) isClosed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closed
+}
+
+func (l *providerGatewayListener) close(ctx context.Context) error {
 	if l == nil {
-		return
+		return ctx.Err()
 	}
-	if l.server != nil {
-		_ = l.server.Close()
-	}
-	if l.ln != nil {
+	l.mu.Lock()
+	if !l.closed {
+		l.closed = true
+		l.cancel()
+		_ = l.server.Close() // Also closes idle and not-yet-admitted connections.
 		_ = l.ln.Close()
+		go func() {
+			l.active.Wait()
+			close(l.done)
+		}()
+	}
+	l.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-l.done:
+		return ctx.Err()
 	}
 }
 
@@ -191,7 +243,7 @@ func (m *providerGatewayManager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for name, listener := range m.listeners {
-		listener.close()
+		_ = listener.close(context.Background())
 		delete(m.listeners, name)
 	}
 }

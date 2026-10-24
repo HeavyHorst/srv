@@ -133,7 +133,7 @@ func finishDelete(ctx context.Context, c config, path string, r record) error {
 	if err != nil {
 		return err
 	}
-	if proof.Version != 2 || proof.Kind != "orb" || proof.Image != r.Image || proof.BackendID != r.BackendID || proof.RequestID != r.RequestID || proof.InstanceID != r.InstanceID || proof.Name != r.Name || !proof.CreatedAt.Equal(created) || proof.DeletedAt.IsZero() || proof.AuthKeyDisposition != "never-minted" || proof.RetainedTemplates == nil || !proof.IngressClosed || !proof.RuntimeAbsent || !proof.JailerAbsent || !proof.CgroupAbsent || !proof.NetworkAbsent || !proof.StorageAbsent || !proof.BackupsAbsent || !proof.SnapshotsAbsent {
+	if proof.Version != 3 || !proof.GatewaysAbsent || proof.Kind != "orb" || proof.Image != r.Image || proof.BackendID != r.BackendID || proof.RequestID != r.RequestID || proof.InstanceID != r.InstanceID || proof.Name != r.Name || !proof.CreatedAt.Equal(created) || proof.DeletedAt.IsZero() || proof.AuthKeyDisposition != "never-minted" || proof.RetainedTemplates == nil || !proof.IngressClosed || !proof.RuntimeAbsent || !proof.JailerAbsent || !proof.CgroupAbsent || !proof.NetworkAbsent || !proof.StorageAbsent || !proof.BackupsAbsent || !proof.SnapshotsAbsent {
 		return errors.New("incomplete or mismatched cleanup receipt; release remains fenced")
 	}
 	// Retain the exact authoritative disposition alongside the tombstone.

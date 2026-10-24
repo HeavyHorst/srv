@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"srv/internal/config"
 	"srv/internal/model"
 	"srv/internal/provision"
 	"srv/internal/store"
@@ -307,5 +309,233 @@ func TestOrbBootstrapTerminalReceiptRequiresGenerationAck(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
+	for _, scenario := range []string{"success", "backup-preflight", "late-dial", "cancelled-drain"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := loadServiceTestConfig(t, nil)
+			st := newServiceTestStore(t)
+			dir, err := os.MkdirTemp("", "srv-gateway-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			socket := filepath.Join(dir, "helpers.sock")
+			ln, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Only privileged runtime/network helpers are substituted. Deletion,
+			// SQLite, disk removal and TCP gateway handling are the real stack.
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/vm/stop", "/vm/cleanup-proof-v1", "/network/cleanup", "/network/cleanup-proof-v1":
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Errorf("unexpected helper request: %s", r.URL.Path)
+					http.Error(w, "unexpected", 400)
+				}
+			})}
+			go server.Serve(ln)
+			defer server.Close()
+			cfg.VMRunnerSocketPath, cfg.NetHelperSocketPath, cfg.OutboundInterface = socket, socket, "fixture0"
+			manager := newAmpConnectGatewayManager(config.Config{AmpConnectGatewayPort: 0}, nil)
+			defer manager.Close()
+			peers := make(chan net.Conn, 3)
+			dialStarted, dialCancelled, releaseDial := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseDial) }) }
+			defer release()
+			manager.dial = func(ctx context.Context, _, address string) (net.Conn, error) {
+				upstream, peer := net.Pipe()
+				peers <- peer
+				if address == "late.example:443" {
+					close(dialStarted)
+					<-ctx.Done()
+					close(dialCancelled)
+					<-releaseDial // Deliberately return a socket after cancellation.
+				}
+				return upstream, nil
+			}
+			a := &App{cfg: cfg, store: st, log: manager.log, backendID: "backend", ampConnectGateway: manager}
+			a.provisioner, err = provision.New(cfg, a.log, st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var instances []model.Instance
+			for _, name := range []string{"target", "neighbor"} {
+				i := serviceTestInstance(name, model.StateReady, time.Now().UTC())
+				i.ID, i.Kind, i.Image = uuid.NewString(), model.KindOrb, "amp-orb"
+				i.StartRequestID, i.StartBootID = uuid.NewString(), "boot"
+				i.HostAddr, i.GuestAddr = "127.0.0.1", "127.0.0.1"
+				i.RootFSPath = filepath.Join(cfg.InstancesDir(), name, "rootfs.img")
+				if err := os.MkdirAll(filepath.Dir(i.RootFSPath), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(i.RootFSPath, []byte(name), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.CreateInstance(ctx, i); err != nil {
+					t.Fatal(err)
+				}
+				instances = append(instances, i)
+			}
+			a.syncManagedGatewaysBestEffort()
+			i := instances[0]
+			addr := manager.listeners[i.Name].ln.Addr().String()
+			target := connectGateway(t, addr, "active.example:443", true)
+			defer target.Close()
+			targetPeer := <-peers
+			defer targetPeer.Close()
+			neighbor := connectGateway(t, manager.listeners["neighbor"].ln.Addr().String(), "active.example:443", true)
+			defer neighbor.Close()
+			neighborPeer := <-peers
+			defer neighborPeer.Close()
+			assertGatewayTraffic(t, target, targetPeer)
+			if scenario == "backup-preflight" {
+				if err := os.MkdirAll(filepath.Join(cfg.BackupsDir(), i.Name), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			late := scenario == "late-dial" || scenario == "cancelled-drain"
+			var lateGuest, latePeer net.Conn
+			if late {
+				lateGuest = connectGateway(t, addr, "late.example:443", false)
+				defer lateGuest.Close()
+				latePeer = <-peers
+				defer latePeer.Close()
+				<-dialStarted
+			}
+			id := uuid.NewString()
+			actor := model.Actor{UserLogin: i.CreatedByUser}
+			args := []string{"delete-proof", id, i.Name, i.ID, i.CreatedAt.Format(time.RFC3339Nano), a.backendID, i.Image}
+			deleteCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { _, err := a.cmdDeleteProof(deleteCtx, actor, args); done <- err }()
+			if late {
+				select {
+				case <-dialCancelled:
+				case <-deleteCtx.Done():
+					t.Fatal("gateway dial was not cancelled")
+				}
+				if _, err := st.CleanupReceipt(ctx, id, actor.UserLogin); !errors.Is(err, sql.ErrNoRows) {
+					t.Fatal("receipt before pending dial drained", err)
+				}
+				if err := st.CheckCleanupFence(ctx, i.ID); err == nil {
+					t.Fatal("missing in-flight cleanup fence")
+				}
+				select {
+				case err := <-done:
+					t.Fatal("delete returned before pending handler drained", err)
+				default:
+				}
+				if scenario == "cancelled-drain" {
+					cancel()
+				} else {
+					release()
+				}
+			}
+			err = <-done
+			failed := scenario == "backup-preflight" || scenario == "cancelled-drain"
+			if (err != nil) != failed {
+				t.Fatal("unexpected delete result", err)
+			}
+			release()
+			if failed {
+				if _, err := st.CleanupReceipt(ctx, id, actor.UserLogin); !errors.Is(err, sql.ErrNoRows) {
+					t.Fatal("failed cleanup published receipt", err)
+				}
+				if _, err := os.Stat(i.RootFSPath); err != nil {
+					t.Fatal("failure removed disk", err)
+				}
+				fence := st.CheckCleanupFence(ctx, i.ID)
+				if (fence != nil) != (scenario == "cancelled-drain") {
+					t.Fatal("wrong cleanup fence", fence)
+				}
+			} else {
+				proof, err := st.CleanupReceipt(ctx, id, actor.UserLogin)
+				if err != nil || proof.Version != 3 || !proof.GatewaysAbsent {
+					t.Fatal("missing gateway proof", proof, err)
+				}
+				if _, err := os.Stat(i.RootFSPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("disk retained", err)
+				}
+				if _, err := a.cmdDeleteProof(ctx, actor, args); err != nil {
+					t.Fatal("receipt replay", err)
+				}
+			}
+			a.syncManagedGatewaysBestEffort()
+			if scenario == "backup-preflight" {
+				assertGatewayTraffic(t, target, targetPeer)
+			} else {
+				assertGatewayClosed(t, target)
+				assertGatewayClosed(t, targetPeer)
+				if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+					conn.Close()
+					t.Fatal("deleted/fenced gateway reopened")
+				}
+				if late {
+					assertGatewayClosed(t, lateGuest)
+					assertGatewayClosed(t, latePeer)
+				}
+			}
+			assertGatewayTraffic(t, neighbor, neighborPeer)
+		})
+	}
+}
+
+func connectGateway(t *testing.T, address, authority string, acknowledge bool) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", authority, authority); err != nil {
+		t.Fatal(err)
+	}
+	if acknowledge {
+		response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+		if err != nil || response.StatusCode != 200 {
+			t.Fatalf("CONNECT: %v %v", response, err)
+		}
+	}
+	return conn
+}
+
+func assertGatewayTraffic(t *testing.T, guest, peer net.Conn) {
+	t.Helper()
+	guest.SetDeadline(time.Now().Add(time.Second))
+	peer.SetDeadline(time.Now().Add(time.Second))
+	if _, err := io.WriteString(guest, "outbound"); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	if _, err := io.ReadFull(peer, buf); err != nil || string(buf) != "outbound" {
+		t.Fatalf("outbound: %q %v", buf, err)
+	}
+	if _, err := io.WriteString(peer, "inbound!"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(guest, buf); err != nil || string(buf) != "inbound!" {
+		t.Fatalf("inbound: %q %v", buf, err)
+	}
+	guest.SetDeadline(time.Time{})
+	peer.SetDeadline(time.Time{})
+}
+
+func assertGatewayClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, err := conn.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("gateway still forwards data")
+	}
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("gateway socket remained open")
 	}
 }

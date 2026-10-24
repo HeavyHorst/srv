@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -23,7 +24,7 @@ func cleanupFixture(t *testing.T, s *Store) (model.Instance, model.CleanupReceip
 	if ok, err := s.AdmitLifecycleRequest(ctx, LifecycleRequest{ID: "request-one", Actor: "owner", Command: "delete-proof", Name: i.Name, Arguments: "bound-arguments"}); err != nil || !ok {
 		t.Fatal(ok, err)
 	}
-	r := model.CleanupReceipt{Version: 2, BackendID: "backend-one", Kind: i.Kind, Image: i.Image, RetainedTemplates: []string{}, RequestID: "request-one", Actor: "owner", InstanceID: i.ID, Name: i.Name, CreatedAt: i.CreatedAt, CreatedByUser: i.CreatedByUser, CreatedByNode: i.CreatedByNode, AuthKeyDisposition: "never-minted", IngressClosed: true, RuntimeAbsent: true, JailerAbsent: true, CgroupAbsent: true, NetworkAbsent: true, TapDevice: i.TapDevice, NetworkCIDR: i.NetworkCIDR, InstanceDir: filepath.Dir(i.RootFSPath), RootFSPath: i.RootFSPath, BackupsDir: "/backups/cleanup", StorageAbsent: true, BackupsAbsent: true, SnapshotsAbsent: true, DeletedAt: i.CreatedAt.Add(time.Hour)}
+	r := model.CleanupReceipt{Version: 3, BackendID: "backend-one", Kind: i.Kind, Image: i.Image, RetainedTemplates: []string{}, RequestID: "request-one", Actor: "owner", InstanceID: i.ID, Name: i.Name, CreatedAt: i.CreatedAt, CreatedByUser: i.CreatedByUser, CreatedByNode: i.CreatedByNode, AuthKeyDisposition: "never-minted", IngressClosed: true, GatewaysAbsent: true, RuntimeAbsent: true, JailerAbsent: true, CgroupAbsent: true, NetworkAbsent: true, TapDevice: i.TapDevice, NetworkCIDR: i.NetworkCIDR, InstanceDir: filepath.Dir(i.RootFSPath), RootFSPath: i.RootFSPath, BackupsDir: "/backups/cleanup", StorageAbsent: true, BackupsAbsent: true, SnapshotsAbsent: true, DeletedAt: i.CreatedAt.Add(time.Hour)}
 	return i, r
 }
 
@@ -95,7 +96,7 @@ func TestCleanupAtomicCommitAndReopen(t *testing.T) {
 }
 
 func TestCleanupRejectsChangedIdentityAndPartialProof(t *testing.T) {
-	for _, change := range []string{"uuid", "created-at", "kind", "key", "request", "version", "backup", "interrupted"} {
+	for _, change := range []string{"uuid", "created-at", "kind", "key", "request", "version", "gateways", "backup", "interrupted"} {
 		t.Run(change, func(t *testing.T) {
 			s := newTestStore(t)
 			ctx := context.Background()
@@ -117,7 +118,9 @@ func TestCleanupRejectsChangedIdentityAndPartialProof(t *testing.T) {
 			case "request":
 				r.RequestID = "foreign"
 			case "version":
-				r.Version = 1
+				r.Version = 2
+			case "gateways":
+				r.GatewaysAbsent = false
 			case "backup":
 				r.BackupsAbsent = false
 			case "interrupted":
@@ -136,5 +139,27 @@ func TestCleanupRejectsChangedIdentityAndPartialProof(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestHistoricalCleanupReceiptIsNotUpgraded(t *testing.T) {
+	s := newTestStore(t)
+	_, receipt := cleanupFixture(t, s)
+	receipt.Version, receipt.GatewaysAbsent = 2, false
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Represent a receipt committed by the old binary, not a new v2 write.
+	if _, err := s.db.Exec(`INSERT INTO cleanup_receipts(request_id,actor,receipt) VALUES(?,?,?)`, receipt.RequestID, receipt.Actor, string(data)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.CleanupReceipt(context.Background(), receipt.RequestID, receipt.Actor)
+	if err != nil || !reflect.DeepEqual(got, receipt) {
+		t.Fatal("historical receipt changed", got, err)
+	}
+	var stored string
+	if err := s.db.QueryRow(`SELECT receipt FROM cleanup_receipts WHERE request_id=?`, receipt.RequestID).Scan(&stored); err != nil || stored != string(data) {
+		t.Fatal("read rewrote receipt", stored, err)
 	}
 }

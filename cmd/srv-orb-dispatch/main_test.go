@@ -274,7 +274,7 @@ func fakeSSH() error {
 		if len(args) != 8 || s.VM == nil || args[4] != s.VM.ID || args[5] != s.VM.CreatedAt || args[6] != s.VM.BackendID || args[7] != s.VM.Image {
 			return fmt.Errorf("unbound delete")
 		}
-		s.Proof = map[string]any{"version": 2, "kind": "orb", "image": s.VM.Image, "backend_id": s.VM.BackendID, "request_id": args[2], "instance_id": s.VM.ID, "name": s.VM.Name, "created_at": s.VM.CreatedAt, "deleted_at": "2026-01-02T04:04:05Z", "auth_key_disposition": "never-minted", "retained_templates": []string{}, "ingress_closed": true, "runtime_absent": true, "jailer_absent": true, "cgroup_absent": true, "network_absent": true, "storage_absent": true, "backups_absent": true, "snapshots_absent": true}
+		s.Proof = map[string]any{"version": 3, "gateways_absent": true, "kind": "orb", "image": s.VM.Image, "backend_id": s.VM.BackendID, "request_id": args[2], "instance_id": s.VM.ID, "name": s.VM.Name, "created_at": s.VM.CreatedAt, "deleted_at": "2026-01-02T04:04:05Z", "auth_key_disposition": "never-minted", "retained_templates": []string{}, "ingress_closed": true, "runtime_absent": true, "jailer_absent": true, "cgroup_absent": true, "network_absent": true, "storage_absent": true, "backups_absent": true, "snapshots_absent": true}
 		s.VM, s.Disk, s.Environment = nil, "", ""
 		if err := write(); err != nil {
 			return err
@@ -668,6 +668,74 @@ func TestProjectSnapshotLifecycle(t *testing.T) {
 			}
 			if _, err := h.run("pause", "", snapshot, "ORB_ID=second-thread"); err == nil {
 				t.Fatal("different orb overwrote immutable snapshot ID")
+			}
+		})
+	}
+}
+
+func TestDeleteReceiptGatewayCompatibility(t *testing.T) {
+	for _, scenario := range []string{"v2-pending", "v3-missing-proof", "v2-finalized"} {
+		t.Run(scenario, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.must("spawn", "synthetic")
+			s := h.read()
+			name := s.VM.Name
+			s.LoseDelete = true
+			h.write(s)
+			if _, err := h.run("delete", ""); err == nil {
+				t.Fatal("expected lost reply")
+			}
+			s = h.read()
+			delete(s.Proof, "gateways_absent")
+			if scenario != "v3-missing-proof" {
+				s.Proof["version"] = 2
+			}
+			h.write(s)
+			path := filepath.Join(h.dir, "state", name+".json")
+			if scenario == "v2-finalized" {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var r record
+				if err := json.Unmarshal(data, &r); err != nil {
+					t.Fatal(err)
+				}
+				r.Phase = "deleted"
+				if err := save(path, r); err != nil {
+					t.Fatal(err)
+				}
+				if err := save(path+".cleanup", s.Proof); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = h.run("delete", "")
+			if (err == nil) != (scenario == "v2-finalized") {
+				t.Fatal("unexpected receipt acceptance", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("historical/fenced state changed", err)
+			}
+			if scenario == "v2-finalized" {
+				data, err := os.ReadFile(path + ".cleanup")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var proof map[string]any
+				if err := json.Unmarshal(data, &proof); err != nil {
+					t.Fatal(err)
+				}
+				if proof["version"] != float64(2) || proof["gateways_absent"] != nil {
+					t.Fatal("v2 proof upgraded", proof)
+				}
+				if _, err := h.run("spawn", "late"); err == nil {
+					t.Fatal("historical deletion resurrected")
+				}
 			}
 		})
 	}

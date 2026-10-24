@@ -400,6 +400,8 @@ func (a *App) syncAmpConnectGatewayBestEffort() {
 	if a == nil || a.ampConnectGateway == nil || a.store == nil {
 		return
 	}
+	a.gatewayMu.Lock()
+	defer a.gatewayMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	instances, err := a.store.ListInstances(ctx, false)
@@ -416,6 +418,8 @@ func (a *App) syncIntegrationGatewayBestEffort() {
 	if a == nil || a.integrationGateway == nil || a.store == nil {
 		return
 	}
+	a.gatewayMu.Lock()
+	defer a.gatewayMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	instances, err := a.store.ListInstances(ctx, false)

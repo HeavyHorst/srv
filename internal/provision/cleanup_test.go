@@ -110,9 +110,9 @@ func TestAuthoritativeOrbCleanup(t *testing.T) {
 				removePathAll = func(string) error { return errors.New("busy") }
 				defer func() { removePathAll = old }()
 			}
-			proof, err := p.DeleteWithProof(ctx, i, "request", "owner", "backend-one")
+			proof, err := p.DeleteWithProof(ctx, i, "request", "owner", "backend-one", func(context.Context, model.Instance) error { return nil })
 			if scenario == "success" || scenario == "template" {
-				if err != nil || proof.Version != 2 || proof.Kind != model.KindOrb || proof.AuthKeyDisposition != "never-minted" || !proof.StorageAbsent {
+				if err != nil || proof.Version != 3 || !proof.GatewaysAbsent || proof.Kind != model.KindOrb || proof.AuthKeyDisposition != "never-minted" || !proof.StorageAbsent {
 					t.Fatal(proof, err)
 				}
 				if _, err := os.Stat(i.RootFSPath); !errors.Is(err, os.ErrNotExist) {

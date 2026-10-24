@@ -20,6 +20,7 @@ type CleanupReceipt struct {
 	AuthKeyDisposition string    `json:"auth_key_disposition"`
 	RetainedTemplates  []string  `json:"retained_templates"`
 	IngressClosed      bool      `json:"ingress_closed"`
+	GatewaysAbsent     bool      `json:"gateways_absent,omitempty"`
 	RuntimeAbsent      bool      `json:"runtime_absent"`
 	JailerAbsent       bool      `json:"jailer_absent"`
 	CgroupAbsent       bool      `json:"cgroup_absent"`

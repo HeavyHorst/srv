@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -51,6 +52,7 @@ type testVM struct {
 type testServer struct {
 	Results       map[string]map[string]any
 	Proof         map[string]any
+	ProxyBypass   *string
 	Creates       int
 	LateStop      bool
 	LoseBootstrap bool
@@ -73,6 +75,9 @@ type testServer struct {
 func fakeSSH() error {
 	if os.Getenv("ORB_TOKEN") != "" || os.Getenv("AMP_ORB_PROVIDER_TOKEN") != "" {
 		return fmt.Errorf("credential leaked into SSH environment")
+	}
+	if _, ok := os.LookupEnv("SRV_ORB_PROXY_BYPASS"); ok {
+		return fmt.Errorf("bypass configuration leaked into SSH environment")
 	}
 	path := os.Getenv("SRV_ORB_TEST_SERVER")
 	b, err := os.ReadFile(path)
@@ -156,14 +161,24 @@ func fakeSSH() error {
 		return emit(s.Proof)
 	case "bootstrap":
 		var req struct {
-			Token      string `json:"token"`
-			AMPURL     string `json:"amp_url"`
-			Proxy      string `json:"proxy"`
-			Generation int64  `json:"generation"`
+			Token       string `json:"token"`
+			AMPURL      string `json:"amp_url"`
+			Proxy       string `json:"proxy"`
+			ProxyBypass string `json:"proxy_bypass"`
+			Generation  int64  `json:"generation"`
 		}
+		var keys map[string]any
 		payload, err := io.ReadAll(os.Stdin)
-		if err != nil || json.Unmarshal(payload, &req) != nil || req.Token == "" || s.VM == nil || args[2] != s.VM.Name || req.Generation <= s.VM.Generation {
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.DisallowUnknownFields()
+		if err != nil || decoder.Decode(&req) != nil || json.Unmarshal(payload, &keys) != nil || req.Token == "" || s.VM == nil || args[2] != s.VM.Name || req.Generation <= s.VM.Generation {
 			return fmt.Errorf("invalid bootstrap")
+		}
+		if value, ok := keys["proxy_bypass"]; ok {
+			text, _ := value.(string)
+			s.ProxyBypass = &text
+		} else {
+			s.ProxyBypass = nil
 		}
 		if strings.Contains(command, req.Token) {
 			return fmt.Errorf("token leaked in argv")
@@ -465,6 +480,47 @@ func TestDispatchUncertainOutcomes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDispatchProviderProxyBypass(t *testing.T) {
+	// Unset keeps the payload byte-compatible with older backends and guest
+	// images: no proxy_bypass key is sent at all.
+	h := newHarness(t, "")
+	h.must("spawn", "token")
+	if s := h.read(); s.ProxyBypass != nil {
+		t.Fatalf("unset SRV_ORB_PROXY_BYPASS was sent: %q", *s.ProxyBypass)
+	}
+	h.must("spawn", "fresh-token", "SRV_ORB_PROXY_BYPASS=.tail1234.ts.net")
+	if s := h.read(); s.ProxyBypass == nil || *s.ProxyBypass != ".tail1234.ts.net" {
+		t.Fatalf("provider bypass destination not forwarded: %+v", s.ProxyBypass)
+	}
+	h.must("spawn", "list-token", "SRV_ORB_PROXY_BYPASS=.corp.example,.tail1234.ts.net")
+	if s := h.read(); s.ProxyBypass == nil || *s.ProxyBypass != ".corp.example,.tail1234.ts.net" {
+		t.Fatalf("provider bypass list not forwarded verbatim: %+v", s.ProxyBypass)
+	}
+	h.must("spawn", "fqdn-token", "SRV_ORB_PROXY_BYPASS=.example.com.")
+	if s := h.read(); s.ProxyBypass == nil || *s.ProxyBypass != ".example.com." {
+		t.Fatalf("FQDN bypass destination not forwarded verbatim: %+v", s.ProxyBypass)
+	}
+	nine := strings.Join([]string{"e1.example", "e2.example", "e3.example", "e4.example", "e5.example", "e6.example", "e7.example", "e8.example", "e9.example"}, ",")
+	oversize := strings.TrimSuffix(strings.Repeat("e"+strings.Repeat("x", 61)+".example,", 8), ",")
+	for _, invalid := range []string{"", "a b", "a*b", `a"b`, "a\\b", "a\nb", "a:b", "a/b", "a?b", "a#b", "a@b", ".", "..", "-", "_", "http://internal", strings.Repeat("x", 254),
+		",a", "a,", "a,,b", "a, b", ".x.com,.x.com", "localhost", ".ts.net", nine, oversize} {
+		// Validation runs in the bootstrap payload builder, so it fails after
+		// inventory but before any credential SSH exchange: a bootstrapped orb
+		// keeps its generation and never sees the invalid value.
+		h := newHarness(t, "")
+		h.must("spawn", "first")
+		before := h.read()
+		out, err := h.run("spawn", "second", "SRV_ORB_PROXY_BYPASS="+invalid)
+		if err == nil || !strings.Contains(out, "SRV_ORB_PROXY_BYPASS") {
+			t.Fatalf("invalid SRV_ORB_PROXY_BYPASS %q accepted: %v %s", invalid, err, out)
+		}
+		after := h.read()
+		if after.VM == nil || after.VM.Generation != before.VM.Generation || after.ProxyBypass != nil {
+			t.Fatalf("invalid SRV_ORB_PROXY_BYPASS %q reached bootstrap", invalid)
+		}
 	}
 }
 

@@ -1,7 +1,11 @@
 import importlib.util
 import json
+import http.server
+import ssl
+import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -37,7 +41,8 @@ class GuestTests(unittest.TestCase):
         self.assertEqual(self.exchange(b'{"action":"ping"}\n'), b'{"ok":true}\n')
         for payload in [b'{}\n', b'{"action":"exec","command":"id"}\n',
                         b'not json\n', b'{"action":"ping"}', b'x' * 65537 + b'\n',
-                        b'{"action":"bootstrap","token":"bad\\nsecret"}\n']:
+                        b'{"action":"bootstrap","token":"bad\\nsecret"}\n',
+                        b'{"action":"bootstrap","token":"t","extra":1}\n']:
             self.assertEqual(self.exchange(payload), b'{"ok":false}\n')
         self.assertEqual(self.exchange(b'{"action":"ping"}\n', 3), b'')
 
@@ -77,6 +82,166 @@ class GuestTests(unittest.TestCase):
                 self.assertIn("KillMode=control-group", unit.read_text())
                 self.assertIn("EnvironmentFile=-/etc/amp-orb.env", unit.read_text())
                 self.assertTrue(calls)
+
+    def test_provider_proxy_bypass_destinations(self):
+        # Absent keeps the built-in bypass list; the provider's destination
+        # list is appended to it, and malformed values are refused without
+        # effects and without consuming a generation.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, unit = Path(tmp) / "runtime", Path(tmp) / "unit"
+            seen = {}
+            def command(*args):
+                if args[1] in {"start", "is-active"}:
+                    seen["env"] = (runtime / "bootstrap.env").read_text()
+            with patch.object(guest, "RUNTIME", runtime), patch.object(guest, "UNIT", unit), \
+                    patch.object(guest, "command", command), patch.object(guest, "stopped"):
+                guest.initialize_generation()
+                result = self.exchange(json.dumps({"action": "bootstrap", "token": "fresh-secret",
+                                                   "proxy": "http://proxy",
+                                                   "proxy_bypass": ".example.com,.corp.test",
+                                                   "generation": 1}).encode() + b"\n")
+            self.assertEqual(json.loads(result), {"ok": True, "generation": 1})
+            no_proxy = re.search(r'^NO_PROXY="([^"]*)"$', seen["env"], re.M).group(1)
+            # Built-ins stay, each provider suffix matches its own hosts at a
+            # label boundary (not glued names), others still use the gateway.
+            for host, bypass in [("box.tail1234.ts.net", True), ("a.example.com", True),
+                                 ("a.corp.test", True), ("evilexample.com", False),
+                                 ("evilcorp.test", False), ("evil-ts.net", False),
+                                 ("localhost", True), ("ampcode.com", False)]:
+                self.assertEqual(bool(urllib.request.proxy_bypass_environment(host, {"no": no_proxy})), bypass, host)
+            for bad in ["a,b,c,d,e,f,g,h,i", ",a", "a,", "a,,b", "a, b", "a b", 'a"b',
+                        "a\\b", "a\nb", "a:b", "a/b", "a*b", "a?b", "a#b", "a@b", ".", "..",
+                        "-", "_", "*", 5, "x" * 254, ".x.com,.x.com", "localhost", ".ts.net",
+                        "100.64.0.0/10", ",".join("e%d.%s" % (i, "x" * 64) for i in range(8))]:
+                with patch.object(guest, "RUNTIME", runtime), patch.object(guest, "UNIT", unit), \
+                        patch.object(guest, "command", command), patch.object(guest, "stopped"):
+                    payload = json.dumps({"action": "bootstrap", "token": "t", "proxy_bypass": bad,
+                                          "generation": 2}).encode() + b"\n"
+                    self.assertEqual(json.loads(self.exchange(payload)), {"ok": False})
+            with patch.object(guest, "RUNTIME", runtime):
+                self.assertEqual(guest.read_generation(), {"generation": 1, "phase": "done"})
+            # The FQDN trailing-dot form is accepted verbatim; urllib simply
+            # does not match it against dotless hostnames (a client fact).
+            with patch.object(guest, "RUNTIME", runtime), patch.object(guest, "UNIT", unit), \
+                    patch.object(guest, "command", command), patch.object(guest, "stopped"):
+                result = self.exchange(json.dumps({"action": "bootstrap", "token": "fresh-secret",
+                                                   "proxy_bypass": ".example.com.",
+                                                   "generation": 3}).encode() + b"\n")
+            self.assertEqual(json.loads(result), {"ok": True, "generation": 3})
+            no_proxy = re.search(r'^NO_PROXY="([^"]*)"$', seen["env"], re.M).group(1)
+            self.assertTrue(no_proxy.endswith(",.example.com."))
+            self.assertFalse(urllib.request.proxy_bypass_environment("a.example.com", {"no": no_proxy}))
+
+    def test_invalid_proxy_bypass_never_consumes_a_generation(self):
+        # Validation happens in handle(), before bootstrap(): a malformed
+        # list — including one with a valid first entry — is refused like an
+        # unknown key, nothing is appended, and the same generation stays
+        # usable, with no bootstrap effects at all.
+        with tempfile.TemporaryDirectory() as tmp, patch.object(guest, "RUNTIME", Path(tmp)):
+            guest.initialize_generation()
+            for bad in ["a,b,", ",.good.example", "a,b,c,d,e,f,g,h,i", ".good.example,.good.example"]:
+                with patch.object(guest, "apply_bootstrap") as apply:
+                    payload = json.dumps({"action": "bootstrap", "token": "t", "proxy_bypass": bad,
+                                          "generation": 1}).encode() + b"\n"
+                    self.assertEqual(json.loads(self.exchange(payload)), {"ok": False})
+                apply.assert_not_called()
+            self.assertEqual(guest.read_generation(), {"generation": 0, "phase": "new"})
+            with patch.object(guest, "apply_bootstrap"):
+                payload = json.dumps({"action": "bootstrap", "token": "t",
+                                      "generation": 1}).encode() + b"\n"
+                self.assertEqual(json.loads(self.exchange(payload)), {"ok": True, "generation": 1})
+
+    def test_bypass_matches_real_clients(self):
+        # Exercise matching through real curl over https:// against loopback
+        # listeners only: no DNS, no external network, no assumption about
+        # unused ports. The test uses the exact uppercase HTTPS_PROXY and
+        # NO_PROXY values a mocked guest bootstrap wrote for the same
+        # destination list — the contract the guest actually writes; curl
+        # honors both for https (its uppercase-HTTP_PROXY refusal is an
+        # http://-only rule and nothing here tests that path). A temporary
+        # self-signed fixture cert (generated per run, never committed)
+        # serves the direct path, with hosts pinned via --resolve;
+        # non-bypassed requests must issue a proxy CONNECT and fail at our
+        # accept-and-close listener. Only a verified TLS response that the
+        # fixture actually served counts as bypassed, so no unrelated failure
+        # (timeout, DNS, TLS) can pass as either outcome.
+        if shutil.which("curl") is None or shutil.which("openssl") is None:
+            self.skipTest("curl or openssl not installed")
+        proxy = socket.socket()
+        proxy.bind(("127.0.0.1", 0))
+        proxy.listen(8)
+        self.addCleanup(proxy.close)
+        def refuse():
+            while True:
+                try:
+                    conn, _ = proxy.accept()
+                except OSError:
+                    return
+                conn.close()
+        threading.Thread(target=refuse, daemon=True).start()
+        proxy_url = f"http://127.0.0.1:{proxy.getsockname()[1]}"
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, unit = Path(tmp) / "runtime", Path(tmp) / "unit"
+            seen = {}
+            def command(*args):
+                if args[1] in {"start", "is-active"}:
+                    seen["env"] = (runtime / "bootstrap.env").read_text()
+            with patch.object(guest, "RUNTIME", runtime), patch.object(guest, "UNIT", unit), \
+                    patch.object(guest, "command", command), patch.object(guest, "stopped"):
+                guest.initialize_generation()
+                result = self.exchange(json.dumps({"action": "bootstrap", "token": "t",
+                                                   "proxy": proxy_url,
+                                                   "proxy_bypass": ".example.test,.corp.test",
+                                                   "generation": 1}).encode() + b"\n")
+            self.assertEqual(json.loads(result), {"ok": True, "generation": 1})
+            def env_value(key):
+                return re.search(rf'^{key}="([^"]*)"$', seen["env"], re.M).group(1)
+            guest_env = {key: env_value(key) for key in ["HTTPS_PROXY", "NO_PROXY"]}
+        fixtures = tempfile.TemporaryDirectory()
+        self.addCleanup(fixtures.cleanup)
+        cert = str(Path(fixtures.name) / "fixture.pem")
+        key = str(Path(fixtures.name) / "fixture-key.pem")
+        hosts = "a.example.test b.corp.test evilexample.test evilcorp.test".split()
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=fixture",
+                        "-addext", "subjectAltName=" + ",".join(f"DNS:{h}" for h in hosts)],
+                       check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        hits = []
+        class direct(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.headers.get("Host", "").split(":")[0])
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), direct)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        for host, bypass in [("a.example.test", True), ("b.corp.test", True),
+                             ("evilexample.test", False), ("evilcorp.test", False)]:
+            env = dict(os.environ, **guest_env)
+            for inherited in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                              "NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"]:
+                env.pop(inherited, None)
+            env.update(guest_env)
+            result = subprocess.run(["curl", "-s", "-o", os.devnull, "--max-time", "5",
+                                     "--cacert", cert,
+                                     "--resolve", f"{host}:{port}:127.0.0.1",
+                                     f"https://{host}:{port}/"], env=env, timeout=15)
+            served = host in hits
+            if bypass:
+                self.assertTrue(result.returncode == 0 and served,
+                                f"{host} not bypassed (curl exit {result.returncode}, served={served})")
+            else:
+                self.assertTrue(result.returncode in (52, 56) and not served,
+                                f"{host} unexpectedly bypassed or ambiguous (curl exit {result.returncode}, served={served})")
 
     def test_failed_start_is_cancelled_before_acknowledgment(self):
         # A systemctl client timeout leaves PID1's start job queued. The

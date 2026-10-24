@@ -173,6 +173,38 @@ bootstrap uses direct egress. The gateway's existing private-address restriction
 still apply. Private Git hosts or a private `AMP_URL` require an appropriate
 network/proxy policy; this integration does not weaken it automatically.
 
+Proxy bypass is provider configuration, not a security boundary. Bootstrap
+writes a fixed bypass list for guest-local services, MMDS, the CGNAT range and
+`.ts.net` tailnet MagicDNS names. To send additional destinations past the
+gateway — an internal registry, a private DNS suffix — set
+`SRV_ORB_PROXY_BYPASS` in the provider environment to a comma-separated list
+of up to eight entries (512 characters joined). Each entry is a hostname, an
+IPv4 literal, or a leading-dot DNS suffix; an optional trailing dot (the FQDN
+form) is accepted verbatim but only matches clients that compare the same
+form. The entries are client-native `NO_PROXY` tokens, not a universal
+matcher: label-boundary subdomain matching agreed across urllib, curl and
+Go's `httpproxy` in the runs verified for this change, but apex handling does
+not — urllib and curl match the bare apex host for a leading-dot entry while
+Go's `httpproxy` does not, so configure the bare hostname (which matched apex
+and subdomains in all three) when the apex itself must be covered. CIDR
+ranges and IPv6 literals are not accepted in this field for the same reason:
+Python's urllib ignores CIDR entries entirely (including the built-in CGNAT
+entry), while curl and Go honor them for IP literals.
+Empty entries, duplicates and repeats of built-in entries are configuration
+errors. The dispatcher validates the list and the guest independently
+re-validates every entry, before any bootstrap generation is consumed, and
+appends the list to the unchanged built-in entries; unset keeps exactly the
+built-in list, and repository setup must not be used to repair this provider
+networking. Bypass only removes the gateway from the path: the guest still
+needs actual routing to the destination.
+
+Setting `SRV_ORB_PROXY_BYPASS` adds a `proxy_bypass` field to the bootstrap
+payload. A new dispatcher with the variable unset, and an older dispatcher
+against a new guest image, both keep working because the field is simply
+absent; but a *set* variable needs the dispatcher, srv backend and orb guest
+image upgraded together, since older components reject the extra field and the
+bootstrap fails rather than silently dropping the destination.
+
 The control endpoint's SSH host key must be installed in the service user's
 `known_hosts` through a trusted channel. Control connections use strict host-key
 checking. The provider never connects to guest SSH: the authenticated backend

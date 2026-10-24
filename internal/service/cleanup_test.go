@@ -86,6 +86,43 @@ func TestLegacyOrbInspectDoesNotAdoptBootstrapCounter(t *testing.T) {
 	}
 }
 
+func TestOrbBootstrapDecodesProxyBypass(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	i := serviceTestInstance("legacy-orb", model.StateReady, time.Now().UTC())
+	i.ID, i.Kind, i.Image = uuid.NewString(), model.KindOrb, "amp-orb"
+	if err := st.CreateInstance(ctx, i); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{store: st, cfg: loadServiceTestConfig(t, nil), backendID: "backend-one"}
+	actor := model.Actor{UserLogin: i.CreatedByUser}
+	args := []string{"orb", "bootstrap", i.Name, "--expect", uuid.NewString(), i.ID, i.CreatedAt.Format(time.RFC3339Nano), a.backendID, i.Image}
+	// The relay decodes stdin with DisallowUnknownFields: the optional
+	// proxy_bypass field must pass decoding (and fail later, like any legacy
+	// bootstrap, at admission), while unknown fields fail at decoding.
+	for _, scenario := range []struct{ payload, want string }{
+		{`{"token":"synthetic","generation":1,"proxy_bypass":".corp.example"}`, "anything-but-decode"},
+		{`{"token":"synthetic","generation":1,"no_proxy":".corp.example"}`, "invalid orb bootstrap request"},
+		{`{"token":"synthetic","generation":1,"extra":true}`, "invalid orb bootstrap request"},
+	} {
+		session := newServiceTestSession(ctx, scenario.payload, false, args)
+		code, err := a.handleOrbBootstrapSession(session, actor, args)
+		if err == nil || code == 0 {
+			t.Fatalf("legacy bootstrap admitted for %s", scenario.payload)
+		}
+		if scenario.want == "anything-but-decode" && err.Error() == "invalid orb bootstrap request" {
+			t.Fatalf("proxy_bypass rejected at decode: %v", err)
+		}
+		if scenario.want != "anything-but-decode" && err.Error() != scenario.want {
+			t.Fatalf("decode error = %q, want %q", err.Error(), scenario.want)
+		}
+	}
+}
+
 func TestBoundOrbMutationsRejectReplacementBeforeEffects(t *testing.T) {
 	for _, change := range []string{"uuid", "created-at", "backend", "image", "legacy-vm"} {
 		t.Run(change, func(t *testing.T) {

@@ -17,10 +17,11 @@ const Port = 4050
 const MaxMessage = 64 * 1024
 
 type Request struct {
-	Token      string `json:"token"`
-	AMPURL     string `json:"amp_url"`
-	Proxy      string `json:"proxy"`
-	Generation int64  `json:"generation"`
+	Token       string `json:"token"`
+	AMPURL      string `json:"amp_url"`
+	Proxy       string `json:"proxy"`
+	ProxyBypass string `json:"proxy_bypass,omitempty"`
+	Generation  int64  `json:"generation"`
 }
 
 func Ping(ctx context.Context, path string) error { return exchange(ctx, path, "ping", nil) }

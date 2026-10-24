@@ -17,13 +17,17 @@ const Port = 4050
 const MaxMessage = 64 * 1024
 
 type Request struct {
-	Token  string `json:"token"`
-	AMPURL string `json:"amp_url"`
-	Proxy  string `json:"proxy"`
+	Token      string `json:"token"`
+	AMPURL     string `json:"amp_url"`
+	Proxy      string `json:"proxy"`
+	Generation int64  `json:"generation"`
 }
 
 func Ping(ctx context.Context, path string) error { return exchange(ctx, path, "ping", nil) }
 func Bootstrap(ctx context.Context, path string, req Request) error {
+	if req.Generation <= 0 {
+		return errors.New("positive bootstrap generation required")
+	}
 	return exchange(ctx, path, "bootstrap", &req)
 }
 
@@ -71,11 +75,15 @@ func exchange(ctx context.Context, path, action string, req *Request) error {
 		return errors.New("orb response unavailable or oversized")
 	}
 	var response struct {
-		OK bool `json:"ok"`
+		OK         bool  `json:"ok"`
+		Generation int64 `json:"generation"`
 	}
 	// Never echo remote response text: it may contain credentials.
 	if json.Unmarshal(line, &response) != nil || !response.OK {
 		return errors.New("orb guest rejected request")
+	}
+	if req != nil && response.Generation != req.Generation {
+		return errors.New("orb guest generation acknowledgment mismatch")
 	}
 	return nil
 }

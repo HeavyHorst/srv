@@ -258,3 +258,35 @@ func TestNodeListShowsBudgetsAndUnavailableHosts(t *testing.T) {
 		t.Fatalf("explicit host should not depend on offline hosts: %v", err)
 	}
 }
+
+func TestBoundOrbRoutesPreserveIdentityAndRequest(t *testing.T) {
+	for _, args := range [][]string{
+		{"start", "orb-name", "--expect", "request", "uuid", "created", "backend", "image"},
+		{"stop", "orb-name", "--expect", "request", "uuid", "created", "backend", "image"},
+		{"orb", "bootstrap", "orb-name", "--expect", "request", "uuid", "created", "backend", "image"},
+		{"delete-proof", "request", "orb-name", "uuid", "created", "backend", "image"},
+		{"cleanup-receipt", "request"},
+		{"operation-result", "request"},
+		{"operation-cancel", "request", "orb-name", "stop", "uuid", "created", "backend", "image"},
+	} {
+		calls := 0
+		r := router(func(h front.Host, got []string, _ io.Reader, _ io.Writer) error {
+			calls++
+			if h.Name != "b" || !reflect.DeepEqual(got, args) {
+				t.Fatalf("forwarded %s %q, want b %q", h.Name, got, args)
+			}
+			return nil
+		})
+		if _, _, err := run(r, append(append([]string{}, args...), "--host", "b")...); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 1 {
+			t.Fatal("unexpected routing", calls)
+		}
+		if args[0] == "delete-proof" || args[0] == "cleanup-receipt" || strings.HasPrefix(args[0], "operation-") {
+			if _, _, err := run(r, args...); err == nil {
+				t.Fatal("receipt command routed without host")
+			}
+		}
+	}
+}

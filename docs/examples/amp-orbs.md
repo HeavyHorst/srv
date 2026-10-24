@@ -13,7 +13,7 @@ but image boot and the Amp connection still need validation on a real srv host.
 | First `spawn` | Create an Orb, wait for its host-only vsock agent, start `amp orb bootstrap` as `user`. |
 | Later `spawn` | Start the same stopped Orb, or reuse the running Orb; restart bootstrap with the fresh token. |
 | `pause` | Stop the VM and retain its disk; with `ORB_SNAPSHOT_ID`, save an immutable prepared disk template. |
-| `delete` | Delete the VM and disk; retain a small local deletion record. |
+| `delete` | Require a native-Orb cleanup receipt before marking the local record deleted; retain the exact receipt and template disposition. |
 
 Orbs use the same Firecracker, capacity accounting and placement infrastructure
 as VMs, but have a separate workload kind and default inventory:
@@ -209,6 +209,23 @@ Install a current Amp CLI accessible as `/usr/local/bin/amp`; for self-updates,
 keep its actual installation writable by this account. Configure its SSH trust
 and test `ssh srv -- --json orb list` as that account before starting the provider.
 
+Initialize a **new** empty dispatcher directory explicitly, using the same
+endpoint and account as the service:
+
+```bash
+sudo -u srv-orbs env SRV_ORB_ENDPOINT=srv SRV_ORB_STATE_DIR=/var/lib/srv-orbs/dispatch \
+  /usr/local/bin/srv-orb-dispatch init
+```
+
+Never initialize over lost provider state. Restore its backup instead. Update
+srv, srv-front (when used), srv-vm-runner, srv-net-helper and the prepared guest
+image together before enabling this protocol. Older components fail closed;
+there is no fallback to ordinary `delete` or unbound bootstrap. Preexisting Orb
+records without a backend bootstrap counter require deliberate retirement and
+recreation, not a counter reset or automatic adoption. JSON inspection remains
+available for diagnostics, omitting `bootstrap_generation` when its row is
+missing; this does not initialize a counter or permit managed bootstrap.
+
 Create a provider in **Amp workspace Settings → Orbs → Add Orb Provider**.
 Store its token in `/etc/srv-orbs.env`, owned by root with mode `0600`. Copy the
 non-secret settings from
@@ -261,7 +278,9 @@ lock waits, leaving time inside Amp's five-minute dispatch limit.
 ## Recovery and security
 
 The state directory contains an identity/host mapping, operation phase and deletion
-record. Back it up and keep it private. It never stores
+record. Bindings include the backend's own SSH host-key fingerprint, VM UUID,
+creation timestamp, workload kind and image, not just a frontend placement label.
+Back it up and keep it private. It never stores
 the provider or orb tokens. The bootstrap token travels over control SSH stdin
 and the host-only vsock channel,
 briefly enters a root-only environment file under `/run`, and is removed after
@@ -269,18 +288,114 @@ systemd starts bootstrap. It remains in the bootstrap process environment;
 root inside the VM is trusted. Guest bootstrap output is not relayed to provider
 logs because it could contain credentials.
 
+The srv daemon and dispatcher disable process dumpability. For the daemon this
+also restricts ptrace and changes `/proc` ownership/access; debugging must account
+for those effects. Both token-bearing
+systemd units set `LimitCORE=0`. The example provider unit additionally refuses a
+piped host `core_pattern`: not all external collectors honor the process limit.
+This intentionally excludes a stock systemd-coredump configuration until the
+operator supplies a reviewed no-dump policy; the integration does not change
+host-wide core settings. Guest root and its configured collector are trusted;
+the guest unit's limit is not a guarantee against a privileged piped collector.
+The srv-front forwarding process, SSH client and Amp CLI remain part of the
+trusted transport/runtime boundary. Avoid diagnostic dumps of those processes.
+
 The adapter records `creating` **before** sending `orb new`. If the SSH response is
-lost, a later job searches for the VM and records its host. It never automatically
+lost, a later job refuses automatic adoption or replay. It never automatically
 retries a missing, uncertain create. Initial discovery through srv-front requires
 every host to answer; after placement is recorded, only the selected host is
 queried, so an unrelated backend outage does not prevent wake-up.
 
-If an uncertain create remains absent, stop the provider, inspect every eligible
-backend and establish that no create is still running or can complete late.
-Only after that verification may an operator remove that orb's `creating` JSON
-record and retry. Do not remove lock files while dispatch jobs may still run.
-Keep the record if the outcome is unknown. A VM found without a record is not
-silently adopted: restore the state backup instead.
+An explicit `srv-orb-dispatch bind ORB_ID UUID`, under the provider's existing
+configuration, can bind a visible native Orb on the **already recorded** host
+with no import/migration history and bootstrap generation zero. A lost reply to
+automatic frontend placement has no recorded host and cannot use this escape
+hatch. Use a pinned host when deterministic create reconciliation is required.
+Missing dispatch records, counters or lock-associated records fail closed.
+Do not delete or hand-edit JSON/lock files to release a fence. A VM found without
+a record is not silently adopted: restore the state backup instead. An unknown
+allocation that cannot satisfy these checks remains unavailable pending a
+separate reconciliation design.
+
+### Operation receipts and bootstrap generations
+
+The dispatcher persists a fresh request ID before start, stop, bootstrap or
+delete. Bound start/stop accept `--expect REQUEST UUID CREATED_AT BACKEND_ID IMAGE`;
+unbound human start/stop commands retain their previous behavior. srv checks the
+binding and admission under the instance lock. Repeating an admitted request
+never reexecutes it. `operation-result REQUEST` only reads its stored result.
+After a lost outer SSH reply, a matching `done` result is sufficient to recover.
+
+`srv-orb-dispatch cancel ORB_ID REQUEST` attempts cancellation of a pending
+**start or stop**. srv takes the same instance lock and installs an exactly bound
+cancel tombstone only if the request was never admitted. If the worker won the
+race, cancel reports its actual phase and never overwrites it. No operator flag
+asserts quiescence. Failed, executing or interrupted operations mean unavailable
+pending later reconciliation, not safe to retry. A stopped/started observation
+or srv reboot alone is insufficient: downstream runner work is not durably bound
+to the ingress request at every crash boundary. Stop/start remain fenced, and
+the dispatcher refuses delete while either is uncertain.
+
+Bootstrap has a narrower recovery protocol. Before sending credentials the
+dispatcher fsyncs its next generation and request ID. srv atomically consumes a
+strictly increasing generation for the exact UUID/creation timestamp, together
+with request admission. It holds the instance lock through the vsock exchange.
+A new spawn may supersede an uncertain bootstrap with a **higher** generation;
+an equal generation never executes again. Lower/missing/inconsistent provider
+or backend counters fail closed, rather than catching up or resetting.
+Pause remains refused while bootstrap is uncertain. Receipt-based deletion is
+allowed without an intervening spawn, provided the normal cleanup proof succeeds.
+
+The guest serializes generation check, consumption and effects with a lock in
+`/run/srv-orb`. It first records `executing`, installs `KillMode=control-group`,
+synchronously stops any old unit/job with systemd's replace job mode, and checks
+inactive state, no queued job and an empty cgroup. A completed forced kill may
+leave systemd's unit in failed state; only after checking no processes remain is
+that bookkeeping cleared and inactive state checked again. Only then does it
+write the new environment, start the unit, verify active, unlink the environment
+file, record `done` and acknowledge the exact generation. Consuming a generation
+is never reported as success. The acknowledgment certifies the old unit's
+processes are gone and the replacement exec is active with new credentials;
+**it does not certify Amp registration**.
+
+The journal survives agent restarts within a guest boot and is never part of
+disk templates. A guest reboot starts a new Firecracker process, discarding the
+old guest's vsock/backlog and unit processes; srv's durable high-water excludes
+older host-queued requests. This argument depends on that runtime boundary, not
+on arbitrary state rollback. Deleting all `/run` journal state within a live
+guest, restoring coherent old copies of all stores, or cloning backend host keys
+is outside the supported recovery model. Preserve state and distinct host keys.
+Partial journal loss refuses initialization. No reset/adoption command exists.
+Old guests without the echoed generation acknowledgment are rejected.
+
+### Authoritative native-Orb deletion
+
+`delete-proof REQUEST NAME UUID CREATED_AT BACKEND_ID IMAGE` is native-Orb-only;
+ordinary VM deletion is unchanged. `cleanup-receipt REQUEST` reads the stored
+v2 result without invoking deletion. Both require an explicit `--host` through
+srv-front. A failed or lost delete reply is queried by that same request ID,
+never retried with another ID and never downgraded to plain `delete`.
+
+The backend fences ingress, then asks the VM runner to prove runtime/jailer/
+cgroup absence. The exact recorded start receipt must be closed, and the runner
+scans the entire name's receipt journal for corrupt identities or nonclosed
+attempts. It checks for no live VM with that name, no jailer workspace or runtime
+socket, and no delegated cgroup. This is name-scoped proof, not a separate
+UUID-bound enumeration of every historical runtime path. Nethelper proves
+network absence only. Missing/older helper endpoints and unreadable resources fail
+closed. It removes and fsyncs instance storage, checks backups and local data
+snapshots, and atomically commits the receipt, deleted tombstone and release of
+the cleanup fence. Failed cleanup remains charged by the existing srv capacity
+accounting. There is no added scheduler or independent slot counter.
+
+`never-minted` is derived only for native Orbs with no enrollment-key row and no
+node ID. It says nothing about project-managed Tailscale or external copies.
+Sorted source-UUID-matched project templates are explicitly retained in the
+receipt, never erased or called absent. Local data snapshots containing source
+disks, backups or template copies block proof; they need a separate retention
+decision. Receipt/request records survive name reuse. An uncertain bootstrap
+can be deleted through this path: the runtime proof closes the guest work and
+the backend tombstone prevents late host admission. Uncertain start/stop cannot.
 
 Do not manually migrate, delete/recreate or reuse managed orb names. A missing
 managed disk causes spawn to fail rather than creating an empty replacement.
@@ -320,9 +435,20 @@ Before relying on this provider, create a disposable Amp thread and verify:
 7. Under the configured service identity, verify foreign users' VMs are invisible
    and admin commands are rejected, both directly and through srv-front.
 
-Local automated checks: `go test ./cmd/srv-orb-dispatch`. These use a subprocess
-SSH stand-in, not Firecracker or the Amp service, and do not prove guest bootstrap
-or Tunnel interoperability. Provision tests additionally check real temporary
+Local automated checks:
+
+```bash
+go test ./cmd/srv-orb-dispatch ./internal/store ./internal/service ./internal/provision ./internal/front ./internal/vmrunner ./internal/nethelper ./internal/orbguest
+python3 -m unittest discover -s contrib/amp/orbs -p 'test_*.py'
+# Disposable root/systemd environment only; unique temporary unit, synthetic token:
+sudo python3 contrib/amp/orbs/probe_guest_systemd.py
+```
+
+The Go dispatch tests use a subprocess SSH stand-in, not Firecracker or Amp.
+The root probe exercises the real guest handler, systemd jobs, token-holding
+descendants and environment lifecycle over a socketpair, not real vsock. Neither
+proves Amp/Tunnel interoperability or the guest-reset runtime boundary.
+Provision tests additionally check real temporary
 ext4 images, identity cleanup, retained settings/skills, immutable templates and
 cancellation. Actual Amp setup-skipping still requires the live cycle above;
 its internal completion-marker format is not a documented provider contract.

@@ -6,6 +6,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/python3 /usr/local/lib/srv/orb-guest.py --initialize
 ExecStartPre=/usr/bin/python3 /usr/local/lib/srv/orb-guest.py --network
 ExecStart=/usr/bin/python3 /usr/local/lib/srv/orb-guest.py
 Restart=on-failure

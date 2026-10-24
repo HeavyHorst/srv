@@ -34,7 +34,7 @@ func serve(t *testing.T, fn func(net.Conn)) string {
 func TestProtocol(t *testing.T) {
 	for _, action := range []string{"ping", "bootstrap"} {
 		t.Run(action, func(t *testing.T) {
-			requests := make(chan map[string]string, 1)
+			requests := make(chan map[string]any, 1)
 			path := serve(t, func(c net.Conn) {
 				r := bufio.NewReader(c)
 				line, _ := r.ReadString('\n')
@@ -44,18 +44,18 @@ func TestProtocol(t *testing.T) {
 				}
 				fmt.Fprint(c, "OK 1234\n")
 				line, _ = r.ReadString('\n')
-				var req map[string]string
+				var req map[string]any
 				if err := json.Unmarshal([]byte(line), &req); err != nil {
 					t.Error(err)
 				}
 				requests <- req
-				fmt.Fprint(c, "{\"ok\":true}\n")
+				fmt.Fprint(c, "{\"ok\":true,\"generation\":7}\n")
 			})
 			var err error
 			if action == "ping" {
 				err = Ping(context.Background(), path)
 			} else {
-				err = Bootstrap(context.Background(), path, Request{Token: "fresh-secret", AMPURL: "https://ampcode.com", Proxy: "http://proxy"})
+				err = Bootstrap(context.Background(), path, Request{Token: "fresh-secret", AMPURL: "https://ampcode.com", Proxy: "http://proxy", Generation: 7})
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -87,8 +87,26 @@ func TestRejectResponses(t *testing.T) {
 			t.Fatalf("unsafe result: %v", err)
 		}
 	}
-	if err := Bootstrap(context.Background(), "unused", Request{Token: strings.Repeat("x", MaxMessage)}); err == nil {
-		t.Fatal("oversized request accepted")
+	if err := Bootstrap(context.Background(), "unused", Request{Token: strings.Repeat("x", MaxMessage), Generation: 1}); err == nil || err.Error() != "invalid orb request" {
+		t.Fatalf("oversized request validation: %v", err)
+	}
+}
+
+func TestRejectGenerationAcknowledgment(t *testing.T) {
+	for _, response := range []string{`{"ok":true}`, `{"ok":true,"generation":6}`, `{"ok":true,"generation":8}`} {
+		t.Run(response, func(t *testing.T) {
+			path := serve(t, func(c net.Conn) {
+				r := bufio.NewReader(c)
+				r.ReadString('\n')
+				fmt.Fprint(c, "OK 1\n")
+				r.ReadString('\n')
+				fmt.Fprintln(c, response)
+			})
+			err := Bootstrap(context.Background(), path, Request{Token: "fresh-secret", Generation: 7})
+			if err == nil || err.Error() != "orb guest generation acknowledgment mismatch" {
+				t.Fatalf("generation acknowledgment validation: %v", err)
+			}
+		})
 	}
 }
 

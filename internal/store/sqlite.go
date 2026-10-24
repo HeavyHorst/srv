@@ -54,7 +54,12 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 
 func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 	normalizeInstanceMemory(&inst)
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO instances (
 			id, name, state, created_at, updated_at, created_by_user, created_by_node,
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
@@ -97,7 +102,14 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 	if err != nil {
 		return fmt.Errorf("insert instance: %w", err)
 	}
-	return nil
+	if inst.KindName() == model.KindOrb {
+		// Import can retain a UUID. Never reset its retained high-water mark;
+		// managed operations separately refuse import/migration history.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO orb_bootstrap(instance_id,created_at,generation) VALUES(?,?,0) ON CONFLICT(instance_id) DO NOTHING`, inst.ID, timeString(inst.CreatedAt)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpdateInstance(ctx context.Context, inst model.Instance) error {
@@ -573,6 +585,12 @@ func (s *Store) ListInstanceIntegrations(ctx context.Context, instanceID string)
 func (s *Store) migrate(ctx context.Context) error {
 	stmts := []string{
 		`PRAGMA journal_mode = WAL;`,
+		`PRAGMA synchronous = FULL;`,
+		`CREATE TABLE IF NOT EXISTS lifecycle_requests (id TEXT PRIMARY KEY, actor TEXT NOT NULL, command TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL, phase TEXT NOT NULL, exit_code INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);`,
+		`CREATE TABLE IF NOT EXISTS enrollment_keys (instance_id TEXT PRIMARY KEY, key_id TEXT NOT NULL);`,
+		`CREATE TABLE IF NOT EXISTS cleanup_receipts (request_id TEXT PRIMARY KEY REFERENCES lifecycle_requests(id), actor TEXT NOT NULL, receipt TEXT NOT NULL);`,
+		`CREATE TABLE IF NOT EXISTS cleanup_fences (instance_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_requests(id));`,
+		`CREATE TABLE IF NOT EXISTS orb_bootstrap (instance_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, generation INTEGER NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS migrations (instance_id TEXT PRIMARY KEY, token TEXT NOT NULL, target TEXT NOT NULL, was_running INTEGER NOT NULL, phase TEXT NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS import_receipts (instance_id TEXT PRIMARY KEY, token TEXT NOT NULL DEFAULT '', source_instance_id TEXT NOT NULL, exported_at TEXT NOT NULL, phase TEXT NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS instances (

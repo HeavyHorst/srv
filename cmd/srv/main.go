@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"golang.org/x/sys/unix"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -14,6 +15,10 @@ import (
 )
 
 func main() {
+	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+		slog.Error("disable core dumps", "err", err)
+		os.Exit(1)
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("load config", "err", err)

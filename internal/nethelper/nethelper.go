@@ -144,6 +144,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/network/setup", s.handleSetup)
 	mux.HandleFunc("/network/cleanup", s.handleCleanup)
+	mux.HandleFunc("/network/cleanup-proof-v1", s.handleCleanupProof)
 	return mux
 }
 

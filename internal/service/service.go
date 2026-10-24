@@ -62,6 +62,7 @@ type App struct {
 	mu                 sync.Mutex
 	lockMu             sync.Mutex
 	locks              map[string]*instanceLockEntry
+	backendID          string
 }
 
 type instanceLockEntry struct {
@@ -116,37 +117,41 @@ type inspectResponseJSON struct {
 }
 
 type inspectInstanceJSON struct {
-	Name              string          `json:"name"`
-	Kind              string          `json:"kind"`
-	Image             string          `json:"image"`
-	State             string          `json:"state"`
-	MigrationPhase    string          `json:"migration_phase,omitempty"`
-	MigrationTarget   string          `json:"migration_target,omitempty"`
-	CreatedByUser     string          `json:"created_by_user,omitempty"`
-	CreatedByNode     string          `json:"created_by_node,omitempty"`
-	CreatedAt         time.Time       `json:"created_at"`
-	UpdatedAt         time.Time       `json:"updated_at"`
-	VCPUCount         int64           `json:"vcpu_count,omitempty"`
-	MemoryMiB         int64           `json:"memory_mib,omitempty"`
-	MemoryMode        string          `json:"memory_mode,omitempty"`
-	MemoryPool        string          `json:"memory_pool,omitempty"`
-	HostReservation   string          `json:"host_reservation,omitempty"`
-	RootFSPath        string          `json:"rootfs_path"`
-	RootFSSizeBytes   int64           `json:"rootfs_size_bytes,omitempty"`
-	FirecrackerPID    int             `json:"firecracker_pid"`
-	TapDevice         string          `json:"tap_device,omitempty"`
-	NetworkCIDR       string          `json:"network_cidr,omitempty"`
-	HostIP            string          `json:"host_ip,omitempty"`
-	GuestIP           string          `json:"guest_ip,omitempty"`
-	ZenGateway        string          `json:"zen_gateway,omitempty"`
-	AmpConnectGateway string          `json:"amp_connect_gateway,omitempty"`
-	DeepSeekGateway   string          `json:"deepseek_gateway,omitempty"`
-	TailscaleName     string          `json:"tailscale_name,omitempty"`
-	TailscaleIP       string          `json:"tailscale_ip,omitempty"`
-	LastError         string          `json:"last_error,omitempty"`
-	DeletedAt         *time.Time      `json:"deleted_at,omitempty"`
-	Logs              inspectLogsJSON `json:"logs"`
-	DebugHint         string          `json:"debug_hint,omitempty"`
+	ID                  string          `json:"id"`
+	BackendID           string          `json:"backend_id"`
+	ImportPhase         string          `json:"import_phase,omitempty"`
+	BootstrapGeneration *int64          `json:"bootstrap_generation,omitempty"`
+	Name                string          `json:"name"`
+	Kind                string          `json:"kind"`
+	Image               string          `json:"image"`
+	State               string          `json:"state"`
+	MigrationPhase      string          `json:"migration_phase,omitempty"`
+	MigrationTarget     string          `json:"migration_target,omitempty"`
+	CreatedByUser       string          `json:"created_by_user,omitempty"`
+	CreatedByNode       string          `json:"created_by_node,omitempty"`
+	CreatedAt           time.Time       `json:"created_at"`
+	UpdatedAt           time.Time       `json:"updated_at"`
+	VCPUCount           int64           `json:"vcpu_count,omitempty"`
+	MemoryMiB           int64           `json:"memory_mib,omitempty"`
+	MemoryMode          string          `json:"memory_mode,omitempty"`
+	MemoryPool          string          `json:"memory_pool,omitempty"`
+	HostReservation     string          `json:"host_reservation,omitempty"`
+	RootFSPath          string          `json:"rootfs_path"`
+	RootFSSizeBytes     int64           `json:"rootfs_size_bytes,omitempty"`
+	FirecrackerPID      int             `json:"firecracker_pid"`
+	TapDevice           string          `json:"tap_device,omitempty"`
+	NetworkCIDR         string          `json:"network_cidr,omitempty"`
+	HostIP              string          `json:"host_ip,omitempty"`
+	GuestIP             string          `json:"guest_ip,omitempty"`
+	ZenGateway          string          `json:"zen_gateway,omitempty"`
+	AmpConnectGateway   string          `json:"amp_connect_gateway,omitempty"`
+	DeepSeekGateway     string          `json:"deepseek_gateway,omitempty"`
+	TailscaleName       string          `json:"tailscale_name,omitempty"`
+	TailscaleIP         string          `json:"tailscale_ip,omitempty"`
+	LastError           string          `json:"last_error,omitempty"`
+	DeletedAt           *time.Time      `json:"deleted_at,omitempty"`
+	Logs                inspectLogsJSON `json:"logs"`
+	DebugHint           string          `json:"debug_hint,omitempty"`
 }
 
 type inspectLogsJSON struct {
@@ -374,6 +379,8 @@ func (a *App) inspectPayload(inst model.Instance, poolName string, integrations 
 	}
 	payload := inspectResponseJSON{
 		Instance: inspectInstanceJSON{
+			ID:                inst.ID,
+			BackendID:         a.backendID,
 			Name:              inst.Name,
 			Kind:              inst.KindName(),
 			Image:             inst.ImageName(),
@@ -500,11 +507,15 @@ func (a *App) Run(ctx context.Context) error {
 			a.log.Error("close store", "err", err)
 		}
 	}()
+	if err := a.store.InterruptLifecycleRequests(ctx); err != nil {
+		return fmt.Errorf("fence interrupted lifecycle requests: %w", err)
+	}
 
 	hostSigner, err := ensureHostSigner(a.cfg.HostKeyPath())
 	if err != nil {
 		return fmt.Errorf("ensure host signer: %w", err)
 	}
+	a.backendID = ssh.FingerprintSHA256(hostSigner.PublicKey())
 	a.log.Info("ssh host key", "public_key", strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostSigner.PublicKey()))))
 
 	a.tailscale = &tsnet.Server{
@@ -856,6 +867,12 @@ func (a *App) handleSession(sess gssh.Session) {
 
 func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandRequest) (commandResult, error) {
 	switch req.args[0] {
+	case "delete-proof":
+		return a.cmdDeleteProof(ctx, actor, req.args)
+	case "cleanup-receipt":
+		return a.cmdCleanupReceipt(ctx, actor, req.args)
+	case "operation-result", "operation-cancel":
+		return a.cmdOperationResult(ctx, actor, req.args)
 	case "project-template":
 		return a.cmdProjectTemplate(ctx, actor, req.args)
 	case "placement", "import-placement":
@@ -1285,6 +1302,20 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	if outFormat == outputFormatJSON {
 		payload := a.inspectPayload(inst, poolName, integrations, events)
 		payload.Instance.MigrationPhase, payload.Instance.MigrationTarget = migration.Phase, migration.Target
+		imported, err := a.store.GetImportReceipt(ctx, inst.ID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return cleanupError(err)
+		}
+		payload.Instance.ImportPhase = imported.Phase
+		if inst.KindName() == model.KindOrb {
+			generation, err := a.store.BootstrapGeneration(ctx, inst.ID, inst.CreatedAt)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return cleanupError(err)
+			}
+			if err == nil {
+				payload.Instance.BootstrapGeneration = &generation
+			}
+		}
 		return jsonResult(payload)
 	}
 
@@ -2946,7 +2977,7 @@ func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string, 
 }
 
 func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
-	if len(args) != 2 {
+	if len(args) != 2 && len(args) != 8 {
 		err := errors.New("usage: start <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
@@ -2957,8 +2988,12 @@ func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, ou
 		a.syncManagedGatewaysBestEffort()
 	}()
 
-	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
+	current, err := a.lookupVisibleInstance(ctx, actor, args[1])
+	if err != nil {
 		return missingInstanceResult("start", args[1], err)
+	}
+	if err := a.beginOrbOperation(ctx, actor, current, "start", args[2:]); err != nil {
+		return cleanupError(err)
 	}
 
 	inst, err := a.provisioner.Start(ctx, args[1])
@@ -2969,6 +3004,9 @@ func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, ou
 		}
 		return commandResult{stderr: stderr, exitCode: 1}, err
 	}
+	if err := a.finishOrbOperation(ctx, actor, args[2:]); err != nil {
+		return cleanupError(err)
+	}
 	if outFormat == outputFormatJSON {
 		return jsonResult(commandActionJSON{Action: "started", Instance: instanceSummaryPayload(a.cfg, inst, true)})
 	}
@@ -2976,7 +3014,7 @@ func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, ou
 }
 
 func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
-	if len(args) != 2 {
+	if len(args) != 2 && len(args) != 8 {
 		err := errors.New("usage: stop <name>")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
@@ -2987,8 +3025,12 @@ func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string, out
 		a.syncManagedGatewaysBestEffort()
 	}()
 
-	if _, err := a.lookupVisibleInstance(ctx, actor, args[1]); err != nil {
+	current, err := a.lookupVisibleInstance(ctx, actor, args[1])
+	if err != nil {
 		return missingInstanceResult("stop", args[1], err)
+	}
+	if err := a.beginOrbOperation(ctx, actor, current, "stop", args[2:]); err != nil {
+		return cleanupError(err)
 	}
 
 	inst, err := a.provisioner.Stop(ctx, args[1])
@@ -2997,6 +3039,9 @@ func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string, out
 			err = fmt.Errorf("instance %q does not exist", args[1])
 		}
 		return commandResult{stderr: fmt.Sprintf("stop %s: %v\n", args[1], err), exitCode: 1}, err
+	}
+	if err := a.finishOrbOperation(ctx, actor, args[2:]); err != nil {
+		return cleanupError(err)
 	}
 	if outFormat == outputFormatJSON {
 		return jsonResult(commandActionJSON{Action: "stopped", Instance: instanceSummaryPayload(a.cfg, inst, false)})

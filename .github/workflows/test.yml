@@ -1,0 +1,111 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./... -count=1 -coverprofile=coverage.out
+
+      - name: Report coverage
+        run: go tool cover -func=coverage.out | tail -1
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # cmd/srv-orb-dispatch re-execs the race-instrumented test binary for every
+      # fake SSH call. The race runtime's default atexit sleep dominates that
+      # harness, so disable it and keep the package in the full race run.
+      - name: Race
+        env:
+          GORACE: atexit_sleep_ms=0
+        run: go test -race -count=1 -timeout=15m ./...
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: ./internal/provision
+            target: FuzzPortableManifestValidate
+          - package: ./internal/provision
+            target: FuzzReadPortableManifest
+          - package: ./internal/nethelper
+            target: FuzzSetupHandler
+          - package: ./internal/storage
+            target: FuzzParseMountInfoLine
+          - package: ./internal/storage
+            target: FuzzUnescapeMountInfoValue
+          - package: ./internal/service
+            target: FuzzIntegrationGatewayPath
+          - package: ./internal/service
+            target: FuzzParseImportOptions
+          - package: ./internal/config
+            target: FuzzParseProviderBaseURL
+          - package: ./internal/vmrunner
+            target: FuzzStartResultValidate
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Fuzz ${{ matrix.target }}
+        run: go test -run='^$' -fuzz='^${{ matrix.target }}$' -fuzztime=20s ${{ matrix.package }}
+
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Mutation audit
+        run: python3 test/mutation_audit.py

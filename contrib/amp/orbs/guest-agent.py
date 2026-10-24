@@ -15,9 +15,12 @@ MAX_MESSAGE = 65536
 RUNTIME = Path("/run/srv-orb")
 UNIT = Path("/run/systemd/system/srv-orb-bootstrap.service")
 UNIT_NAME = UNIT.name
+# Not ordered after network-online.target: the host only bootstraps after this
+# agent answers, and the agent starts after its --network step configured the
+# kernel-provided address, routes and DNS. Images may still pull in a
+# wait-online that can stall far longer than the host's bootstrap exchange.
 BOOTSTRAP_UNIT = """[Unit]
 Description=Amp orb bootstrap
-After=network-online.target
 [Service]
 Type=exec
 User=user

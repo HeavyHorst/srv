@@ -92,6 +92,15 @@ Orb builds omit Tailscale and mask native srv enrollment; ordinary image builds
 retain their existing boot and enrollment behavior. Use an Orb-enabled kernel
 with built-in virtio-vsock support and rebuild older Orb images for this transport.
 
+Both image builders include Docker and Compose v2; the supported command is
+`docker compose`. Amp runs as `user` with passwordless sudo, not as root:
+use `sudo docker compose` for daemon operations with the default root-owned
+Docker socket. This is an access convention, not a privilege boundary against
+the agent, which already has sudo. No Docker-group grant or socket-mode change
+is required. Browser/test dependencies belong in the repository's `.agents/setup`.
+Podman, Nix and legacy Compose v1 are not interchangeable provider contracts;
+projects that need them must prepare and qualify those environments explicitly.
+
 Register the prepared kernel/rootfs as `amp-orb` in
 [`SRV_IMAGES_FILE`](../reference/configuration.md#guest-artifacts) on every
 eligible backend. Keep any existing catalog entries. Example additional entry:

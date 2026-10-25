@@ -12,6 +12,10 @@ WORK=""
 PACKAGES=(systemd-sysv systemd-resolved ca-certificates curl git jq tmux
   openssh-client iproute2 iptables kmod docker.io docker-cli containerd
   bash-completion less procps iputils-ping)
+# Also works with Debian 12's Docker 20.10 when adapting this builder to bookworm.
+# Keep the version and upstream linux/amd64 checksum together when updating.
+COMPOSE_VERSION=2.24.7
+COMPOSE_SHA256=19c9deb6f4d3915f5c93441b8d2da751a09af82df62d55eab097c2cbfebd519f
 
 die() { echo "$*" >&2; exit 1; }
 cleanup() {
@@ -63,6 +67,14 @@ mount --rbind /dev "$ROOT/dev"
 mount --make-rslave "$ROOT/dev"
 chroot "$ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
 chroot "$ROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PACKAGES[@]}"
+# Install the CLI plugin system-wide so root and Amp's user discover the same
+# version. Debian 12's docker-compose package is the incompatible Python v1 CLI.
+curl -fsSL --retry 3 \
+  "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+  -o "$WORK/docker-compose"
+printf '%s  %s\n' "$COMPOSE_SHA256" "$WORK/docker-compose" | sha256sum -c -
+install -D -m 0755 "$WORK/docker-compose" "$ROOT/usr/local/lib/docker/cli-plugins/docker-compose"
+[[ $(chroot "$ROOT" docker compose version --short) == "$COMPOSE_VERSION" ]] || die 'Docker Compose plugin validation failed'
 if [[ "${SRV_AMP_ORB:-0}" != 1 ]]; then
 install -d "$ROOT/usr/share/keyrings" "$ROOT/etc/apt/sources.list.d"
 curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
@@ -127,6 +139,8 @@ cp "$KERNEL_IMAGE" "$WORK/vmlinux"
   echo "kernel_release=$KERNEL_RELEASE"
   echo "debian_mirror=$DEBIAN_MIRROR"
   echo "rootfs_size=$ROOTFS_SIZE"
+  echo "docker_compose_version=$COMPOSE_VERSION"
+  echo "docker_compose_sha256=$COMPOSE_SHA256"
   if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
     echo 'srv_amp_orb=1'
   fi

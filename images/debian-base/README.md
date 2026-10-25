@@ -6,12 +6,21 @@ Builds a native **amd64 Debian 13 (trixie)** ext4 development guest with
 versions). No partition table, bootloader or initramfs is needed.
 
 This is intentionally smaller in scope than Arch: systemd, systemd-resolved,
-Tailscale, Docker (Debian's docker.io/docker-cli), git, curl, jq, tmux,
+Tailscale, Docker (Debian's docker.io/docker-cli), Compose v2, git, curl, jq, tmux,
 openssh-client, iproute2, iptables, kmod and basic shell utilities. It does **not**
 include Arch's language toolchains, editors, Chromium, agent-browser, Pi or
 OpenCode. Install project-specific tools with apt or `.agents/setup`; the Amp
 runner installs Amp separately unless you opt into native Amp orb preparation
 below. SSH access uses Tailscale SSH, not an sshd.
+
+Compose is the checksum-pinned upstream linux/amd64 **v2.24.7 CLI plugin** at
+`/usr/local/lib/docker/cli-plugins/docker-compose`; use `docker compose`, not the
+legacy Python `docker-compose` command. This version was qualified with Debian
+12's Docker 20.10 in the deployed bookworm adaptation; pinning it keeps that
+adaptation from accidentally installing Debian 12's v1 package. The default
+builder still targets Debian 13. Update the version and checksum together after
+compatibility testing. The build checks plugin discovery without starting a
+daemon and records its version/checksum in `manifest.txt`.
 
 ## Host requirements
 
@@ -20,7 +29,8 @@ and mount privileges (CAP_SYS_ADMIN). An unprivileged container is insufficient;
 a container must be privileged and have working mount propagation. Build only
 trusted inputs: package maintainer scripts execute as root in a chroot, which
 is not a security boundary. Allow several GB of staging space in addition to
-the sparse image, and network access to Debian and pkgs.tailscale.com.
+the sparse image, and network access to Debian, pkgs.tailscale.com, GitHub and
+its release-asset redirects.
 
 On Debian 12/13 or Ubuntu:
 

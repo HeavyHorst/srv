@@ -15,6 +15,7 @@ MAX_MESSAGE = 65536
 RUNTIME = Path("/run/srv-orb")
 UNIT = Path("/run/systemd/system/srv-orb-bootstrap.service")
 UNIT_NAME = UNIT.name
+NO_PROXY_BASE = "localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10,.ts.net"
 # Not ordered after network-online.target: the host only bootstraps after this
 # agent answers, and the agent starts after its --network step configured the
 # kernel-provided address, routes and DNS. Images may still pull in a
@@ -126,12 +127,17 @@ def bootstrap(request):
 
 
 def apply_bootstrap(request):
+    # Guest-local destinations never use the gateway. proxy_bypass is the
+    # provider's list of extra direct-connect destinations — hostnames, IPv4
+    # literals, or leading-dot DNS suffixes, validated entry by entry in
+    # handle() before any generation is consumed — and is only ever appended
+    # to the built-in entries.
+    extra = request.get("proxy_bypass", "")
     values = {"ORB_TOKEN": request["token"],
               "AMP_URL": request.get("amp_url") or "https://ampcode.com",
               "HTTPS_PROXY": request.get("proxy", ""),
               "HTTP_PROXY": request.get("proxy", ""),
-              # Tailscale CIDRs only match IP literals; MagicDNS names need the suffix.
-              "NO_PROXY": "localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10,.ts.net"}
+              "NO_PROXY": NO_PROXY_BASE + ("," + extra if extra else "")}
     if not values["ORB_TOKEN"] or any(not isinstance(v, str) or
             any(c in v for c in "\r\n\x00") for v in values.values()):
         raise ValueError("invalid credentials")
@@ -192,7 +198,11 @@ def handle(conn, peer_cid):
         action = request.get("action")
         if action == "ping" and set(request) == {"action"}:
             pass
-        elif action == "bootstrap" and set(request) <= {"action", "token", "amp_url", "proxy", "generation"}:
+        elif action == "bootstrap" and set(request) <= {"action", "token", "amp_url", "proxy", "generation", "proxy_bypass"}:
+            # Validate before bootstrap(): an invalid destination must be
+            # rejected like an unknown key, without consuming a generation.
+            if not valid_proxy_bypass(request.get("proxy_bypass", "")):
+                raise ValueError("invalid proxy bypass")
             bootstrap(request)
         else:
             raise ValueError("unsupported action")
@@ -206,6 +216,59 @@ def handle(conn, peer_cid):
         conn.sendall(response)
     except OSError:
         pass
+
+
+def valid_proxy_bypass(value):
+    # The provider's optional destination list, re-validated here because
+    # dispatcher validation is not the trust boundary: one to eight
+    # comma-separated entries, at most 512 characters joined, no whitespace,
+    # empty entries, duplicates, or built-in repeats. Each entry is a
+    # hostname, IPv4 literal, or leading-dot DNS suffix with an optional
+    # trailing dot kept verbatim — it only matches clients that compare the
+    # same form. CIDR and IPv6 stay out: NO_PROXY handling differs between
+    # HTTP clients. A matching contract, not a DNS linter or policy framework.
+    if value == "":
+        return True
+    if (not isinstance(value, str) or len(value) > 512 or not value.isascii()
+            or any(c.isspace() or c in "\x00'\"\\\\" for c in value)):
+        return False
+    seen = set()
+    entries = value.split(",")
+    if len(entries) > 8:
+        return False
+    for entry in entries:
+        if (not entry or entry in NO_PROXY_BASE.split(",") or entry in seen
+                or not valid_bypass_entry(entry)):
+            return False
+        seen.add(entry)
+    return True
+
+
+def valid_bypass_entry(entry):
+    # One entry: hostname, IPv4 literal, or leading-dot DNS suffix; an
+    # optional single trailing dot is the valid FQDN form, kept verbatim.
+    # Junk without an alphanumeric is rejected; label characters are letters,
+    # digits, hyphens and underscores.
+    if len(entry) > 253:
+        return False
+    name = entry[1:] if entry.startswith(".") else entry
+    if not name:
+        return False
+    labels = name.split(".")
+    if labels[-1] == "":
+        labels = labels[:-1]
+    if not labels:
+        return False
+    alphanumeric = False
+    for label in labels:
+        if not label or len(label) > 63:
+            return False
+        for c in label:
+            if c.isalnum():
+                alphanumeric = True
+            elif c not in "-_":
+                return False
+    return alphanumeric
 
 
 def network():

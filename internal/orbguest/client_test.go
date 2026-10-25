@@ -92,6 +92,39 @@ func TestRejectResponses(t *testing.T) {
 	}
 }
 
+func TestBootstrapProxyBypassField(t *testing.T) {
+	// The field is optional on the wire: omitted when empty so older guest
+	// images that reject unknown bootstrap keys still accept the request.
+	for _, value := range []string{"", ".corp.example"} {
+		requests := make(chan map[string]any, 1)
+		path := serve(t, func(c net.Conn) {
+			r := bufio.NewReader(c)
+			line, _ := r.ReadString('\n')
+			if line != "CONNECT 4050\n" {
+				t.Errorf("handshake = %q", line)
+				return
+			}
+			fmt.Fprint(c, "OK 1234\n")
+			line, _ = r.ReadString('\n')
+			var req map[string]any
+			if err := json.Unmarshal([]byte(line), &req); err != nil {
+				t.Error(err)
+			}
+			requests <- req
+			fmt.Fprint(c, "{\"ok\":true,\"generation\":7}\n")
+		})
+		err := Bootstrap(context.Background(), path, Request{Token: "fresh-secret", Generation: 7, ProxyBypass: value})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := <-requests
+		_, present := req["proxy_bypass"]
+		if present != (value != "") {
+			t.Fatalf("proxy_bypass presence = %v for %q", present, value)
+		}
+	}
+}
+
 func TestRejectGenerationAcknowledgment(t *testing.T) {
 	for _, response := range []string{`{"ok":true}`, `{"ok":true,"generation":6}`, `{"ok":true,"generation":8}`} {
 		t.Run(response, func(t *testing.T) {

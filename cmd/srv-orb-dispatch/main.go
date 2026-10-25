@@ -108,6 +108,102 @@ func envDefault(key, fallback string) string {
 	return fallback
 }
 
+// SRV_ORB_PROXY_BYPASS names the provider-owned destinations appended to the
+// guest's built-in NO_PROXY list. It is read and validated only here, inside
+// the bootstrap payload builder, and travels only in that payload: never in
+// SSH argv, state records, logs, or the SSH child environment. Unset omits
+// the field entirely, keeping the payload compatible with older srv backends
+// and guest images; an empty value is a configuration error, not "unset".
+// The value is a bounded list: one to eight comma-separated entries, at most
+// 512 characters joined, each a hostname, an IPv4 literal, or a leading-dot
+// DNS suffix with an optional trailing dot (FQDN form) kept verbatim. Empty
+// entries, duplicates, built-in repeats, whitespace, CIDR and IPv6 forms are
+// rejected: NO_PROXY handling differs between HTTP clients, so this is a
+// matching contract, not a DNS-name linter or a policy framework.
+func proxyBypass() (string, error) {
+	value, configured := os.LookupEnv("SRV_ORB_PROXY_BYPASS")
+	if !configured {
+		return "", nil
+	}
+	if value == "" {
+		return "", errors.New("SRV_ORB_PROXY_BYPASS must not be empty; unset it to keep the built-in bypass list")
+	}
+	if err := validateProxyBypassList(value); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+// The guest's fixed bypass entries. Repeating one in the provider list cannot
+// disable it — appending only adds — but it is noise implying a second policy.
+var builtinNoProxyTokens = map[string]bool{
+	"localhost": true, "127.0.0.1": true, "::1": true,
+	"169.254.169.254": true, "100.64.0.0/10": true, ".ts.net": true,
+}
+
+func validateProxyBypassList(value string) error {
+	if len(value) > 512 {
+		return errors.New("SRV_ORB_PROXY_BYPASS must stay within 512 characters")
+	}
+	if strings.ContainsAny(value, " \t\r\n\x00'\"\\") {
+		return errors.New("SRV_ORB_PROXY_BYPASS entries must not contain whitespace, quotes, or backslashes")
+	}
+	entries := strings.Split(value, ",")
+	if len(entries) > 8 {
+		return errors.New("SRV_ORB_PROXY_BYPASS accepts at most 8 entries")
+	}
+	seen := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		switch {
+		case entry == "":
+			return errors.New("SRV_ORB_PROXY_BYPASS must not contain empty entries (leading, trailing, or doubled commas)")
+		case !validProxyBypass(entry):
+			return errors.New("SRV_ORB_PROXY_BYPASS entries must each be a hostname, IPv4 literal, or leading-dot DNS suffix (no CIDR, IPv6, wildcard, scheme, or port)")
+		case builtinNoProxyTokens[entry]:
+			return errors.New("SRV_ORB_PROXY_BYPASS must not repeat a built-in bypass entry")
+		case seen[entry]:
+			return errors.New("SRV_ORB_PROXY_BYPASS must not contain duplicate entries")
+		}
+		seen[entry] = true
+	}
+	return nil
+}
+
+func validProxyBypass(value string) bool {
+	if len(value) > 253 {
+		return false
+	}
+	name := strings.TrimPrefix(value, ".")
+	if name == "" {
+		return false
+	}
+	labels := strings.Split(name, ".")
+	if labels[len(labels)-1] == "" {
+		// A single trailing dot is the valid FQDN form; it is applied
+		// verbatim and only matches clients that compare the same form.
+		labels = labels[:len(labels)-1]
+	}
+	if len(labels) == 0 {
+		return false
+	}
+	alphanumeric := false
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		for _, c := range label {
+			switch {
+			case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+				alphanumeric = true
+			case c == '-', c == '_':
+			default:
+				return false
+			}
+		}
+	}
+	return alphanumeric
+}
+
 func dispatch(ctx context.Context, c config, j job) error {
 	if j.id == "" || (j.operation != "spawn" && j.operation != "pause" && j.operation != "delete" && j.operation != "bind" && j.operation != "cancel" && j.operation != "retire" && j.operation != "fresh-start") {
 		return errors.New("ORB_ID and ORB_OPERATION=spawn|pause|delete are required")
@@ -430,11 +526,22 @@ func dispatch(ctx context.Context, c config, j job) error {
 			if *r.BootstrapGeneration == int64(^uint64(0)>>1) {
 				return errors.New("bootstrap generation exhausted")
 			}
-			r.BootstrapFloor = *v.BootstrapGeneration
-			*r.BootstrapGeneration++
-			payload, err := json.Marshal(map[string]any{"token": j.token, "amp_url": j.ampURL, "proxy": v.Proxy, "generation": *r.BootstrapGeneration})
+			bypass, err := proxyBypass()
 			if err != nil {
 				return err
+			}
+			r.BootstrapFloor = *v.BootstrapGeneration
+			*r.BootstrapGeneration++
+			payload := map[string]any{"token": j.token, "amp_url": j.ampURL, "proxy": v.Proxy, "generation": *r.BootstrapGeneration}
+			if bypass != "" {
+				payload["proxy_bypass"] = bypass
+			}
+			data, err := json.Marshal(payload)
+			if err != nil {
+				return err
+			}
+			if len(data)+1 > 16384 {
+				return errors.New("orb bootstrap payload exceeds the backend request limit")
 			}
 			r.Pending, r.RequestID = "bootstrap", uuid.NewString()
 			if err := save(path, r); err != nil {
@@ -447,7 +554,7 @@ func dispatch(ctx context.Context, c config, j job) error {
 			for i := range args {
 				args[i] = quote(args[i])
 			}
-			if _, err := ssh(ctx, c, c.endpoint, strings.Join(args, " "), strings.NewReader(string(payload))); err != nil {
+			if _, err := ssh(ctx, c, c.endpoint, strings.Join(args, " "), strings.NewReader(string(data))); err != nil {
 				return errors.New("orb bootstrap failed; inspect the backend and guest bootstrap service")
 			}
 			return resolveOperation(ctx, c, path, &r)
@@ -512,7 +619,7 @@ func ssh(ctx context.Context, c config, destination, command string, input *stri
 	// Do not expose provider credentials to ssh (including SendEnv configurations).
 	for _, value := range os.Environ() {
 		key, _, _ := strings.Cut(value, "=")
-		if key != "AMP_ORB_PROVIDER_TOKEN" && key != "ORB_TOKEN" {
+		if key != "AMP_ORB_PROVIDER_TOKEN" && key != "ORB_TOKEN" && key != "SRV_ORB_PROXY_BYPASS" {
 			cmd.Env = append(cmd.Env, value)
 		}
 	}

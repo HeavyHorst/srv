@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -28,7 +30,10 @@ func (d *templateDisk) command(operation, path string) (string, error) {
 	if strings.ContainsAny(path, "\x00\r\n\"\\") {
 		return "", errors.New("unsupported escape or control character in cleanup path")
 	}
-	command := operation + " \"" + path + "\""
+	return d.run(operation + " \"" + path + "\"")
+}
+
+func (d *templateDisk) run(command string) (string, error) {
 	cmd := exec.CommandContext(d.ctx, "debugfs", "-w", "-R", command, d.path)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -140,6 +145,60 @@ func (d *templateDisk) clean(path string) error {
 	return nil
 }
 
+var emptyMachineIDStat = regexp.MustCompile(`(?s)Type: regular\s+Mode:\s+0444\b.*User:\s+0\s+Group:\s+0\b.*Size: 0\n`)
+
+// resetMachineID leaves /etc/machine-id as an empty, root-owned, read-only file.
+// A missing machine-id makes systemd treat the clone's boot as its first boot:
+// it applies the preset policy, which enables units such as
+// systemd-networkd-wait-online that stall boot past the orb bootstrap deadline.
+// An empty file still gets a fresh transient ID on every boot, so clones never
+// share the source's identity.
+func (d *templateDisk) resetMachineID() error {
+	entries, err := d.list("/")
+	if err != nil {
+		return err
+	}
+	hasEtc := false
+	for _, entry := range entries {
+		if entry.name == "etc" {
+			if entry.mode&0170000 != 0040000 {
+				return errors.New("unsafe non-directory /etc in template")
+			}
+			hasEtc = true
+		}
+	}
+	if !hasEtc {
+		return nil
+	}
+	empty, err := os.CreateTemp("", "srv-empty-machine-id-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(empty.Name())
+	if err := empty.Close(); err != nil {
+		return err
+	}
+	if strings.ContainsAny(empty.Name(), "\x00\r\n\"\\ ") {
+		return errors.New("unsupported temporary file path for debugfs")
+	}
+	if _, err := d.run("write " + empty.Name() + " \"/etc/machine-id\""); err != nil {
+		return err
+	}
+	for _, field := range []string{"uid 0", "gid 0", "mode 0100444"} {
+		if _, err := d.run("set_inode_field \"/etc/machine-id\" " + field); err != nil {
+			return err
+		}
+	}
+	out, err := d.command("stat", "/etc/machine-id")
+	if err != nil {
+		return err
+	}
+	if !emptyMachineIDStat.MatchString(out) {
+		return fmt.Errorf("machine-id reset verification failed: %s", out)
+	}
+	return nil
+}
+
 func sanitizeTemplateDisk(ctx context.Context, path string) error {
 	if err := runRootFSCheckContext(ctx, path, "check template filesystem before cleanup"); err != nil {
 		return err
@@ -159,6 +218,9 @@ func sanitizeTemplateDisk(ctx context.Context, path string) error {
 				return err
 			}
 		}
+	}
+	if err := d.resetMachineID(); err != nil {
+		return err
 	}
 	return runRootFSCheckContext(ctx, path, "check template filesystem after cleanup")
 }

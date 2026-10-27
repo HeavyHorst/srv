@@ -70,9 +70,9 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	inst := provisionTestInstance(cfg, "source", model.StateStopped, time.Now())
 	actor := model.Actor{UserLogin: inst.CreatedByUser}
-	removed := []string{"etc/machine-id", "var/lib/dbus/machine-id", "var/lib/tailscale/tailscaled.state", "var/lib/tailscale/ssh/ssh_host_ed25519_key", "var/lib/tailscale/My Notes Grüße", "var/lib/srv/bootstrap.done", "var/lib/systemd/random-seed", "root/.config/amp/secrets.json", "root/.local/share/amp/session.json", "home/user/.local/share/amp/device-id.json", "home/user/.local/share/amp/secrets.json"}
+	removed := []string{"var/lib/dbus/machine-id", "var/lib/tailscale/tailscaled.state", "var/lib/tailscale/ssh/ssh_host_ed25519_key", "var/lib/tailscale/My Notes Grüße", "var/lib/srv/bootstrap.done", "var/lib/systemd/random-seed", "root/.config/amp/secrets.json", "root/.local/share/amp/session.json", "home/user/.local/share/amp/device-id.json", "home/user/.local/share/amp/secrets.json"}
 	kept := []string{"home/user/.amp/bin/amp", "root/.amp/bin/amp", "home/user/.config/amp/settings.json", "home/user/.config/amp/skills/custom/SKILL.md", "home/user/.local/share/amp/prepared-state", "home/user/My Notes Grüße", "home/user/project/.agents/setup", "home/user/project/code.go", "etc/hostname"}
-	files := map[string]string{}
+	files := map[string]string{"etc/machine-id": "payload-etc/machine-id"}
 	for _, path := range append(removed, kept...) {
 		files[path] = "payload-" + path
 	}
@@ -99,6 +99,7 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 			t.Errorf("identity retained at %s: %s", path, out)
 		}
 	}
+	assertEmptyMachineID(t, disk)
 	for _, path := range kept {
 		out, err := exec.Command("debugfs", "-R", "cat \"/"+path+"\"", disk).Output()
 		if err != nil || string(out) != files[path] {
@@ -272,10 +273,7 @@ func TestCreateUsesOwnerTemplateWithFreshInstanceIdentity(t *testing.T) {
 			if err != nil || string(out) != "prepared" {
 				t.Fatalf("prepared project missing: %q %v", out, err)
 			}
-			out, _ = exec.Command("debugfs", "-R", "stat /etc/machine-id", dest).CombinedOutput()
-			if !strings.Contains(string(out), "File not found") {
-				t.Fatal("old machine identity cloned")
-			}
+			assertEmptyMachineID(t, dest)
 			return stop
 		}
 		return nil
@@ -336,5 +334,20 @@ func TestTemplateCancellationCleansStaging(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Dir(dir))
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("cancelled snapshot retained staging/publication: %v %v", entries, err)
+	}
+}
+
+// assertEmptyMachineID checks that a template-derived disk has an empty,
+// root-owned, read-only /etc/machine-id: no cloned identity, and no systemd
+// first-boot preset run (which a missing file triggers) on the clone.
+func assertEmptyMachineID(t *testing.T, disk string) {
+	t.Helper()
+	out, err := exec.Command("debugfs", "-R", "cat /etc/machine-id", disk).Output()
+	if err != nil || len(out) != 0 {
+		t.Fatalf("machine-id not empty: %q %v", out, err)
+	}
+	stat, _ := exec.Command("debugfs", "-R", "stat /etc/machine-id", disk).CombinedOutput()
+	if !emptyMachineIDStat.Match(stat) {
+		t.Fatalf("machine-id not an empty root-owned 0444 file: %s", stat)
 	}
 }

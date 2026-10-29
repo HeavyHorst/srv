@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 
 	"srv/internal/format"
 	"srv/internal/model"
+	"srv/internal/storage"
 	"srv/internal/vmrunner"
 )
 
@@ -27,6 +29,9 @@ func (p *Provisioner) Placement(ctx context.Context, name string, opts CreateOpt
 
 // ImportPlacement checks the incoming disk, not the destination rootfs template.
 // The local kernel/initrd must still exist; compatibility is operator-managed.
+// This preflight also fronts native transfers, but its inputs do not identify
+// incremental stream bytes. Estimate conservatively as a portable rootfs plus
+// both bounded logs; the receiver must still measure its actual write budget.
 func (p *Provisioner) ImportPlacement(ctx context.Context, name string, opts CreateOptions) Placement {
 	return p.placement(ctx, name, opts, true)
 }
@@ -110,14 +115,20 @@ func (p *Provisioner) placement(ctx context.Context, name string, opts CreateOpt
 				}
 				result.MemoryLeftMiB = left / format.MiB
 			case "disk":
-				left := resource.Left
-				if resource.Filesystem != nil {
-					left = min(left, resource.Filesystem.Available-resource.Reserve)
+				if resource.Filesystem == nil {
+					return errors.New("disk placement requires measured filesystem availability")
 				}
-				result.DiskLeftBytes = left - resolved.RootFSSizeBytes
-				if result.DiskLeftBytes < 0 {
-					return fmt.Errorf("insufficient available disk space for requested rootfs and host reserve")
+				var payload int64
+				if importing {
+					if resolved.RootFSSizeBytes > math.MaxInt64-2*portableLogMaxSize {
+						return errors.New("import disk payload estimate overflows")
+					}
+					payload = resolved.RootFSSizeBytes + 2*portableLogMaxSize
 				}
+				if err := storage.CheckAvailableSpace(resource.Filesystem.Available, payload); err != nil {
+					return err
+				}
+				result.DiskLeftBytes = resource.Left - payload
 			}
 		}
 		return nil

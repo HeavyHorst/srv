@@ -14,7 +14,8 @@ RuntimeDirectory=srv-vm-runner
 RuntimeDirectoryMode=0770
 UMask=0007
 ExecStart=/usr/local/bin/srv-vm-runner -socket /run/srv-vm-runner/vm-runner.sock -client-group srv
-ExecStop=/usr/local/bin/srv-vm-runner -drain-only -cgroup-root /system.slice/srv-vm-runner.service
+# Request cleanup in ExecStart's namespace, which owns the disk bind mounts.
+ExecStop=/usr/local/bin/srv-vm-runner -drain-only -socket /run/srv-vm-runner/vm-runner.sock
 # The jailer drops to the configured uid/gid and execs Firecracker itself.
 # NoNewPrivileges blocks that handoff on real hosts.
 PrivateTmp=yes

@@ -131,9 +131,9 @@ sudo ./contrib/systemd/install.sh --enable-now
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SRV_DATA_DIR` | `/var/lib/srv` | State directory on the same reflink-capable filesystem as `SRV_BASE_ROOTFS`, for example `btrfs` or reflink-enabled `xfs` |
+| `SRV_DATA_DIR` | `/var/lib/srv` | btrfs subvolume root on the same filesystem as every base rootfs image; requires `btrfs-progs` and `user_subvol_rm_allowed` |
 | `SRV_BASE_KERNEL` | - | Firecracker kernel path |
-| `SRV_BASE_ROOTFS` | - | Base rootfs image on the same reflink-capable filesystem as `SRV_DATA_DIR`, such as `btrfs` or reflink-enabled `xfs` |
+| `SRV_BASE_ROOTFS` | - | Base rootfs image on the same btrfs filesystem as `SRV_DATA_DIR` |
 | `SRV_BASE_INITRD` | - | Optional initrd |
 | `SRV_ALLOWED_USERS` | - | Comma-separated Tailscale allowlist |
 | `SRV_ADMIN_USERS` | - | Cross-instance admin access |
@@ -145,6 +145,11 @@ sudo ./contrib/systemd/install.sh --enable-now
 | `SRV_SECRET_*` | - | Host-managed integration secret values referenced by name from the SSH API |
 
 ## Backup & Restore
+
+Stop every VM and Orb first. Follow the [operations runbook](reference/operations.md#backup)
+for metadata and runner receipts: tar does not preserve subvolume boundaries or
+readonly properties, which must be restored before starting services. Prefer
+[host snapshot bundles](tasks/host-snapshots.md) for btrfs backup and restore.
 
 ```bash
 # Backup
@@ -179,7 +184,8 @@ cat /sys/fs/cgroup/firecracker-vms/<name>/memory.max
 
 ## Notes
 
-- VM disks at: `SRV_DATA_DIR/instances/<name>/rootfs.img`
+- VM and Orb disks at: `SRV_DATA_DIR/instances/<name>/disk/rootfs.img`, in a dedicated `disk` subvolume
+- Legacy stopped instances migrate automatically on start with a durable journal; non-btrfs hosts require an [offline storage migration](reference/operations.md#storage-layout-migration)
 - VM backups live at: `SRV_DATA_DIR/backups/<name>/<backup-id>/`
 - Resize requires a stopped VM; CPU and RAM can go up or down within limits, but rootfs shrink is rejected
 - Resize and fsck only work on stopped VMs

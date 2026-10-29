@@ -41,12 +41,17 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_VM_VCPUS", "2")
 	t.Setenv("SRV_VM_MEMORY_MIB", "2048")
 	t.Setenv("SRV_LOG_LEVEL", "debug")
+	t.Setenv("SRV_COLD_STORAGE_HOST", "storage.example")
+	t.Setenv("SRV_COLD_STORAGE_AFTER_STOP", "true")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load(): %v", err)
 	}
 
+	if cfg.ColdStorageHost != "storage.example" || !cfg.ColdStorageAfterStop {
+		t.Fatal("cold-storage environment configuration not loaded")
+	}
 	if cfg.Hostname != "control" {
 		t.Fatalf("Hostname = %q, want %q", cfg.Hostname, "control")
 	}

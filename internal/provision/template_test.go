@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"srv/internal/host"
 	"srv/internal/model"
+	"srv/internal/storage"
 	"tailscale.com/client/tailscale/v2"
 )
 
@@ -69,7 +71,7 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 			ctx := context.Background()
 			cfg := loadProvisionTestConfig(t, nil)
 			st := newProvisionTestStore(t, cfg)
-			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: noopVMRunner{}}
 			inst := provisionTestInstance(cfg, "source", model.StateStopped, time.Now())
 			actor := model.Actor{UserLogin: inst.CreatedByUser}
 			removed := []string{"var/lib/dbus/machine-id", "var/lib/tailscale/tailscaled.state", "var/lib/tailscale/ssh/ssh_host_ed25519_key", "var/lib/tailscale/My Notes Grüße", "var/lib/srv/bootstrap.done", "var/lib/systemd/random-seed", "root/.config/amp/secrets.json", "root/.local/share/amp/session.json", "home/user/.local/share/amp/device-id.json", "home/user/.local/share/amp/secrets.json"}
@@ -100,7 +102,7 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			disk := filepath.Join(dir, "rootfs.img")
+			disk := filepath.Join(dir, "disk", "rootfs.img")
 			for _, path := range removed {
 				out, _ := exec.Command("debugfs", "-R", "stat \"/"+path+"\"", disk).CombinedOutput()
 				if !strings.Contains(string(out), "File not found") {
@@ -245,7 +247,9 @@ func TestCreateUsesOwnerTemplateWithFreshInstanceIdentity(t *testing.T) {
 	st := newProvisionTestStore(t, cfg)
 	p := &Provisioner{cfg: cfg, store: st, tsClient: &tailscale.Client{}, networkHelper: noopNetworkHelper{}, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		readHostMemoryBytes: func() (int64, error) { return 64 << 30, nil },
-		readFilesystemBytes: func(string) (int64, error) { return 128 << 30, nil },
+		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
+			return host.FilesystemUsage{Total: 128 << 30, Used: 1 << 30, Available: 127 << 30}, nil
+		},
 	}
 	inst := provisionTestInstance(cfg, "source", model.StateStopped, time.Now())
 	actor := model.Actor{UserLogin: inst.CreatedByUser}
@@ -266,18 +270,23 @@ func TestCreateUsesOwnerTemplateWithFreshInstanceIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	disk := filepath.Join(dir, "rootfs.img")
-	copyFile := reflinkCloneFile
+	disk := filepath.Join(dir, "disk", "rootfs.img")
+	snapshotDisk := storage.SnapshotSubvolume
+	t.Cleanup(func() { storage.SnapshotSubvolume = snapshotDisk })
 	stop := errors.New("stop test after observing clone, before network and boot")
 	observed := false
-	reflinkCloneFile = func(ctx context.Context, src, dest string) error {
-		if src != disk {
+	storage.SnapshotSubvolume = func(ctx context.Context, src, dest string, readonly bool) error {
+		if src != filepath.Dir(disk) {
 			t.Fatalf("cloned %q, want template %q", src, disk)
 		}
-		if err := copyFile(ctx, src, dest); err != nil {
+		if readonly {
+			t.Fatal("new instance snapshot must be writable")
+		}
+		if err := snapshotDisk(ctx, src, dest, readonly); err != nil {
 			return err
 		}
-		if dest == filepath.Join(cfg.InstancesDir(), "fresh", "rootfs.img") {
+		if dest == filepath.Join(cfg.InstancesDir(), "fresh", "disk") {
+			dest = filepath.Join(dest, "rootfs.img")
 			observed = true
 			out, err := exec.Command("debugfs", "-R", "cat /home/user/project/prepared", dest).Output()
 			if err != nil || string(out) != "prepared" {
@@ -305,7 +314,7 @@ func TestCreateUsesOwnerTemplateWithFreshInstanceIdentity(t *testing.T) {
 	if err := st.UpdateInstance(ctx, mismatch); err != nil {
 		t.Fatal(err)
 	}
-	reflinkCloneFile = copyFile
+	storage.SnapshotSubvolume = snapshotDisk
 	if err := p.CreateTemplate(ctx, inst.Name, "debian", actor); err != nil {
 		t.Fatal(err)
 	}
@@ -359,5 +368,72 @@ func assertEmptyMachineID(t *testing.T, disk string) {
 	stat, _ := exec.Command("debugfs", "-R", "stat /etc/machine-id", disk).CombinedOutput()
 	if !emptyMachineIDStat.Match(stat) {
 		t.Fatalf("machine-id not an empty root-owned 0444 file: %s", stat)
+	}
+}
+
+func TestDeleteTemplateResumesUnpublishedCleanup(t *testing.T) {
+	for _, manifestRemoved := range []bool{false, true} {
+		name := "manifest-retained"
+		if manifestRemoved {
+			name = "manifest-removed"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := loadProvisionTestConfig(t, nil)
+			p := &Provisioner{cfg: cfg}
+			actor := model.Actor{UserLogin: "alice@example.com"}
+			dir, err := p.templatePath("prepared", actor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			manifest := []byte(`{"Version":2,"ID":"prepared","Owner":"alice@example.com","SourceID":"source-id","Image":"debian-13"}`)
+			if err := os.WriteFile(filepath.Join(dir, "manifest.json"), manifest, 0400); err != nil {
+				t.Fatal(err)
+			}
+			// A published sibling must not be reclaimed with unpublished trash.
+			retained := filepath.Join(filepath.Dir(dir), "retained")
+			if err := os.Mkdir(retained, 0700); err != nil {
+				t.Fatal(err)
+			}
+			oldRemove := removePathAll
+			t.Cleanup(func() { removePathAll = oldRemove })
+			removePathAll = func(path string) error {
+				if manifestRemoved {
+					if err := os.Remove(filepath.Join(path, "manifest.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+						return err
+					}
+				}
+				return os.ErrPermission
+			}
+			if err := p.DeleteTemplate(ctx, "prepared", actor); !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("initial deletion: %v", err)
+			}
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("failed deletion left template published", err)
+			}
+			if err := p.DeleteTemplate(ctx, "prepared", actor); !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("retry hid outstanding cleanup failure: %v", err)
+			}
+			removePathAll = oldRemove
+			if err := p.DeleteTemplate(ctx, "prepared", model.Actor{UserLogin: "bob@example.com"}); err != nil {
+				t.Fatal(err)
+			}
+			trash, err := filepath.Glob(filepath.Join(filepath.Dir(dir), ".deleted-*"))
+			if err != nil || len(trash) != 1 {
+				t.Fatal("foreign deletion affected owner's trash", trash, err)
+			}
+			if err := p.DeleteTemplate(ctx, "prepared", actor); err != nil {
+				t.Fatal("resume deletion", err)
+			}
+			if _, err := os.Stat(trash[0]); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("retry left unpublished trash", err)
+			}
+			if _, err := os.Stat(retained); err != nil {
+				t.Fatal("retry removed published sibling", err)
+			}
+		})
 	}
 }

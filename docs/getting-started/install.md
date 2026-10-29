@@ -4,11 +4,15 @@
 
 - Linux host with cgroup v2 and `/dev/kvm`
 - IPv4 forwarding enabled: `net.ipv4.ip_forward=1`
-- `SRV_DATA_DIR` on a reflink-capable filesystem (`btrfs` or reflink-enabled `xfs`), with `SRV_BASE_ROOTFS` on the same filesystem
+- `SRV_DATA_DIR` must be a btrfs subvolume root for all VMs and Orbs, with every base rootfs image on the same btrfs filesystem
+- `btrfs-progs` installed and the btrfs mount option `user_subvol_rm_allowed` enabled for deletion of service-owned subvolumes by unprivileged `srv`
+- Orb runtime and jail directories in the same subvolume, not merely the same filesystem; see [path constraints](../reference/configuration.md#path-constraints)
 - Tailscale installed and working on the host
 - Tailscale OAuth client credentials (`TS_CLIENT_ID` and `TS_CLIENT_SECRET`) with permission to mint auth keys for the configured guest tags
 - `ip`, `iptables`, `cp`, `e2fsck`, and `resize2fs` available on the host
 - Official static Firecracker and jailer release pair (the installer can download these for you)
+
+Existing installations must follow the [storage migration runbook](../reference/operations.md#storage-layout-migration) before upgrading a non-btrfs host. Starting the new service on XFS cannot convert it in place.
 
 !!! note
     srv is intentionally a single-host control plane. Clustering, multi-host scheduling, and high availability are out of scope for the current phase.

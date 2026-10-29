@@ -61,7 +61,8 @@ srv runs on Linux with the following requirements:
 
 - Linux host with cgroup v2 and `/dev/kvm`
 - IPv4 forwarding enabled (`net.ipv4.ip_forward=1`)
-- `SRV_DATA_DIR` on a reflink-capable filesystem (`btrfs` or reflink-enabled `xfs`)
+- `SRV_DATA_DIR` as a btrfs subvolume root, all base rootfs images on the same btrfs filesystem, and `btrfs-progs` installed
+- `user_subvol_rm_allowed` for unprivileged deletion of service-owned subvolumes; Orb runtime and jail directories in the same subvolume
 - Tailscale installed and working on the host
 - Tailscale OAuth client credentials with permission to mint auth keys for guest tags
 - `ip`, `iptables`, `cp`, `e2fsck`, and `resize2fs` available on the host

@@ -5,9 +5,54 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"path/filepath"
 
 	"srv/internal/model"
+	"srv/internal/storage"
+	"srv/internal/vmrunner"
 )
+
+func (p *Provisioner) migrationDiskRPC(ctx context.Context, q vmrunner.MigrationDiskRequest, in io.Reader, out io.Writer) (vmrunner.MigrationDiskResult, error) {
+	runner, ok := p.vmRunner.(interface {
+		MigrationDisk(context.Context, vmrunner.MigrationDiskRequest, io.Reader, io.Writer) (vmrunner.MigrationDiskResult, error)
+	})
+	if !ok {
+		return vmrunner.MigrationDiskResult{}, errors.New("runner does not support native migration")
+	}
+	return runner.MigrationDisk(ctx, q, in, out)
+}
+
+// TransferMigrationDisk is called under the service's instance lock, only for
+// native commands from an authenticated trusted frontend. Source operations
+// additionally require the durable prepared migration fence and its token.
+func (p *Provisioner) TransferMigrationDisk(ctx context.Context, q vmrunner.MigrationDiskRequest, in io.Reader, out io.Writer) (vmrunner.MigrationDiskResult, error) {
+	switch q.Action {
+	case "prepare", "send-base", "send-disk", "cleanup":
+		inst, err := p.requireStoppedInstance(ctx, q.Name)
+		if err != nil {
+			return vmrunner.MigrationDiskResult{}, err
+		}
+		m, err := p.store.GetMigration(ctx, inst.ID)
+		if err != nil {
+			return vmrunner.MigrationDiskResult{}, err
+		}
+		if m.Token != q.Token || (m.Phase != "prepared" && !(q.Action == "cleanup" && m.Phase == "completed")) {
+			return vmrunner.MigrationDiskResult{}, errors.New("native transfer requires the matching prepared migration")
+		}
+		q.InstanceID = inst.ID
+		if q.Action == "prepare" {
+			q.ExpectedDisk, err = storage.ValidateDiskSubvolume(ctx, filepath.Dir(inst.RootFSPath))
+			if err != nil {
+				return vmrunner.MigrationDiskResult{}, err
+			}
+		}
+	case "check", "base-present", "receive-base", "receive-disk":
+	default:
+		return vmrunner.MigrationDiskResult{}, errors.New("unsupported native transfer action")
+	}
+	return p.migrationDiskRPC(ctx, q, in, out)
+}
 
 func (p *Provisioner) MigrationStatus(ctx context.Context, name string) (model.Migration, error) {
 	inst, err := p.store.GetInstance(ctx, name)
@@ -56,6 +101,9 @@ func (p *Provisioner) PrepareMigration(ctx context.Context, name, target, token 
 	defer p.admissionMu.Unlock()
 	inst, err := p.store.GetInstance(ctx, name)
 	if err != nil {
+		return model.Migration{}, err
+	}
+	if err := p.coldDiskFence(ctx, inst, false); err != nil {
 		return model.Migration{}, err
 	}
 	if target == "" || token == "" || inst.State == model.StateDeleted || inst.State == model.StateDeleting {

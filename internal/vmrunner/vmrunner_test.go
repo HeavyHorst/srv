@@ -1669,6 +1669,10 @@ func TestServerConfigValidate(t *testing.T) {
 			t.Fatalf("%s unexpectedly passed validation", tc.name)
 		}
 	}
+	valid.ColdStorage.Host = "storage.example"
+	if err := valid.Validate(); err == nil {
+		t.Fatal("enabled cold storage without protected credentials passed validation")
+	}
 }
 
 func TestResolveInstanceRuntimePaths(t *testing.T) {
@@ -1680,7 +1684,7 @@ func TestResolveInstanceRuntimePaths(t *testing.T) {
 		SocketPath: "/var/lib/srv/instances/demo/firecracker.sock",
 		LogPath:    "/var/lib/srv/instances/demo/firecracker.log",
 		SerialLog:  "/var/lib/srv/instances/demo/serial.log",
-		RootFSPath: "/var/lib/srv/instances/demo/rootfs.img",
+		RootFSPath: "/var/lib/srv/instances/demo/disk/rootfs.img",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("resolveInstanceRuntimePaths() = %#v, want %#v", got, want)

@@ -25,9 +25,13 @@ func (p *Provisioner) waitForOrb(ctx context.Context, inst model.Instance) (mode
 	if err != nil {
 		return inst, err
 	}
+	dir, err := p.instanceDir(inst.Name)
+	if err != nil {
+		return inst, err
+	}
 	for {
 		probe, cancelProbe := context.WithTimeout(ctx, 2*time.Second)
-		err = orbguest.Ping(probe, filepath.Join(filepath.Dir(inst.RootFSPath), "orb.vsock"))
+		err = orbguest.Ping(probe, filepath.Join(dir, "orb.vsock"))
 		cancelProbe()
 		if err == nil {
 			current, runtimeErr := p.instanceRuntimeIdentity(ctx, inst)

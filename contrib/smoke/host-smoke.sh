@@ -397,7 +397,7 @@ assert_backup_artifacts() {
 	fi
 	for path in \
 		"${BACKUP_PATH}/manifest.json" \
-		"${BACKUP_PATH}/rootfs.img" \
+		"${BACKUP_PATH}/disk/rootfs.img" \
 		"${BACKUP_PATH}/serial.log" \
 		"${BACKUP_PATH}/firecracker.log"; do
 		if [[ ! -e "${path}" ]]; then

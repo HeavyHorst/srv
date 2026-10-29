@@ -2,10 +2,77 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
+
+	gssh "github.com/gliderlabs/ssh"
 
 	"srv/internal/model"
+	"srv/internal/vmrunner"
 )
+
+// handleMigrationDisk is reachable only after trusted-node forwarding checks.
+// The frontend refuses this command from users; only migrate constructs it.
+func (a *App) handleMigrationDisk(sess gssh.Session, actor model.Actor, args []string) (int, error) {
+	if len(args) >= 2 && args[1] == "import" {
+		return a.handleImportSessionMode(sess, actor, append([]string{"import"}, args[2:]...), true)
+	}
+	if len(args) != 2 || len(args[1]) > 16384 {
+		return 2, fmt.Errorf("invalid internal migration command")
+	}
+	data, err := base64.RawURLEncoding.DecodeString(args[1])
+	var q vmrunner.MigrationDiskRequest
+	if err != nil || json.Unmarshal(data, &q) != nil {
+		return 2, fmt.Errorf("invalid migration request")
+	}
+	if err := rejectPTY(sess, "migration-disk"); err != nil {
+		return 1, err
+	}
+	unlock := a.lockInstance(q.Name)
+	defer unlock()
+	if q.Action == "prepare" || q.Action == "send-base" || q.Action == "send-disk" || q.Action == "metadata" || q.Action == "cleanup" {
+		if _, err := a.lookupVisibleInstance(sess.Context(), actor, q.Name); err != nil {
+			return 1, err
+		}
+	} else if err := a.authorizeReplacement(sess.Context(), actor, q.Name, actor.UserLogin); err != nil {
+		return 1, err
+	}
+	if q.Action == "metadata" {
+		m, err := a.provisioner.MigrationStatus(sess.Context(), q.Name)
+		if err != nil {
+			return 1, err
+		}
+		if m.Phase != "prepared" || m.Token != q.Token {
+			return 1, fmt.Errorf("migration token mismatch")
+		}
+		_, err = a.provisioner.ExportNativeMetadata(sess.Context(), q.Name, sess, q.Transfer)
+		if err != nil {
+			return 1, err
+		}
+		return 0, nil
+	}
+	var in io.Reader
+	if q.Action == "receive-base" || q.Action == "receive-disk" {
+		in = sess
+	}
+	var out io.Writer
+	if q.Action == "send-base" || q.Action == "send-disk" {
+		out = sess
+	}
+	result, err := a.provisioner.TransferMigrationDisk(sess.Context(), q, in, out)
+	if err != nil {
+		return 1, err
+	}
+	if out == nil {
+		err = json.NewEncoder(sess).Encode(result)
+	}
+	if err != nil {
+		return 1, err
+	}
+	return 0, nil
+}
 
 // cmdMigration takes the full command argv, including "migration". Responses
 // are JSON regardless of output mode, for reconnect-safe frontend orchestration.

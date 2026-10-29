@@ -55,7 +55,7 @@ All instance state, event history, command audits, and authorization decisions a
 
 ### Reflink cloning
 
-When a new VM is created, the base rootfs is cloned using filesystem reflinks (on btrfs or reflink-enabled xfs). This gives each VM its own writable copy without actually copying the data — the copy is instantaneous on a reflink-capable filesystem.
+When a new VM or Orb is created, the base rootfs is reflink-cloned on btrfs into a dedicated `instances/<name>/disk` subvolume. This gives each instance its own writable `rootfs.img` while initially sharing data extents. All base rootfs images must be on the same btrfs filesystem as the data-root subvolume. Legacy stopped instances migrate automatically on start using a durable journal; see [storage migration](operations.md#storage-layout-migration).
 
 ### Network helper
 
@@ -64,6 +64,10 @@ A root-only helper process owns all TAP device creation, iptables MASQUERADE rul
 ### VM runner
 
 A root-owned process invokes Firecracker through the official jailer binary. After the jailer sets up the chroot and drops privileges, the microVM process runs as `srv-vm:srv`. Each VM is placed into its own cgroup v2 leaf under `firecracker-vms/<name>` with enforced limits.
+
+The runner bind-mounts the disk, kernel, initrd, and log files into the jail.
+Only the Orb socket is hard-linked, so Orb runtime and jail directories must
+remain in the same subvolume. The main `srv` process gains no new capabilities.
 
 ### Tailscale integration
 
@@ -94,7 +98,8 @@ SRV_DATA_DIR/
 │       └── rootfs-base.img  # Base rootfs (reflink source)
 ├── instances/
 │   └── <name>/
-│       ├── rootfs.img       # Writable reflink clone
+│       ├── disk/            # btrfs disk subvolume
+│       │   └── rootfs.img   # Writable reflink clone
 │       ├── serial.log       # Serial console output
 │       └── firecracker.log  # VMM log
 ├── backups/
@@ -102,9 +107,17 @@ SRV_DATA_DIR/
 │       └── <backup-id>/
 │           └── rootfs.img   # Backup copy
 ├── jailer/                 # Jailer workspaces
-└── .snapshots/              # btrfs host snapshots
+└── .snapshots/              # btrfs archive subvolume
     └── <timestamp>/
 ```
+
+Host snapshots are [root-and-disk bundles with a manifest](../tasks/host-snapshots.md),
+not recursive snapshots of the data root. They do not provide global disk atomicity.
+Optional [cold storage over SSH](operations.md#optional-cold-disks-over-ssh) moves
+stopped disks to a trusted btrfs server and restores them fully before boot.
+The root runner owns transfer journals and shares its name lock with VM starts;
+the unprivileged control plane gains no filesystem capabilities. Complete host
+snapshots require all cold generations hydrated and purged first.
 
 ## Service architecture
 

@@ -25,6 +25,7 @@ import (
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
 	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 
+	"srv/internal/coldstore"
 	"srv/internal/model"
 )
 
@@ -253,6 +254,9 @@ func (c *Client) post(ctx context.Context, path string, payload any, out any) er
 		return nil
 	}
 
+	if path == "/vm/cold-disk-v1" && resp.StatusCode == http.StatusNotFound {
+		return errors.New("cold disk API unavailable; upgrade srv-vm-runner before enabling cold storage (deletion remains fenced)")
+	}
 	var helperErr errorResponse
 	if err := json.NewDecoder(resp.Body).Decode(&helperErr); err == nil && strings.TrimSpace(helperErr.Error) != "" {
 		return errors.New(helperErr.Error)
@@ -282,6 +286,8 @@ type ServerConfig struct {
 	ImagesDir         string
 	VMPIDsMax         int64
 	CgroupRoot        string
+	ColdStorage       coldstore.Config
+	MigrationStoreDir string
 }
 
 type instanceRuntimePaths struct {
@@ -334,6 +340,8 @@ type Server struct {
 	metrics          MetricsFunc
 	deleteMemoryPool DeleteMemoryPoolFunc
 
+	startAdmission     sync.RWMutex
+	draining           bool
 	cgroupMu           sync.Mutex
 	delegatedCgroupRel string
 	firecrackerClients sync.Map
@@ -370,6 +378,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vm/start-result", s.handleStartResult)
 	mux.HandleFunc("/vm/stop", s.handleStop)
 	mux.HandleFunc("/vm/cleanup-proof-v1", s.handleCleanupProof)
+	mux.HandleFunc("/vm/storage-idle-v1", s.handleStorageIdle)
+	mux.HandleFunc("/vm/cold-disk-v1", s.handleColdDisk)
+	mux.HandleFunc("/vm/migration-disk-v1", s.handleMigrationDisk)
+	mux.HandleFunc("/vm/drain", s.handleDrain)
 	mux.HandleFunc("/vm/metrics", s.handleMetrics)
 	mux.HandleFunc("/pool/delete", s.handleDeleteMemoryPool)
 	return mux
@@ -708,6 +720,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, errors.New("image-aware start requires a kernel path"))
 		return
 	}
+	s.startAdmission.RLock()
+	defer s.startAdmission.RUnlock()
+	if s.draining {
+		respondError(w, http.StatusServiceUnavailable, errors.New("runner is draining"))
+		return
+	}
 	resp, err := s.receiptStart(r.Context(), req)
 	if err != nil {
 		s.log.Error("start vm", "name", req.Name, "err", err)
@@ -875,7 +893,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 			ExecFile:       s.config.FirecrackerBinary,
 			JailerBinary:   s.config.JailerBinary,
 			ChrootBaseDir:  s.config.JailerBaseDir,
-			ChrootStrategy: firecracker.NewNaiveChrootStrategy(bootConfig.KernelPath),
+			ChrootStrategy: bindChrootStrategy{},
 			CgroupVersion:  detectJailerCgroupVersion(),
 			Stdout:         serialLog,
 			Stderr:         serialLog,
@@ -899,7 +917,9 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	// initialization failure and process exit, outside our lifecycle lock. Own
 	// launch/reaping instead; only locked, identity-checked stop removes paths.
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Swap(preserveRuntimeLaunchHandler(processRunner))
-	machine.Handlers.FcInit = machine.Handlers.FcInit.Swap(prepareJailedRuntimeHandler(paths, jailerPaths, s.config.JailerGID))
+	// Mounts must exist before the jailer creates its private mount namespace.
+	machine.Handlers.FcInit = machine.Handlers.FcInit.Remove(firecracker.CreateLogFilesHandlerName).
+		Prepend(prepareJailedRuntimeHandler(paths, jailerPaths, s.config.JailerGID))
 	if req.Kind != "orb" {
 		machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.NewSetMetadataHandler(Metadata{SRV: req.Bootstrap}))
 	}
@@ -1364,6 +1384,8 @@ func (c ServerConfig) normalized() ServerConfig {
 		ImagesDir:         strings.TrimSpace(c.ImagesDir),
 		VMPIDsMax:         pidsMax,
 		CgroupRoot:        strings.TrimSpace(c.CgroupRoot),
+		ColdStorage:       c.ColdStorage,
+		MigrationStoreDir: strings.TrimSpace(c.MigrationStoreDir),
 	}
 }
 
@@ -1400,7 +1422,15 @@ func (c ServerConfig) Validate() error {
 	if c.CgroupRoot != "" && !filepath.IsAbs(c.CgroupRoot) {
 		return fmt.Errorf("cgroup root %q is not absolute", c.CgroupRoot)
 	}
-	return nil
+	if err := validateAbsolutePath("migration store", c.MigrationStoreDir, true); err != nil {
+		return err
+	}
+	if c.ColdStorage.Host != "" {
+		if _, err := exec.LookPath("losetup"); err != nil {
+			return fmt.Errorf("cold storage requires losetup: %w", err)
+		}
+	}
+	return c.ColdStorage.Validate()
 }
 
 // Requests may select boot files only from the administrator-managed images
@@ -1449,7 +1479,7 @@ func resolveInstanceRuntimePaths(instancesDir, name string) (instanceRuntimePath
 		SocketPath: filepath.Join(instanceDir, "firecracker.sock"),
 		LogPath:    filepath.Join(instanceDir, "firecracker.log"),
 		SerialLog:  filepath.Join(instanceDir, "serial.log"),
-		RootFSPath: filepath.Join(instanceDir, "rootfs.img"),
+		RootFSPath: filepath.Join(instanceDir, "disk", "rootfs.img"),
 	}, nil
 }
 
@@ -1561,10 +1591,13 @@ func prepareJailedRuntimeHandler(hostPaths instanceRuntimePaths, jailerPaths jai
 	return firecracker.Handler{
 		Name: firecracker.CreateLogFilesHandlerName,
 		Fn: func(_ context.Context, m *firecracker.Machine) error {
+			if err := os.MkdirAll(jailerPaths.RootDir, 0o755); err != nil {
+				return fmt.Errorf("create jail root: %w", err)
+			}
 			if err := prepareFirecrackerLogFile(hostPaths.LogPath, jailerGID); err != nil {
 				return err
 			}
-			if err := linkFileIntoJail(hostPaths.LogPath, jailerPaths.LogPath); err != nil {
+			if err := bindFileIntoJail(hostPaths.LogPath, jailerPaths.LogPath, false); err != nil {
 				return err
 			}
 			if err := exposeJailedSocket(hostPaths.SocketPath, m.Cfg.SocketPath); err != nil {
@@ -1605,19 +1638,6 @@ func prepareFirecrackerLogFile(path string, gid int) error {
 	return nil
 }
 
-func linkFileIntoJail(srcPath, jailedPath string) error {
-	if err := os.Remove(jailedPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove stale jailed file %s: %w", jailedPath, err)
-	}
-	if err := os.Link(srcPath, jailedPath); err != nil {
-		if errors.Is(err, syscall.EXDEV) {
-			return fmt.Errorf("link %s into jail at %s: %w (keep SRV_JAILER_BASE_DIR on the same filesystem as SRV_DATA_DIR)", srcPath, jailedPath, err)
-		}
-		return fmt.Errorf("link %s into jail at %s: %w", srcPath, jailedPath, err)
-	}
-	return nil
-}
-
 func exposeJailedSocket(hostSocketPath, jailedSocketPath string) error {
 	if err := os.Remove(hostSocketPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove stale firecracker socket alias %s: %w", hostSocketPath, err)
@@ -1629,6 +1649,11 @@ func exposeJailedSocket(hostSocketPath, jailedSocketPath string) error {
 }
 
 func cleanupJailedRuntimePaths(hostPaths instanceRuntimePaths, jailerPaths jailerRuntimePaths) error {
+	// Never recurse into a mounted disk or unlink an exposed file while its
+	// mount is still live. Failed unmounts must keep runtime cleanup fenced.
+	if err := unmountJail(jailerPaths.WorkspaceDir); err != nil {
+		return err
+	}
 	var errs []error
 	if err := os.Remove(filepath.Join(filepath.Dir(hostPaths.SocketPath), "orb.vsock")); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, fmt.Errorf("remove orb socket: %w", err))

@@ -55,6 +55,20 @@ credentials are JSON on stdin, never command arguments; it does not accept `--js
 | `fsck <name>` | Force-check and repair the rootfs of a stopped VM |
 | `delete <name>` | Delete a VM and all its resources |
 
+## Cold disk commands
+
+| Command | Description |
+|---------|-------------|
+| `disk status <name>` | Inspect local/remote disk residency without contacting remote storage |
+| `disk offload <name>` | Upload and evict a stopped instance's disk after verified remote publication |
+| `disk hydrate <name>` | Restore/recover a stopped disk without booting |
+| `disk purge <name>` | Delete a retained remote generation; requires a valid local disk |
+
+Supports `--json` and backend-qualified names through srv-front. Mutations on
+native Orbs require admin access. `start` hydrates automatically when needed;
+other disk-consuming commands require explicit hydration. See
+[configuration, outage behavior and recovery](operations.md#optional-cold-disks-over-ssh).
+
 ## Resize command
 
 | Command | Description |
@@ -113,7 +127,7 @@ cold migration, host-qualified names, and `node list` across servers, see the
 | `pool inspect <name>` | Admin-only show a memory pool and its member VMs |
 | `pool delete <name>` | Admin-only delete an empty memory pool |
 | `status` | Admin-only host capacity and allocation summary |
-| `snapshot create` | Admin-only host-local btrfs snapshot of SRV_DATA_DIR |
+| `snapshot create` | Admin-only host-local [readonly root-and-disk snapshot bundle](../tasks/host-snapshots.md) with a manifest |
 
 ## Integration commands
 

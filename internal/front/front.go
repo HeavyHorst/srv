@@ -4,6 +4,7 @@ package front
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"srv/internal/host"
 	"srv/internal/identity"
 	"srv/internal/model"
+	"srv/internal/vmrunner"
 )
 
 type Host struct {
@@ -232,6 +234,7 @@ resize / fsck / delete NAME           Manage a VM
 logs [-f] NAME [serial|firecracker]   Read or follow logs
 backup create|list NAME               Manage backups on the owning host
 backup delete NAME ID / restore NAME ID
+disk status|offload|hydrate|purge NAME Manage optional cold storage
 export NAME / import --host HOST      Stream portable VM artifacts
 migrate NAME --to HOST                Cold migration (no --json)
 pool / integration / snapshot         Require --host
@@ -243,7 +246,7 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 `)
 		return err
 	}
-	if cmd == "forward" {
+	if cmd == "forward" || cmd == "migration-disk" {
 		return fmt.Errorf("reserved command")
 	}
 	if cmd == "migration" && (len(args) != 3 || (args[1] != "status" && args[1] != "receipt") || hostName == "") {
@@ -319,12 +322,12 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 		} else if hostName == "" {
 			h, err = r.choose(ctx, a, args[1:])
 		}
-	case "inspect", "start", "stop", "restart", "delete", "resize", "fsck", "restore", "backup", "logs", "export", "bootstrap":
+	case "inspect", "start", "stop", "restart", "delete", "resize", "fsck", "restore", "backup", "disk", "logs", "export", "bootstrap":
 		if cmd == "bootstrap" && !orb {
 			return fmt.Errorf("use orb bootstrap NAME")
 		}
 		nameIndex := 1
-		if cmd == "backup" {
+		if cmd == "backup" || cmd == "disk" {
 			nameIndex = 2
 		}
 		if cmd == "logs" {
@@ -416,6 +419,7 @@ func (r *Router) migrate(ctx context.Context, a model.Actor, args []string, over
 	}
 	var inspect struct {
 		Instance struct {
+			ID    string `json:"id"`
 			Image string `json:"image"`
 			CPUs  int64  `json:"vcpu_count"`
 			RAM   int64  `json:"memory_mib"`
@@ -454,6 +458,12 @@ func (r *Router) migrate(ctx context.Context, a model.Actor, args []string, over
 		return fmt.Errorf("target ineligible: %s", p.Reason)
 	}
 	token := uuid.NewString()
+	q := vmrunner.MigrationDiskRequest{Action: "check", Name: name, InstanceID: v.ID, Token: token}
+	for _, h := range []Host{source, target} {
+		if _, err := r.commandJSON(ctx, h, a, migrationDiskArgs(q)); err != nil {
+			return fmt.Errorf("host %s native migration unavailable (source not prepared): %w", h.Name, err)
+		}
+	}
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("migration source=%s target=%s name=%s token=%s: %w; do not retry automatically; inspect migration status on source and receipt on target and recover manually; do not start source while target may exist", source.Name, target.Name, name, token, err)
@@ -477,34 +487,47 @@ func (r *Router) migrate(ctx context.Context, a model.Actor, args []string, over
 	if prepared.Token != token || prepared.Target != target.Name || prepared.Phase != "prepared" {
 		return fmt.Errorf("prepare response mismatch")
 	}
-	fmt.Fprintln(stderr, "migration: streaming export to import")
-	// Both SSH sessions can emit progress/errors concurrently.
-	streamErrors := &lockedWriter{writer: stderr}
-	pipeCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	rd, wr := io.Pipe()
-	defer rd.Close()
-	defer wr.Close()
-	done := make(chan error, 1)
-	go func() {
-		e := r.Transport.Run(pipeCtx, source, a, []string{"export", name}, nil, wr, streamErrors)
-		wr.CloseWithError(e)
-		if e != nil {
-			cancel()
-		}
-		done <- e
-	}()
-	err = r.Transport.Run(pipeCtx, target, a, append([]string{"import"}, policy...), rd, io.Discard, streamErrors)
-	rd.CloseWithError(err)
-	if err != nil {
-		cancel()
-	}
-	exportErr := <-done
+	q.Action, q.InstanceID = "prepare", prepared.InstanceID
+	data, err = r.commandJSON(ctx, source, a, migrationDiskArgs(q))
 	if err != nil {
 		return err
 	}
-	if exportErr != nil {
-		return exportErr
+	var transfer vmrunner.MigrationDiskResult
+	if err = json.Unmarshal(data, &transfer); err != nil {
+		return err
+	}
+	if transfer.Transfer.Disk.ID != token {
+		return fmt.Errorf("native source transfer token mismatch")
+	}
+	q.Transfer = transfer.Transfer
+	q.Action = "base-present"
+	data, err = r.commandJSON(ctx, target, a, migrationDiskArgs(q))
+	if err != nil {
+		return err
+	}
+	var base vmrunner.MigrationDiskResult
+	if err = json.Unmarshal(data, &base); err != nil {
+		return err
+	}
+	if q.Transfer.Base != nil && !base.BasePresent {
+		fmt.Fprintln(stderr, "migration: transferring shared base")
+		q.Action = "send-base"
+		receive := q
+		receive.Action = "receive-base"
+		if err = r.migrationStream(ctx, a, source, target, migrationDiskArgs(q), migrationDiskArgs(receive), stderr); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintln(stderr, "migration: transferring disk snapshot")
+	q.Action = "send-disk"
+	receive := q
+	receive.Action = "receive-disk"
+	if err = r.migrationStream(ctx, a, source, target, migrationDiskArgs(q), migrationDiskArgs(receive), stderr); err != nil {
+		return err
+	}
+	q.Action = "metadata"
+	if err = r.migrationStream(ctx, a, source, target, migrationDiskArgs(q), append([]string{"migration-disk", "import"}, policy...), stderr); err != nil {
+		return err
 	}
 	data, err = r.query(ctx, target, a, []string{"--json", "migration", "receipt", name})
 	if err != nil {
@@ -526,6 +549,10 @@ func (r *Router) migrate(ctx context.Context, a model.Actor, args []string, over
 	if err != nil {
 		return err
 	}
+	q.Action = "cleanup"
+	if _, cleanupErr := r.commandJSON(ctx, source, a, migrationDiskArgs(q)); cleanupErr != nil {
+		fmt.Fprintf(stderr, "migration committed; source transfer snapshot needs cleanup: %v\n", cleanupErr)
+	}
 	if prepared.WasRunning {
 		err = r.Transport.Run(ctx, target, a, []string{"start", name}, nil, out, stderr)
 		if err != nil {
@@ -534,6 +561,39 @@ func (r *Router) migrate(ctx context.Context, a model.Actor, args []string, over
 	}
 	fmt.Fprintf(out, "migrated: %s/%s\n", target.Name, name)
 	return nil
+}
+
+func migrationDiskArgs(q vmrunner.MigrationDiskRequest) []string {
+	data, _ := json.Marshal(q) // This concrete struct contains no unsupported JSON types.
+	return []string{"migration-disk", base64.RawURLEncoding.EncodeToString(data)}
+}
+
+func (r *Router) migrationStream(ctx context.Context, actor model.Actor, source, target Host, send, receive []string, stderr io.Writer) error {
+	streamErrors := &lockedWriter{writer: stderr}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	rd, wr := io.Pipe()
+	defer rd.Close()
+	defer wr.Close()
+	done := make(chan error, 1)
+	go func() {
+		err := r.Transport.Run(ctx, source, actor, send, nil, wr, streamErrors)
+		wr.CloseWithError(err)
+		if err != nil {
+			cancel()
+		}
+		done <- err
+	}()
+	err := r.Transport.Run(ctx, target, actor, receive, rd, io.Discard, streamErrors)
+	rd.CloseWithError(err)
+	if err != nil {
+		cancel()
+	}
+	exportErr := <-done
+	if err != nil {
+		return err
+	}
+	return exportErr
 }
 
 type lockedWriter struct {

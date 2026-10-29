@@ -47,6 +47,12 @@ If `/etc/srv/srv.env` already exists before an upgrade, the installer keeps it b
 
 ## Upgrading
 
+For an existing pre-subvolume installation or customized systemd stack, first
+read [storage layout migration](../reference/operations.md#storage-layout-migration)
+and [jailer/custom-unit upgrade checks](../reference/operations.md#jailer-path-and-custom-unit-upgrades).
+In particular, an ordinary Btrfs directory is not converted by the installer,
+and a short jailer bind-mount alias cannot publish Orb socket hard links.
+
 1. Take a quiesced backup or a [host snapshot](../tasks/host-snapshots.md).
 2. Build and install the new `srv`, `srv-net-helper`, and `srv-vm-runner` binaries.
 3. If you also refreshed Firecracker, verify `/etc/srv/srv.env` still points at the correct binaries.

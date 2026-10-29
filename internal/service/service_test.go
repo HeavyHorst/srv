@@ -678,6 +678,72 @@ func TestFormatStatusResourceLineUsesInlineReserveNote(t *testing.T) {
 	}
 }
 
+func TestOrbBackupCommandsRejectOwnersAndAdmins(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadServiceTestConfig(t, nil)
+	cfg.AdminUsers = []string{"ops@example.com"}
+	st := newServiceTestStore(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+	for _, state := range []string{model.StateStopped, model.StateReady} {
+		inst := serviceTestInstance("orb-"+state, state, time.Now().UTC())
+		inst.Kind, inst.Image = model.KindOrb, "amp-orb"
+		inst.RootFSPath = filepath.Join(cfg.InstancesDir(), inst.Name, "disk", "rootfs.img")
+		if state == model.StateReady {
+			inst.FirecrackerPID = os.Getpid()
+		}
+		if err := st.CreateInstance(ctx, inst); err != nil {
+			t.Fatal(err)
+		}
+		backupDir := filepath.Join(cfg.BackupsDir(), inst.Name, "legacy-backup")
+		files := map[string]string{
+			inst.RootFSPath:                           "live Orb disk",
+			filepath.Join(backupDir, "rootfs.img"):    "old backup disk",
+			filepath.Join(backupDir, "manifest.json"): "unreadable old manifest",
+		}
+		for path, contents := range files {
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, user := range []string{inst.CreatedByUser, "ops@example.com"} {
+			for _, args := range [][]string{
+				{"backup", "create", inst.Name},
+				{"backup", "list", inst.Name},
+				{"backup", "delete", inst.Name, "legacy-backup"},
+				{"restore", inst.Name, "legacy-backup"},
+			} {
+				t.Run(state+"/"+user+"/"+strings.Join(args, " "), func(t *testing.T) {
+					result, err := app.dispatch(ctx, model.Actor{UserLogin: user}, commandRequest{args: args, format: outputFormatJSON})
+					if err == nil || result.exitCode == 0 || !strings.Contains(result.stderr, "not Orbs") {
+						t.Fatalf("Orb backup command not rejected: %+v, %v", result, err)
+					}
+					for path, want := range files {
+						if data, err := os.ReadFile(path); err != nil || string(data) != want {
+							t.Fatalf("rejected command changed %s: %q, %v", path, data, err)
+						}
+					}
+					entries, err := os.ReadDir(filepath.Dir(backupDir))
+					if err != nil || len(entries) != 1 {
+						t.Fatal("rejected command created a backup", entries, err)
+					}
+					stored, err := st.GetInstance(ctx, inst.Name)
+					if err != nil || stored.State != inst.State || stored.FirecrackerPID != inst.FirecrackerPID {
+						t.Fatal("rejected command changed runtime state", stored, err)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestCmdBackupListFormatsBackupsAsTable(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadServiceTestConfig(t, nil)

@@ -116,6 +116,9 @@ type replacedRestoreFile struct {
 }
 
 func (p *Provisioner) CreateBackup(ctx context.Context, name string) (BackupInfo, error) {
+	if _, err := p.requireBackupVM(ctx, name); err != nil {
+		return BackupInfo{}, err
+	}
 	if err := p.ensureHostDiskCapacity(ctx, "", 0); err != nil {
 		return BackupInfo{}, err
 	}
@@ -221,7 +224,10 @@ func (p *Provisioner) CreateBackup(ctx context.Context, name string) (BackupInfo
 	return info, nil
 }
 
-func (p *Provisioner) ListBackups(_ context.Context, name string) ([]BackupInfo, error) {
+func (p *Provisioner) ListBackups(ctx context.Context, name string) ([]BackupInfo, error) {
+	if _, err := p.requireBackupVM(ctx, name); err != nil {
+		return nil, err
+	}
 	instanceBackupsDir, err := p.instanceBackupsDir(name)
 	if err != nil {
 		return nil, err
@@ -259,7 +265,7 @@ func (p *Provisioner) ListBackups(_ context.Context, name string) ([]BackupInfo,
 }
 
 func (p *Provisioner) DeleteBackup(ctx context.Context, name, backupID string) (BackupInfo, error) {
-	inst, err := p.store.GetInstance(ctx, name)
+	inst, err := p.requireBackupVM(ctx, name)
 	if err != nil {
 		return BackupInfo{}, err
 	}
@@ -287,6 +293,9 @@ func (p *Provisioner) DeleteBackup(ctx context.Context, name, backupID string) (
 }
 
 func (p *Provisioner) RestoreBackup(ctx context.Context, name, backupID string) (model.Instance, BackupInfo, error) {
+	if _, err := p.requireBackupVM(ctx, name); err != nil {
+		return model.Instance{}, BackupInfo{}, err
+	}
 	if err := p.ensureHostDiskCapacity(ctx, "", 0); err != nil {
 		return model.Instance{}, BackupInfo{}, err
 	}
@@ -376,6 +385,19 @@ func (p *Provisioner) RestoreBackup(ctx context.Context, name, backupID string) 
 	info := backupInfoFromManifest(backupDir, manifest)
 	p.recordEvent(restored.ID, "backup", "instance restored from backup", map[string]any{"backup_id": info.ID, "path": info.Path})
 	return restored, info, nil
+}
+
+// Reject Orbs before runtime reconciliation or touching backup/disk contents.
+// Legacy Orb backups survive deletion and may be cleaned up manually.
+func (p *Provisioner) requireBackupVM(ctx context.Context, name string) (model.Instance, error) {
+	inst, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return model.Instance{}, err
+	}
+	if inst.KindName() != model.KindVM {
+		return model.Instance{}, errors.New("backup and restore are only supported for normal VMs, not Orbs")
+	}
+	return inst, nil
 }
 
 func (p *Provisioner) requireStoppedInstance(ctx context.Context, name string) (model.Instance, error) {

@@ -154,12 +154,11 @@ func TestOrbLifecycleWithoutGuestTailscale(t *testing.T) {
 	if _, err := p.Create(ctx, "wrong-kind", actor, CreateOptions{Kind: model.KindVM, Template: "prepared-orb"}); err == nil || !strings.Contains(err.Error(), "template workload kind") {
 		t.Fatalf("Orb template kind check: %v", err)
 	}
-	backup, err := p.CreateBackup(ctx, inst.Name)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := p.CreateBackup(ctx, inst.Name); err == nil || !strings.Contains(err.Error(), "not Orbs") {
+		t.Fatalf("Orb backup must be rejected: %v", err)
 	}
-	if restored, _, err := p.RestoreBackup(ctx, inst.Name, backup.ID); err != nil || restored.Kind != model.KindOrb {
-		t.Fatalf("restored kind: %s, %v", restored.Kind, err)
+	if _, _, err := p.RestoreBackup(ctx, inst.Name, "legacy-backup"); err == nil || !strings.Contains(err.Error(), "not Orbs") {
+		t.Fatalf("Orb restore must be rejected: %v", err)
 	}
 	var artifact bytes.Buffer
 	if _, err := p.ExportInstance(ctx, inst.Name, &artifact); err != nil {

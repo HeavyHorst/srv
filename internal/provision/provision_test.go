@@ -3812,6 +3812,7 @@ func (noopVMRunner) DeleteMemoryPool(context.Context, vmrunner.MemoryPoolRequest
 }
 
 type recordingVMRunner struct {
+	noopVMRunner
 	deletedPools        []vmrunner.MemoryPoolRequest
 	deleteMemoryPoolErr error
 	started             []vmrunner.StartRequest

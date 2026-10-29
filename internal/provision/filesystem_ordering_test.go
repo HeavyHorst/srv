@@ -30,7 +30,7 @@ func TestImportDoesNotPublishReceiptBeforeStagingCompletes(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
 		t.Fatal(err)
@@ -94,7 +94,7 @@ func TestImportCommitFailureDoesNotPublishImportedReceipt(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
 		t.Fatal(err)
@@ -439,7 +439,7 @@ func TestRestoreRetryConvergesAfterPartialReplacement(t *testing.T) {
 	}
 }
 
-// An imported receipt without its rootfs must fail before the runner is called,
+// An imported receipt without its rootfs must fail before the runner launches,
 // not boot an empty instance.
 func TestImportedReceiptWithoutRootFSDoesNotStart(t *testing.T) {
 	ctx := context.Background()
@@ -464,7 +464,7 @@ func TestImportedReceiptWithoutRootFSDoesNotStart(t *testing.T) {
 	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: runner, networkHelper: noopNetworkHelper{}}
 
 	_, err := p.Start(ctx, inst.Name)
-	if err == nil || !strings.Contains(err.Error(), "required file") {
+	if !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), inst.RootFSPath) {
 		t.Fatalf("Start() error = %v, want a missing rootfs", err)
 	}
 	if len(runner.started) != 0 {

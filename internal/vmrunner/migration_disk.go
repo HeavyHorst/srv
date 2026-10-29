@@ -104,12 +104,6 @@ func (s *Server) handleMigrationDisk(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), coldstore.DefaultTimeout)
 	defer cancel()
-	s.startAdmission.RLock()
-	defer s.startAdmission.RUnlock()
-	if s.draining {
-		respondError(w, http.StatusServiceUnavailable, errors.New("runner is draining"))
-		return
-	}
 	if q.Action == "receive-base" || q.Action == "receive-disk" {
 		var release func()
 		var err error
@@ -119,6 +113,14 @@ func (s *Server) handleMigrationDisk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer release()
+	}
+	// Match hydration's payload-before-admission order so drain cannot
+	// deadlock a deletion that owns payload and still needs the runner.
+	s.startAdmission.RLock()
+	defer s.startAdmission.RUnlock()
+	if s.draining {
+		respondError(w, http.StatusServiceUnavailable, errors.New("runner is draining"))
+		return
 	}
 	ctx, unlock, err := s.lockNameInherited(ctx, q.Name)
 	if err != nil {

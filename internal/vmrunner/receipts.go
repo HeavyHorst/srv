@@ -562,6 +562,19 @@ func (s *Server) receiptStop(ctx context.Context, req StopRequest) error {
 	}
 	defer unlock()
 	if req.RequestID == "" {
+		if req.InstanceID != "" {
+			data, err := os.ReadFile(s.coldDeletedPath(ColdRequest{Name: req.Name, InstanceID: req.InstanceID}))
+			if err == nil {
+				var id string
+				if err := json.Unmarshal(data, &id); err != nil || id != req.InstanceID {
+					return errors.New("invalid incarnation deletion fence")
+				}
+				return nil // A delayed legacy stop must not touch a successor.
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
 		a, err := s.activeReceipt(req.Name)
 		if err != nil {
 			return err

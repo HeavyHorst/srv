@@ -190,6 +190,76 @@ func (f *coldFixture) contents() string {
 	return string(b)
 }
 
+func TestPayloadWaitDoesNotBlockRunnerDrain(t *testing.T) {
+	for _, action := range []string{"hydrate", "receive-base", "receive-disk"} {
+		t.Run(action, func(t *testing.T) {
+			f := newColdFixture(t)
+			f.s.config.MigrationStoreDir = t.TempDir()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			// Deletion owns payload while it still needs runner admission.
+			_, release, err := storage.AcquirePayload(ctx, filepath.Dir(f.s.config.InstancesDir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			acquire := storage.AcquirePayload
+			waiting := make(chan struct{})
+			storage.AcquirePayload = func(ctx context.Context, dir string) (context.Context, func(), error) {
+				close(waiting)
+				return acquire(ctx, dir)
+			}
+			operationDone, drainDone := make(chan struct{}), make(chan struct{})
+			t.Cleanup(func() {
+				cancel()
+				release()
+				<-operationDone
+				<-drainDone
+				storage.AcquirePayload = acquire
+			})
+			q := f.q
+			q.Action = action
+			data, _ := json.Marshal(q)
+			req := httptest.NewRequest(http.MethodPost, "/vm/cold-disk-v1", strings.NewReader(string(data)))
+			if action != "hydrate" {
+				metadata, _ := json.Marshal(MigrationDiskRequest{Action: action, Name: q.Name, InstanceID: q.InstanceID, Token: uuid.NewString()})
+				req = httptest.NewRequest(http.MethodPost, "/vm/migration-disk-v1", nil)
+				req.Header.Set("X-Srv-Migration", string(metadata))
+			}
+			w := httptest.NewRecorder()
+			go func() {
+				defer close(operationDone)
+				f.s.Handler().ServeHTTP(w, req.WithContext(ctx))
+			}()
+			drainResult := make(chan error, 1)
+			go func() {
+				defer close(drainDone)
+				select {
+				case <-waiting:
+					drainResult <- f.c.Drain(ctx)
+				case <-ctx.Done():
+					drainResult <- ctx.Err()
+				}
+			}()
+			select {
+			case err := <-drainResult:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("runner drain blocked behind a payload waiter")
+			}
+			release()
+			<-operationDone
+			if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "runner is draining") {
+				t.Fatalf("unadmitted storage operation: HTTP %d: %s", w.Code, w.Body.String())
+			}
+			if f.contents() != "unique guest data, not the base" {
+				t.Fatal("unadmitted storage operation changed the disk")
+			}
+		})
+	}
+}
+
 func TestColdDiskRoundtripAndNextGeneration(t *testing.T) {
 	f := newColdFixture(t)
 	want := f.contents()
@@ -373,6 +443,13 @@ func TestColdDiskDeleteFencesLateOffload(t *testing.T) {
 			f.volume(f.disk, []byte("replacement instance"), "", "")
 			f.q.InstanceID = uuid.NewString()
 			f.must("offload", "cold")
+			f.s.stop = func(context.Context, StopRequest) error {
+				t.Error("late stop reached successor runtime")
+				return errors.New("unexpected stop")
+			}
+			if err := f.c.StopInstanceVM(context.Background(), StopRequest{Name: late.Name, InstanceID: late.InstanceID}); err != nil {
+				t.Fatal("late legacy stop", err)
+			}
 		})
 	}
 }

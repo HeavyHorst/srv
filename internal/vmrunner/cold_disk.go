@@ -184,13 +184,6 @@ func (s *Server) handleColdDisk(w http.ResponseWriter, request *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(request.Context(), timeout)
 	defer cancel()
-	// Drain waits for storage operations just as it waits for admitted starts.
-	s.startAdmission.RLock()
-	defer s.startAdmission.RUnlock()
-	if s.draining {
-		respondError(w, http.StatusServiceUnavailable, errors.New("runner is draining"))
-		return
-	}
 	if q.Action == "hydrate" {
 		var release func()
 		var err error
@@ -200,6 +193,14 @@ func (s *Server) handleColdDisk(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 		defer release()
+	}
+	// Payload waiters are not admitted: deletion can own payload while it
+	// still needs runner admission, so they must not hold up drain.
+	s.startAdmission.RLock()
+	defer s.startAdmission.RUnlock()
+	if s.draining {
+		respondError(w, http.StatusServiceUnavailable, errors.New("runner is draining"))
+		return
 	}
 	ctx, unlock, err := s.lockNameInherited(ctx, q.Name)
 	if err != nil {

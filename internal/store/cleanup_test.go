@@ -72,6 +72,19 @@ func TestCleanupAtomicCommitAndReopen(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TRIGGER fail_receipt`); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InterruptLifecycleRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginCleanup(ctx, r.RequestID, r.Actor, i); err != nil {
+		t.Fatal("resume after failed commit", err)
+	}
 	if err := s.CommitCleanup(ctx, r); err != nil {
 		t.Fatal(err)
 	}
@@ -201,5 +214,62 @@ func TestCleanupCommitRejectsReadyInstanceWithFence(t *testing.T) {
 	}
 	if err := s.CheckCleanupFence(ctx, inst.ID); err == nil {
 		t.Fatal("fence cleared after rejected commit")
+	}
+}
+
+func TestCleanupResumeRequiresOwningFence(t *testing.T) {
+	for _, scenario := range []string{"failed-preflight", "cancelled-admission", "interrupted", "other-request", "missing-fence", "new-delete-missing-fence"} {
+		t.Run(scenario, func(t *testing.T) {
+			s := newTestStore(t)
+			ctx := context.Background()
+			i, r := cleanupFixture(t, s)
+			r.Version, r.RetainedTemplates, r.SnapshotsAbsent = 4, nil, false
+			if scenario == "failed-preflight" {
+				if ok, err := s.FinishLifecycleRequest(ctx, r.RequestID, r.Actor, 75); err != nil || !ok {
+					t.Fatal(ok, err)
+				}
+			} else if scenario != "cancelled-admission" {
+				if err := s.BeginCleanup(ctx, r.RequestID, r.Actor, i); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.InterruptLifecycleRequests(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "other-request" {
+				r.RequestID = "another-request"
+				if _, err := s.AdmitLifecycleRequest(ctx, LifecycleRequest{ID: r.RequestID, Actor: r.Actor, Command: "delete-proof", Name: i.Name, Arguments: "same-instance"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "missing-fence" || scenario == "new-delete-missing-fence" {
+				if _, err := s.db.Exec(`DELETE FROM cleanup_fences`); err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "new-delete-missing-fence" {
+					r.RequestID = "ordinary-delete"
+					if _, err := s.AdmitLifecycleRequest(ctx, LifecycleRequest{ID: r.RequestID, Actor: r.Actor, Command: "delete", Name: i.Name, Arguments: "bound"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			err := s.BeginCleanup(ctx, r.RequestID, r.Actor, i)
+			if scenario == "other-request" || scenario == "missing-fence" || scenario == "new-delete-missing-fence" {
+				if err == nil {
+					t.Fatal("unsafe resume accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal("safe retry refused", err)
+			}
+			if err := s.CommitCleanup(ctx, r); err != nil {
+				t.Fatal(err)
+			}
+			got, err := s.CleanupReceipt(ctx, r.RequestID, r.Actor)
+			if err != nil || !reflect.DeepEqual(got, r) {
+				t.Fatal(got, err)
+			}
+		})
 	}
 }

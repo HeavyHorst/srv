@@ -59,7 +59,7 @@ func (s *Store) FinalizeImport(ctx context.Context, instanceID string, updatedAt
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE instances SET state = ?, firecracker_pid = 0, last_error = '', deleted_at = NULL, updated_at = ? WHERE id = ?`, model.StateStopped, timeString(updatedAt), instanceID)
+	result, err := tx.ExecContext(ctx, `UPDATE instances SET state = ?, firecracker_pid = 0, last_error = '', deleted_at = NULL, updated_at = ? WHERE id = ? AND state = 'provisioning'`, model.StateStopped, timeString(updatedAt), instanceID)
 	if err != nil {
 		return err
 	}

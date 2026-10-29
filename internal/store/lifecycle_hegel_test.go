@@ -230,7 +230,7 @@ func (m *lifecycleMachine) RuleBeginCleanup(tc hegel.TestCase) {
 	}
 	matching := requestID != "missing" && m.requests[requestID].name == name
 	valid := matching &&
-		(expected.state == model.StateReady || expected.state == model.StateStopped) &&
+		(expected.state == model.StateReady || expected.state == model.StateStopped || expected.state == model.StateProvisioning) &&
 		expected.fence == ""
 
 	stored, err := m.store.GetInstance(context.Background(), name)
@@ -264,7 +264,7 @@ func (m *lifecycleMachine) RuleCommitCleanup(tc hegel.TestCase) {
 	expected := m.instances[name]
 	requestID := expected.fence
 	valid := requestID != "" && m.requests[requestID].phase == "executing" &&
-		expected.state == model.StateDeleting && expected.fixture.KindName() == model.KindOrb
+		expected.state == model.StateDeleting
 	receipt := cleanupReceiptFor(expected.fixture, requestID)
 	err := m.store.CommitCleanup(context.Background(), receipt)
 	if valid {
@@ -392,7 +392,7 @@ func (m *lifecycleMachine) RuleFinalizeImport(tc hegel.TestCase) {
 	}
 	imp := m.imports[id]
 	instance, instanceExists := m.instances[imp.name]
-	valid := imp.receipt.Phase == "importing" && instanceExists
+	valid := imp.receipt.Phase == "importing" && instanceExists && instance.state == model.StateProvisioning
 	err := m.store.FinalizeImport(context.Background(), id, time.Now().UTC())
 	if valid {
 		tc.Event("finalize-succeeded")
@@ -551,7 +551,7 @@ func (m *lifecycleMachine) InvariantImports(tc hegel.TestCase) {
 		}
 		// An imported receipt records completed import, not a perpetual stopped
 		// state: later lifecycle operations may move the instance.
-		if stored.Phase == "importing" && instance.state != model.StateProvisioning {
+		if stored.Phase == "importing" && instance.state != model.StateProvisioning && instance.state != model.StateDeleting && instance.state != model.StateDeleted {
 			tc.Errorf("importing instance %s state = %q", expected.name, instance.state)
 			return
 		}
@@ -601,12 +601,15 @@ func (m *lifecycleMachine) InvariantTerminalRequests(tc hegel.TestCase) {
 }
 
 func cleanupReceiptFor(inst model.Instance, requestID string) model.CleanupReceipt {
+	authDisposition := "not-asserted"
+	if inst.KindName() == model.KindOrb {
+		authDisposition = "never-minted"
+	}
 	return model.CleanupReceipt{
-		Version:            3,
+		Version:            5,
 		BackendID:          "backend-one",
 		Kind:               inst.KindName(),
 		Image:              inst.ImageName(),
-		RetainedTemplates:  []string{},
 		RequestID:          requestID,
 		Actor:              "owner",
 		InstanceID:         inst.ID,
@@ -614,7 +617,8 @@ func cleanupReceiptFor(inst model.Instance, requestID string) model.CleanupRecei
 		CreatedAt:          inst.CreatedAt,
 		CreatedByUser:      inst.CreatedByUser,
 		CreatedByNode:      inst.CreatedByNode,
-		AuthKeyDisposition: "never-minted",
+		AuthKeyDisposition: authDisposition,
+		TailnetDisposition: "absent",
 		IngressClosed:      true,
 		GatewaysAbsent:     true,
 		RuntimeAbsent:      true,
@@ -627,8 +631,6 @@ func cleanupReceiptFor(inst model.Instance, requestID string) model.CleanupRecei
 		RootFSPath:         inst.RootFSPath,
 		BackupsDir:         filepath.Join("/backups", inst.Name),
 		StorageAbsent:      true,
-		BackupsAbsent:      true,
-		SnapshotsAbsent:    true,
 		DeletedAt:          inst.CreatedAt.Add(time.Hour),
 	}
 }

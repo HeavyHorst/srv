@@ -41,7 +41,7 @@ func TestLifecycleRequestRecoveryAndBinding(t *testing.T) {
 	}
 }
 
-func TestLifecycleRequestSurvivesReopenWithoutReplay(t *testing.T) {
+func TestLifecycleRequestSurvivesReopenWithBoundCleanupResume(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "state.db")
 	s, err := Open(path)
@@ -72,9 +72,6 @@ func TestLifecycleRequestSurvivesReopenWithoutReplay(t *testing.T) {
 	if ok, err := s.AdmitLifecycleRequest(ctx, r); err != nil || ok {
 		t.Fatalf("interrupted delete replay: %v %v", ok, err)
 	}
-	if err := s.BeginCleanup(ctx, r.ID, r.Actor, i); err == nil {
-		t.Fatal("interrupted delete executed")
-	}
 	if _, err := s.GetLifecycleRequest(ctx, r.ID, "bob"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("foreign actor obtained receipt: %v", err)
 	}
@@ -89,6 +86,12 @@ func TestLifecycleRequestSurvivesReopenWithoutReplay(t *testing.T) {
 	}
 	if finished, err := s.FinishLifecycleRequest(ctx, r.ID, r.Actor, 0); err != nil || finished {
 		t.Fatalf("interrupted request completed: %v %v", finished, err)
+	}
+	if err := s.BeginCleanup(ctx, r.ID, r.Actor, i); err != nil {
+		t.Fatal("bound cleanup resume refused", err)
+	}
+	if err := s.CheckCleanupFence(ctx, i.ID); err == nil {
+		t.Fatal("resume removed its fence before completion")
 	}
 }
 

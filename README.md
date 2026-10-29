@@ -128,20 +128,35 @@ Per-VM backup and restore is currently an in-place stopped-instance workflow: cr
 
 Because the guest's durable Tailscale identity lives in the copied rootfs, treat this as cutover or move semantics, not cloning semantics: do not boot the source and imported copies at the same time.
 
-`snapshot create` is a separate host-local disaster-recovery primitive. It briefly blocks all SSH commands, checkpoints SQLite, flushes the filesystem, and creates a readonly btrfs snapshot of `SRV_DATA_DIR` under `SRV_DATA_DIR/.snapshots/<timestamp>`. The semantics are intentionally simple: control-plane consistent, stopped guests fully safe, and running guests crash-consistent only.
+Imports allocate a fresh local instance ID and retain the source ID in the import
+receipt. Reimporting a deleted instance never clears its old runtime deletion fence.
 
-`status` is an admin-only host summary. It reports instance counts plus host CPU, memory, and disk allocation headroom. CPU is intentionally advisory so hosts can be overcommitted; memory and disk reflect the same reservation budgets that gate `new`, `start`, and grow-style `resize`. The `DISK RSV` row is rootfs reservation headroom; `FS SPACE` reports filesystem space used and available, including backups, reflink divergence, logs, and other data outside those reservations. Shared reflink extents contribute once to filesystem usage, while divergence and new metadata consume additional space.
+Optional [cold storage over SSH](docs/reference/operations.md#optional-cold-disks-over-ssh)
+can evict a stopped VM or Orb's local disk after verified remote publication:
+`ssh srv disk offload demo`, `disk status demo`, `disk hydrate demo`, and
+`disk purge demo`. Start hydrates the entire disk before booting. Cold storage is
+disabled by default; it is not a substitute for backups.
+
+`snapshot create` is a separate host-local disaster-recovery primitive. It briefly blocks all SSH commands, checkpoints SQLite, flushes the filesystem, and creates a bundle of readonly root and disk subvolume snapshots with a manifest under `SRV_DATA_DIR/.snapshots/<timestamp>`. It is control-plane consistent, with stopped guests fully safe and running guests crash-consistent only; it does not provide global disk atomicity. See [host snapshot bundles](docs/tasks/host-snapshots.md) for backup and restore requirements.
+
+`status` is an admin-only host summary. It reports instance counts plus host CPU, memory, and disk headroom. CPU is intentionally advisory so hosts can be overcommitted; memory uses reservation budgets. Disk uses measured physical usage and available space with a 1 GiB runtime floor, not virtual rootfs reservations (the existing `DISK RSV` label is retained). `FS SPACE` includes backups, reflink divergence, logs, and unrelated data. Shared reflink extents contribute once to filesystem usage, while divergence and new metadata consume additional space. Bulk import/receive/hydration admission additionally checks an estimated payload under a host lock; neither this estimate nor the runtime floor guarantees physical fit. See [disk admission and migration](docs/getting-started/multi-host.md#enable-native-transfer).
 
 ## Host Requirements
 
-- Linux host with cgroup v2 and `/dev/kvm`
+- Linux host (kernel 5.6 or newer) with cgroup v2 and `/dev/kvm`
 - IPv4 forwarding enabled on the host, for example `net.ipv4.ip_forward=1`
-- `SRV_DATA_DIR` on a reflink-capable filesystem, with `SRV_BASE_ROOTFS` on the same filesystem; for example `btrfs`, or `xfs` created with reflink support enabled
-- `snapshot create` additionally requires `SRV_DATA_DIR` itself to be a btrfs subvolume root, not just a directory on btrfs
+- `SRV_DATA_DIR` must be a dedicated btrfs subvolume root with its own UUID (not top-level ID 5) for all VMs and Orbs, with every base rootfs image on the same btrfs filesystem
+- `btrfs-progs` installed and `user_subvol_rm_allowed` enabled so the unprivileged service can delete subvolumes it owns; no new capabilities are granted to the main `srv` process
+- Orb runtime and jail directories must be in the same subvolume (not merely the same filesystem), because the Orb socket is hard-linked; disk, kernel, initrd, and logs are bind-mounted by the runner
 - Tailscale installed and working on the host
 - Tailscale OAuth client credentials with permission to mint auth keys for the configured guest tags
 - `ip`, `iptables`, `cp`, `e2fsck`, and `resize2fs` available on the host
 - Official static Firecracker and jailer release pair, or let `contrib/systemd/install.sh` install them
+
+VM and Orb disks live at `SRV_DATA_DIR/instances/<name>/disk/rootfs.img` in dedicated
+disk subvolumes. Legacy stopped instances migrate automatically on start with a
+durable journal. Non-btrfs hosts need an offline move before upgrade; see the
+[storage migration runbook](docs/reference/operations.md#storage-layout-migration).
 
 ## Key Configuration
 
@@ -153,7 +168,7 @@ Core environment variables live in [`contrib/systemd/srv.env.example`](contrib/s
 - `SRV_ADMIN_USERS`: optional comma-separated Tailscale login list with cross-instance visibility and management rights
 - `SRV_BASE_KERNEL`: Firecracker guest kernel image
 - `SRV_BASE_INITRD`: optional initrd image
-- `SRV_BASE_ROOTFS`: base guest rootfs image stored on the same reflink-capable filesystem as `SRV_DATA_DIR` such as `btrfs` or reflink-enabled `xfs`
+- `SRV_BASE_ROOTFS`: base guest rootfs image stored on the same btrfs filesystem as `SRV_DATA_DIR`
 - `SRV_IMAGES_FILE`: optional JSON image catalog for `new --image NAME`; Arch remains the default. See [image configuration](docs/reference/configuration.md#guest-artifacts) and the [Debian 13 basic image builder](images/debian-base/README.md).
 - `SRV_GUEST_AUTH_TAGS`: comma-separated tags applied to guest auth keys
 - `SRV_GUEST_USER_AUTH_TAGS`: optional comma-separated `tailscale-login=tag:name` mappings that replace the default tags based on the verified VM creator
@@ -189,7 +204,7 @@ When debugging a failed host run, start with `ssh srv inspect <name>`, then comp
 - The control plane mints a one-off Tailscale auth key for each guest and injects it through Firecracker MMDS metadata.
 - When provider API keys such as `SRV_ZEN_API_KEY` or `SRV_DEEPSEEK_API_KEY` are configured, `srv` also binds per-instance HTTP proxies on that instance's host/gateway IP and forwards `/v1/...` requests to the upstream provider APIs with host keys injected. The proxies only serve requests from that instance's guest IP, and guest bootstrap writes both `/root/.config/opencode/opencode.json` and Pi config under `/root/.pi/agent/` so the preinstalled `opencode` and `pi` CLIs target those per-VM gateways by default without storing the real provider keys inside the guest.
 - Generic HTTP integrations use a separate per-instance host-side gateway on `SRV_INTEGRATION_GATEWAY_PORT`. Admins define integrations once, reference only host env secret names such as `SRV_SECRET_OPENAI_PROD`, enable them per VM, and guests reach them under `/integrations/<name>/...` on their gateway IP without learning the underlying credentials.
-- `snapshot create` is an admin-only global barrier; while it is active, all other SSH commands are rejected until the local readonly btrfs snapshot has been created.
+- `snapshot create` is an admin-only control-plane barrier; while it is active, all other SSH commands are rejected until the local readonly snapshot bundle has been created.
 - Existing stopped guests pick up the currently configured `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` on their next `start` or `restart`.
 - Rootfs changes only affect newly created guests after you rebuild the base image artifacts and refresh `SRV_BASE_ROOTFS`.
 

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"srv/internal/model"
+	"srv/internal/storage"
 )
 
 type templateManifest struct {
@@ -45,7 +46,7 @@ func (p *Provisioner) readTemplate(id string, actor model.Actor) (string, templa
 	if err := json.Unmarshal(b, &m); err != nil {
 		return "", m, err
 	}
-	if m.Version != 1 || m.ID != id || !strings.EqualFold(m.Owner, actor.UserLogin) || m.SourceID == "" || m.Image == "" {
+	if (m.Version != 1 && m.Version != 2) || m.ID != id || !strings.EqualFold(m.Owner, actor.UserLogin) || m.SourceID == "" || m.Image == "" {
 		return "", m, errors.New("invalid template manifest or owner")
 	}
 	return dir, m, nil
@@ -84,6 +85,9 @@ func (p *Provisioner) createTemplate(ctx context.Context, name, templateID strin
 	if !strings.EqualFold(inst.CreatedByUser, actor.UserLogin) {
 		return errors.New("template source belongs to another owner")
 	}
+	if err := p.coldDiskFence(ctx, inst, false); err != nil {
+		return err
+	}
 	if err := p.resolveRuntime(ctx, &inst); err != nil {
 		return err
 	}
@@ -92,7 +96,7 @@ func (p *Provisioner) createTemplate(ctx context.Context, name, templateID strin
 	}
 	if _, old, err := p.readTemplate(templateID, actor); err == nil {
 		if old.SourceID == inst.ID && old.Image == inst.ImageName() && (model.Instance{Kind: old.Kind}).KindName() == inst.KindName() {
-			info, err := os.Stat(filepath.Join(dest, "rootfs.img"))
+			info, err := os.Stat(templateDiskPath(dest, old))
 			if err != nil {
 				return fmt.Errorf("published template disk unavailable: %w", err)
 			}
@@ -114,6 +118,12 @@ func (p *Provisioner) createTemplate(ctx context.Context, name, templateID strin
 	if mustExist {
 		return errors.New("published template is missing; refusing to recreate it")
 	}
+	if err := p.ensureHostDiskCapacity(ctx, "", 0); err != nil {
+		return err
+	}
+	if err := p.ensureDiskLayout(ctx, &inst); err != nil {
+		return err
+	}
 	parent := filepath.Dir(dest)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return err
@@ -122,24 +132,32 @@ func (p *Provisioner) createTemplate(ctx context.Context, name, templateID strin
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(stage)
-	disk := filepath.Join(stage, "rootfs.img")
-	if err := p.cloneRootFS(ctx, inst.RootFSPath, disk); err != nil {
+	defer removePathAll(stage)
+	writable := filepath.Join(stage, "writable")
+	if err := storage.SnapshotSubvolume(ctx, filepath.Dir(inst.RootFSPath), writable, false); err != nil {
 		return err
 	}
+	disk := filepath.Join(writable, "rootfs.img")
 	if err := sanitizeTemplateDisk(ctx, disk); err != nil {
 		return fmt.Errorf("sanitize template: %w", err)
 	}
-	m := templateManifest{Version: 1, ID: templateID, Owner: actor.UserLogin, SourceID: inst.ID, Image: inst.ImageName(), Kind: inst.KindName()}
+	if err := storage.SyncPath(disk); err != nil {
+		return err
+	}
+	if err := storage.SnapshotSubvolume(ctx, writable, filepath.Join(stage, "disk"), true); err != nil {
+		return err
+	}
+	if err := removePathAll(writable); err != nil {
+		return err
+	}
+	disk = filepath.Join(stage, "disk", "rootfs.img")
+	m := templateManifest{Version: 2, ID: templateID, Owner: actor.UserLogin, SourceID: inst.ID, Image: inst.ImageName(), Kind: inst.KindName()}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
 	manifest := filepath.Join(stage, "manifest.json")
 	if err := os.WriteFile(manifest, b, 0o400); err != nil {
-		return err
-	}
-	if err := os.Chmod(disk, 0o400); err != nil {
 		return err
 	}
 	for _, path := range []string{disk, manifest, stage} {
@@ -166,26 +184,55 @@ func (p *Provisioner) DeleteTemplate(ctx context.Context, templateID string, act
 	}
 	p.admissionMu.Lock()
 	defer p.admissionMu.Unlock()
-	dir, _, err := p.readTemplate(templateID, actor)
+	dir, err := p.templatePath(templateID, actor)
+	if err != nil {
+		return err
+	}
+	parent := filepath.Dir(dir)
+	if err := storage.ValidatePath(parent); err != nil {
+		return err
+	}
+	if _, _, err := p.readTemplate(templateID, actor); err == nil {
+		// Unpublish before reclaiming files so a partial removal cannot leave
+		// a visible template with a missing manifest or disk.
+		trash := filepath.Join(parent, ".deleted-"+uuid.NewString())
+		if err := os.Rename(dir, trash); err != nil {
+			return err
+		}
+		if err := syncTemplatePath(parent); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	entries, err := os.ReadDir(parent)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	// Unpublish atomically before reclaiming files; an interrupted recursive
-	// removal must not leave a visible template with a missing manifest or disk.
-	trash := filepath.Join(filepath.Dir(dir), ".deleted-"+uuid.NewString())
-	if err := os.Rename(dir, trash); err != nil {
-		return err
+	// UUID trash in this owner's private namespace was already unpublished
+	// for deletion. Resume old attempts too, even if their manifest is gone.
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), ".deleted-") {
+			continue
+		}
+		if _, err := uuid.Parse(strings.TrimPrefix(entry.Name(), ".deleted-")); err != nil {
+			continue
+		}
+		if err := removePathAll(filepath.Join(parent, entry.Name())); err != nil {
+			return err
+		}
 	}
-	if err := syncTemplatePath(filepath.Dir(dir)); err != nil {
-		return err
+	return syncTemplatePath(parent)
+}
+
+func templateDiskPath(dir string, m templateManifest) string {
+	if m.Version == 2 {
+		return filepath.Join(dir, "disk", "rootfs.img")
 	}
-	if err := os.RemoveAll(trash); err != nil {
-		return err
-	}
-	return syncTemplatePath(filepath.Dir(dir))
+	return filepath.Join(dir, "rootfs.img")
 }
 
 func syncTemplatePath(path string) error {

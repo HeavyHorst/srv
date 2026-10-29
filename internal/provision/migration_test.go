@@ -3,17 +3,18 @@ package provision
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
 	"srv/internal/host"
 	"srv/internal/model"
+	"srv/internal/vmrunner"
 	"tailscale.com/client/tailscale/v2"
 )
 
@@ -47,7 +48,7 @@ func TestRecoveredMigrationRequiresFreshToken(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, store: st}
+	p := &Provisioner{cfg: cfg, store: st, vmRunner: noopVMRunner{}}
 	inst := provisionTestInstance(cfg, "retry", model.StateStopped, time.Now().UTC())
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatal(err)
@@ -75,7 +76,7 @@ func TestMigrationDestinationPolicyPersists(t *testing.T) {
 			ctx := context.Background()
 			cfg := loadProvisionTestConfig(t, nil)
 			st := newProvisionTestStore(t, cfg)
-			p := &Provisioner{cfg: cfg, store: st}
+			p := &Provisioner{cfg: cfg, store: st, vmRunner: noopVMRunner{}}
 			inst := provisionTestInstance(cfg, "pooled", model.StateStopped, time.Now().UTC())
 			inst.MemoryMode, inst.MemoryPoolID = "pool", "source-local-id"
 			if err := st.CreateInstance(ctx, inst); err != nil {
@@ -135,14 +136,14 @@ func TestImportDestinationMemoryPolicy(t *testing.T) {
 				ctx := context.Background()
 				cfg := loadProvisionTestConfig(t, nil)
 				st := newProvisionTestStore(t, cfg)
-				p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), readFilesystemBytes: host.DefaultReadFilesystemBytes}
+				p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), readFilesystemUsage: host.DefaultReadFilesystemUsage}
 				now := time.Now().UTC()
 				pool := model.MemoryPool{ID: "destination-local-id", Name: "destination", ReservedBytes: 1024 * 1024 * 1024, CreatedAt: now, UpdatedAt: now}
 				if err := st.CreateMemoryPool(ctx, pool); err != nil {
 					t.Fatal(err)
 				}
 				inst := provisionTestInstance(cfg, "imported", model.StateStopped, now)
-				if err := os.MkdirAll(filepath.Dir(filepath.Dir(inst.RootFSPath)), 0o770); err != nil {
+				if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
 					t.Fatal(err)
 				}
 				inst.MemoryMode, inst.MemoryPoolID, inst.MemoryMiB, inst.VCPUCount, inst.RootFSSizeBytes = sourceMode, "source-local-id", 512, 1, 6
@@ -182,19 +183,29 @@ func TestImportDestinationMemoryPolicy(t *testing.T) {
 	}
 }
 
+type migrationStopFailureRunner struct {
+	noopVMRunner
+	stopErr error
+}
+
+func (r migrationStopFailureRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {
+	return r.stopErr
+}
+
 func TestFailedMigrationStopRetainsFence(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	stopErr := errors.New("runtime helper unavailable")
+	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: migrationStopFailureRunner{stopErr: stopErr}}
 	inst := provisionTestInstance(cfg, "uncertain", model.StateReady, time.Now().UTC())
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatal(err)
 	}
-	// No runtime helper: stop cannot be confirmed, so export/complete and all
+	// The runtime helper is unavailable for stop, so export/complete and all
 	// starts must remain prohibited rather than rolling back the durable fence.
-	if _, err := p.PrepareMigration(ctx, inst.Name, "destination", "transfer"); err == nil {
-		t.Fatal("unconfirmed stop prepared migration")
+	if _, err := p.PrepareMigration(ctx, inst.Name, "destination", "transfer"); !errors.Is(err, stopErr) {
+		t.Fatalf("migration must reach and fail stop confirmation: %v", err)
 	}
 	m, err := p.MigrationStatus(ctx, inst.Name)
 	if err != nil || m.Phase != "preparing" || !m.WasRunning {
@@ -213,9 +224,9 @@ func TestFailedMigrationStopRetainsFence(t *testing.T) {
 
 func TestImportInstanceIDCollisionPreservesExistingJournal(t *testing.T) {
 	ctx := context.Background()
-	cfg := loadProvisionTestConfig(t, nil)
+	cfg := loadProvisionTestConfig(t, map[string]string{"SRV_VM_NETWORK_CIDR": "10.0.0.0/28"})
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), readFilesystemBytes: host.DefaultReadFilesystemBytes}
+	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: noopVMRunner{}, readFilesystemUsage: host.DefaultReadFilesystemUsage}
 	inst := provisionTestInstance(cfg, "existing", model.StateStopped, time.Now().UTC())
 	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o770); err != nil {
 		t.Fatal(err)
@@ -238,15 +249,17 @@ func TestImportInstanceIDCollisionPreservesExistingJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := portableManifest{Version: portableManifestVersion, MigrationToken: "collision-token", ExportedAt: time.Now().UTC(), Instance: portableInstance{ID: inst.ID, Name: "different-name", CreatedAt: inst.CreatedAt, RootFSSizeBytes: 6}, Files: backupFiles{RootFS: backupRootFSName}}
-	stream := portableArtifactTestStream(t, manifest, map[string][]byte{backupRootFSName: []byte("rootfs")})
 	for _, phase := range []string{"importing", "imported"} {
 		t.Run(phase, func(t *testing.T) {
+			manifest.Instance.Name = "different-" + phase
+			stream := portableArtifactTestStream(t, manifest, map[string][]byte{backupRootFSName: []byte("rootfs")})
 			receipt := model.ImportReceipt{InstanceID: inst.ID, Token: "original-token", SourceInstanceID: "original-source", ExportedAt: "original-export", Phase: phase}
 			if err := st.PutImportReceipt(ctx, receipt); err != nil {
 				t.Fatal(err)
 			}
-			if _, _, err := p.ImportInstance(ctx, model.Actor{}, bytes.NewReader(stream)); err == nil || !strings.Contains(err.Error(), "already exists") {
-				t.Fatalf("colliding import: %v", err)
+			imported, _, err := p.ImportInstance(ctx, model.Actor{}, bytes.NewReader(stream))
+			if err != nil || imported.ID == inst.ID || imported.ID == "" {
+				t.Fatalf("import must allocate a distinct incarnation: %+v, %v", imported, err)
 			}
 			got, err := st.GetImportReceipt(ctx, inst.ID)
 			if err != nil || got != receipt {
@@ -264,8 +277,9 @@ func TestImportInstanceIDCollisionPreservesExistingJournal(t *testing.T) {
 			if err != nil || string(payload) != "original source disk" {
 				t.Fatalf("existing disk changed: %q, %v", payload, err)
 			}
-			if _, found, err := st.FindInstance(ctx, "different-name"); err != nil || found {
-				t.Fatalf("collision left reservation: %v, %v", found, err)
+			importReceipt, err := st.GetImportReceipt(ctx, imported.ID)
+			if err != nil || importReceipt.SourceInstanceID != inst.ID || importReceipt.Token != manifest.MigrationToken || importReceipt.Phase != "imported" {
+				t.Fatalf("new incarnation receipt: %+v, %v", importReceipt, err)
 			}
 		})
 	}

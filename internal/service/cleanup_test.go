@@ -225,11 +225,16 @@ func TestOrbBootstrapTerminalReceiptRequiresGenerationAck(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer os.RemoveAll(dir)
-			i.RootFSPath = filepath.Join(dir, "rootfs")
+			cfg := loadServiceTestConfig(t, map[string]string{"SRV_DATA_DIR": dir})
+			runtimeDir := filepath.Join(cfg.InstancesDir(), i.Name)
+			i.RootFSPath = filepath.Join(runtimeDir, "disk", "rootfs.img")
+			if err := os.MkdirAll(filepath.Dir(i.RootFSPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
 			if err := st.CreateInstance(ctx, i); err != nil {
 				t.Fatal(err)
 			}
-			listener, err := net.Listen("unix", filepath.Join(dir, "orb.vsock"))
+			listener, err := net.Listen("unix", filepath.Join(runtimeDir, "orb.vsock"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -268,7 +273,7 @@ func TestOrbBootstrapTerminalReceiptRequiresGenerationAck(t *testing.T) {
 				}
 				served <- nil
 			}()
-			a := &App{store: st, backendID: "backend-one"}
+			a := &App{cfg: cfg, store: st, backendID: "backend-one"}
 			actor := model.Actor{UserLogin: i.CreatedByUser}
 			ids := []string{uuid.NewString(), uuid.NewString()}
 			call := func(id string, generation int) error {
@@ -334,6 +339,15 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 				switch r.URL.Path {
 				case "/vm/stop", "/vm/cleanup-proof-v1", "/network/cleanup", "/network/cleanup-proof-v1":
 					w.WriteHeader(http.StatusNoContent)
+				case "/vm/cold-disk-v1":
+					var q struct {
+						Action string `json:"action"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&q); err != nil || (q.Action != "status" && q.Action != "fence-delete" && q.Action != "delete") {
+						http.Error(w, "expected cold status or deletion fence", http.StatusBadRequest)
+						return
+					}
+					_, _ = io.WriteString(w, `{"phase":"hot","remote":false,"journal_present":false}`)
 				default:
 					t.Errorf("unexpected helper request: %s", r.URL.Path)
 					http.Error(w, "unexpected", 400)

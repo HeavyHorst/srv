@@ -72,7 +72,7 @@ require_root() {
 require_commands() {
 	local missing=()
 	local cmd
-	for cmd in awk chown curl go install sha256sum systemctl tar id useradd; do
+	for cmd in awk btrfs chown curl go install sha256sum stat systemctl tar id useradd; do
 		if ! command -v "${cmd}" >/dev/null 2>&1; then
 			missing+=("${cmd}")
 		fi
@@ -222,6 +222,7 @@ install_vm_runner_unit() {
 		'
 			/^EnvironmentFile=/ { print "EnvironmentFile=" env_path; next }
 			/^ExecStart=/ { print "ExecStart=" binary_path " -socket /run/srv-vm-runner/vm-runner.sock -client-group " service_group; next }
+			/^ExecStop=/ { print "ExecStop=" binary_path " -drain-only -socket /run/srv-vm-runner/vm-runner.sock"; next }
 			/^User=/ { print "User=root"; next }
 			/^Group=/ { print "Group=" service_group; next }
 			{ print }
@@ -325,15 +326,48 @@ configured_data_dir() {
 install_data_dirs() {
 	local data_dir
 	data_dir="$(configured_data_dir)"
+	if [[ ! -e "${data_dir}" ]]; then
+		if [[ "$(stat -f -c %T "$(dirname -- "${data_dir}")")" != btrfs ]]; then
+			echo "prepare ${data_dir} as a btrfs subvolume before installation; XFS is no longer supported" >&2
+			exit 1
+		fi
+		btrfs subvolume create "${data_dir}"
+	fi
+	if [[ -L "${data_dir}" || "$(stat -f -c %T "${data_dir}")" != btrfs || "$(stat -c %i "${data_dir}")" != 256 ]]; then
+		echo "${data_dir} must be a btrfs subvolume root; existing data is not converted by the installer" >&2
+		exit 1
+	fi
+	if [[ "$(btrfs inspect-internal rootid "${data_dir}")" == 5 ]]; then
+		echo "${data_dir} must be a dedicated subvolume with a UUID, not the btrfs top-level tree" >&2
+		exit 1
+	fi
 	install -d -m 0755 "${data_dir}"
+	# Keep the inode across upgrades: running receivers may still hold its flock.
+	install -d -m 0755 -o root -g root "${data_dir}/.host-locks"
+	local payload_lock="${data_dir}/.host-locks/payload.lock"
+	if [[ -L "${payload_lock}" || ( -e "${payload_lock}" && ! -f "${payload_lock}" ) ]]; then
+		echo "unsafe payload lock: ${payload_lock}" >&2
+		exit 1
+	fi
+	if [[ ! -e "${payload_lock}" ]]; then
+		(umask 077; set -o noclobber; : > "${payload_lock}")
+	fi
+	chown "root:${SERVICE_GROUP}" "${payload_lock}"
+	chmod 0660 "${payload_lock}"
 	install -d -m 0755 "${data_dir}/images"
 	install -d -m 0755 "${data_dir}/jailer"
 	install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/state"
 	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/backups"
 	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/instances"
+	install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/image-bases"
+	if [[ ! -e "${data_dir}/.snapshots" ]]; then
+		btrfs subvolume create "${data_dir}/.snapshots"
+	fi
+	chown "${SERVICE_USER}:${SERVICE_GROUP}" "${data_dir}/.snapshots"
 	# Project templates are confidential copies of guest disks.
 	install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${data_dir}/templates"
-	chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${data_dir}/state" "${data_dir}/backups" "${data_dir}/instances"
+	# Never recursively chown immutable disk snapshots on an upgrade.
+	chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${data_dir}/state"
 }
 
 reload_systemd() {

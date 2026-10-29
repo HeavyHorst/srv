@@ -40,7 +40,7 @@ import (
 
 const (
 	hostMemoryReserveMiB = int64(512)
-	hostDiskReserveBytes = int64(1 << 30)
+	hostDiskReserveBytes = storage.DiskRuntimeFloorBytes
 	guestHaltTailBytes   = int64(64 << 10)
 )
 
@@ -61,7 +61,8 @@ var (
 		}
 		return strings.TrimSpace(string(output)), nil
 	}
-	removePathAll    = os.RemoveAll
+	removeTree       = storage.RemoveTree
+	removePathAll    = func(path string) error { return storage.RemoveTree(context.Background(), path) }
 	reflinkCloneFile = func(ctx context.Context, src, dest string) error {
 		cmd := exec.CommandContext(ctx, "cp", "--reflink=always", src, dest)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -251,7 +252,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		if manifest.Image != imageName {
 			return model.Instance{}, fmt.Errorf("template image %q does not match requested image %q", manifest.Image, imageName)
 		}
-		image.RootFS = filepath.Join(dir, "rootfs.img")
+		image.RootFS = templateDiskPath(dir, manifest)
 	}
 	baseRootFSSize, err := p.rootFSSize(image.RootFS)
 	if err != nil {
@@ -294,7 +295,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 
 		networkCIDR, hostAddr, guestAddr, gateway, err := p.allocateNetwork(ctx)
 		if err != nil {
-			_ = os.RemoveAll(instanceDir)
+			_ = removePathAll(instanceDir)
 			return err
 		}
 
@@ -313,7 +314,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 			MemoryMiB:       resolved.MemoryMiB,
 			MemoryMode:      model.MemoryModeFixed,
 			RootFSSizeBytes: resolved.RootFSSizeBytes,
-			RootFSPath:      filepath.Join(instanceDir, "rootfs.img"),
+			RootFSPath:      filepath.Join(instanceDir, "disk", "rootfs.img"),
 			KernelPath:      image.Kernel,
 			InitrdPath:      image.Initrd,
 			SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
@@ -332,7 +333,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		}
 
 		if err := p.store.CreateInstance(ctx, inst); err != nil {
-			_ = os.RemoveAll(instanceDir)
+			_ = removePathAll(instanceDir)
 			return err
 		}
 		return nil
@@ -361,7 +362,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		}
 	}()
 
-	if err := p.cloneRootFS(ctx, image.RootFS, inst.RootFSPath); err != nil {
+	if err := p.cloneInstanceDisk(ctx, image.RootFS, inst.RootFSPath, opts.Template != ""); err != nil {
 		inst.LastError = err.Error()
 		return inst, err
 	}
@@ -509,6 +510,9 @@ func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, 
 
 	if err := p.stopFirecracker(ctx, inst); err != nil {
 		return inst, fmt.Errorf("delete requires a confirmed stop: %w", err)
+	}
+	if err := p.cleanupColdForRemoval(ctx, inst); err != nil {
+		return inst, err
 	}
 	if err := p.cleanupNetworking(inst); err != nil {
 		return inst, fmt.Errorf("delete network cleanup: %w", err)
@@ -773,6 +777,9 @@ func (p *Provisioner) CheckRootFS(ctx context.Context, name string) (model.Insta
 	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
 		return inst, fmt.Errorf("instance %q must be stopped before fsck", name)
 	}
+	if err := p.diskMutationFence(ctx, inst); err != nil {
+		return inst, err
+	}
 	if _, err := exec.LookPath("e2fsck"); err != nil {
 		return inst, errors.New("fsck requires e2fsck on the host")
 	}
@@ -805,6 +812,9 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 		}
 		if current.FirecrackerPID > 0 && processExists(current.FirecrackerPID) {
 			return fmt.Errorf("instance %q must be stopped before resize", name)
+		}
+		if err := p.diskMutationFence(ctx, current); err != nil {
+			return err
 		}
 
 		resized := current
@@ -893,13 +903,13 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 			return inst, nil
 		}
 	}
-	if err := p.ensureStartPrereqs(inst); err != nil {
-		return inst, err
-	}
 	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
 		return inst, fmt.Errorf("instance %q is already running", name)
 	}
 
+	if err := p.hydrateColdDisk(ctx, inst); err != nil {
+		return inst, err
+	}
 	var pool model.MemoryPool
 	err = func() error {
 		p.admissionMu.Lock()
@@ -924,6 +934,13 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		if current.State == model.StateProvisioning {
 			return fmt.Errorf("instance %q is already starting", name)
 		}
+		if err := p.ensureHostDiskCapacity(ctx, current.Name, current.RootFSSizeBytes); err != nil {
+			return err
+		}
+		if err := p.ensureDiskLayout(ctx, &current); err != nil {
+			return err
+		}
+		inst = current
 		if err := p.ensureStartPrereqs(current); err != nil {
 			return err
 		}
@@ -1140,43 +1157,19 @@ func (p *Provisioner) reconcileLateTailnetJoin(ctx context.Context, inst *model.
 }
 
 func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (string, error) {
-	instanceDir, err := p.instanceDir(name)
+	instanceDir, existing, err := p.checkInstanceDirReusable(ctx, name)
 	if err != nil {
 		return "", err
 	}
-	if existing, found, err := p.store.FindInstance(ctx, name); err != nil {
-		return "", err
-	} else if found {
-		// Only an explicitly deleted completed source may be replaced. A
-		// failed incarnation is not permission to remove its durable fence.
-		migration, err := p.store.GetMigration(ctx, existing.ID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if existing != nil {
+		if err := p.cleanupColdForRemoval(ctx, *existing); err != nil {
 			return "", err
 		}
-		if err == nil && migration.Phase != "aborted" && !(existing.State == model.StateDeleted && migration.Phase == "completed") {
-			return "", fmt.Errorf("instance %q is fenced by migration (%s)", name, migration.Phase)
+		if err := cleanupInstanceTree(ctx, instanceDir); err != nil {
+			return "", fmt.Errorf("remove instance directory %s: %w", instanceDir, err)
 		}
-		switch existing.State {
-		case model.StateFailed, model.StateDeleted:
-			if existing.State != model.StateDeleted {
-				if err := p.migrationFence(ctx, name); err != nil {
-					return "", err
-				}
-			}
-			if err := p.resolveRuntime(ctx, &existing); err != nil {
-				return "", err
-			}
-			if existing.FirecrackerPID != 0 {
-				return "", errors.New("existing runtime must be stopped before reuse")
-			}
-			if err := p.removeInstanceDir(name); err != nil {
-				return "", err
-			}
-			if err := p.store.DeleteInstance(ctx, name); err != nil {
-				return "", err
-			}
-		default:
-			return "", fmt.Errorf("instance %q already exists with state %s", name, existing.State)
+		if err := p.store.DeleteInstance(ctx, name); err != nil {
+			return "", err
 		}
 	}
 	if err := os.Mkdir(instanceDir, 0o770); err != nil {
@@ -1189,6 +1182,66 @@ func (p *Provisioner) prepareInstanceDir(ctx context.Context, name string) (stri
 		return "", fmt.Errorf("set instance directory permissions: %w", err)
 	}
 	return instanceDir, nil
+}
+
+// Cleanup must survive request cancellation without dropping the payload locks
+// inherited by storage subprocesses. Bound each attempt, not the whole import.
+func cleanupInstanceTree(ctx context.Context, path string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	return removeTree(cleanupCtx, path)
+}
+
+// checkInstanceDirReusable removes no disk or row. Runtime reconciliation may
+// still repair metadata/networking. Import uses this before disk admission,
+// so an ordinary space denial cannot destroy a failed incarnation.
+func (p *Provisioner) checkInstanceDirReusable(ctx context.Context, name string) (string, *model.Instance, error) {
+	instanceDir, err := p.instanceDir(name)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := storage.RequireBtrfs(p.cfg.InstancesDir()); err != nil {
+		return "", nil, err
+	}
+	if existing, found, err := p.store.FindInstance(ctx, name); err != nil {
+		return "", nil, err
+	} else if found {
+		// Only an explicitly deleted completed source may be replaced. A
+		// failed incarnation is not permission to remove its durable fence.
+		migration, err := p.store.GetMigration(ctx, existing.ID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", nil, err
+		}
+		if err == nil && migration.Phase != "aborted" && !(existing.State == model.StateDeleted && migration.Phase == "completed") {
+			return "", nil, fmt.Errorf("instance %q is fenced by migration (%s)", name, migration.Phase)
+		}
+		switch existing.State {
+		case model.StateFailed, model.StateDeleted:
+			if existing.State != model.StateDeleted {
+				if err := p.migrationFence(ctx, name); err != nil {
+					return "", nil, err
+				}
+			}
+			if err := p.resolveRuntime(ctx, &existing); err != nil {
+				return "", nil, err
+			}
+			if existing.FirecrackerPID != 0 {
+				return "", nil, errors.New("existing runtime must be stopped before reuse")
+			}
+			if err := p.coldDiskFence(ctx, existing, true); err != nil {
+				return "", nil, err
+			}
+			return instanceDir, &existing, nil
+		default:
+			return "", nil, fmt.Errorf("instance %q already exists with state %s", name, existing.State)
+		}
+	}
+	if _, err := os.Lstat(instanceDir); err == nil {
+		return "", nil, fmt.Errorf("instance %q already exists on disk", name)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", nil, err
+	}
+	return instanceDir, nil, nil
 }
 
 func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool, image config.Image, kind string) error {
@@ -1231,6 +1284,9 @@ func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool,
 
 func (p *Provisioner) ensureRootFSReflinkSupport(ctx context.Context, rootfs string) error {
 	probeParent := p.cfg.InstancesDir()
+	if err := storage.RequireBtrfs(probeParent); err != nil {
+		return err
+	}
 	probeDir, err := os.MkdirTemp(probeParent, ".srv-reflink-check-")
 	if err != nil {
 		return fmt.Errorf("create reflink probe dir in %s: %w", probeParent, err)
@@ -1374,25 +1430,16 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 	if _, statErr := os.Stat(statusFilesystemPath); errors.Is(statErr, os.ErrNotExist) {
 		statusFilesystemPath = p.cfg.DataDirAbs()
 	}
-	filesystemUsage, filesystemMeasured, err := p.filesystemUsage(statusFilesystemPath)
+	filesystemUsage, _, err := p.filesystemUsage(statusFilesystemPath)
 	if err != nil {
 		return host.CapacitySummary{}, fmt.Errorf("read filesystem status for %s: %w", statusFilesystemPath, err)
 	}
 	totalDiskBytes := filesystemUsage.Total
-	allocatedDiskBytes, err := p.sumReservedCapacity(ctx, "", "disk", true, func(inst model.Instance) int64 {
-		return reservedInstanceRootFSBytes(inst)
-	})
-	if err != nil {
-		return host.CapacitySummary{}, err
-	}
-	diskBudgetBytes := max(totalDiskBytes-hostDiskReserveBytes, int64(0))
+	diskBudgetBytes := totalDiskBytes - storage.DiskRuntimeFloorBytes
 	diskDetails := p.capacityStorageDetails(ctx, statusFilesystemPath)
-	var capacityFilesystem *host.CapacityFilesystem
-	if filesystemMeasured {
-		capacityFilesystem = &host.CapacityFilesystem{
-			Used:      filesystemUsage.Used,
-			Available: filesystemUsage.Available,
-		}
+	capacityFilesystem := &host.CapacityFilesystem{
+		Used:      filesystemUsage.Used,
+		Available: filesystemUsage.Available,
 	}
 
 	hostCPUs := int64(runtime.NumCPU())
@@ -1440,13 +1487,13 @@ func (p *Provisioner) CapacitySummary(ctx context.Context) (host.CapacitySummary
 			{
 				Resource:   "disk",
 				Unit:       "bytes",
-				Allocated:  allocatedDiskBytes,
+				Allocated:  filesystemUsage.Used,
 				Budget:     diskBudgetBytes,
-				Left:       diskBudgetBytes - allocatedDiskBytes,
+				Left:       filesystemUsage.Available - storage.DiskRuntimeFloorBytes,
 				Total:      totalDiskBytes,
 				Filesystem: capacityFilesystem,
-				Reserve:    hostDiskReserveBytes,
-				Note:       fmt.Sprintf("%s total - %s host reserve", format.BinarySize(totalDiskBytes), format.BinarySize(hostDiskReserveBytes)),
+				Reserve:    storage.DiskRuntimeFloorBytes,
+				Note:       fmt.Sprintf("measured filesystem usage; %s runtime free-space floor; no virtual disk capacity promise", format.BinarySize(storage.DiskRuntimeFloorBytes)),
 				Details:    diskDetails,
 			},
 		},
@@ -1483,28 +1530,16 @@ func (p *Provisioner) ensureHostMemoryReservationCapacity(ctx context.Context, e
 	return nil
 }
 
-func (p *Provisioner) ensureHostDiskCapacity(ctx context.Context, excludeName string, requestedRootFSBytes int64) error {
+// ensureHostDiskCapacity checks the runtime free-space floor, not lifetime virtual
+// rootfs commitments. Keep the legacy arguments for callers; payload writes must
+// additionally check their own operation-specific space budget.
+func (p *Provisioner) ensureHostDiskCapacity(_ context.Context, _ string, _ int64) error {
 	filesystemUsage, _, err := p.filesystemUsage(p.cfg.InstancesDir())
 	if err != nil {
 		return fmt.Errorf("read filesystem status for %s: %w", p.cfg.InstancesDir(), err)
 	}
-	totalBytes := filesystemUsage.Total
-	reservedBytes, err := p.sumReservedCapacity(ctx, excludeName, "disk", true, func(inst model.Instance) int64 {
-		return reservedInstanceRootFSBytes(inst)
-	})
-	if err != nil {
-		return err
-	}
-	budgetBytes := max(totalBytes-hostDiskReserveBytes, int64(0))
-	if reservedBytes+requestedRootFSBytes > budgetBytes {
-		return fmt.Errorf(
-			"insufficient host disk reservation budget in %s: reserving %s of rootfs capacity would exceed %s (%s total minus %s reserve)",
-			p.cfg.InstancesDir(),
-			format.BinarySize(reservedBytes+requestedRootFSBytes),
-			format.BinarySize(budgetBytes),
-			format.BinarySize(totalBytes),
-			format.BinarySize(hostDiskReserveBytes),
-		)
+	if err := storage.CheckAvailableSpace(filesystemUsage.Available, 0); err != nil {
+		return fmt.Errorf("host disk capacity in %s: %w", p.cfg.InstancesDir(), err)
 	}
 	return nil
 }
@@ -1515,8 +1550,7 @@ func (p *Provisioner) filesystemUsage(path string) (host.FilesystemUsage, bool, 
 		return usage, true, err
 	}
 	if p.readFilesystemBytes != nil {
-		total, err := p.readFilesystemBytes(path)
-		return host.FilesystemUsage{Total: total}, false, err
+		return host.FilesystemUsage{}, false, errors.New("filesystem measurement must include available bytes, not only total capacity")
 	}
 	usage, err := host.DefaultReadFilesystemUsage(path)
 	return usage, true, err
@@ -1576,42 +1610,6 @@ func instanceReservesFixedHostMemory(inst model.Instance) bool {
 		return true
 	}
 	return instanceHasActiveRuntime(inst)
-}
-
-func reservedInstanceRootFSBytes(inst model.Instance) int64 {
-	if inst.State == model.StateDeleted || inst.State == model.StateDeleting || inst.State == model.StateFailed {
-		return allocatedFileBytes(inst.RootFSPath)
-	}
-	if inst.RootFSSizeBytes > 0 {
-		return inst.RootFSSizeBytes
-	}
-	return fileSizeBytes(inst.RootFSPath)
-}
-
-func fileSizeBytes(path string) int64 {
-	if path == "" {
-		return 0
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	return info.Size()
-}
-
-func allocatedFileBytes(path string) int64 {
-	if path == "" {
-		return 0
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return info.Size()
-	}
-	return st.Blocks * 512
 }
 
 func (p *Provisioner) resolveCreateOptions(opts CreateOptions, baseRootFSSize int64) (CreateOptions, bool, error) {
@@ -1827,7 +1825,11 @@ func (p *Provisioner) writeMetadataFile(inst model.Instance, bootstrap guestBoot
 	if err != nil {
 		return fmt.Errorf("marshal bootstrap metadata: %w", err)
 	}
-	path := filepath.Join(filepath.Dir(inst.RootFSPath), "meta.json")
+	dir, err := p.instanceDir(inst.Name)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "meta.json")
 	if err := os.WriteFile(path, payload, 0o640); err != nil {
 		return fmt.Errorf("write metadata file: %w", err)
 	}

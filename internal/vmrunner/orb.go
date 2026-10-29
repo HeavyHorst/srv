@@ -7,9 +7,9 @@ import (
 	"syscall"
 )
 
-// Hard-link the socket as we do other jail resources: clients need not traverse
-// the jailer's private directories. Its owner/group follow the trusted instance
-// directory created by the control service, never request-supplied identities.
+// Hard-link the socket so clients need not traverse the jailer's private
+// directories. Runtime directories (unlike disks) share the data subvolume.
+// Its owner/group follow the trusted instance directory, never request identities.
 func exposeOrbSocket(instanceDir, jailRoot string) error {
 	info, err := os.Stat(instanceDir)
 	if err != nil {
@@ -33,5 +33,12 @@ func exposeOrbSocket(instanceDir, jailRoot string) error {
 	if err := os.Chmod(socket, 0o660); err != nil {
 		return err
 	}
-	return linkFileIntoJail(socket, filepath.Join(instanceDir, "orb.vsock"))
+	target := filepath.Join(instanceDir, "orb.vsock")
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Link(socket, target); err != nil {
+		return fmt.Errorf("expose orb socket (jailer and instance runtime directories must share a subvolume): %w", err)
+	}
+	return nil
 }

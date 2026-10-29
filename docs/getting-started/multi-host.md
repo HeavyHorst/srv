@@ -100,8 +100,8 @@ ssh srv pool list --host a
 ```
 
 `node list` shows one row per configured server: running/total VMs, allocated
-vCPUs versus CPU budget, one-minute load average, RAM and disk reservations versus
-their budgets, and actual available filesystem space. These are allocations and
+vCPUs versus CPU budget, one-minute load average, RAM reservations versus their
+budget, and measured disk usage and available filesystem space. These are allocations and
 capacity, not instantaneous CPU/RAM utilization percentages. Unreachable or
 unauthorized hosts remain visible with an error rather than disappearing. Use
 `node list --host a` to query just one host; `status` gives more detail.
@@ -122,7 +122,8 @@ must go directly to a backend.
 Automatic `new` placement asks each backend whether the requested image, shape,
 pool, and integrations fit. It ranks eligible hosts by remaining RAM budget,
 then remaining disk space, then host name. RAM includes VM overhead; disk checks
-both logical reservations and available filesystem space with the host reserve.
+measured available filesystem space against a 1 GiB runtime floor, not virtual
+rootfs reservations.
 CPU remains advisory, consistent with srv's existing overcommit policy.
 
 Preflight does not reserve capacity. The selected host still performs normal
@@ -137,13 +138,87 @@ admission checks.
 ssh srv migrate a/demo --to b
 ```
 
-The frontend checks the destination before stopping the source, records a durable
-source start fence, streams `export` into `import` through bounded pipes, confirms
-the transfer, marks the source completed, and starts the destination only if the
-source was previously running. An already stopped VM stays stopped. `migrate`
+The frontend checks destination placement and both native-transfer runners before
+stopping the source, records the existing durable source start fence, and asks
+the source runner for a readonly disk snapshot. The runners reuse coldstore's
+validated Btrfs send/receive, with streams relayed through the frontend's pinned
+SSH connections and bounded pipes. No additional host-to-host SSH key is needed.
+
+If the disk has a known readonly image base, the destination receives that base
+once, then receives each VM using `btrfs send -p BASE SNAPSHOT`. A matching stored
+base is reused by its UUID and exact manifest, not by an image name or a content
+hash alone. Independently created, byte-identical bases with different UUIDs are
+not interchangeable Btrfs parents. Unknown lineage falls back to a full Btrfs
+send, not a tarred rootfs. Concurrent first arrivals are safe, although they can
+send redundant base traffic; duplicate publication consumes the stream and
+retains the existing immutable base.
+
+The destination verifies the received UUID, rootfs size and SHA256 before
+publication, creates a writable snapshot for the VM, and imports its metadata
+and logs using the existing archive framing (without rootfs bytes). A root-owned
+receipt binds this writable incarnation to its retained original base so onward
+and return migrations can remain incremental. The existing SQLite import receipt
+still fences incomplete imports. Only after the destination commits does the
+frontend complete the source, clean up its export snapshot, and start the
+destination if the source was previously running. An already stopped VM stays
+stopped. `migrate`
 currently reports text and progress, and rejects `--json` before doing any work. The
 frontend needs no disk-sized buffer, but all transfer traffic crosses its network
-connection. This is cold migration: downtime includes transfer and startup.
+connection. This is cold migration: downtime includes hashing, transfer and startup.
+
+### Enable native transfer
+
+Set `SRV_MIGRATION_STORE` in each backend's `/etc/srv/srv.env`, then restart its
+runner. The directory must already exist on the **same Btrfs filesystem as that
+host's instances**. The directory and every ancestor must be root-owned,
+nonsymlink directories, not writable by group or others. Use a separate private
+directory, not the service-writable data tree or a remote coldstore namespace.
+The runner also accepts `-migration-store`. An empty setting disables native
+migration; a capability refusal occurs before source preparation.
+
+Use a consistent Btrfs mount-path view for the data directory and migration store.
+With btrfs-progs 6.17.1, accessing an image-base parent through a bind-mount alias
+while accessing the source snapshot through the original mount can fail with
+`ERROR: not on mount point`, despite matching filesystem UUIDs. For a new host,
+use, for example, `SRV_DATA_DIR=/srv-btrfs/srv` and
+`SRV_MIGRATION_STORE=/srv-btrfs/private/srv-migration`. These may be different
+subvolumes. The capability check verifies filesystem identity, not compatibility
+of mount aliases with incremental send. Do not relocate existing instances by
+changing `SRV_DATA_DIR`: their stored paths are absolute.
+
+This is an explicit trust grant: a configured trusted frontend can relay native
+streams to a privileged receiver. Btrfs receive is **not** safe for malicious
+streams. Trust the frontend and every participating source host; isolate them
+from untrusted users and machines. Public `import` still accepts portable
+file archives only, and users cannot invoke the internal `migration-disk`
+command through the frontend or directly on a backend.
+
+Bases remain in the private store for reuse; there is no automatic expiry or
+cache sweeper. The temporary received VM object is removed after its writable
+clone and SQLite import receipt are durable. Failed/interrupted transfers and
+failed cleanup can leave objects or source snapshots for explicit administrator
+recovery. Do not share this store with remote offload operations or delete a base
+still needed by migrated guests. This change does not add a space-reservation
+ledger. One srv per host serializes its portable imports, native receives and
+cold hydrations using the installer-provisioned `SRV_DATA_DIR/.host-locks/payload.lock`.
+Admission measures available space after acquiring this lock, requiring the
+1 GiB runtime floor plus the announced payload (logical rootfs size and logs
+where applicable). Create, grow, start, backup and template operations check only
+the floor; virtual disk sizes are not lifetime space reservations.
+
+Local Btrfs subprocesses inherit held locks so a surviving storage writer keeps
+them after its parent dies. SSH transport processes do not retain these file
+descriptors; remote coldstore operations use their own namespace lock and
+tombstones. Independent forced-command coldstore uploads and other external
+writers are outside host-payload serialization. Neither the estimate nor Btrfs
+CoW guarantees fit: metadata, guest writes and unrelated writers can still cause
+ENOSPC. Upgrade srv and its runner together; older runners are rejected when
+they cannot report journal presence or serialized receive support.
+
+Cold payload stages live under `SRV_DATA_DIR/.cold-staging`, on the data
+filesystem; the existing root-only journal remains in the runner receipt tree.
+Old stages there block operations rather than being silently ignored. Resolve
+them before upgrading; moving `SRV_DATA_DIR` is not a recovery procedure.
 
 For pooled VMs, explicitly select an existing destination pool or convert to fixed
 memory. A fixed-memory VM can also be assigned to a destination pool:
@@ -211,7 +286,7 @@ the destination. A completed source cannot be aborted.
 | --- | --- | --- |
 | No migration record | No transfer started | Inspect both hosts before issuing a fresh migration. |
 | `preparing` | Stop not yet confirmed | Keep source fenced. Resolve its stop failure, then repeat `migration prepare NAME TARGET TOKEN` directly with the same token and memory-policy flags. Do not export yet. |
-| `prepared` | Missing or `importing` receipt | Keep source fenced. Inspect/discard partial destination data before manually repeating export/import with the selected memory policy, or follow the abort procedure below. |
+| `prepared` | Missing or `importing` receipt | Keep source fenced. Inspect partial destination disks and the native store. Use a deliberate portable export/import recovery with the selected memory policy, or follow the abort procedure below. Do not issue another frontend migration over an uncertain transfer. |
 | `prepared` | `imported`, with matching token and source instance ID | Complete the source with `migration complete NAME TOKEN`; then start the destination if wanted. |
 | `completed` | Matching committed import | Never abort or restart the source. Retry destination start if necessary; delete the source only after verification. |
 | Any active phase | Unreachable host or mismatched receipt | Stop recovery actions until the outcome is established. Neither a timeout nor a same-name VM is proof of this transfer. |
@@ -223,7 +298,14 @@ any fresh migration needs a new token.
 
 If abandoning an incomplete migration, an administrator must first establish
 that **all destination copies of the guest identity are destroyed**, including
-saved transfer artifacts that might be booted. Then the explicit recovery command
+saved transfer artifacts that might be booted. For native transfers this includes
+the immutable VM object keyed by the migration token in `SRV_MIGRATION_STORE`,
+not just the VM directory. The existing local-admin `srv-cold-store --root DIR
+--discard TOKEN` command can fence and discard that object; this is destructive
+and is not a substitute for checking which transfer it belongs to. A shared base
+does not contain that VM's identity and should be retained. Source export
+snapshots under `sources/<name-hash>/<token>` can be explicitly removed after the
+outcome is resolved. Then the explicit recovery command
 on the source removes the fence without starting the VM:
 
 ```bash

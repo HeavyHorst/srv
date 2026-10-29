@@ -37,7 +37,7 @@ Users listed in `SRV_ADMIN_USERS` can additionally:
 
 - View and manage **all** VMs, not just their own
 - Run `status` (host capacity summary)
-- Run `snapshot create` (host-level btrfs snapshot)
+- Run `snapshot create` (host-level readonly root-and-disk btrfs snapshot bundle)
 - Import VMs
 
 ## Configuration

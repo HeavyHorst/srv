@@ -68,18 +68,36 @@ Use either `TS_AUTHKEY` or `TS_CLIENT_ID`/`TS_CLIENT_SECRET` for the control-pla
 |----------|---------|-------------|
 | `SRV_HOSTNAME` | `srv` | Tailscale hostname for the control plane |
 | `SRV_LISTEN_ADDR` | `:22` | Tailnet TCP listen address for the SSH API |
-| `SRV_DATA_DIR` | `/var/lib/srv` | State directory. Must be on the same reflink-capable filesystem as `SRV_BASE_ROOTFS`. |
+| `SRV_DATA_DIR` | `/var/lib/srv` | State directory; must be a btrfs subvolume root on the same filesystem as every base rootfs image. |
 | `SRV_NET_HELPER_SOCKET` | `/run/srv/net-helper.sock` | Unix socket for the privileged network helper |
 | `SRV_VM_RUNNER_SOCKET` | `/run/srv-vm-runner/vm-runner.sock` | Unix socket for the Firecracker VM runner |
 | `SRV_FIRECRACKER_BIN` | `/usr/bin/firecracker` | Path to the Firecracker binary |
 | `SRV_JAILER_BIN` | `/usr/bin/jailer` | Path to the jailer binary |
+
+## Optional cold storage
+
+See [cold-disk setup and recovery](operations.md#optional-cold-disks-over-ssh).
+Keep these settings consistent between srv and the runner; only the runner reads
+the SSH credentials. Neither daemon formats storage or configures the remote host.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SRV_COLD_STORAGE_HOST` | empty (disabled) | Trusted SSH hostname/IP, optionally prefixed `root@`; dedicated forced-command namespace per backend |
+| `SRV_COLD_STORAGE_KEY` | empty | Root-owned SSH identity file with no group/other permissions, with protected root-owned ancestors |
+| `SRV_COLD_STORAGE_KNOWN_HOSTS` | empty | Root-owned pinned host-key file, with protected root-owned ancestors |
+| `SRV_COLD_STORAGE_AFTER_STOP` | `false` | Set to `true` to attempt eviction after a successful explicit stop; errors retain local data and do not fail shutdown |
+
+The runner's `--cold-storage-timeout` defaults to `6h`, including checksum verification;
+the remote helper's `--timeout` must also cover the operation. Leaving after-stop off
+permits manual `disk offload` when the host is configured. Before changing or
+removing the host, hydrate and purge its cold generations.
 
 ## Guest artifacts
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SRV_BASE_KERNEL` | (required) | Path to the Firecracker guest kernel image |
-| `SRV_BASE_ROOTFS` | (required) | Path to the base rootfs image. Must be on the same reflink-capable filesystem as `SRV_DATA_DIR`. |
+| `SRV_BASE_ROOTFS` | (required) | Path to the base rootfs image. Must be on the same btrfs filesystem as `SRV_DATA_DIR`. |
 | `SRV_BASE_INITRD` | (empty) | Optional initrd image path |
 | `SRV_IMAGES_FILE` | (empty) | JSON image catalog; also available as `--images-file`. Read at service startup. |
 | `SRV_IMAGES_DIR` | `SRV_DATA_DIR/images` | Runner's trusted boot-artifact directory; also available as runner `--images-dir`. |
@@ -197,24 +215,58 @@ The `SRV_SECRET_*` entries are a naming convention rather than a fixed list. The
 |----------|---------|-------------|
 | `SRV_LOG_LEVEL` | `info` | Log level |
 | `SRV_EXTRA_KERNEL_ARGS` | (empty) | Additional kernel arguments appended to the guest boot line |
-| `SRV_JAILER_BASE_DIR` | `SRV_DATA_DIR/jailer` | Base directory for jailer workspaces. Must be on the same filesystem as `SRV_DATA_DIR`. |
+| `SRV_JAILER_BASE_DIR` | `SRV_DATA_DIR/jailer` | Base directory for jailer workspaces. Must be in the same subvolume as Orb runtime directories. |
 
 ## Path constraints
 
-Several paths must share the same reflink-capable filesystem (typically btrfs or reflink-enabled xfs):
+All VMs and Orbs require btrfs storage:
 
-- `SRV_DATA_DIR` — host state directory
-- `SRV_BASE_ROOTFS` — base guest image
-- `SRV_JAILER_BASE_DIR` — jailer workspaces (hard-links log files into the jail)
+- `SRV_DATA_DIR` — a btrfs subvolume root, not an ordinary directory on btrfs
+- `SRV_BASE_ROOTFS` and catalog base rootfs images — on that same btrfs filesystem
+- `instances/<name>/disk` — a dedicated subvolume containing `rootfs.img`
+- `SRV_JAILER_BASE_DIR` — jailer workspaces in the same subvolume as the instance runtime directories (outside `disk`)
 
-Cross-filesystem hard-links fail, so keeping these on the same filesystem is required.
+Install `btrfs-progs` and enable `user_subvol_rm_allowed` on the mount. This
+[btrfs mount option](https://btrfs.readthedocs.io/en/latest/btrfs-man5.html#btrfs-specific-mount-options)
+allows owners to delete their subvolumes; appropriate ownership and directory
+permissions are still required. Do not grant new capabilities to the main `srv`
+process. The privileged runner bind-mounts disk, kernel, initrd, and log files
+into the jail. Only the Orb socket is still hard-linked between runtime and jail;
+hard links cannot cross subvolume boundaries even on the same filesystem. They
+also cannot cross mount boundaries: shortening only the jailer path through a
+bind-mount alias fails with `EXDEV`, even when both paths report the same Btrfs
+subvolume ID. Keep the effective jailer path inside the data root through the
+same mount view as `instances`, outside the per-instance `disk` subvolumes.
 
 Host-side clients dial `SRV_JAILER_BASE_DIR/<firecracker binary name>/<vm name>/root/firecracker.sock`
 and `SRV_DATA_DIR/instances/<vm name>/firecracker.sock` (plus `orb.vsock` for Orbs) by
 absolute path, and Unix socket paths are limited to 107 bytes. With the binary named
 `firecracker`, the default `SRV_DATA_DIR/jailer` is too long for 60-character Orb names;
-`SRV_JAILER_BASE_DIR` must then be at most 12 bytes (9 bytes for 63-character names), for
-example `/srvj` on the root filesystem when it also holds `SRV_DATA_DIR`. The VM runner
-rejects a start whose socket paths are too long before launching anything. Choose the base
-before the first start: start receipts and lifecycle locks live under it, so moving it later
-abandons the records of existing attempts.
+`SRV_JAILER_BASE_DIR` must then be at most 12 bytes (9 bytes for 63-character names).
+The Orb dispatcher generates 60-character names; srv accepts names up to 63
+characters. Check the complete paths, not only the data directory or VM name.
+The VM runner rejects overlong socket paths before launching anything.
+
+One verified layout for a data root at `/var/lib/srvorb` is:
+
+```ini
+SRV_DATA_DIR=/var/lib/srvorb
+SRV_JAILER_BASE_DIR=/var/lib/srvorb/j
+SRV_FIRECRACKER_BIN=/opt/srvorb/bin/fc
+```
+
+Here `j` is an ordinary directory in the data-root subvolume, not a separate
+subvolume or bind mount. `fc` must be a regular, root-owned executable copy of the
+matching official static Firecracker binary (root:root, mode 0755), with identical
+bytes. Do not use a symlink: the jailer canonicalizes its executable path, while
+srv derives the workspace from the configured executable basename. The jailed
+API socket path is 103 bytes for a 60-character name and 106 for a 63-character
+name. This is an optional layout, not a requirement to rename every installation's
+Firecracker. Refresh and verify the copy whenever upgrading Firecracker, keeping
+the matching jailer version.
+
+Choose the base and executable name before the first start. Start receipts and
+lifecycle locks live under the base, and workspace lookup depends on the executable
+basename. Changing either on a populated host requires the stopped-boundary
+[upgrade procedure](operations.md#jailer-path-and-custom-unit-upgrades); a new,
+empty namespace is not proof that the old runtime has been cleaned up.

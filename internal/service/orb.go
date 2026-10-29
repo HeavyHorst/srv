@@ -55,7 +55,7 @@ func (a *App) handleOrbBootstrapSession(sess gssh.Session, actor model.Actor, ar
 	if err := a.store.AdmitBootstrap(sess.Context(), r, inst.ID, inst.CreatedAt, request.Generation); err != nil {
 		return fail(err)
 	}
-	if err := orbguest.Bootstrap(sess.Context(), filepath.Join(filepath.Dir(inst.RootFSPath), "orb.vsock"), request); err != nil {
+	if err := orbguest.Bootstrap(sess.Context(), filepath.Join(a.cfg.InstancesDir(), inst.Name, "orb.vsock"), request); err != nil {
 		// Do not relay guest output or credentials into logs.
 		return fail(errors.New("orb bootstrap failed; inspect the guest bootstrap service"))
 	}

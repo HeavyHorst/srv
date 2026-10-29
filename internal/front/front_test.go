@@ -3,6 +3,7 @@ package front_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,8 +13,10 @@ import (
 	"sync"
 	"testing"
 
+	"srv/internal/coldstore"
 	"srv/internal/front"
 	"srv/internal/model"
+	"srv/internal/vmrunner"
 )
 
 type fake func(front.Host, []string, io.Reader, io.Writer) error
@@ -94,96 +97,275 @@ func TestPlacementEligibilityAndNoRetry(t *testing.T) {
 }
 func TestMigrationCompletionOrdering(t *testing.T) {
 	for _, policy := range [][]string{nil, {"--fixed-memory"}, {"--pool", "destination"}} {
-		for _, failure := range []string{"export", "import", "complete", "wrong-token", "success"} {
+		for _, failure := range []string{"send-base", "receive-base", "send-disk", "receive-disk", "metadata", "import", "complete", "wrong-token", "success"} {
 			t.Run(failure, func(t *testing.T) {
-				var mu sync.Mutex
-				var starts []string
-				completed := false
-				var preparedToken string
-				r := router(func(h front.Host, args []string, in io.Reader, out io.Writer) error {
-					cmd := args[0]
-					if cmd == "--json" {
-						cmd = args[1]
-					}
-					switch cmd {
-					case "inspect":
-						mode := "fixed"
-						if len(policy) > 0 {
-							mode = "pool"
-						}
-						fmt.Fprintf(out, `{"instance":{"memory_mode":%q,"image":"arch","vcpu_count":1,"memory_mib":512,"rootfs_size_bytes":1000}}`, mode)
-					case "import-placement":
-						want := []string{"--json", "import-placement", "vm", "--image", "arch", "--cpus", "1", "--ram", "512MiB", "--rootfs-size", "1000B"}
-						if len(policy) == 2 {
-							want = append(want, policy...)
-						}
-						if !reflect.DeepEqual(args, want) {
-							t.Errorf("preflight args %v want %v", args, want)
-						}
-						io.WriteString(out, `{"eligible":true}`)
-					case "migration":
-						if args[2] == "prepare" {
-							if !reflect.DeepEqual(args[6:], policy) && !(len(args[6:]) == 0 && len(policy) == 0) {
-								t.Errorf("prepare policy %v want %v", args[6:], policy)
-							}
-							preparedToken = args[5]
-							return json.NewEncoder(out).Encode(map[string]any{"instance_id": "source-id", "token": args[5], "target": args[4], "was_running": true, "phase": "prepared"})
-						}
-						if args[2] == "receipt" {
-							receiptToken := preparedToken
-							if failure == "wrong-token" {
-								receiptToken = "stale-token"
-							}
-							return json.NewEncoder(out).Encode(map[string]any{"source_instance_id": "source-id", "phase": "imported", "token": receiptToken})
-						}
-						if failure == "complete" {
-							return errors.New("complete uncertain")
-						}
-						completed = true
-						io.WriteString(out, `{}`)
-					case "export":
-						if failure == "export" {
-							return errors.New("export failed")
-						}
-						_, err := io.WriteString(out, "archive")
-						return err
-					case "import":
-						if !reflect.DeepEqual(args, append([]string{"import"}, policy...)) {
-							return errors.New("import policy mismatch")
-						}
-						if failure == "import" {
-							return errors.New("import failed")
-						}
-						_, err := io.Copy(io.Discard, in)
-						return err
-					case "start":
-						if !completed {
-							return errors.New("target start before source completion")
-						}
-						mu.Lock()
-						starts = append(starts, h.Name)
-						mu.Unlock()
-					default:
-						return errors.New("unexpected command")
-					}
-					return nil
-				})
+				backend := newMigrationBackend(t, policy, failure)
+				r := router(backend.run)
 				r.Transport = checkedTransport{t: t, next: r.Transport}
 				out, stderr, err := run(r, append([]string{"migrate", "a/vm", "--to", "b"}, policy...)...)
 				if failure == "success" {
-					if err != nil || len(starts) != 1 || starts[0] != "b" || !strings.Contains(out, "b/vm") {
-						t.Fatalf("starts=%v out=%s err=%v", starts, out, err)
+					if err != nil || backend.count("b/start") != 1 || backend.count("a/start") != 0 || backend.count("a/cleanup") != 1 || !strings.Contains(out, "b/vm") {
+						t.Fatalf("events=%v out=%s err=%v", backend.events, out, err)
 					}
 					return
 				}
-				if failure == "wrong-token" && (completed || err == nil || !strings.Contains(err.Error(), "receipt mismatch")) {
-					t.Fatalf("stale receipt must not complete source: completed=%v err=%v", completed, err)
+				wantComplete := 0
+				if failure == "complete" {
+					wantComplete = 1
 				}
-				if err == nil || !strings.Contains(err.Error(), "token=") || !strings.Contains(err.Error(), "recover manually") || len(starts) != 0 || !strings.Contains(stderr, "prepare") {
-					t.Fatalf("starts=%v stderr=%s err=%v", starts, stderr, err)
+				if backend.count("a/complete") != wantComplete || backend.count("a/cleanup") != 0 || backend.count("a/prepare") != 1 {
+					t.Fatalf("failure must not complete, clean up, or retry migration: events=%v", backend.events)
+				}
+				if failure == "wrong-token" && (err == nil || !strings.Contains(err.Error(), "receipt mismatch")) {
+					t.Fatalf("stale receipt must not complete source: err=%v", err)
+				}
+				if failure != "wrong-token" {
+					host := "a"
+					if strings.HasPrefix(failure, "receive-") || failure == "import" {
+						host = "b"
+					}
+					if err == nil || !strings.Contains(err.Error(), failure+" failed") || backend.count(host+"/"+failure) != 1 {
+						t.Fatalf("failed action must be attempted once without retry: events=%v err=%v", backend.events, err)
+					}
+				}
+				if err == nil || !strings.Contains(err.Error(), "token=") || !strings.Contains(err.Error(), "recover manually") || !strings.Contains(err.Error(), "do not retry automatically") || backend.count("a/start") != 0 || backend.count("b/start") != 0 || !strings.Contains(stderr, "prepare") {
+					t.Fatalf("events=%v stderr=%s err=%v", backend.events, stderr, err)
 				}
 			})
 		}
+	}
+}
+
+// The fake retains shared bases across Router calls, but every disk and import
+// is scoped to the newly prepared token. Stream producers and consumers run
+// concurrently, so only the event log is shared between their goroutines.
+type migrationBackend struct {
+	t         *testing.T
+	policy    []string
+	failure   string
+	mu        sync.Mutex
+	events    []string
+	tokens    map[string]string
+	completed map[string]bool
+	bases     map[string]bool
+	disks     map[string]bool
+	imported  map[string]bool
+}
+
+func newMigrationBackend(t *testing.T, policy []string, failure string) *migrationBackend {
+	return &migrationBackend{t: t, policy: policy, failure: failure, tokens: map[string]string{}, completed: map[string]bool{}, bases: map[string]bool{}, disks: map[string]bool{}, imported: map[string]bool{}}
+}
+
+func (b *migrationBackend) count(event string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, got := range b.events {
+		if got == event {
+			n++
+		}
+	}
+	return n
+}
+
+func (b *migrationBackend) run(h front.Host, args []string, in io.Reader, out io.Writer) error {
+	cmd := args[0]
+	if cmd == "--json" {
+		cmd = args[1]
+	}
+	var q vmrunner.MigrationDiskRequest
+	action := cmd
+	if cmd == "migration-disk" {
+		if len(args) < 2 {
+			return errors.New("missing native migration request")
+		}
+		if args[1] == "import" {
+			action = "import"
+		} else {
+			if len(args) != 2 {
+				return fmt.Errorf("unexpected native migration args: %v", args)
+			}
+			data, err := base64.RawURLEncoding.DecodeString(args[1])
+			if err != nil {
+				return err
+			}
+			if err := json.Unmarshal(data, &q); err != nil {
+				return err
+			}
+			action = q.Action
+			if q.InstanceID != "source-id" || q.Name == "" || q.Token == "" {
+				return fmt.Errorf("incomplete native request: %+v", q)
+			}
+			if action != "check" && q.Token != b.tokens[q.Name] {
+				return errors.New("native request token differs from prepare")
+			}
+		}
+	} else if cmd == "migration" {
+		action = args[2]
+	}
+	event := h.Name + "/" + action
+	if cmd == "migration-disk" && action == "prepare" {
+		event = h.Name + "/disk-prepare"
+	}
+	b.mu.Lock()
+	b.events = append(b.events, event)
+	b.mu.Unlock()
+	if action == b.failure || b.failure == "check-"+h.Name && action == "check" {
+		return fmt.Errorf("%s failed", action)
+	}
+	switch cmd {
+	case "inspect":
+		if h.Name != "a" {
+			return errors.New("inspect must run on source")
+		}
+		mode := "fixed"
+		if len(b.policy) > 0 {
+			mode = "pool"
+		}
+		_, err := fmt.Fprintf(out, `{"instance":{"id":"source-id","memory_mode":%q,"image":"arch","vcpu_count":1,"memory_mib":512,"rootfs_size_bytes":1000}}`, mode)
+		return err
+	case "import-placement":
+		want := []string{"--json", "import-placement", args[2], "--image", "arch", "--cpus", "1", "--ram", "512MiB", "--rootfs-size", "1000B"}
+		if len(b.policy) == 2 {
+			want = append(want, b.policy...)
+		}
+		if h.Name != "b" || !reflect.DeepEqual(args, want) {
+			return fmt.Errorf("preflight on %s: %v want %v", h.Name, args, want)
+		}
+		_, err := io.WriteString(out, `{"eligible":true}`)
+		return err
+	case "migration":
+		name := args[3]
+		switch action {
+		case "prepare":
+			if h.Name != "a" || args[4] != "b" || strings.Join(args[6:], " ") != strings.Join(b.policy, " ") {
+				return fmt.Errorf("unexpected prepare: %s %v", h.Name, args)
+			}
+			if b.count("a/check") == 0 || b.count("b/check") == 0 {
+				b.t.Error("source fenced before both hosts passed native capability checks")
+			}
+			b.tokens[name] = args[5]
+			return json.NewEncoder(out).Encode(map[string]any{"instance_id": "source-id", "token": args[5], "target": args[4], "was_running": true, "phase": "prepared"})
+		case "receipt":
+			if h.Name != "b" || !b.imported[b.tokens[name]] {
+				return errors.New("receipt requested before target import")
+			}
+			token := b.tokens[name]
+			if b.failure == "wrong-token" {
+				token = "stale-token"
+			}
+			return json.NewEncoder(out).Encode(map[string]any{"source_instance_id": "source-id", "phase": "imported", "token": token})
+		case "complete":
+			if h.Name != "a" || args[4] != b.tokens[name] || !b.imported[b.tokens[name]] || b.count("b/receipt") == 0 {
+				return errors.New("source completion before verified target receipt")
+			}
+			b.completed[name] = true
+			_, err := io.WriteString(out, `{}`)
+			return err
+		}
+	case "migration-disk":
+		wantHost := "a"
+		if action == "base-present" || action == "receive-base" || action == "receive-disk" || action == "import" {
+			wantHost = "b"
+		}
+		if action != "check" && h.Name != wantHost {
+			return fmt.Errorf("%s on %s, want %s", action, h.Name, wantHost)
+		}
+		switch action {
+		case "check":
+			_, err := io.WriteString(out, `{}`)
+			return err
+		case "prepare":
+			return json.NewEncoder(out).Encode(vmrunner.MigrationDiskResult{Transfer: vmrunner.MigrationDisk{
+				Disk: coldstore.Object{ID: q.Token, Parent: "shared-base"}, Base: &coldstore.Object{ID: "shared-base"},
+			}})
+		case "base-present":
+			if q.Transfer.Base == nil || q.Transfer.Disk.ID != q.Token || q.Transfer.Disk.Parent != q.Transfer.Base.ID {
+				return errors.New("source transfer objects not forwarded to destination")
+			}
+			return json.NewEncoder(out).Encode(vmrunner.MigrationDiskResult{BasePresent: b.bases[q.Transfer.Base.ID]})
+		case "send-base", "send-disk", "metadata":
+			_, err := io.WriteString(out, q.Token)
+			return err
+		case "receive-base", "receive-disk":
+			data, err := io.ReadAll(in)
+			if err != nil {
+				return err
+			}
+			if string(data) != q.Token || q.Transfer.Disk.ID != q.Token || q.Transfer.Base == nil {
+				return errors.New("transfer stream or objects mismatch")
+			}
+			if action == "receive-base" {
+				b.bases[q.Transfer.Base.ID] = true
+			} else {
+				if !b.bases[q.Transfer.Base.ID] {
+					return errors.New("disk received before shared base")
+				}
+				b.disks[q.Token] = true
+			}
+			return nil
+		case "import":
+			if !reflect.DeepEqual(args, append([]string{"migration-disk", "import"}, b.policy...)) {
+				return errors.New("import policy mismatch")
+			}
+			data, err := io.ReadAll(in)
+			if err != nil {
+				return err
+			}
+			token := string(data)
+			if !b.disks[token] {
+				return errors.New("metadata imported before disk transfer")
+			}
+			b.imported[token] = true
+			return nil
+		case "cleanup":
+			if !b.completed[q.Name] {
+				return errors.New("snapshot cleanup before source completion")
+			}
+			_, err := io.WriteString(out, `{}`)
+			return err
+		}
+	case "start":
+		if h.Name != "b" || !b.completed[args[1]] || b.count("a/cleanup") == 0 {
+			return errors.New("start before source completion and snapshot cleanup")
+		}
+		return nil
+	}
+	return fmt.Errorf("unexpected command on %s: %v", h.Name, args)
+}
+
+func TestMigrationReusesSharedBase(t *testing.T) {
+	backend := newMigrationBackend(t, nil, "")
+	r := router(backend.run)
+	for _, name := range []string{"vm-one", "vm-two"} {
+		if out, stderr, err := run(r, "migrate", "a/"+name, "--to", "b"); err != nil || !strings.Contains(out, "b/"+name) {
+			t.Fatalf("out=%s stderr=%s err=%v", out, stderr, err)
+		}
+	}
+	for event, want := range map[string]int{"a/check": 2, "b/check": 2, "a/prepare": 2, "a/disk-prepare": 2, "b/base-present": 2, "a/send-base": 1, "b/receive-base": 1, "a/send-disk": 2, "b/receive-disk": 2, "a/metadata": 2, "b/import": 2, "a/complete": 2, "a/cleanup": 2, "b/start": 2} {
+		if got := backend.count(event); got != want {
+			t.Errorf("%s count=%d want=%d; events=%v", event, got, want, backend.events)
+		}
+	}
+	if backend.tokens["vm-one"] == backend.tokens["vm-two"] {
+		t.Error("distinct VM migrations reused a transfer token")
+	}
+}
+
+func TestMigrationRequiresNativeCapabilityBeforePrepare(t *testing.T) {
+	for _, host := range []string{"a", "b"} {
+		t.Run(host, func(t *testing.T) {
+			backend := newMigrationBackend(t, nil, "check-"+host)
+			_, _, err := run(router(backend.run), "migrate", "a/vm", "--to", "b")
+			if err == nil || !strings.Contains(err.Error(), "check failed") || backend.count(host+"/check") != 1 {
+				t.Fatalf("missing capability must fail preflight: events=%v err=%v", backend.events, err)
+			}
+			for _, event := range []string{"a/prepare", "a/disk-prepare", "a/send-base", "a/send-disk", "b/import", "a/complete", "a/start", "b/start"} {
+				if backend.count(event) != 0 {
+					t.Errorf("capability failure must not mutate either host: events=%v", backend.events)
+				}
+			}
+		})
 	}
 }
 
@@ -204,6 +386,8 @@ func TestBackendArgumentContracts(t *testing.T) {
 		{[]string{"backup", "create", "a/demo"}, []string{"backup", "create", "demo"}},
 		{[]string{"backup", "list", "a/demo"}, []string{"backup", "list", "demo"}},
 		{[]string{"backup", "delete", "a/demo", "backup-id"}, []string{"backup", "delete", "demo", "backup-id"}},
+		{[]string{"disk", "offload", "a/demo"}, []string{"disk", "offload", "demo"}},
+		{[]string{"disk", "hydrate", "a/demo"}, []string{"disk", "hydrate", "demo"}},
 		{[]string{"logs", "-f", "a/demo", "serial"}, []string{"logs", "-f", "demo", "serial"}},
 		{[]string{"logs", "serial", "--follow", "a/demo"}, []string{"logs", "serial", "--follow", "demo"}},
 		{[]string{"import", "--host", "a"}, []string{"import"}},

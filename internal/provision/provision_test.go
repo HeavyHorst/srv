@@ -55,7 +55,7 @@ func TestPrepareInstanceDirAllowsReuseOfFailedAndDeletedInstances(t *testing.T) 
 				"SRV_VM_NETWORK_CIDR": "10.0.0.0/29",
 			})
 			st := newProvisionTestStore(t, cfg)
-			p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+			p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st, vmRunner: noopVMRunner{}}
 
 			inst := provisionTestInstance(cfg, "demo", tt.state, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 			if tt.state == model.StateDeleted {
@@ -107,7 +107,7 @@ func TestPrepareInstanceDirRejectsActiveOrOrphanedNames(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 
 	active := provisionTestInstance(cfg, "busy", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
@@ -252,7 +252,7 @@ func TestAllocateNetworkSkipsDeletedSubnetsAndDetectsExhaustion(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 
 	used := provisionTestInstance(cfg, "used", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
@@ -406,7 +406,7 @@ func TestWriteMetadataFileRedactsAuthKey(t *testing.T) {
 		t.Fatalf("writeMetadataFile: %v", err)
 	}
 
-	payload, err := os.ReadFile(filepath.Join(filepath.Dir(inst.RootFSPath), "meta.json"))
+	payload, err := os.ReadFile(filepath.Join(cfg.InstancesDir(), inst.Name, "meta.json"))
 	if err != nil {
 		t.Fatalf("ReadFile(meta.json): %v", err)
 	}
@@ -437,7 +437,7 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 
 	oldReflinkCloneFile := reflinkCloneFile
@@ -653,13 +653,13 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 		cfg:                 sourceCfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               sourceStore,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 	dest := &Provisioner{
 		cfg:                 destCfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               destStore,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 	for _, dir := range []string{sourceCfg.InstancesDir(), destCfg.InstancesDir()} {
 		if err := os.MkdirAll(dir, 0o770); err != nil {
@@ -714,6 +714,18 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 		t.Fatalf("Debian export must require an image-aware reader: %#v, %v", manifest, err)
 	}
 
+	// The public portable path must never turn an uploaded manifest into a
+	// privileged native-disk publication request, even for a valid archive.
+	nativeManifest := manifest
+	nativeManifest.NativeDisk = &vmrunner.MigrationDisk{}
+	nativeStream := portableArtifactTestStream(t, nativeManifest, nil)
+	if _, _, err := dest.ImportInstance(ctx, model.Actor{}, bytes.NewReader(nativeStream)); err == nil || !strings.Contains(err.Error(), "trusted-frontend") {
+		t.Fatalf("public import accepted native metadata: %v", err)
+	}
+	if _, _, err := dest.ImportNativeMetadata(ctx, model.Actor{}, bytes.NewReader(stream.Bytes()), ImportOptions{}); err == nil || !strings.Contains(err.Error(), "trusted-frontend") {
+		t.Fatalf("native migration accepted portable payload: %v", err)
+	}
+
 	progressByFile := make(map[string]ImportProgress)
 	imported, importedInfo, err := dest.ImportInstance(
 		ctx,
@@ -732,8 +744,8 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 	if imported.Name != sourceInst.Name {
 		t.Fatalf("ImportInstance() target name = %q, want %q", imported.Name, sourceInst.Name)
 	}
-	if imported.ID != sourceInst.ID {
-		t.Fatalf("ImportInstance() id = %q, want %q", imported.ID, sourceInst.ID)
+	if imported.ID == "" || imported.ID == sourceInst.ID {
+		t.Fatalf("ImportInstance() id = %q, want a fresh incarnation", imported.ID)
 	}
 	if imported.Image != "debian-13" {
 		t.Fatalf("ImportInstance() image = %q, want debian-13", imported.Image)
@@ -802,7 +814,7 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 		t.Fatalf("stored imported instance = %#v, want %#v", stored, imported)
 	}
 	receipt, err := destStore.GetImportReceipt(ctx, imported.ID)
-	if err != nil || receipt.Token != "portable-transfer" || receipt.Phase != "imported" || exportedInfo.MigrationToken != receipt.Token {
+	if err != nil || receipt.SourceInstanceID != sourceInst.ID || receipt.Token != "portable-transfer" || receipt.Phase != "imported" || exportedInfo.MigrationToken != receipt.Token {
 		t.Fatalf("destination receipt = %+v, %v", receipt, err)
 	}
 	if err := dest.migrationFence(ctx, imported.Name); err != nil {
@@ -961,7 +973,7 @@ func TestImportInstanceRejectsAliasedPortableArtifactEntries(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
 		t.Fatalf("MkdirAll(instances dir): %v", err)
@@ -998,7 +1010,7 @@ func TestImportInstanceRejectsOversizedPortableLogs(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
 		t.Fatalf("MkdirAll(instances dir): %v", err)
@@ -1106,7 +1118,7 @@ func TestImportInstanceReleasesAdmissionLockDuringStreaming(t *testing.T) {
 		cfg:                 cfg,
 		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:               st,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
+		readFilesystemUsage: host.DefaultReadFilesystemUsage,
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
 		t.Fatalf("MkdirAll(instances dir): %v", err)
@@ -1320,45 +1332,59 @@ func (r *gatedReadCloser) Read(p []byte) (int, error) {
 }
 
 func TestBackupAllowsNonStoppedInstanceWithWarning(t *testing.T) {
-	ctx := context.Background()
-	cfg := loadProvisionTestConfig(t, nil)
-	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{
-		cfg:                 cfg,
-		log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:               st,
-		readFilesystemBytes: host.DefaultReadFilesystemBytes,
-	}
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprint("legacy=", legacy), func(t *testing.T) {
+			ctx := context.Background()
+			cfg := loadProvisionTestConfig(t, nil)
+			st := newProvisionTestStore(t, cfg)
+			p := &Provisioner{
+				cfg:                 cfg,
+				log:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+				store:               st,
+				readFilesystemUsage: host.DefaultReadFilesystemUsage,
+			}
 
-	inst := provisionTestInstance(cfg, "demo", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
-	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
-		t.Fatalf("MkdirAll(instance dir): %v", err)
-	}
-	if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0o644); err != nil {
-		t.Fatalf("WriteFile(rootfs): %v", err)
-	}
-	if err := st.CreateInstance(ctx, inst); err != nil {
-		t.Fatalf("CreateInstance(): %v", err)
-	}
+			inst := provisionTestInstance(cfg, "demo", model.StateReady, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+			if legacy {
+				inst.RootFSPath = filepath.Join(cfg.InstancesDir(), inst.Name, "rootfs.img")
+			}
+			if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+				t.Fatalf("MkdirAll(instance dir): %v", err)
+			}
+			if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0o644); err != nil {
+				t.Fatalf("WriteFile(rootfs): %v", err)
+			}
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatalf("CreateInstance(): %v", err)
+			}
 
-	oldReflinkCloneFile := reflinkCloneFile
-	t.Cleanup(func() {
-		reflinkCloneFile = oldReflinkCloneFile
-	})
-	reflinkCloneFile = func(_ context.Context, src, dest string) error {
-		payload, err := os.ReadFile(src)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(dest, payload, 0o644)
-	}
+			oldReflinkCloneFile := reflinkCloneFile
+			t.Cleanup(func() {
+				reflinkCloneFile = oldReflinkCloneFile
+			})
+			reflinkCloneFile = func(_ context.Context, src, dest string) error {
+				payload, err := os.ReadFile(src)
+				if err != nil {
+					return err
+				}
+				return os.WriteFile(dest, payload, 0o644)
+			}
 
-	info, err := p.CreateBackup(ctx, inst.Name)
-	if err != nil {
-		t.Fatalf("CreateBackup() error = %v", err)
-	}
-	if info.Name != inst.Name {
-		t.Fatalf("CreateBackup() name = %q, want %q", info.Name, inst.Name)
+			info, err := p.CreateBackup(ctx, inst.Name)
+			if err != nil {
+				t.Fatalf("CreateBackup() error = %v", err)
+			}
+			if info.Name != inst.Name {
+				t.Fatalf("CreateBackup() name = %q, want %q", info.Name, inst.Name)
+			}
+			stored, err := st.GetInstance(ctx, inst.Name)
+			if err != nil || stored.RootFSPath != inst.RootFSPath {
+				t.Fatalf("backup migrated active disk: %s %v", stored.RootFSPath, err)
+			}
+			if data, err := os.ReadFile(filepath.Join(info.Path, "disk", "rootfs.img")); err != nil || string(data) != "rootfs" {
+				t.Fatalf("backup disk: %q %v", data, err)
+			}
+		})
 	}
 }
 
@@ -1848,8 +1874,8 @@ func TestCreateRejectsPooledInstanceLargerThanPoolReservation(t *testing.T) {
 		readHostMemoryBytes: func() (int64, error) {
 			return 8 * 1024 * format.MiB, nil
 		},
-		readFilesystemBytes: func(string) (int64, error) {
-			return 128 * 1024 * format.GiB, nil
+		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
+			return host.FilesystemUsage{Total: 128 * format.GiB, Available: 127 * format.GiB, Used: format.GiB}, nil
 		},
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
@@ -1919,8 +1945,8 @@ func TestCreateRejectsWhenHostDiskSpaceIsLow(t *testing.T) {
 		readHostMemoryBytes: func() (int64, error) {
 			return 8 * 1024 * format.MiB, nil
 		},
-		readFilesystemBytes: func(string) (int64, error) {
-			return 512 * format.MiB, nil
+		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
+			return host.FilesystemUsage{Total: 128 * format.GiB, Available: 512 * format.MiB, Used: 127 * format.GiB}, nil
 		},
 	}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0o770); err != nil {
@@ -1942,12 +1968,12 @@ func TestCreateRejectsWhenHostDiskSpaceIsLow(t *testing.T) {
 	loopDevicesForPath = func(string) (string, error) { return "", nil }
 	reflinkCloneFile = func(context.Context, string, string) error { return nil }
 
-	if _, err := p.Create(context.Background(), "demo", model.Actor{UserLogin: "alice@example.com"}, CreateOptions{}); err == nil || !strings.Contains(err.Error(), "insufficient host disk") {
+	if _, err := p.Create(context.Background(), "demo", model.Actor{UserLogin: "alice@example.com"}, CreateOptions{}); err == nil || !strings.Contains(err.Error(), "insufficient available disk space") {
 		t.Fatalf("Create() disk capacity error = %v", err)
 	}
 	p.cfg.Images = map[string]config.Image{"debian-13": {Kernel: baseKernel, RootFS: baseRootFS}}
 	p.cfg.BaseRootFSPath = "/unavailable/arch/rootfs.img"
-	if _, err := p.Create(context.Background(), "demo", model.Actor{UserLogin: "alice@example.com"}, CreateOptions{Image: "debian-13"}); err == nil || !strings.Contains(err.Error(), "insufficient host disk") {
+	if _, err := p.Create(context.Background(), "demo", model.Actor{UserLogin: "alice@example.com"}, CreateOptions{Image: "debian-13"}); err == nil || !strings.Contains(err.Error(), "insufficient available disk space") {
 		t.Fatalf("Create() must use the selected rootfs for admission, not the Arch default: %v", err)
 	}
 	if _, err := p.Create(context.Background(), "demo", model.Actor{}, CreateOptions{Image: "unknown"}); err == nil || !strings.Contains(err.Error(), "unknown image") {
@@ -2846,7 +2872,13 @@ func TestResizeRetriesFilesystemResizeWhenImageFileAlreadyExpanded(t *testing.T)
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st,
+		// No room for a full virtual rootfs reservation, but the runtime floor
+		// remains available for this sparse image's filesystem resize.
+		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
+			return host.FilesystemUsage{Total: hostDiskReserveBytes + 1, Used: 1, Available: hostDiskReserveBytes}, nil
+		},
+	}
 
 	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 	inst.RootFSSizeBytes = 8 * testMiB
@@ -2963,7 +2995,7 @@ func TestResizeRejectsPooledGuestMemoryLargerThanPoolReservation(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st}
+	p := &Provisioner{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: st, vmRunner: noopVMRunner{}}
 
 	pool := model.MemoryPool{
 		ID:            "pool-a-id",
@@ -3008,8 +3040,8 @@ func TestResizeRejectsGrowingRootFSWhenHostDiskSpaceIsLow(t *testing.T) {
 		cfg:   cfg,
 		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store: st,
-		readFilesystemBytes: func(string) (int64, error) {
-			return 256 * format.MiB, nil
+		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
+			return host.FilesystemUsage{Total: 128 * format.GiB, Available: 256 * format.MiB, Used: 127 * format.GiB}, nil
 		},
 	}
 
@@ -3042,7 +3074,7 @@ func TestResizeRejectsGrowingRootFSWhenHostDiskSpaceIsLow(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	if _, err := p.Resize(ctx, inst.Name, CreateOptions{RootFSSizeBytes: 12 * testMiB}); err == nil || !strings.Contains(err.Error(), "insufficient host disk") {
+	if _, err := p.Resize(ctx, inst.Name, CreateOptions{RootFSSizeBytes: 12 * testMiB}); err == nil || !strings.Contains(err.Error(), "insufficient available disk space") {
 		t.Fatalf("Resize() disk capacity error = %v", err)
 	}
 }
@@ -3062,6 +3094,13 @@ func TestCapacitySummaryIncludesDiskStorageDetails(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
+	for i, state := range []string{model.StateStopped, model.StateReady, model.StateFailed, model.StateDeleting, model.StateDeleted} {
+		inst := provisionTestInstance(cfg, fmt.Sprintf("physical-%d", i), state, time.Now().UTC())
+		inst.RootFSSizeBytes = 1024 * format.GiB
+		if err := st.CreateInstance(ctx, inst); err != nil {
+			t.Fatal(err)
+		}
+	}
 	filesystemUsage := host.FilesystemUsage{
 		Total:     128 * 1024 * format.MiB,
 		Used:      37 * 1024 * format.MiB,
@@ -3142,9 +3181,28 @@ func TestCapacitySummaryIncludesDiskStorageDetails(t *testing.T) {
 	if disk.Total != filesystemUsage.Total || !reflect.DeepEqual(disk.Filesystem, wantFilesystem) {
 		t.Fatalf("disk filesystem usage = %#v with total %d, want %#v with total %d", disk.Filesystem, disk.Total, wantFilesystem, filesystemUsage.Total)
 	}
+	if disk.Allocated != filesystemUsage.Used || disk.Budget != filesystemUsage.Total-hostDiskReserveBytes || disk.Left != filesystemUsage.Available-hostDiskReserveBytes {
+		t.Fatalf("disk capacity must report measured usage, not logical reservations: %+v", disk)
+	}
+	if !strings.Contains(disk.Note, "measured") || !strings.Contains(disk.Note, "no virtual disk capacity promise") {
+		t.Fatalf("disk note must distinguish physical measurement from a virtual promise: %q", disk.Note)
+	}
+	filesystemUsage.Available = hostDiskReserveBytes - 1
+	summary, err = p.CapacitySummary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range summary.Capacity {
+		if resource.Resource == "disk" && resource.Left != -1 {
+			t.Fatalf("disk status must show a breached floor, not clamp or promise capacity: %+v", resource)
+		}
+	}
 }
 
-func TestReservedInstanceRootFSBytesUsesAllocatedBytesForDeletedAndDeletingInstances(t *testing.T) {
+func TestDiskCapacityUsesMeasuredBytesForSparseDeletedAndDeletingInstances(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	db := newProvisionTestStore(t, cfg)
 	rootfsPath := filepath.Join(t.TempDir(), "rootfs.img")
 	if err := os.WriteFile(rootfsPath, []byte("payload"), 0o644); err != nil {
 		t.Fatalf("WriteFile(rootfs): %v", err)
@@ -3162,19 +3220,31 @@ func TestReservedInstanceRootFSBytesUsesAllocatedBytesForDeletedAndDeletingInsta
 		t.Fatalf("Stat(rootfs) sys = %T, want *syscall.Stat_t", info.Sys())
 	}
 
+	p := &Provisioner{cfg: cfg, store: db,
+		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
+			return host.FilesystemUsage{Total: hostDiskReserveBytes + st.Blocks*512, Used: st.Blocks * 512, Available: hostDiskReserveBytes}, nil
+		},
+	}
 	for _, state := range []string{model.StateDeleted, model.StateDeleting} {
-		inst := model.Instance{
-			State:           state,
-			RootFSPath:      rootfsPath,
-			RootFSSizeBytes: 64 * format.MiB,
+		inst := provisionTestInstance(cfg, state, state, time.Now().UTC())
+		inst.RootFSPath = rootfsPath
+		inst.RootFSSizeBytes = 64 * format.MiB
+		if err := db.CreateInstance(ctx, inst); err != nil {
+			t.Fatal(err)
 		}
-		if got, want := reservedInstanceRootFSBytes(inst), st.Blocks*512; got != want {
-			t.Fatalf("reservedInstanceRootFSBytes(%q) = %d, want %d", state, got, want)
+		summary, err := p.CapacitySummary(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, resource := range summary.Capacity {
+			if resource.Resource == "disk" && (resource.Allocated != st.Blocks*512 || resource.Left != 0) {
+				t.Fatalf("%s sparse disk must use measured bytes exactly once: %+v", state, resource)
+			}
 		}
 	}
 }
 
-func TestEnsureHostDiskCapacityCountsDeletedInstancesStillPresentInStore(t *testing.T) {
+func TestEnsureHostDiskCapacityUsesMeasuredAvailabilityIncludingRetainedDeletedFiles(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
 	st := newProvisionTestStore(t, cfg)
@@ -3208,18 +3278,72 @@ func TestEnsureHostDiskCapacityCountsDeletedInstancesStillPresentInStore(t *test
 		t.Fatalf("CreateInstance(deleted): %v", err)
 	}
 
-	requestedBytes := int64(8 * format.MiB)
+	requestedBytes := int64(1024 * format.GiB)
+	available := hostDiskReserveBytes - 1
 	p := &Provisioner{
 		cfg:   cfg,
 		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store: st,
 		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
-			return host.FilesystemUsage{Total: hostDiskReserveBytes + allocatedBytes + requestedBytes - 1}, nil
+			return host.FilesystemUsage{Total: 20 * format.GiB, Used: allocatedBytes, Available: available}, nil
 		},
 	}
 
-	if err := p.ensureHostDiskCapacity(ctx, "", requestedBytes); err == nil || !strings.Contains(err.Error(), "insufficient host disk") {
+	if err := p.ensureHostDiskCapacity(ctx, "", requestedBytes); err == nil || !strings.Contains(err.Error(), "insufficient available disk space") {
 		t.Fatalf("ensureHostDiskCapacity() error = %v", err)
+	}
+	available = hostDiskReserveBytes
+	if err := p.ensureHostDiskCapacity(ctx, "", requestedBytes); err != nil {
+		t.Fatalf("virtual request and retained file must not be added to measured usage: %v", err)
+	}
+	// Admission does not consult the instance database at all, so virtual
+	// commitments cannot turn into a lifetime rootfs reservation ledger.
+	p.store = nil
+	if err := p.ensureHostDiskCapacity(ctx, "anything", math.MaxInt64); err != nil {
+		t.Fatalf("disk admission should require only measured availability: %v", err)
+	}
+}
+
+func TestDiskCapacityFailsClosedWithoutAvailableMeasurement(t *testing.T) {
+	cfg := loadProvisionTestConfig(t, nil)
+	p := &Provisioner{cfg: cfg, store: newProvisionTestStore(t, cfg),
+		readFilesystemBytes: func(string) (int64, error) { return 128 * format.GiB, nil },
+	}
+	if err := p.ensureHostDiskCapacity(context.Background(), "", 1); err == nil || !strings.Contains(err.Error(), "available bytes") {
+		t.Fatalf("total-only measurement must not admit writes: %v", err)
+	}
+	if _, err := p.CapacitySummary(context.Background()); err == nil || !strings.Contains(err.Error(), "available bytes") {
+		t.Fatalf("total-only measurement must not report invented availability: %v", err)
+	}
+}
+
+func TestStartRejectsWhenRuntimeDiskFloorIsNotAvailable(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Now().UTC())
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	p := &Provisioner{cfg: cfg, store: st,
+		log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		networkHelper: panicNetworkHelper{t: t}, vmRunner: panicVMRunner{t: t},
+		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
+			return host.FilesystemUsage{Total: 20 * format.GiB, Used: 19 * format.GiB, Available: hostDiskReserveBytes - 1}, nil
+		},
+	}
+	if _, err := p.Start(ctx, inst.Name); err == nil || !strings.Contains(err.Error(), "insufficient available disk space") {
+		t.Fatalf("Start must reject before runtime setup: %v", err)
+	}
+	stored, err := st.GetInstance(ctx, inst.Name)
+	if err != nil || stored.State != model.StateStopped {
+		t.Fatalf("Start floor rejection must leave the stopped instance unchanged: %+v %v", stored, err)
 	}
 }
 
@@ -3493,6 +3617,7 @@ func loadProvisionTestConfig(t *testing.T, env map[string]string) config.Config 
 	if err != nil {
 		t.Fatalf("config.Load(): %v", err)
 	}
+	useTestDiskStorage(t)
 	return cfg
 }
 
@@ -3523,7 +3648,7 @@ func provisionTestInstance(cfg config.Config, name, state string, createdAt time
 		VCPUCount:       cfg.VCPUCount,
 		MemoryMiB:       cfg.MemoryMiB,
 		RootFSSizeBytes: 4 << 30,
-		RootFSPath:      filepath.Join(instanceDir, "rootfs.img"),
+		RootFSPath:      filepath.Join(instanceDir, "disk", "rootfs.img"),
 		KernelPath:      filepath.Join(cfg.ImagesDir(), "vmlinux"),
 		InitrdPath:      filepath.Join(cfg.ImagesDir(), "initrd.img"),
 		SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
@@ -3665,6 +3790,10 @@ func (r panicVMRunner) DeleteMemoryPool(context.Context, vmrunner.MemoryPoolRequ
 }
 
 type noopVMRunner struct{}
+
+func (noopVMRunner) ColdDisk(context.Context, vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
+	return vmrunner.ColdStatus{Phase: "hot"}, nil
+}
 
 func (noopVMRunner) StartInstanceVM(context.Context, vmrunner.StartRequest) (vmrunner.StartResponse, error) {
 	return vmrunner.StartResponse{}, nil

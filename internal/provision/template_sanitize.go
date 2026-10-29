@@ -148,11 +148,10 @@ func (d *templateDisk) clean(path string) error {
 var emptyMachineIDStat = regexp.MustCompile(`(?s)Type: regular\s+Mode:\s+0444\b.*User:\s+0\s+Group:\s+0\b.*Size: 0\n`)
 
 // resetMachineID leaves /etc/machine-id as an empty, root-owned, read-only file.
-// A missing machine-id makes systemd treat the clone's boot as its first boot:
-// it applies the preset policy, which enables units such as
-// systemd-networkd-wait-online that stall boot past the orb bootstrap deadline.
-// An empty file still gets a fresh transient ID on every boot, so clones never
-// share the source's identity.
+// Unlike a missing file, an empty file suppresses systemd first-boot
+// initialization, including presetting and custom ConditionFirstBoot=yes units.
+// Each clone establishes its own ID, which systemd attempts to persist when
+// /etc is writable so subsequent boots retain it.
 func (d *templateDisk) resetMachineID() error {
 	entries, err := d.list("/")
 	if err != nil {

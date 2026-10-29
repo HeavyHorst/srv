@@ -63,136 +63,146 @@ func templateTestImage(t *testing.T, image string, files map[string]string) {
 }
 
 func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
-	templateTestTools(t)
-	ctx := context.Background()
-	cfg := loadProvisionTestConfig(t, nil)
-	st := newProvisionTestStore(t, cfg)
-	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	inst := provisionTestInstance(cfg, "source", model.StateStopped, time.Now())
-	actor := model.Actor{UserLogin: inst.CreatedByUser}
-	removed := []string{"var/lib/dbus/machine-id", "var/lib/tailscale/tailscaled.state", "var/lib/tailscale/ssh/ssh_host_ed25519_key", "var/lib/tailscale/My Notes Grüße", "var/lib/srv/bootstrap.done", "var/lib/systemd/random-seed", "root/.config/amp/secrets.json", "root/.local/share/amp/session.json", "home/user/.local/share/amp/device-id.json", "home/user/.local/share/amp/secrets.json"}
-	kept := []string{"home/user/.amp/bin/amp", "root/.amp/bin/amp", "home/user/.config/amp/settings.json", "home/user/.config/amp/skills/custom/SKILL.md", "home/user/.local/share/amp/prepared-state", "home/user/My Notes Grüße", "home/user/project/.agents/setup", "home/user/project/code.go", "etc/hostname"}
-	files := map[string]string{"etc/machine-id": "payload-etc/machine-id"}
-	for _, path := range append(removed, kept...) {
-		files[path] = "payload-" + path
-	}
-	templateTestImage(t, inst.RootFSPath, files)
-	source, err := os.ReadFile(inst.RootFSPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	before := sha256.Sum256(source)
-	if err := st.CreateInstance(ctx, inst); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.CreateTemplate(ctx, inst.Name, "prepared", actor); err != nil {
-		t.Fatal(err)
-	}
-	dir, _, err := p.readTemplate("prepared", actor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	disk := filepath.Join(dir, "rootfs.img")
-	for _, path := range removed {
-		out, _ := exec.Command("debugfs", "-R", "stat \"/"+path+"\"", disk).CombinedOutput()
-		if !strings.Contains(string(out), "File not found") {
-			t.Errorf("identity retained at %s: %s", path, out)
-		}
-	}
-	assertEmptyMachineID(t, disk)
-	for _, path := range kept {
-		out, err := exec.Command("debugfs", "-R", "cat \"/"+path+"\"", disk).Output()
-		if err != nil || string(out) != files[path] {
-			t.Errorf("prepared file lost %s: %s (%v)", path, out, err)
-		}
-	}
-	source, err = os.ReadFile(inst.RootFSPath)
-	if err != nil || sha256.Sum256(source) != before {
-		t.Fatal("source modified", err)
-	}
-	snapshot, err := os.ReadFile(disk)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := p.CreateTemplate(ctx, inst.Name, "prepared", actor); err != nil {
-		t.Fatal("retry", err)
-	}
-	again, err := os.ReadFile(disk)
-	if err != nil || sha256.Sum256(again) != sha256.Sum256(snapshot) {
-		t.Fatal("retry changed snapshot")
-	}
-	if err := os.Rename(disk, disk+".missing"); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.CreateTemplate(ctx, inst.Name, "prepared", actor); err == nil {
-		t.Fatal("retry reported success for a missing published disk")
-	}
-	if err := os.Rename(disk+".missing", disk); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(dir, dir+".missing"); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.VerifyTemplate(ctx, inst.Name, "prepared", actor); err == nil {
-		t.Fatal("verify recreated a missing published template directory")
-	}
-	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("verify created a directory")
-	}
-	if err := os.Rename(dir+".missing", dir); err != nil {
-		t.Fatal(err)
-	}
-	bob := model.Actor{UserLogin: "bob@example.com"}
-	if err := p.CreateTemplate(ctx, inst.Name, "other", bob); err == nil {
-		t.Fatal("foreign source accepted")
-	}
-	if _, _, err := p.readTemplate("prepared", bob); err == nil {
-		t.Fatal("foreign template visible")
-	}
-	if err := p.DeleteTemplate(ctx, "prepared", bob); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(disk); err != nil {
-		t.Fatal("foreign delete removed template")
-	}
-	other := provisionTestInstance(cfg, "other", model.StateStopped, time.Now())
-	if err := st.CreateInstance(ctx, other); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.CreateTemplate(ctx, other.Name, "prepared", actor); err == nil {
-		t.Fatal("source collision accepted")
-	}
-	if _, err := p.PrepareMigration(ctx, other.Name, "destination", "transfer"); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.CreateTemplate(ctx, other.Name, "fenced", actor); err == nil || !strings.Contains(err.Error(), "fenced") {
-		t.Fatalf("migration fence: %v", err)
-	}
-	inst.State = model.StateReady
-	if err := st.UpdateInstance(ctx, inst); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.CreateTemplate(ctx, inst.Name, "running", actor); err == nil {
-		t.Fatal("running source accepted")
-	}
-	inst.State = model.StateDeleted
-	if err := st.UpdateInstance(ctx, inst); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(filepath.Dir(inst.RootFSPath)); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := p.readTemplate("prepared", actor); err != nil {
-		t.Fatal("source deletion lost template", err)
-	}
-	if err := p.DeleteTemplate(ctx, "prepared", actor); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.DeleteTemplate(ctx, "prepared", actor); err != nil {
-		t.Fatal("repeat delete", err)
-	}
-	if _, _, err := p.readTemplate("../prepared", actor); err == nil {
-		t.Fatal("invalid ID accepted")
+	for _, state := range []string{"populated", "absent", "empty"} {
+		t.Run(state, func(t *testing.T) {
+			templateTestTools(t)
+			ctx := context.Background()
+			cfg := loadProvisionTestConfig(t, nil)
+			st := newProvisionTestStore(t, cfg)
+			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			inst := provisionTestInstance(cfg, "source", model.StateStopped, time.Now())
+			actor := model.Actor{UserLogin: inst.CreatedByUser}
+			removed := []string{"var/lib/dbus/machine-id", "var/lib/tailscale/tailscaled.state", "var/lib/tailscale/ssh/ssh_host_ed25519_key", "var/lib/tailscale/My Notes Grüße", "var/lib/srv/bootstrap.done", "var/lib/systemd/random-seed", "root/.config/amp/secrets.json", "root/.local/share/amp/session.json", "home/user/.local/share/amp/device-id.json", "home/user/.local/share/amp/secrets.json"}
+			kept := []string{"home/user/.amp/bin/amp", "root/.amp/bin/amp", "home/user/.config/amp/settings.json", "home/user/.config/amp/skills/custom/SKILL.md", "home/user/.local/share/amp/prepared-state", "home/user/My Notes Grüße", "home/user/project/.agents/setup", "home/user/project/code.go", "etc/hostname"}
+			files := map[string]string{}
+			switch state {
+			case "populated":
+				files["etc/machine-id"] = "payload-etc/machine-id"
+			case "empty":
+				files["etc/machine-id"] = ""
+			}
+			for _, path := range append(removed, kept...) {
+				files[path] = "payload-" + path
+			}
+			templateTestImage(t, inst.RootFSPath, files)
+			source, err := os.ReadFile(inst.RootFSPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := sha256.Sum256(source)
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.CreateTemplate(ctx, inst.Name, "prepared", actor); err != nil {
+				t.Fatal(err)
+			}
+			dir, _, err := p.readTemplate("prepared", actor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			disk := filepath.Join(dir, "rootfs.img")
+			for _, path := range removed {
+				out, _ := exec.Command("debugfs", "-R", "stat \"/"+path+"\"", disk).CombinedOutput()
+				if !strings.Contains(string(out), "File not found") {
+					t.Errorf("identity retained at %s: %s", path, out)
+				}
+			}
+			assertEmptyMachineID(t, disk)
+			for _, path := range kept {
+				out, err := exec.Command("debugfs", "-R", "cat \"/"+path+"\"", disk).Output()
+				if err != nil || string(out) != files[path] {
+					t.Errorf("prepared file lost %s: %s (%v)", path, out, err)
+				}
+			}
+			source, err = os.ReadFile(inst.RootFSPath)
+			if err != nil || sha256.Sum256(source) != before {
+				t.Fatal("source modified", err)
+			}
+			snapshot, err := os.ReadFile(disk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.CreateTemplate(ctx, inst.Name, "prepared", actor); err != nil {
+				t.Fatal("retry", err)
+			}
+			again, err := os.ReadFile(disk)
+			if err != nil || sha256.Sum256(again) != sha256.Sum256(snapshot) {
+				t.Fatal("retry changed snapshot")
+			}
+			if err := os.Rename(disk, disk+".missing"); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.CreateTemplate(ctx, inst.Name, "prepared", actor); err == nil {
+				t.Fatal("retry reported success for a missing published disk")
+			}
+			if err := os.Rename(disk+".missing", disk); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(dir, dir+".missing"); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.VerifyTemplate(ctx, inst.Name, "prepared", actor); err == nil {
+				t.Fatal("verify recreated a missing published template directory")
+			}
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("verify created a directory")
+			}
+			if err := os.Rename(dir+".missing", dir); err != nil {
+				t.Fatal(err)
+			}
+			bob := model.Actor{UserLogin: "bob@example.com"}
+			if err := p.CreateTemplate(ctx, inst.Name, "other", bob); err == nil {
+				t.Fatal("foreign source accepted")
+			}
+			if _, _, err := p.readTemplate("prepared", bob); err == nil {
+				t.Fatal("foreign template visible")
+			}
+			if err := p.DeleteTemplate(ctx, "prepared", bob); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(disk); err != nil {
+				t.Fatal("foreign delete removed template")
+			}
+			other := provisionTestInstance(cfg, "other", model.StateStopped, time.Now())
+			if err := st.CreateInstance(ctx, other); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.CreateTemplate(ctx, other.Name, "prepared", actor); err == nil {
+				t.Fatal("source collision accepted")
+			}
+			if _, err := p.PrepareMigration(ctx, other.Name, "destination", "transfer"); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.CreateTemplate(ctx, other.Name, "fenced", actor); err == nil || !strings.Contains(err.Error(), "fenced") {
+				t.Fatalf("migration fence: %v", err)
+			}
+			inst.State = model.StateReady
+			if err := st.UpdateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.CreateTemplate(ctx, inst.Name, "running", actor); err == nil {
+				t.Fatal("running source accepted")
+			}
+			inst.State = model.StateDeleted
+			if err := st.UpdateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.RemoveAll(filepath.Dir(inst.RootFSPath)); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := p.readTemplate("prepared", actor); err != nil {
+				t.Fatal("source deletion lost template", err)
+			}
+			if err := p.DeleteTemplate(ctx, "prepared", actor); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.DeleteTemplate(ctx, "prepared", actor); err != nil {
+				t.Fatal("repeat delete", err)
+			}
+			if _, _, err := p.readTemplate("../prepared", actor); err == nil {
+				t.Fatal("invalid ID accepted")
+			}
+		})
 	}
 }
 

@@ -13,7 +13,7 @@ but image boot and the Amp connection still need validation on a real srv host.
 | First `spawn` | Create an Orb, wait for its host-only vsock agent, start `amp orb bootstrap` as `user`. |
 | Later `spawn` | Start the same stopped Orb, or reuse the running Orb; restart bootstrap with the fresh token. |
 | `pause` | Stop the VM and retain its disk; with `ORB_SNAPSHOT_ID`, save an immutable prepared disk template. |
-| `delete` | Require a native-Orb cleanup receipt before marking the local record deleted; retain the exact receipt and template disposition. |
+| `delete` | Remove the native Orb; retain any legacy backups, shared snapshots, project templates and the exact cleanup receipt. |
 
 Orbs use the same Firecracker, capacity accounting and placement infrastructure
 as VMs, but have a separate workload kind and default inventory:
@@ -28,7 +28,14 @@ ssh srv orb new demo --image amp-orb
 Names remain unique across both kinds on each backend. Existing records remain
 VMs; they are not inferred or converted from image names. Previously created
 Tailscale-based Orbs need a deliberate rebuild rather than automatic adoption.
-Common `inspect`, `start`, `stop`, `delete`, backup and capacity commands still
+
+Orbs do not support individual backups or restore. `backup create`, `backup list`,
+`backup delete` and `restore` reject Orbs, including for admins. Legacy backups
+are left untouched by deletion and may be cleaned up manually if desired. A reused
+name may also have backups of a former VM. Project templates and shared host
+snapshots are unchanged.
+
+Common `inspect`, `start`, `stop`, `delete` and capacity commands still
 operate on both kinds. The same list separation applies through srv-front.
 
 There is **no RAM suspend or automatic migration**. New orbs reuse a known
@@ -382,17 +389,17 @@ They are not a backup of the whole filesystem. Amp's UI may not immediately
 reflect provider-side retirement; subsequent dispatched spawn jobs explicitly
 refuse to resume until an operator authorizes a fresh workspace for that thread.
 
-The command takes the existing per-Orb lock and uses srv's `delete-proof` API,
-including the complete backend identity and v3 gateway/runtime/network/storage
+The command takes the existing per-Orb lock and uses srv's `delete NAME --expect …` API,
+including the complete backend identity and gateway/runtime/network/storage
 proof. It records `retiring` before sending the request and `retired` only after
-verifying and saving the exact cleanup receipt. Project templates remain retained
-as listed in the receipt; backup and snapshot exclusions still apply. Ordinary
+verifying and saving the exact cleanup receipt. Individual backups,
+project templates and shared host snapshots remain outside deletion scope. Ordinary
 Amp deletion records are not relabeled or upgraded to retirement.
 
 If the reply is lost, repeat the **same command and UUID**. A pending retirement
-only queries the original receipt; it does not send a second deletion request.
-A crash before admission, failed preflight or incomplete cleanup stays fenced
-for operator reconciliation rather than reporting success from an absent VM.
+reads the original receipt or resubmits the exact same bound deletion request.
+Failed preflight is rechecked; incomplete cleanup resumes under its existing
+fence. An absent VM alone never reports success.
 Uncertain start/stop operations still block retirement. Later Amp `delete` may
 finish reading the same retirement receipt, but makes the disposition ordinary
 `deleted`, not eligible for fresh start. Amp `delete` after completed retirement
@@ -415,7 +422,7 @@ To continue the **same retained thread** with a new workspace:
    message in the retained Amp thread to request a fresh `spawn` and token.
 
 The authorization command itself starts no VM and needs no token. It requires
-the completed retirement and its full v3 receipt, then records one successor
+the completed retirement and its full v3, v4 or v5 receipt, then records one successor
 with a distinct srv name. The next spawn uses normal base-image or ready project
 snapshot selection, creates a new instance UUID, and bootstraps it with the new
 token. Amp's documented fresh-disk contract runs repository setup again when
@@ -455,15 +462,15 @@ the managed instance name: those actions do not reconcile provider state.
 Neither operator command is an `ORB_OPERATION` value. There is no automatic
 expiry, bulk deletion or automatic recreation of missing disks. Older dispatchers
 reject the new phases or successor names; use the updated dispatcher after using
-these commands. The existing v3 backend receipt contract is unchanged.
+these commands. See the coordinated deletion-protocol upgrade below.
 
 ### Operation receipts and bootstrap generations
 
 The dispatcher persists a fresh request ID before start, stop, bootstrap or
 delete. Bound start/stop accept `--expect REQUEST UUID CREATED_AT BACKEND_ID IMAGE`;
 unbound human start/stop commands retain their previous behavior. srv checks the
-binding and admission under the instance lock. Repeating an admitted request
-never reexecutes it. `operation-result REQUEST` only reads its stored result.
+binding and admission under the instance lock. Repeating an admitted start/stop
+request never reexecutes it. `operation-result REQUEST` only reads its stored result.
 After a lost outer SSH reply, a matching `done` result is sufficient to recover.
 
 `srv-orb-dispatch cancel ORB_ID REQUEST` attempts cancellation of a pending
@@ -510,13 +517,20 @@ Old guests without the echoed generation acknowledgment are rejected.
 
 ### Authoritative native-Orb deletion
 
-`delete-proof REQUEST NAME UUID CREATED_AT BACKEND_ID IMAGE` is native-Orb-only;
-ordinary VM deletion is unchanged. `cleanup-receipt REQUEST` reads the stored
+`delete NAME --expect REQUEST_ID UUID CREATED_AT BACKEND_ID IMAGE` supports both native
+Orbs and ordinary VMs. Plain `delete NAME` and background recovery use the same
+durable deletion engine. `cleanup-receipt REQUEST` reads the stored
 result without invoking deletion. Both require an explicit `--host` through
-srv-front. A failed or lost delete reply is queried by that same request ID,
-never retried with another ID and never downgraded to plain `delete`.
+srv-front. On a failed or lost reply, repeat the same deletion: the dispatcher
+queries the receipt and, if missing, resubmits the original identity and request
+ID. Never substitute a new ID or downgrade to plain `delete`.
 
-New deletions publish v3 receipts with `gateways_absent: true`. After preflight
+The former `delete-proof` SSH command is removed, with no alias. Update the
+dispatcher and other callers together with srv and srv-front. The durable
+request format and existing receipts are unchanged, so the new syntax can resume
+an already-admitted request using its original request ID and identity arguments.
+
+New deletions publish v5 receipts with `gateways_absent: true`. After preflight
 and durable cleanup admission, srv closes this instance's Amp CONNECT, provider
 and integration listeners, cancels their upstream requests and upgraded streams,
 and waits for admitted handlers (including pending dials) to finish. Gateway
@@ -526,35 +540,71 @@ gateways untouched. Neighboring instances' gateways remain available.
 This proves absence of per-instance listeners and active handlers/streams, not
 absence of every host socket: shared idle upstream transport pools are retained.
 
-Upgrade srv and `srv-orb-dispatch` together: the dispatcher now requires v3 to
-finalize a pending deletion. Stored v2 receipts remain readable, unchanged; they
-do **not** prove gateway quiescence and cannot finalize a `deleting` dispatcher
-record under the new version. Already-finalized `deleted` records still make
-repeat delete a no-op and reject spawn; that no-op does not upgrade the historical
-receipt to v3. Do not rewrite receipts or tombstones to bypass this distinction.
+Upgrade srv, `srv-vm-runner`, `srv-net-helper`, its systemd unit and
+`srv-orb-dispatch` together. Stop provider admission and srv first, then
+stop/drain the old helpers and their children before starting the updated
+services. Old unbound helper requests cannot be retrospectively fenced; do not
+enable recovery while they can still run. The unit provisions
+`/var/lib/srv-net-helper` for durable network deletion
+records. Preserve it alongside the backend state; do not clear it or downgrade
+to a helper that ignores incarnation fences. Manual installations must provision
+this directory root-owned with mode 0700. The existing root-owned payload lock
+must also be installed for storage deletion.
+
+The dispatcher accepts v3, v4 and v5 receipts. Stored v2 receipts remain readable,
+unchanged; they do **not** prove gateway quiescence and cannot finalize a
+`deleting` dispatcher record under the new version. Already-finalized `deleted`
+records still make repeat delete a no-op and reject spawn; that no-op does not
+upgrade the historical receipt. Do not rewrite receipts or tombstones to bypass
+this distinction.
 The existing coordinated runner/nethelper/guest-image protocol requirements still
 apply; this change does not deploy or validate any installed host binary.
 
-The backend fences ingress and drains gateways, then asks the VM runner to prove
-runtime/jailer/cgroup absence. The exact recorded start receipt must be closed, and the runner
+The backend fences ingress, drains gateways, stops the runtime, and removes cold
+storage directly, without hydration. A remote-storage error leaves the instance
+in `deleting` for retry. The runner durably fences the deleted incarnation before
+proving runtime/jailer/cgroup absence through `cleanup-proof-v2`.
+The exact recorded start receipt must be closed, and the runner
 scans the entire name's receipt journal for corrupt identities or nonclosed
 attempts. It checks for no live VM with that name, no jailer workspace or runtime
 socket, and no delegated cgroup. This is name-scoped proof, not a separate
-UUID-bound enumeration of every historical runtime path. Nethelper proves
-network absence only. Missing/older helper endpoints and unreadable resources fail
-closed. It removes and fsyncs instance storage, checks backups and local data
-snapshots, and atomically commits the receipt, deleted tombstone and release of
+UUID-bound enumeration of every historical runtime path. A never-started instance
+may have no start attempt: its exact durable deletion fence and vacant runtime
+are still required. A missing expected attempt is not treated as absence.
+Nethelper binds network
+finalization to the incarnation, request and TAP/CIDR, fences late setup/cleanup,
+and durably records completion after checking absence. A completed retry does no
+more destructive work, even if another instance has since reused the network.
+Mutating helper children retain the network lock until exit, including after a
+helper crash. Missing/older helper endpoints and unreadable resources fail closed.
+
+For both kinds, srv removes `instances/<name>` and fsyncs its parent, then atomically
+commits the receipt, deleted tombstone and release of
 the cleanup fence. Failed cleanup remains charged by the existing srv capacity
-accounting. There is no added scheduler or independent slot counter.
+accounting. The same request can resume after timeout, service restart or partial
+removal, including a missing disk or partially removed instance directory. Missing
+owned trees are already complete; filesystem errors are not absence. Btrfs
+children retain the existing payload lock so a retry cannot release the allocation
+ahead of old filesystem work. Known preflight failures and startup-cancelled
+admissions are rechecked; executing/interrupted cleanup requires its original
+fence. Another request cannot take it over. Background reconciliation resumes
+that same owning request. There is no added scheduler or independent slot counter.
+Deletion retains all individual backups and v5 records `backups_absent: false`.
+Ordinary VM deletion removes only the exact recorded Tailscale node, retaining the shared identity
+for a completed migration source or an incomplete destination import.
 
 `never-minted` is derived only for native Orbs with no enrollment-key row and no
 node ID. It says nothing about project-managed Tailscale or external copies.
-Sorted source-UUID-matched project templates are explicitly retained in the
-receipt, never erased or called absent. Local data snapshots containing source
-disks, backups or template copies block proof; they need a separate retention
-decision. Receipt/request records survive name reuse. An uncertain bootstrap
+Project templates and shared host snapshots are neither scanned nor removed,
+including copies of the Orb's disk/backups. v4 and v5 set `snapshots_absent: false`
+and `retained_templates: null`: neither makes a copy-erasure or exhaustive template
+inventory claim. Cold-storage cleanup must confirm remote absence; missing local
+files alone do not establish it.
+Receipt/request records survive name reuse. An uncertain bootstrap
 can be deleted through this path: the runtime proof closes the guest work and
-the backend tombstone prevents late host admission. Uncertain start/stop cannot.
+the backend tombstone prevents late host admission. A persisted start that never
+reached the runner is resolved into a closed exact-attempt receipt, fencing its
+late arrival. An outcome that remains unknown still blocks deletion.
 
 Do not manually migrate, delete/recreate or reuse managed orb names. A missing
 managed disk causes spawn to fail rather than creating an empty replacement.

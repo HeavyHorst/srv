@@ -53,7 +53,134 @@ credentials are JSON on stdin, never command arguments; it does not accept `--js
 | `stop <name>` | Stop a running VM (graceful shutdown) |
 | `restart <name>` | Stop and start a VM |
 | `fsck <name>` | Force-check and repair the rootfs of a stopped VM |
-| `delete <name>` | Delete a VM and all its resources |
+| `delete <name>` | Delete an instance's runtime, network, and local/cold disk allocation |
+| `delete <name> --expect REQUEST_ID UUID CREATED_AT BACKEND_ID IMAGE` | Delete the exact expected incarnation; return its durable JSON cleanup receipt |
+| `cleanup-receipt REQUEST_ID` | Read the stored cleanup receipt without executing deletion |
+
+Deletion uses the same durable workflow for VMs and Orbs. It drains gateways,
+stops the runtime, removes any remote cold disk without hydration, and only marks
+the instance deleted after cleanup succeeds. Once cleanup has begun, a failure
+leaves it `deleting`; background reconciliation or another `delete` resumes the
+same request. A preflight rejection need not change the instance's state. All backups
+(including legacy Orb backups), project templates and shared host snapshots are
+retained. A fresh `delete NAME` selects the current incarnation: automation replaying
+an old request after name reuse must use `delete NAME --expect …` instead. Bound
+deletion and receipt queries require an explicit `--host` through srv-front.
+The former `delete-proof` command is no longer accepted; there is no alias.
+The updated runner and network helper are required; drain old helper work during
+the coordinated upgrade described in [Orb deletion](../examples/amp-orbs.md#authoritative-native-orb-deletion).
+
+### Manual deletion
+
+Here `srv-a` is a direct backend SSH endpoint. These commands actually delete the
+active environment; substitute the intended instance name. No preceding `stop`
+or `disk hydrate` is required. Cold storage holds the offloaded active disk, not
+an independent backup, so deletion removes it too.
+
+```bash
+# Normal VM
+ssh srv-a delete demo
+
+# Orb: the same command, not "orb delete"
+ssh srv-a delete dev-orb
+```
+
+Successful text output for `demo`:
+
+```text
+deleted: demo
+state: deleted
+```
+
+Repeat `delete demo` to resume an incomplete deletion. It reports an error if the
+instance is already deleted. If the name has been reused, however, it selects the
+new instance. Use bound deletion for delayed jobs and automated retries.
+
+### Bound deletion and retries
+
+`delete NAME --expect REQUEST_ID UUID CREATED_AT BACKEND_ID IMAGE` deletes only
+the expected incarnation and returns a JSON cleanup receipt without needing
+`--json`.
+
+| Argument | Source and meaning |
+|----------|--------------------|
+| `NAME` | `.instance.name` from JSON `inspect` |
+| `REQUEST_ID` | A new UUID for this deletion request; keep it unchanged on retry |
+| `UUID` | `.instance.id`, the instance UUID, not the request UUID |
+| `CREATED_AT` | `.instance.created_at`, preserving the returned timestamp |
+| `BACKEND_ID` | `.instance.backend_id`, the backend SSH host-key fingerprint, not a frontend host name |
+| `IMAGE` | `.instance.image` |
+
+Prepare the request once, using local `jq` and `uuidgen`. Keep these files until
+the operation is resolved. Do not overwrite them or repeat this preparation when
+retrying: a fresh inspection could select a replacement instance.
+
+```bash
+ssh srv-a -- --json inspect demo > demo-before-delete.json &&
+  uuidgen > demo-delete-request.txt
+```
+
+Execute the following Bash script to submit or retry the saved request. It stops
+if the saved inputs cannot be read:
+
+```bash
+set -e
+request=$(cat demo-delete-request.txt)
+name=$(jq -er '.instance.name' demo-before-delete.json)
+id=$(jq -er '.instance.id' demo-before-delete.json)
+created=$(jq -er '.instance.created_at' demo-before-delete.json)
+backend=$(jq -er '.instance.backend_id' demo-before-delete.json)
+image=$(jq -er '.instance.image' demo-before-delete.json)
+
+ssh srv-a delete "$name" --expect \
+  "$request" "$id" "$created" "$backend" "$image"
+```
+
+Use the same authenticated user and exactly the same arguments on every retry.
+A mismatched identity is rejected. An incomplete request resumes; a completed
+request returns its stored receipt without deleting a later same-name instance.
+This replay contract applies to deletion, not to all start/stop operations.
+
+### Query completion after a lost reply
+
+```bash
+ssh srv-a cleanup-receipt "$(cat demo-delete-request.txt)"
+```
+
+This only reads the receipt; it does not execute deletion. A receipt establishes
+completion. An error means no receipt could be retrieved, not that deletion had
+no effects. If needed, resubmit the original bound request above.
+
+The backend's bound-deletion and receipt handlers return exit code 75 for handled
+errors, including an uncommitted receipt or mismatched request. Do not interpret
+that code as proof that nothing changed. Transport and frontend errors may use
+other exit codes.
+
+### Deletion through srv-front
+
+Here `srv` is the frontend and `a` is its configured backend name. For preparation
+through the frontend, replace the direct `inspect` command above with:
+
+```bash
+ssh srv -- --json inspect demo --host a > demo-before-delete.json &&
+  uuidgen > demo-delete-request.txt
+```
+
+For manual deletion, submission using the saved variables above, or receipt lookup:
+
+```bash
+ssh srv delete demo --host a
+
+ssh srv delete "$name" --host a --expect \
+  "$request" "$id" "$created" "$backend" "$image"
+
+ssh srv cleanup-receipt "$(cat demo-delete-request.txt)" --host a
+```
+
+These are alternative operations, not a sequence to run together. Bound deletion
+and receipt lookup require explicit `--host`; `a` does not replace `BACKEND_ID`.
+When using the bound frontend example, load the saved variables but replace the
+direct `ssh srv-a delete` line with the frontend submission line.
 
 ## Cold disk commands
 
@@ -89,6 +216,10 @@ For pooled VMs, `resize --ram` keeps the VM in the same pool. In v1 it is allowe
 | `backup list <name>` | List backups for a VM |
 | `backup delete <name> <backup-id>` | Permanently delete a backup |
 | `restore <name> <backup-id>` | Restore a stopped VM from a backup |
+
+Backup and restore commands support normal VMs only. Orbs reject all four
+commands, including for admins. Old Orb backups remain untouched even when the Orb
+is deleted; clean them up manually if desired. Project templates remain supported.
 
 ## Project templates
 

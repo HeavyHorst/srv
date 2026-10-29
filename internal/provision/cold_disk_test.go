@@ -226,7 +226,7 @@ func TestColdDiskFencesAndHydration(t *testing.T) {
 				}
 			}
 			if phase != "absent" {
-				if _, err := p.recoveryCopiesAbsent(context.Background(), inst); err == nil {
+				if err := p.coldDiskFence(context.Background(), inst, true); err == nil {
 					t.Fatal("cleanup proof accepted marker")
 				}
 			}
@@ -267,6 +267,8 @@ func TestColdDiskLifecycleFailuresRetainState(t *testing.T) {
 				}
 				return vmrunner.ColdStatus{}, errors.New("remote unavailable")
 			}}}
+			p.networkHelper = noopNetworkHelper{}
+			p.SetCleanup("backend", func(context.Context, model.Instance) error { return nil })
 			var err error
 			switch action {
 			case "start":

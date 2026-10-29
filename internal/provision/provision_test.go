@@ -190,6 +190,8 @@ func TestDeleteDoesNotMarkInstanceDeletedWhenDiskCleanupFails(t *testing.T) {
 		store:    st,
 		vmRunner: noopVMRunner{},
 	}
+	p.networkHelper = noopNetworkHelper{}
+	p.SetCleanup("backend", func(context.Context, model.Instance) error { return nil })
 
 	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0o755); err != nil {
@@ -198,16 +200,23 @@ func TestDeleteDoesNotMarkInstanceDeletedWhenDiskCleanupFails(t *testing.T) {
 	if err := os.WriteFile(inst.RootFSPath, []byte("vm"), 0o644); err != nil {
 		t.Fatalf("WriteFile(rootfs): %v", err)
 	}
+	backup := filepath.Join(cfg.BackupsDir(), inst.Name, "retained", "rootfs.img")
+	if err := os.MkdirAll(filepath.Dir(backup), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backup, []byte("ordinary VM backup"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatalf("CreateInstance(): %v", err)
 	}
 
-	oldRemovePathAll := removePathAll
-	removePathAll = func(string) error {
+	oldRemoveTree := removeTree
+	removeTree = func(context.Context, string) error {
 		return errors.New("disk busy")
 	}
 	t.Cleanup(func() {
-		removePathAll = oldRemovePathAll
+		removeTree = oldRemoveTree
 	})
 
 	deletedInst, err := p.Delete(ctx, inst.Name)
@@ -239,6 +248,17 @@ func TestDeleteDoesNotMarkInstanceDeletedWhenDiskCleanupFails(t *testing.T) {
 	}
 	if _, statErr := os.Stat(inst.RootFSPath); statErr != nil {
 		t.Fatalf("rootfs should remain after failed delete, stat err = %v", statErr)
+	}
+	removeTree = oldRemoveTree
+	deletedInst, err = p.Delete(ctx, inst.Name)
+	if err != nil || deletedInst.State != model.StateDeleted {
+		t.Fatalf("retry Delete(): %+v, %v", deletedInst, err)
+	}
+	if _, err := os.Stat(inst.RootFSPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("ordinary VM disk retained", err)
+	}
+	if data, err := os.ReadFile(backup); err != nil || string(data) != "ordinary VM backup" {
+		t.Fatalf("ordinary VM backup changed: %q, %v", data, err)
 	}
 }
 
@@ -2423,6 +2443,7 @@ func TestFailedShutdownPreservesGuestOnDeleteAndRestore(t *testing.T) {
 				t.Fatal(err)
 			}
 			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: readinessStopRunner{panicVMRunner{t}}, networkHelper: panicNetworkHelper{t}}
+			p.SetCleanup("backend", func(context.Context, model.Instance) error { return nil })
 			var err error
 			if operation == "delete" {
 				_, err = p.Delete(ctx, inst.Name)
@@ -2469,6 +2490,7 @@ func TestReconciliationRetriesCleanupWithoutReleasingGuest(t *testing.T) {
 				t.Fatal(err)
 			}
 			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: noopVMRunner{}, networkHelper: failingCleanupNetworkHelper{}}
+			p.SetCleanup("backend", func(context.Context, model.Instance) error { return nil })
 			if _, err := p.ReconcileInstance(ctx, inst.Name); err == nil {
 				t.Fatal("failed cleanup reported success")
 			}
@@ -2509,6 +2531,10 @@ func TestReconciliationRetriesCleanupWithoutReleasingGuest(t *testing.T) {
 }
 
 type failingCleanupNetworkHelper struct{ noopNetworkHelper }
+
+func (failingCleanupNetworkHelper) FinalizeInstanceNetwork(context.Context, nethelper.FinalizeRequest) error {
+	return errors.New("network helper unavailable")
+}
 
 func (failingCleanupNetworkHelper) CleanupInstanceNetwork(context.Context, nethelper.CleanupRequest) error {
 	return errors.New("network helper unavailable")
@@ -3679,6 +3705,15 @@ func (h panicNetworkHelper) CleanupInstanceNetwork(context.Context, nethelper.Cl
 
 type noopNetworkHelper struct{}
 
+func (noopNetworkHelper) FinalizeInstanceNetwork(context.Context, nethelper.FinalizeRequest) error {
+	return nil
+}
+
+func (h panicNetworkHelper) FinalizeInstanceNetwork(context.Context, nethelper.FinalizeRequest) error {
+	h.t.Fatal("FinalizeInstanceNetwork must not be called")
+	return nil
+}
+
 func (noopNetworkHelper) SetupInstanceNetwork(context.Context, nethelper.SetupRequest) error {
 	return nil
 }
@@ -3790,6 +3825,19 @@ func (r panicVMRunner) DeleteMemoryPool(context.Context, vmrunner.MemoryPoolRequ
 }
 
 type noopVMRunner struct{}
+
+func (noopVMRunner) VerifyInstanceAbsent(context.Context, vmrunner.StartResultRequest) error {
+	return nil
+}
+
+func (r readinessStopRunner) VerifyInstanceAbsent(context.Context, vmrunner.StartResultRequest) error {
+	r.t.Fatal("VerifyInstanceAbsent must not be called")
+	return nil
+}
+
+func (r readinessStopRunner) ColdDisk(context.Context, vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
+	return vmrunner.ColdStatus{Phase: "hot"}, nil
+}
 
 func (noopVMRunner) ColdDisk(context.Context, vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
 	return vmrunner.ColdStatus{Phase: "hot"}, nil

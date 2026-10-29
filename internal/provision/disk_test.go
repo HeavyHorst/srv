@@ -2,7 +2,6 @@ package provision
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -280,23 +279,6 @@ func TestDiskJournalTempCleanupRejectsNonregularResidue(t *testing.T) {
 				t.Fatalf("disk changed: %q %v", data, err)
 			}
 		})
-	}
-}
-
-func TestCleanupRejectsSnapshotBundleDisk(t *testing.T) {
-	cfg := loadProvisionTestConfig(t, nil)
-	inst := provisionTestInstance(cfg, "retained", model.StateStopped, time.Now())
-	root := filepath.Join(cfg.SnapshotsDir(), "snapshot")
-	if err := os.MkdirAll(filepath.Join(root, "root"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	b, _ := json.Marshal(map[string]any{"version": 1, "id": "snapshot", "components": []map[string]string{{"source": ".", "path": "root"}, {"source": "instances/retained/disk", "path": "disk-000000"}}})
-	if err := os.WriteFile(filepath.Join(root, "manifest.json"), b, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	p := &Provisioner{cfg: cfg}
-	if _, err := p.recoveryCopiesAbsent(context.Background(), inst); err == nil {
-		t.Fatal("bundle disk escaped deletion proof")
 	}
 }
 

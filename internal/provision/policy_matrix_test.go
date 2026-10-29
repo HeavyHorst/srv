@@ -118,7 +118,9 @@ func TestProvisionPolicyMatrix(t *testing.T) {
 						t.Fatalf("PrepareMigration() succeeded in fence=%q import=%q", fence, importPhase)
 					}
 
-					deleteWant := fence == "" && importPhase == "" && (migration == "" || migration == "aborted")
+					// This is the owning delete request, so its own fence permits
+					// resumption. Only an active outgoing migration excludes delete.
+					deleteWant := migration == "" || migration == "aborted" || migration == "completed"
 					_, err = p.DeleteWithProof(ctx, deleteInst, "req-"+deleteInst.Name, "owner", "backend-one", func(context.Context, model.Instance) error { return nil })
 					stored, getErr := st.GetInstance(ctx, deleteInst.Name)
 					if getErr != nil {

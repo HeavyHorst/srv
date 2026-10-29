@@ -24,6 +24,8 @@ func TestCompletedMigrationDeletePreservesSharedTailnetIdentity(t *testing.T) {
 	st := newProvisionTestStore(t, cfg)
 	// An unconfigured API client fails if deletion touches the tailnet API.
 	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: noopVMRunner{}, tsClient: &tailscale.Client{}}
+	p.networkHelper = noopNetworkHelper{}
+	p.SetCleanup("backend", func(context.Context, model.Instance) error { return nil })
 	inst := provisionTestInstance(cfg, "moved", model.StateStopped, time.Now().UTC())
 	inst.TailnetNodeID = "shared-node"
 	if err := st.CreateInstance(ctx, inst); err != nil {

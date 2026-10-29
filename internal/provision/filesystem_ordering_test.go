@@ -252,6 +252,7 @@ func waitImport(t *testing.T, gated *gatedImport) error {
 func TestDeleteWithProofKeepsFenceUntilFilesAreGone(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
+	cfg.OutboundInterface = "fixture0"
 	st := newProvisionTestStore(t, cfg)
 	inst := provisionTestInstance(cfg, "delete-ordering", model.StateStopped, time.Date(2026, 4, 5, 13, 0, 0, 0, time.UTC))
 	inst.Kind, inst.Image, inst.TailnetNodeID = model.KindOrb, "amp-orb", ""

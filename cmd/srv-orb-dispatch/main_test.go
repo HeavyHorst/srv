@@ -50,26 +50,28 @@ type testVM struct {
 }
 
 type testServer struct {
-	Results       map[string]map[string]any
-	Proof         map[string]any
-	ProxyBypass   *string
-	Creates       int
-	LateStop      bool
-	LoseBootstrap bool
-	VM            *testVM
-	Disk          string
-	Templates     map[string]string
-	LoseTemplate  bool
-	Environment   string
-	Host          string
-	Unreachable   bool
-	OtherDown     bool
-	LoseCreate    bool
-	RejectCreate  bool
-	LoseStop      bool
-	LoseDelete    bool
-	BadInventory  bool
-	FailGuest     bool
+	Results         map[string]map[string]any
+	Proof           map[string]any
+	ProxyBypass     *string
+	Creates         int
+	LateStop        bool
+	LoseBootstrap   bool
+	VM              *testVM
+	Disk            string
+	Templates       map[string]string
+	LoseTemplate    bool
+	Environment     string
+	Host            string
+	Unreachable     bool
+	OtherDown       bool
+	LoseCreate      bool
+	RejectCreate    bool
+	LoseStop        bool
+	LoseDelete      bool
+	RejectDelete    bool
+	DeleteRequestID string
+	BadInventory    bool
+	FailGuest       bool
 }
 
 func fakeSSH() error {
@@ -288,12 +290,23 @@ func fakeSSH() error {
 			return fmt.Errorf("already running")
 		}
 		s.VM.State = "ready"
-	case "delete-proof":
-		if len(args) != 8 || s.VM == nil || args[4] != s.VM.ID || args[5] != s.VM.CreatedAt || args[6] != s.VM.BackendID || args[7] != s.VM.Image {
+	case "delete":
+		if len(args) != 9 || args[3] != "--expect" || s.VM == nil || args[2] != s.VM.Name || args[5] != s.VM.ID || args[6] != s.VM.CreatedAt || args[7] != s.VM.BackendID || args[8] != s.VM.Image {
 			return fmt.Errorf("unbound delete")
 		}
-		s.Proof = map[string]any{"version": 3, "gateways_absent": true, "kind": "orb", "image": s.VM.Image, "backend_id": s.VM.BackendID, "request_id": args[2], "instance_id": s.VM.ID, "name": s.VM.Name, "created_at": s.VM.CreatedAt, "deleted_at": "2026-01-02T04:04:05Z", "auth_key_disposition": "never-minted", "retained_templates": []string{}, "ingress_closed": true, "runtime_absent": true, "jailer_absent": true, "cgroup_absent": true, "network_absent": true, "storage_absent": true, "backups_absent": true, "snapshots_absent": true}
+		if s.DeleteRequestID != "" && s.DeleteRequestID != args[4] {
+			return fmt.Errorf("deletion request changed on retry")
+		}
+		s.DeleteRequestID = args[4]
+		if s.RejectDelete {
+			if err := write(); err != nil {
+				return err
+			}
+			return fmt.Errorf("cleanup preflight failed")
+		}
+		s.Proof = map[string]any{"version": 3, "gateways_absent": true, "kind": "orb", "image": s.VM.Image, "backend_id": s.VM.BackendID, "request_id": args[4], "instance_id": s.VM.ID, "name": s.VM.Name, "created_at": s.VM.CreatedAt, "deleted_at": "2026-01-02T04:04:05Z", "auth_key_disposition": "never-minted", "retained_templates": []string{}, "ingress_closed": true, "runtime_absent": true, "jailer_absent": true, "cgroup_absent": true, "network_absent": true, "storage_absent": true, "backups_absent": true, "snapshots_absent": true}
 		s.VM, s.Disk, s.Environment = nil, "", ""
+		s.DeleteRequestID = ""
 		if err := write(); err != nil {
 			return err
 		}
@@ -478,6 +491,53 @@ func TestDispatchUncertainOutcomes(t *testing.T) {
 				if h.read().VM != nil {
 					t.Fatal("retry allocated another VM")
 				}
+			}
+		})
+	}
+}
+
+func TestDispatchResumesSameDeleteIntent(t *testing.T) {
+	for _, failure := range []string{"before-submit", "preflight"} {
+		t.Run(failure, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.must("spawn", "token")
+			s := h.read()
+			name := s.VM.Name
+			s.RejectDelete = true
+			h.write(s)
+			if _, err := h.run("delete", ""); err == nil {
+				t.Fatal("expected rejection")
+			}
+			original := h.read().DeleteRequestID
+			if original == "" {
+				t.Fatal("no bound request")
+			}
+			s = h.read()
+			s.RejectDelete = false
+			if failure == "before-submit" {
+				s.DeleteRequestID = ""
+			}
+			s.LoseDelete = true
+			h.write(s)
+			if _, err := h.run("delete", ""); err == nil {
+				t.Fatal("expected lost success reply")
+			}
+			s = h.read()
+			if s.VM != nil || s.Proof["request_id"] != original {
+				t.Fatal("retry lost binding or failed to delete")
+			}
+			// New backends retain shared copies; old v3 remains exercised by
+			// the other lifecycle tests, including retirement/fresh-start.
+			s.Proof["version"], s.Proof["snapshots_absent"], s.Proof["retained_templates"] = 4, false, nil
+			if failure == "before-submit" {
+				s.Proof["version"], s.Proof["backups_absent"] = 5, false
+			}
+			h.write(s)
+			h.must("delete", "")
+			data, err := os.ReadFile(filepath.Join(h.dir, "state", name+".json"))
+			var r record
+			if err != nil || json.Unmarshal(data, &r) != nil || r.Phase != "deleted" || r.RequestID != original {
+				t.Fatal("not finalized", string(data), err)
 			}
 		})
 	}

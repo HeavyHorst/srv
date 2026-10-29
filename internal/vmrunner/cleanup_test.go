@@ -89,6 +89,66 @@ func TestCleanupProofOldRunnerFailsClosed(t *testing.T) {
 	}
 }
 
+func TestDeletionProofRequiresFenceAndAbsentRuntime(t *testing.T) {
+	for _, scenario := range []string{"never-started", "closed", "missing-fence", "foreign-fence", "missing-attempt", "partial-attempt", "active", "jail", "cgroup", "socket"} {
+		t.Run(scenario, func(t *testing.T) {
+			s, root, cgroup := newRunnerShutdownTestServer(t)
+			s.config.CgroupRoot = root
+			q := resultRequest(receiptRequest(t))
+			unlock, err := s.lockName(q.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "missing-fence" {
+				id := q.InstanceID
+				if scenario == "foreign-fence" {
+					id = "another-incarnation"
+				}
+				if err := atomicColdJSON(s.coldDeletedPath(ColdRequest{Name: q.Name, InstanceID: q.InstanceID}), id, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "closed" || scenario == "active" {
+				r := startReceipt{StartResultRequest: q, State: "closed"}
+				if scenario == "active" {
+					r.State, r.Digest = "accepted", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+				}
+				if err := s.writeReceipt(r); err != nil {
+					t.Fatal(err)
+				}
+			}
+			unlock()
+			if scenario != "closed" && scenario != "missing-attempt" && scenario != "partial-attempt" {
+				q.RequestID, q.HostBootID = "", ""
+			}
+			if scenario == "partial-attempt" {
+				q.HostBootID = ""
+			}
+			switch scenario {
+			case "jail":
+				paths, err := resolveJailerRuntimePaths(s.config.JailerBaseDir, s.config.FirecrackerBinary, q.Name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(paths.WorkspaceDir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "cgroup":
+				if err := os.MkdirAll(filepath.Join(cgroup, firecrackerVMRootCgroupName, q.Name), 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "socket":
+				receiptRuntime(t, s.config, q.Name)
+			}
+			client := receiptHTTPClient(t, s.Handler())
+			err = client.VerifyInstanceAbsent(context.Background(), q)
+			if (err == nil) != (scenario == "never-started" || scenario == "closed") {
+				t.Fatalf("deletion proof: %v", err)
+			}
+		})
+	}
+}
+
 func TestStorageIdleRequiresVacantName(t *testing.T) {
 	for _, scenario := range []string{"never-started", "active-receipt", "jail", "cgroup", "live-socket"} {
 		t.Run(scenario, func(t *testing.T) {

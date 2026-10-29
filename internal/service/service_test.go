@@ -109,7 +109,7 @@ func TestBackgroundReconciliationHonorsSnapshotAndBusyInstance(t *testing.T) {
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/vm/stop":
-		case "/network/cleanup":
+		case "/network/cleanup-v2":
 			if failCleanup.Load() {
 				http.Error(w, "temporarily unavailable", 503)
 				return

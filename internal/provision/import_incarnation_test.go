@@ -58,6 +58,7 @@ func TestImportAfterDeleteUsesFreshIncarnation(t *testing.T) {
 			st := newProvisionTestStore(t, cfg)
 			runner := &importIncarnationRunner{deleted: make(map[string]bool), admitted: errors.New("fresh incarnation admitted")}
 			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: runner, networkHelper: noopNetworkHelper{}, readFilesystemUsage: host.DefaultReadFilesystemUsage}
+			p.SetCleanup("backend", func(context.Context, model.Instance) error { return nil })
 			inst := provisionTestInstance(cfg, "returning", model.StateStopped, time.Now().UTC())
 			inst.Kind = model.KindOrb
 			inst.RootFSSizeBytes = 6

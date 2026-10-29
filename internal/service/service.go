@@ -529,6 +529,7 @@ func (a *App) Run(ctx context.Context) error {
 		return fmt.Errorf("ensure host signer: %w", err)
 	}
 	a.backendID = ssh.FingerprintSHA256(hostSigner.PublicKey())
+	a.provisioner.SetCleanup(a.backendID, a.closeInstanceGateways)
 	a.log.Info("ssh host key", "public_key", strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostSigner.PublicKey()))))
 
 	a.tailscale = &tsnet.Server{
@@ -900,7 +901,7 @@ func startCommandKeepAlive(sess gssh.Session, args []string, interval time.Durat
 		return func() {}
 	}
 	switch args[0] {
-	case "start", "stop", "restart", "disk", "delete", "delete-proof":
+	case "start", "stop", "restart", "disk", "delete":
 	case "orb":
 		if len(args) < 2 || args[1] != "bootstrap" {
 			return func() {}
@@ -933,8 +934,6 @@ func startCommandKeepAlive(sess gssh.Session, args []string, interval time.Durat
 
 func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandRequest) (commandResult, error) {
 	switch req.args[0] {
-	case "delete-proof":
-		return a.cmdDeleteProof(ctx, actor, req.args)
 	case "cleanup-receipt":
 		return a.cmdCleanupReceipt(ctx, actor, req.args)
 	case "operation-result", "operation-cancel":
@@ -2638,6 +2637,7 @@ func helpResult() commandResult {
 				{"fsck <name>", "Force-check and repair a stopped instance's rootfs."},
 				{"disk <status|offload|hydrate|purge> <name>", "Manage cold disk storage; mutations require a stopped instance (admin required for Orbs)."},
 				{"delete <name>", "Delete an instance."},
+				{"delete <name> --expect REQUEST_ID UUID CREATED_AT BACKEND_ID IMAGE", "Delete an exact incarnation with a replayable cleanup receipt."},
 			},
 		},
 		{
@@ -3201,8 +3201,11 @@ func (a *App) cmdRestart(ctx context.Context, actor model.Actor, args []string, 
 }
 
 func (a *App) cmdDelete(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
+	if len(args) > 2 {
+		return a.cmdDeleteExpected(ctx, actor, args)
+	}
 	if len(args) != 2 {
-		err := errors.New("usage: delete <name>")
+		err := errors.New("usage: delete NAME [--expect REQUEST_ID UUID CREATED_AT BACKEND_ID IMAGE]")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 

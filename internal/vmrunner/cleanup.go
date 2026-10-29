@@ -92,10 +92,42 @@ func (s *Server) storageIdleLocked(name string) error {
 }
 
 func (c *Client) VerifyInstanceAbsent(ctx context.Context, q StartResultRequest) error {
-	if err := q.Validate(); err != nil {
+	return c.post(ctx, "/vm/cleanup-proof-v2", q, nil)
+}
+
+// A never-started instance has no attempt receipt. Its exact durable deletion
+// fence plus a vacant runtime is required instead; missing expected attempts
+// are never treated as evidence of absence.
+func (s *Server) verifyDeletion(ctx context.Context, q StartResultRequest) error {
+	if !validName.MatchString(q.Name) || q.InstanceID == "" || (q.RequestID == "") != (q.HostBootID == "") {
+		return errors.New("complete incarnation and optional complete attempt required")
+	}
+	unlock, err := s.lockNameContext(ctx, q.Name)
+	if err != nil {
 		return err
 	}
-	return c.post(ctx, "/vm/cleanup-proof-v1", q, nil)
+	defer unlock()
+	data, err := os.ReadFile(s.coldDeletedPath(ColdRequest{Name: q.Name, InstanceID: q.InstanceID}))
+	if err != nil {
+		return err
+	}
+	var id string
+	if err := json.Unmarshal(data, &id); err != nil || id != q.InstanceID {
+		return errors.New("exact incarnation deletion fence required")
+	}
+	if q.RequestID != "" {
+		r, err := s.readReceipt(q)
+		if err != nil {
+			return err
+		}
+		if r == nil || r.State != "closed" {
+			return errors.New("exact attempt not closed")
+		}
+	}
+	if cold, err := s.readCold(ColdRequest{Name: q.Name, InstanceID: q.InstanceID}); err != nil || cold != nil {
+		return errors.New("cold disk journal must be settled before runtime cleanup proof")
+	}
+	return s.storageIdleLocked(q.Name)
 }
 
 func (s *Server) handleCleanupProof(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +138,14 @@ func (s *Server) handleCleanupProof(w http.ResponseWriter, r *http.Request) {
 	var q StartResultRequest
 	if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
 		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if r.URL.Path == "/vm/cleanup-proof-v2" {
+		if err := s.verifyDeletion(r.Context(), q); err != nil {
+			respondError(w, http.StatusConflict, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	cfg := s.config

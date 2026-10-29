@@ -84,6 +84,8 @@ type Provisioner struct {
 	readFilesystemBytes func(path string) (int64, error)
 	readFilesystemUsage func(path string) (host.FilesystemUsage, error)
 	admissionMu         sync.Mutex
+	backendID           string
+	closeGateways       func(context.Context, model.Instance) error
 }
 
 type networkHelper interface {
@@ -471,92 +473,6 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	return inst, nil
 }
 
-func (p *Provisioner) Delete(ctx context.Context, name string) (model.Instance, error) {
-	migration, migrationErr := p.MigrationStatus(ctx, name)
-	if migrationErr != nil && !errors.Is(migrationErr, sql.ErrNoRows) {
-		return model.Instance{}, migrationErr
-	}
-	moved := migrationErr == nil && migration.Phase == "completed"
-	if migrationErr == nil && !moved && migration.Phase != "aborted" {
-		return model.Instance{}, fmt.Errorf("instance %q is fenced by migration (%s)", name, migration.Phase)
-	}
-	inst, err := p.store.GetInstance(ctx, name)
-	if err != nil {
-		return model.Instance{}, err
-	}
-	if err := p.store.CheckCleanupFence(ctx, inst.ID); err != nil {
-		return inst, err
-	}
-	if inst.State == model.StateDeleted {
-		return inst, fmt.Errorf("instance %q is already deleted", name)
-	}
-	// An interrupted destination import can be explicitly discarded under the
-	// instance lock, but its copied identity must not revoke the live source.
-	receipt, receiptErr := p.store.GetImportReceipt(ctx, inst.ID)
-	if receiptErr != nil && !errors.Is(receiptErr, sql.ErrNoRows) {
-		return inst, receiptErr
-	}
-	partialImport := receiptErr == nil && receipt.Phase == "importing"
-
-	inst.State = model.StateDeleting
-	inst.UpdatedAt = time.Now().UTC()
-	if err := p.store.UpdateInstance(ctx, inst); err != nil {
-		return inst, err
-	}
-	p.recordEvent(inst.ID, "delete", "delete requested", nil)
-	if err := p.resolveRuntime(ctx, &inst); err != nil {
-		return inst, err
-	}
-
-	if err := p.stopFirecracker(ctx, inst); err != nil {
-		return inst, fmt.Errorf("delete requires a confirmed stop: %w", err)
-	}
-	if err := p.cleanupColdForRemoval(ctx, inst); err != nil {
-		return inst, err
-	}
-	if err := p.cleanupNetworking(inst); err != nil {
-		return inst, fmt.Errorf("delete network cleanup: %w", err)
-	}
-	// Never delete a same-name device belonging to another incarnation. Keep
-	// the disk and deleting intent when API cleanup needs a retry.
-	if !moved && !partialImport && p.tsClient != nil && inst.TailnetNodeID != "" {
-		devices, err := listTailnetDevices(ctx, p.tsClient)
-		if err != nil {
-			return inst, err
-		}
-		for _, device := range devices {
-			if device.NodeID == inst.TailnetNodeID {
-				if err := p.tsClient.Devices().Delete(ctx, deviceIdentifier(device)); err != nil {
-					return inst, err
-				}
-			}
-		}
-	}
-	if err := p.removeInstanceDir(inst.Name); err != nil {
-		inst.LastError = fmt.Sprintf("delete failed: %v", err)
-		inst.UpdatedAt = time.Now().UTC()
-		if updateErr := p.store.UpdateInstance(ctx, inst); updateErr != nil {
-			return inst, fmt.Errorf("remove instance directory for %q: %w (also failed to persist delete error: %v)", name, err, updateErr)
-		}
-		p.recordEvent(inst.ID, "delete", "instance delete failed before disk cleanup completed", map[string]any{"error": err.Error()})
-		return inst, fmt.Errorf("remove instance directory for %q: %w", name, err)
-	}
-	now := time.Now().UTC()
-	inst.State = model.StateDeleted
-	inst.FirecrackerPID = 0
-	inst.TailscaleName = ""
-	inst.TailscaleIP = ""
-	inst.TailnetNodeID = ""
-	inst.LastError = ""
-	inst.UpdatedAt = now
-	inst.DeletedAt = &now
-	if err := p.store.UpdateInstance(ctx, inst); err != nil {
-		return inst, err
-	}
-	p.recordEvent(inst.ID, "delete", "instance deleted", nil)
-	return inst, nil
-}
-
 func (p *Provisioner) RestoreInstances(ctx context.Context) error {
 	instances, err := p.store.ListInstances(ctx, false)
 	if err != nil {
@@ -634,15 +550,20 @@ func (p *Provisioner) ReconcileInstanceRuntime(ctx context.Context, name string)
 // ReconcileInstance resumes durable intent, but never creates new start intent.
 // The caller must hold the same instance lock as interactive lifecycle commands.
 func (p *Provisioner) ReconcileInstance(ctx context.Context, name string) (model.Instance, error) {
-	inst, err := p.ReconcileInstanceRuntime(ctx, name)
+	inst, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return inst, err
+	}
+	if inst.State == model.StateDeleting {
+		return p.Delete(ctx, name)
+	}
+	inst, err = p.ReconcileInstanceRuntime(ctx, name)
 	if err != nil {
 		return inst, err
 	}
 	switch inst.State {
 	case model.StateStopping:
 		return p.Stop(ctx, name)
-	case model.StateDeleting:
-		return p.Delete(ctx, name)
 	case model.StateAwaitingTailnet:
 		_, err = p.reconcileLateTailnetJoin(ctx, &inst)
 	case model.StateAwaitingGuest:
@@ -1753,6 +1674,7 @@ func (p *Provisioner) setupNetworking(ctx context.Context, inst model.Instance) 
 		return err
 	}
 	return p.networkHelper.SetupInstanceNetwork(ctx, nethelper.SetupRequest{
+		InstanceID:        inst.ID,
 		TapDevice:         inst.TapDevice,
 		HostAddr:          inst.HostAddr,
 		NetworkCIDR:       inst.NetworkCIDR,
@@ -1768,6 +1690,7 @@ func (p *Provisioner) cleanupNetworking(inst model.Instance) error {
 	defer cancel()
 	outbound, _ := p.outboundInterface(ctx)
 	return p.networkHelper.CleanupInstanceNetwork(ctx, nethelper.CleanupRequest{
+		InstanceID:        inst.ID,
 		TapDevice:         inst.TapDevice,
 		NetworkCIDR:       inst.NetworkCIDR,
 		OutboundInterface: outbound,

@@ -378,6 +378,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vm/start-result", s.handleStartResult)
 	mux.HandleFunc("/vm/stop", s.handleStop)
 	mux.HandleFunc("/vm/cleanup-proof-v1", s.handleCleanupProof)
+	mux.HandleFunc("/vm/cleanup-proof-v2", s.handleCleanupProof)
 	mux.HandleFunc("/vm/storage-idle-v1", s.handleStorageIdle)
 	mux.HandleFunc("/vm/cold-disk-v1", s.handleColdDisk)
 	mux.HandleFunc("/vm/migration-disk-v1", s.handleMigrationDisk)

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"srv/internal/config"
 	"srv/internal/model"
 	"srv/internal/provision"
+	"srv/internal/storage"
 	"srv/internal/store"
 )
 
@@ -149,16 +151,37 @@ func TestBoundOrbMutationsRejectReplacementBeforeEffects(t *testing.T) {
 			// Nil provisioner ensures every rejection is before runtime effects.
 			a := &App{store: st, backendID: "backend-one"}
 			actor := model.Actor{UserLogin: i.CreatedByUser}
-			for _, operation := range []string{"start", "stop", "delete-proof"} {
-				args := append([]string{operation, i.Name, "--expect", "32345678-1234-4234-8234-123456789abc"}, identity...)
-				if operation == "delete-proof" {
-					args = append([]string{operation, "32345678-1234-4234-8234-123456789abc", i.Name}, identity...)
+			for _, operation := range []string{"start", "stop", "delete"} {
+				if change == "legacy-vm" && operation == "delete" {
+					continue // Bound deletion now supports both kinds.
 				}
+				args := append([]string{operation, i.Name, "--expect", "32345678-1234-4234-8234-123456789abc"}, identity...)
 				if _, err := a.dispatch(context.Background(), actor, commandRequest{args: args, format: outputFormatJSON}); err == nil {
 					t.Fatal(operation, "accepted replacement")
 				}
 			}
 		})
+	}
+}
+
+func TestDeleteExpectedRejectsRemovedCommandAndMalformedBinding(t *testing.T) {
+	a := &App{} // Rejection must not reach the store or provisioner.
+	legacy := []string{"delete-proof", uuid.NewString(), "target", uuid.NewString(), "2026-01-02T00:00:00Z", "backend", "image"}
+	result, err := a.dispatch(context.Background(), model.Actor{}, commandRequest{args: legacy})
+	if err == nil || err.Error() != `unknown command "delete-proof"` || result.exitCode == 0 {
+		t.Fatal("removed command accepted", result, err)
+	}
+	for _, args := range [][]string{
+		{"delete", "target", "--expect"},
+		{"delete", "target", "--expect", legacy[1], legacy[3], legacy[4], legacy[5]},
+		{"delete", "target", "--wrong", legacy[1], legacy[3], legacy[4], legacy[5], legacy[6]},
+		{"delete", "target", "--expect", "invalid-request", legacy[3], legacy[4], legacy[5], legacy[6]},
+		{"delete", "target", "--expect", legacy[1], "invalid-uuid", legacy[4], legacy[5], legacy[6]},
+		{"delete", "target", "--expect", legacy[1], legacy[3], legacy[4], legacy[5], legacy[6], "extra"},
+	} {
+		if result, err := a.dispatch(context.Background(), model.Actor{}, commandRequest{args: args}); err == nil || result.exitCode == 0 {
+			t.Fatal("malformed binding accepted", args, result, err)
+		}
 	}
 }
 
@@ -356,7 +379,20 @@ func TestOrbBootstrapTerminalReceiptRequiresGenerationAck(t *testing.T) {
 }
 
 func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
-	for _, scenario := range []string{"success", "backup-preflight", "late-dial", "cancelled-drain"} {
+	acquirePayload := storage.AcquirePayload
+	t.Cleanup(func() { storage.AcquirePayload = acquirePayload })
+	// Privileged lock provisioning is covered by storage tests. Keep command
+	// exclusion here without requiring a root-owned test data directory.
+	gate := make(chan struct{}, 1)
+	storage.AcquirePayload = func(ctx context.Context, _ string) (context.Context, func(), error) {
+		select {
+		case gate <- struct{}{}:
+			return ctx, func() { <-gate }, nil
+		case <-ctx.Done():
+			return ctx, nil, ctx.Err()
+		}
+	}
+	for _, scenario := range []string{"success", "backups", "cold-preflight", "late-dial", "cancelled-drain"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
 			cfg := loadServiceTestConfig(t, nil)
@@ -373,9 +409,20 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 			}
 			// Only privileged runtime/network helpers are substituted. Deletion,
 			// SQLite, disk removal and TCP gateway handling are the real stack.
+			var cold, resolved atomic.Bool
+			cold.Store(scenario == "cold-preflight")
 			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/vm/stop", "/vm/cleanup-proof-v1", "/network/cleanup", "/network/cleanup-proof-v1":
+				case "/vm/start-result":
+					resolved.Store(true)
+					_, _ = io.WriteString(w, `{"outcome":"absent"}`)
+				case "/vm/stop":
+					if !resolved.Load() {
+						http.Error(w, "start receipt not found", http.StatusConflict)
+						return
+					}
+					w.WriteHeader(http.StatusNoContent)
+				case "/vm/cleanup-proof-v2", "/network/finalize-v1":
 					w.WriteHeader(http.StatusNoContent)
 				case "/vm/cold-disk-v1":
 					var q struct {
@@ -383,6 +430,10 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 					}
 					if err := json.NewDecoder(r.Body).Decode(&q); err != nil || (q.Action != "status" && q.Action != "fence-delete" && q.Action != "delete") {
 						http.Error(w, "expected cold status or deletion fence", http.StatusBadRequest)
+						return
+					}
+					if cold.Load() {
+						_, _ = io.WriteString(w, `{"phase":"cold","remote":true,"journal_present":true}`)
 						return
 					}
 					_, _ = io.WriteString(w, `{"phase":"hot","remote":false,"journal_present":false}`)
@@ -447,7 +498,7 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 			neighborPeer := <-peers
 			defer neighborPeer.Close()
 			assertGatewayTraffic(t, target, targetPeer)
-			if scenario == "backup-preflight" {
+			if scenario == "backups" {
 				if err := os.MkdirAll(filepath.Join(cfg.BackupsDir(), i.Name), 0700); err != nil {
 					t.Fatal(err)
 				}
@@ -463,11 +514,28 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 			}
 			id := uuid.NewString()
 			actor := model.Actor{UserLogin: i.CreatedByUser}
-			args := []string{"delete-proof", id, i.Name, i.ID, i.CreatedAt.Format(time.RFC3339Nano), a.backendID, i.Image}
+			args := []string{"delete", i.Name, "--expect", id, i.ID, i.CreatedAt.Format(time.RFC3339Nano), a.backendID, i.Image}
+			if scenario == "cold-preflight" {
+				args[5] = i.CreatedAt.Format("2006-01-02T15:04:05.999999999-07:00")
+			}
+			if scenario == "backups" {
+				// An interrupted request from before the SSH syntax change keeps
+				// its original binding; no migration or command alias is needed.
+				legacy, _ := json.Marshal(append([]string{"delete-proof", id, i.Name}, args[4:]...))
+				if _, err := st.AdmitLifecycleRequest(ctx, store.LifecycleRequest{ID: id, Actor: actor.UserLogin, Command: "delete-proof", Name: i.Name, Arguments: string(legacy)}); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.BeginCleanup(ctx, id, actor.UserLogin, i); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.InterruptLifecycleRequests(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
 			deleteCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			done := make(chan error, 1)
-			go func() { _, err := a.cmdDeleteProof(deleteCtx, actor, args); done <- err }()
+			go func() { _, err := a.dispatch(deleteCtx, actor, commandRequest{args: args}); done <- err }()
 			if late {
 				select {
 				case <-dialCancelled:
@@ -492,7 +560,7 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 				}
 			}
 			err = <-done
-			failed := scenario == "backup-preflight" || scenario == "cancelled-drain"
+			failed := scenario == "cold-preflight" || scenario == "cancelled-drain"
 			if (err != nil) != failed {
 				t.Fatal("unexpected delete result", err)
 			}
@@ -505,35 +573,73 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 					t.Fatal("failure removed disk", err)
 				}
 				fence := st.CheckCleanupFence(ctx, i.ID)
-				if (fence != nil) != (scenario == "cancelled-drain") {
+				if fence == nil {
 					t.Fatal("wrong cleanup fence", fence)
 				}
 			} else {
 				proof, err := st.CleanupReceipt(ctx, id, actor.UserLogin)
-				if err != nil || proof.Version != 3 || !proof.GatewaysAbsent {
+				if err != nil || proof.Version != 5 || !proof.GatewaysAbsent {
 					t.Fatal("missing gateway proof", proof, err)
 				}
 				if _, err := os.Stat(i.RootFSPath); !errors.Is(err, os.ErrNotExist) {
 					t.Fatal("disk retained", err)
 				}
-				if _, err := a.cmdDeleteProof(ctx, actor, args); err != nil {
+				if _, err := a.dispatch(ctx, actor, commandRequest{args: args}); err != nil {
 					t.Fatal("receipt replay", err)
 				}
 			}
 			a.syncManagedGatewaysBestEffort()
-			if scenario == "backup-preflight" {
-				assertGatewayTraffic(t, target, targetPeer)
-			} else {
-				assertGatewayClosed(t, target)
-				assertGatewayClosed(t, targetPeer)
-				if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
-					conn.Close()
-					t.Fatal("deleted/fenced gateway reopened")
+			assertGatewayClosed(t, target)
+			assertGatewayClosed(t, targetPeer)
+			if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+				conn.Close()
+				t.Fatal("deleted/fenced gateway reopened")
+			}
+			if late {
+				assertPendingGatewayClosed(t, lateGuest)
+				assertGatewayClosed(t, latePeer)
+			}
+			assertGatewayTraffic(t, neighbor, neighborPeer)
+			// Retry both a known preflight failure and interrupted execution.
+			// Two simultaneous deliveries must converge on the exact same receipt.
+			cold.Store(false)
+			if failed {
+				if err := st.InterruptLifecycleRequests(ctx); err != nil {
+					t.Fatal(err)
 				}
-				if late {
-					assertPendingGatewayClosed(t, lateGuest)
-					assertGatewayClosed(t, latePeer)
+				a.provisioner.SetCleanup("different-backend", a.closeInstanceGateways)
+				if _, err := a.provisioner.ReconcileInstance(ctx, i.Name); err == nil {
+					t.Fatal("background recovery ignored backend binding")
 				}
+				a.provisioner.SetCleanup(a.backendID, a.closeInstanceGateways)
+				if _, err := a.provisioner.ReconcileInstance(ctx, i.Name); err != nil {
+					t.Fatal("background recovery of bound deletion", err)
+				}
+			}
+			results := make(chan commandResult, 2)
+			errors := make(chan error, 2)
+			for range 2 {
+				go func() {
+					result, err := a.dispatch(ctx, actor, commandRequest{args: args})
+					results <- result
+					errors <- err
+				}()
+			}
+			first, second := <-results, <-results
+			if err := <-errors; err != nil {
+				t.Fatal("retry", err)
+			}
+			if err := <-errors; err != nil {
+				t.Fatal("duplicate", err)
+			}
+			if first.stdout == "" || first.stdout != second.stdout {
+				t.Fatal("receipt changed on duplicate")
+			}
+			if _, err := os.Stat(filepath.Join(cfg.BackupsDir(), i.Name)); scenario == "backups" && err != nil {
+				t.Fatal("backup directory lost", err)
+			}
+			if _, err := os.Stat(i.RootFSPath); !os.IsNotExist(err) {
+				t.Fatal("disk retained", err)
 			}
 			assertGatewayTraffic(t, neighbor, neighborPeer)
 		})

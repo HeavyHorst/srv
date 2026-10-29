@@ -323,6 +323,9 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 			h, err = r.choose(ctx, a, args[1:])
 		}
 	case "inspect", "start", "stop", "restart", "delete", "resize", "fsck", "restore", "backup", "disk", "logs", "export", "bootstrap":
+		if cmd == "delete" && len(args) > 2 && args[2] == "--expect" && hostName == "" {
+			return fmt.Errorf("delete --expect requires --host")
+		}
 		if cmd == "bootstrap" && !orb {
 			return fmt.Errorf("use orb bootstrap NAME")
 		}
@@ -348,7 +351,7 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 				return fmt.Errorf("conflicting host")
 			}
 		}
-	case "list", "status", "pool", "integration", "snapshot", "migration", "import", "project-template", "help", "delete-proof", "cleanup-receipt", "operation-result", "operation-cancel":
+	case "list", "status", "pool", "integration", "snapshot", "migration", "import", "project-template", "help", "cleanup-receipt", "operation-result", "operation-cancel":
 		if hostName == "" {
 			return fmt.Errorf("%s requires --host", cmd)
 		}

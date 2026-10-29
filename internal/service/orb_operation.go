@@ -16,6 +16,13 @@ import (
 // Bound operations are optional for human CLI use, mandatory for the provider.
 // Check under the instance lock, not in the front's point-in-time inventory.
 func (a *App) checkOrbIdentity(ctx context.Context, inst model.Instance, identity []string) error {
+	if err := a.checkOrbBinding(ctx, inst, identity); err != nil {
+		return err
+	}
+	return a.store.CheckCleanupFence(ctx, inst.ID)
+}
+
+func (a *App) checkInstanceBinding(inst model.Instance, identity []string) error {
 	if len(identity) != 4 {
 		return errors.New("expected UUID CREATED_AT BACKEND_ID IMAGE")
 	}
@@ -23,8 +30,18 @@ func (a *App) checkOrbIdentity(ctx context.Context, inst model.Instance, identit
 	if err != nil {
 		return err
 	}
-	if inst.KindName() != model.KindOrb || inst.ID != identity[0] || !inst.CreatedAt.Equal(created) || a.backendID == "" || a.backendID != identity[2] || inst.ImageName() != identity[3] {
-		return errors.New("orb incarnation or backend identity mismatch")
+	if inst.ID != identity[0] || !inst.CreatedAt.Equal(created) || a.backendID == "" || a.backendID != identity[2] || inst.ImageName() != identity[3] {
+		return errors.New("instance incarnation or backend identity mismatch")
+	}
+	return nil
+}
+
+func (a *App) checkOrbBinding(ctx context.Context, inst model.Instance, identity []string) error {
+	if err := a.checkInstanceBinding(inst, identity); err != nil {
+		return err
+	}
+	if inst.KindName() != model.KindOrb {
+		return errors.New("orb incarnation required")
 	}
 	if m, err := a.store.GetMigration(ctx, inst.ID); err == nil && m.Phase != "aborted" {
 		return errors.New("migration excludes bound orb operations")
@@ -34,7 +51,7 @@ func (a *App) checkOrbIdentity(ctx context.Context, inst model.Instance, identit
 	if _, err := a.store.GetImportReceipt(ctx, inst.ID); !errors.Is(err, sql.ErrNoRows) {
 		return errors.New("import history excludes bound orb operations")
 	}
-	return a.store.CheckCleanupFence(ctx, inst.ID)
+	return nil
 }
 
 func orbOperationRequest(actor model.Actor, operation, name, id string, identity []string) store.LifecycleRequest {

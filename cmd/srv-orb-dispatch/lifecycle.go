@@ -129,7 +129,16 @@ func finishDelete(ctx context.Context, c config, path string, r record) error {
 	}
 	data, err := control(ctx, c, r, "cleanup-receipt", r.RequestID)
 	if err != nil {
-		return err
+		// Missing receipt is not success. Resume the same bound intent; the
+		// backend serializes it and returns an existing receipt without effects.
+		args := append([]string{"delete", r.Name, "--expect", r.RequestID}, identity(r)...)
+		if _, err := control(ctx, c, r, args...); err != nil {
+			return err
+		}
+		data, err = control(ctx, c, r, "cleanup-receipt", r.RequestID)
+		if err != nil {
+			return err
+		}
 	}
 	var proof model.CleanupReceipt
 	if err := json.Unmarshal(data, &proof); err != nil {
@@ -167,7 +176,7 @@ func validateCleanupReceipt(r record, proof model.CleanupReceipt) error {
 	if err != nil {
 		return err
 	}
-	if proof.Version != 3 || !proof.GatewaysAbsent || proof.Kind != "orb" || proof.Image != r.Image || proof.BackendID != r.BackendID || proof.RequestID != r.RequestID || proof.InstanceID != r.InstanceID || proof.Name != r.Name || !proof.CreatedAt.Equal(created) || proof.DeletedAt.IsZero() || proof.AuthKeyDisposition != "never-minted" || proof.RetainedTemplates == nil || !proof.IngressClosed || !proof.RuntimeAbsent || !proof.JailerAbsent || !proof.CgroupAbsent || !proof.NetworkAbsent || !proof.StorageAbsent || !proof.BackupsAbsent || !proof.SnapshotsAbsent {
+	if !proof.ValidCopyScope() || !proof.GatewaysAbsent || proof.Kind != "orb" || proof.Image != r.Image || proof.BackendID != r.BackendID || proof.RequestID != r.RequestID || proof.InstanceID != r.InstanceID || proof.Name != r.Name || !proof.CreatedAt.Equal(created) || proof.DeletedAt.IsZero() || proof.AuthKeyDisposition != "never-minted" || !proof.IngressClosed || !proof.RuntimeAbsent || !proof.JailerAbsent || !proof.CgroupAbsent || !proof.NetworkAbsent || !proof.StorageAbsent {
 		return errors.New("incomplete or mismatched cleanup receipt; release remains fenced")
 	}
 	return nil

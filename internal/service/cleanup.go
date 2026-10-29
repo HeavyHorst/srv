@@ -16,12 +16,15 @@ func cleanupError(err error) (commandResult, error) {
 	return commandResult{stderr: err.Error() + "\n", exitCode: 75}, err
 }
 
-// delete-proof REQUEST_ID NAME UUID CREATED_AT BACKEND_ID IMAGE.
+// delete NAME --expect REQUEST_ID UUID CREATED_AT BACKEND_ID IMAGE.
 // The service owns identity, admission, and receipt publication under its locks.
-func (a *App) cmdDeleteProof(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
-	if len(args) != 7 {
-		return cleanupError(errors.New("complete cleanup identity required"))
+func (a *App) cmdDeleteExpected(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+	if len(args) != 8 || args[2] != "--expect" {
+		return cleanupError(errors.New("usage: delete NAME --expect REQUEST_ID UUID CREATED_AT BACKEND_ID IMAGE"))
 	}
+	// Keep the durable request format, not an alias for the former SSH command.
+	// Existing requests must retain their binding across the syntax change.
+	args = append([]string{"delete-proof", args[3], args[1]}, args[4:]...)
 	if _, err := uuid.Parse(args[1]); err != nil {
 		return cleanupError(err)
 	}
@@ -40,30 +43,24 @@ func (a *App) cmdDeleteProof(ctx context.Context, actor model.Actor, args []stri
 			return cleanupError(errors.New("request binding mismatch"))
 		}
 		proof, err := a.store.CleanupReceipt(ctx, request.ID, request.Actor)
-		if err != nil {
-			return cleanupError(fmt.Errorf("cleanup request %s; no committed receipt or replay permitted", old.Phase))
+		if err == nil {
+			return jsonResult(proof)
 		}
-		return jsonResult(proof)
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return cleanupError(err)
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return cleanupError(err)
 	}
 	inst, err := a.lookupVisibleInstance(ctx, actor, args[2])
 	if err != nil {
 		return cleanupError(err)
 	}
-	if err := a.checkOrbIdentity(ctx, inst, args[3:]); err != nil {
+	if err := a.checkInstanceBinding(inst, args[3:]); err != nil {
 		return cleanupError(err)
 	}
-	if inst.State != model.StateReady && inst.State != model.StateStopped {
-		return cleanupError(fmt.Errorf("cleanup excludes state %s", inst.State))
-	}
-	admitted, err := a.store.AdmitLifecycleRequest(ctx, request)
-	if err != nil {
+	if _, err := a.store.AdmitLifecycleRequest(ctx, request); err != nil {
 		return cleanupError(err)
-	}
-	if !admitted {
-		return cleanupError(errors.New("request already admitted; query only"))
 	}
 	proof, err := a.provisioner.DeleteWithProof(ctx, inst, request.ID, request.Actor, a.backendID, a.closeInstanceGateways)
 	if err != nil {

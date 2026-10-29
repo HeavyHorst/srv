@@ -448,7 +448,7 @@ func TestBoundOrbRoutesPreserveIdentityAndRequest(t *testing.T) {
 		{"start", "orb-name", "--expect", "request", "uuid", "created", "backend", "image"},
 		{"stop", "orb-name", "--expect", "request", "uuid", "created", "backend", "image"},
 		{"orb", "bootstrap", "orb-name", "--expect", "request", "uuid", "created", "backend", "image"},
-		{"delete-proof", "request", "orb-name", "uuid", "created", "backend", "image"},
+		{"delete", "orb-name", "--expect", "request", "uuid", "created", "backend", "image"},
 		{"cleanup-receipt", "request"},
 		{"operation-result", "request"},
 		{"operation-cancel", "request", "orb-name", "stop", "uuid", "created", "backend", "image"},
@@ -467,10 +467,17 @@ func TestBoundOrbRoutesPreserveIdentityAndRequest(t *testing.T) {
 		if calls != 1 {
 			t.Fatal("unexpected routing", calls)
 		}
-		if args[0] == "delete-proof" || args[0] == "cleanup-receipt" || strings.HasPrefix(args[0], "operation-") {
+		if args[0] == "delete" || args[0] == "cleanup-receipt" || strings.HasPrefix(args[0], "operation-") {
 			if _, _, err := run(r, args...); err == nil {
 				t.Fatal("receipt command routed without host")
 			}
 		}
+	}
+	r := router(func(front.Host, []string, io.Reader, io.Writer) error {
+		t.Fatal("removed delete-proof command reached a backend")
+		return nil
+	})
+	if _, _, err := run(r, "--host", "b", "delete-proof", "request", "orb-name", "uuid", "created", "backend", "image"); err == nil {
+		t.Fatal("removed delete-proof command accepted")
 	}
 }

@@ -158,7 +158,7 @@ func TestFrontendColdMigrationOverSSH(t *testing.T) {
 	var sourceDisks, receivedDisks sync.Map
 	helper := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/vm/stop", "/network/cleanup":
+		case "/vm/stop", "/vm/cleanup-proof-v2", "/network/cleanup-v2", "/network/finalize-v1":
 			_, _ = io.WriteString(w, "{}")
 		case "/vm/cold-disk-v1":
 			var q vmrunner.ColdRequest
@@ -255,6 +255,8 @@ func TestFrontendColdMigrationOverSSH(t *testing.T) {
 			t.Fatal(err)
 		}
 		app := &App{cfg: cfg, store: st, provisioner: p, log: logger, localAPI: localAPI}
+		app.backendID = "fixture-" + name
+		p.SetCleanup(app.backendID, app.closeInstanceGateways)
 		apps = append(apps, app)
 		signer, err := ensureHostSigner(cfg.HostKeyPath())
 		if err != nil {

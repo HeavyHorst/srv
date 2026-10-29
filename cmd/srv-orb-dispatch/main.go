@@ -502,7 +502,7 @@ func dispatch(ctx context.Context, c config, j job) error {
 		if err := save(path, r); err != nil {
 			return err
 		}
-		args := append([]string{"delete-proof", r.RequestID, r.Name}, identity(r)...)
+		args := append([]string{"delete", r.Name, "--expect", r.RequestID}, identity(r)...)
 		if _, err := control(ctx, c, r, args...); err != nil {
 			return err
 		}

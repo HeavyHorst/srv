@@ -19,6 +19,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"srv/internal/storage"
 )
 
 const DefaultSocketPath = "/run/srv/net-helper.sock"
@@ -31,6 +33,7 @@ var iptablesRuleExists = func(ctx context.Context, table, chain string, rule ...
 }
 
 type SetupRequest struct {
+	InstanceID        string `json:"instance_id,omitempty"`
 	TapDevice         string `json:"tap_device"`
 	HostAddr          string `json:"host_addr"`
 	NetworkCIDR       string `json:"network_cidr"`
@@ -38,6 +41,7 @@ type SetupRequest struct {
 }
 
 type CleanupRequest struct {
+	InstanceID        string `json:"instance_id,omitempty"`
 	TapDevice         string `json:"tap_device"`
 	NetworkCIDR       string `json:"network_cidr"`
 	OutboundInterface string `json:"outbound_interface"`
@@ -74,12 +78,18 @@ func (c *Client) SetupInstanceNetwork(ctx context.Context, req SetupRequest) err
 	if err := req.Validate(); err != nil {
 		return err
 	}
+	if req.InstanceID != "" {
+		return c.post(ctx, "/network/setup-v2", req)
+	}
 	return c.post(ctx, "/network/setup", req)
 }
 
 func (c *Client) CleanupInstanceNetwork(ctx context.Context, req CleanupRequest) error {
 	if err := req.Validate(); err != nil {
 		return err
+	}
+	if req.InstanceID != "" {
+		return c.post(ctx, "/network/cleanup-v2", req)
 	}
 	return c.post(ctx, "/network/cleanup", req)
 }
@@ -121,9 +131,11 @@ func (c *Client) post(ctx context.Context, path string, payload any) error {
 type Runner func(ctx context.Context, name string, args ...string) error
 
 type Server struct {
-	log     *slog.Logger
-	tapUser string
-	runner  Runner
+	log      *slog.Logger
+	tapUser  string
+	runner   Runner
+	stateDir string
+	output   func(context.Context, string, ...string) ([]byte, error)
 }
 
 func NewServer(logger *slog.Logger, tapUser string) *Server {
@@ -137,13 +149,18 @@ func NewServerWithRunner(logger *slog.Logger, tapUser string, runner Runner) *Se
 	if strings.TrimSpace(tapUser) == "" {
 		tapUser = "srv"
 	}
-	return &Server{log: logger, tapUser: tapUser, runner: runner}
+	return &Server{log: logger, tapUser: tapUser, runner: runner, stateDir: "/var/lib/srv-net-helper", output: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return exec.CommandContext(ctx, name, args...).Output()
+	}}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/network/setup", s.handleSetup)
 	mux.HandleFunc("/network/cleanup", s.handleCleanup)
+	mux.HandleFunc("/network/setup-v2", s.handleSetup)
+	mux.HandleFunc("/network/cleanup-v2", s.handleCleanup)
+	mux.HandleFunc("/network/finalize-v1", s.handleFinalize)
 	mux.HandleFunc("/network/cleanup-proof-v1", s.handleCleanupProof)
 	return mux
 }
@@ -191,7 +208,17 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.setupNetwork(r.Context(), req); err != nil {
+	ctx, release, err := s.lockNetwork(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer release()
+	if err := s.checkDeletion(req.InstanceID, strings.HasSuffix(r.URL.Path, "-v2")); err != nil {
+		respondError(w, http.StatusConflict, err)
+		return
+	}
+	if err := s.setupNetwork(ctx, req); err != nil {
 		s.log.Error("setup instance network", "tap", req.TapDevice, "err", err)
 		respondError(w, http.StatusInternalServerError, err)
 		return
@@ -213,7 +240,17 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.cleanupNetwork(r.Context(), req); err != nil {
+	ctx, release, err := s.lockNetwork(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer release()
+	if err := s.checkDeletion(req.InstanceID, strings.HasSuffix(r.URL.Path, "-v2")); err != nil {
+		respondError(w, http.StatusConflict, err)
+		return
+	}
+	if err := s.cleanupNetwork(ctx, req); err != nil {
 		s.log.Error("cleanup instance network", "tap", req.TapDevice, "err", err)
 		respondError(w, http.StatusInternalServerError, err)
 		return
@@ -390,6 +427,7 @@ func deleteIPTablesRule(ctx context.Context, runner Runner, table, chain string,
 
 func defaultRunner(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
+	storage.InheritLocks(ctx, cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))

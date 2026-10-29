@@ -44,6 +44,7 @@ func FuzzSetupHandler(f *testing.F) {
 			calls = append(calls, append([]string{name}, args...))
 			return nil
 		})
+		server.stateDir = t.TempDir()
 		previous := iptablesRuleExists
 		iptablesRuleExists = func(context.Context, string, string, ...string) bool { return false }
 		defer func() { iptablesRuleExists = previous }()

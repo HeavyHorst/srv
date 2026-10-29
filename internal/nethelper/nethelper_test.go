@@ -58,6 +58,7 @@ func TestClientAndServerOverUnixSocket(t *testing.T) {
 	}
 
 	server := NewServerWithRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), "srv", runner)
+	server.stateDir = t.TempDir()
 	socketPath := filepath.Join(t.TempDir(), "net-helper.sock")
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {

@@ -7,10 +7,191 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
+	"srv/internal/storage"
 )
+
+type FinalizeRequest struct {
+	CleanupRequest
+	RequestID string `json:"request_id"`
+}
+
+type networkDeletion struct {
+	FinalizeRequest
+	Done bool `json:"done"`
+}
+
+func (q FinalizeRequest) Validate() error {
+	if err := q.CleanupRequest.Validate(); err != nil {
+		return err
+	}
+	if parsed, err := uuid.Parse(q.InstanceID); err != nil || parsed == uuid.Nil || parsed.String() != q.InstanceID {
+		return errors.New("canonical network identity required")
+	}
+	// Match lifecycle admission, preserving the exact spelling of stored requests.
+	// Only the instance ID is used as a filesystem path.
+	_, err := uuid.Parse(q.RequestID)
+	return err
+}
+
+func (c *Client) FinalizeInstanceNetwork(ctx context.Context, q FinalizeRequest) error {
+	if err := q.Validate(); err != nil {
+		return err
+	}
+	return c.post(ctx, "/network/finalize-v1", q)
+}
+
+// All network mutations share one stable lock, including their subprocesses.
+// Closing (not unlocking) preserves exclusion if a child outlives the helper.
+func (s *Server) lockNetwork(ctx context.Context) (context.Context, func(), error) {
+	if err := storage.ValidatePath(s.stateDir); err != nil {
+		return ctx, nil, err
+	}
+	// Provisioned by systemd; never silently recreate lost deletion records.
+	f, err := os.OpenFile(filepath.Join(s.stateDir, "lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return ctx, nil, err
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			f.Close()
+			return ctx, nil, err
+		}
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return storage.WithInheritedLock(ctx, f), func() { _ = f.Close() }, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
+			f.Close()
+			return ctx, nil, err
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Server) deletionPath(id string) string {
+	return filepath.Join(s.stateDir, id+".json")
+}
+
+func (s *Server) checkDeletion(id string, required bool) error {
+	if id == "" && !required {
+		return nil // Legacy VM protocol; drain old unbound Orb jobs at upgrade.
+	}
+	if parsed, err := uuid.Parse(id); err != nil || parsed == uuid.Nil || parsed.String() != id {
+		return errors.New("canonical network identity required")
+	}
+	_, err := os.Lstat(s.deletionPath(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return errors.New("network incarnation has deletion intent")
+}
+
+func (s *Server) writeDeletion(d networkDeletion) error {
+	f, err := os.CreateTemp(s.stateDir, ".deletion-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(d); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(f.Name(), s.deletionPath(d.InstanceID)); err != nil {
+		return err
+	}
+	return storage.SyncPath(s.stateDir)
+}
+
+func (s *Server) handleFinalize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, errors.New("POST required"))
+		return
+	}
+	var q FinalizeRequest
+	if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := q.Validate(); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.finalize(r.Context(), q); err != nil {
+		respondError(w, http.StatusConflict, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) finalize(ctx context.Context, q FinalizeRequest) error {
+	ctx, release, err := s.lockNetwork(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	var d networkDeletion
+	data, err := os.ReadFile(s.deletionPath(q.InstanceID))
+	if err == nil {
+		if err := json.Unmarshal(data, &d); err != nil {
+			return err
+		}
+		if err := d.Validate(); err != nil {
+			return err
+		}
+		if d.OutboundInterface == "" {
+			return errors.New("stored network deletion has no outbound interface")
+		}
+		// Routing may have changed since the first attempt. Keep the original
+		// NAT interface; only the request/incarnation/TAP/CIDR are retry inputs.
+		q.OutboundInterface = d.OutboundInterface
+		if d.FinalizeRequest != q {
+			return errors.New("network deletion binding mismatch")
+		}
+		if d.Done {
+			// Reused TAPs/CIDRs now belong to someone else: never clean again.
+			return storage.SyncPath(s.stateDir)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if q.OutboundInterface == "" {
+		return errors.New("initial network finalization requires an outbound interface")
+	}
+	d.FinalizeRequest = q
+	// Re-sync even an existing intent before allowing any destructive work.
+	if err := s.writeDeletion(d); err != nil {
+		return err
+	}
+	if err := s.cleanupNetwork(ctx, q.CleanupRequest); err != nil {
+		return err
+	}
+	if err := verifyNetworkAbsent(ctx, q.CleanupRequest, s.output); err != nil {
+		return err
+	}
+	d.Done = true
+	return s.writeDeletion(d)
+}
 
 func (c *Client) VerifyInstanceNetworkAbsent(ctx context.Context, q CleanupRequest) error {
 	if err := q.Validate(); err != nil {

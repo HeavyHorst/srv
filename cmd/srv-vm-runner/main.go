@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"srv/internal/coldstore"
 	"srv/internal/vmrunner"
 )
 
@@ -32,6 +33,8 @@ func main() {
 		vmPIDsMax         int64
 		cgroupRoot        string
 		drainOnly         bool
+		cold              coldstore.Config
+		migrationStore    string
 	)
 
 	defaultDataDir := getenv("SRV_DATA_DIR", "/var/lib/srv")
@@ -48,20 +51,19 @@ func main() {
 	flag.StringVar(&jailerGroup, "jailer-group", getenv("SRV_JAILER_GROUP", "srv"), "group that the jailer drops the Firecracker process to")
 	flag.Int64Var(&vmPIDsMax, "vm-pids-max", getenvInt64("SRV_VM_PIDS_MAX", 512), "maximum tasks allowed in each VM cgroup")
 	flag.StringVar(&cgroupRoot, "cgroup-root", getenv("SRV_VM_RUNNER_CGROUP_ROOT", ""), "absolute cgroup v2 root that contains runner-managed VM cgroups")
-	flag.BoolVar(&drainOnly, "drain-only", false, "shut down running Firecracker VMs and exit")
+	flag.BoolVar(&drainOnly, "drain-only", false, "ask the running helper to drain VMs in its mount namespace and exit")
+	flag.StringVar(&cold.Host, "cold-storage-host", os.Getenv("SRV_COLD_STORAGE_HOST"), "optional trusted SSH cold-storage destination")
+	flag.StringVar(&cold.IdentityFile, "cold-storage-key", os.Getenv("SRV_COLD_STORAGE_KEY"), "root-owned SSH private-key path")
+	flag.StringVar(&cold.KnownHostsFile, "cold-storage-known-hosts", os.Getenv("SRV_COLD_STORAGE_KNOWN_HOSTS"), "root-owned pinned SSH known-hosts path")
+	flag.DurationVar(&cold.Timeout, "cold-storage-timeout", coldstore.DefaultTimeout, "maximum time for one cold-storage operation, including checksum verification")
+	flag.StringVar(&migrationStore, "migration-store", os.Getenv("SRV_MIGRATION_STORE"), "root-owned Btrfs directory for trusted-frontend native migration bases and staging; enables native migration")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	if drainOnly {
-		server := vmrunner.NewServer(logger, vmrunner.ServerConfig{
-			FirecrackerBinary: firecrackerBinary,
-			JailerBaseDir:     jailerBaseDir,
-			InstancesDir:      instancesDir,
-			CgroupRoot:        cgroupRoot,
-		})
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
-		if err := server.ShutdownRunningVMs(ctx); err != nil {
+		if err := vmrunner.NewClient(socketPath).Drain(ctx); err != nil {
 			logger.Error("drain running vms", "err", err)
 			os.Exit(1)
 		}
@@ -86,6 +88,8 @@ func main() {
 		ImagesDir:         imagesDir,
 		VMPIDsMax:         vmPIDsMax,
 		CgroupRoot:        cgroupRoot,
+		ColdStorage:       cold,
+		MigrationStoreDir: migrationStore,
 	}
 	if err := cfg.Validate(); err != nil {
 		logger.Error("invalid vm runner config", "err", err)

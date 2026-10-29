@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"srv/internal/storage"
 )
 
 const (
@@ -83,30 +84,37 @@ func (s *Server) lockName(name string) (func(), error) {
 }
 
 func (s *Server) lockNameContext(ctx context.Context, name string) (func(), error) {
+	_, release, err := s.lockNameInherited(ctx, name)
+	return release, err
+}
+
+// lockNameInherited also pins the name lock in storage commands launched by ctx.
+// VM launches deliberately do not opt into storage.InheritLocks.
+func (s *Server) lockNameInherited(ctx context.Context, name string) (context.Context, func(), error) {
 	if !validName.MatchString(name) {
-		return nil, errors.New("invalid instance name")
+		return ctx, nil, errors.New("invalid instance name")
 	}
 	if s.config.JailerBaseDir == "" {
-		return nil, errors.New("jailer base directory required for lifecycle locking")
+		return ctx, nil, errors.New("jailer base directory required for lifecycle locking")
 	}
 	dir := s.receiptDir(name)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
 	// Sync both newly created directory entries before accepting an operation.
 	for _, p := range []string{filepath.Dir(s.config.JailerBaseDir), s.config.JailerBaseDir, filepath.Dir(dir), dir} {
 		if err := syncDirectory(p); err != nil {
-			return nil, err
+			return ctx, nil, err
 		}
 	}
 	f, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
 	for {
 		if err := ctx.Err(); err != nil {
 			f.Close()
-			return nil, err
+			return ctx, nil, err
 		}
 		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
@@ -114,16 +122,16 @@ func (s *Server) lockNameContext(ctx context.Context, name string) (func(), erro
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
 			f.Close()
-			return nil, err
+			return ctx, nil, err
 		}
 		select {
 		case <-ctx.Done():
 			f.Close()
-			return nil, ctx.Err()
+			return ctx, nil, ctx.Err()
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	return func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN); _ = f.Close() }, nil
+	return storage.WithInheritedLock(ctx, f), func() { _ = f.Close() }, nil
 }
 
 func syncDirectory(path string) error {
@@ -403,6 +411,9 @@ func (s *Server) receiptStart(ctx context.Context, req StartRequest) (StartRespo
 	}
 	defer unlock()
 	if req.RequestID == "" {
+		if err := s.coldStartFence(ColdRequest{Name: req.Name, InstanceID: req.InstanceID}); err != nil {
+			return StartResponse{}, err
+		}
 		a, err := s.activeReceipt(req.Name)
 		if err != nil {
 			return StartResponse{}, err
@@ -430,6 +441,11 @@ func (s *Server) receiptStart(ctx context.Context, req StartRequest) (StartRespo
 			return StartResponse{}, errors.New("start request payload mismatch")
 		}
 		return s.resultLocked(r)
+	}
+	// Replays resolve the recorded outcome; only a new attempt may start a VM
+	// and must pass the disk/incarnation fence.
+	if err := s.coldStartFence(ColdRequest{Name: req.Name, InstanceID: req.InstanceID}); err != nil {
+		return StartResponse{}, err
 	}
 	boot, err := hostBootID()
 	if err != nil {

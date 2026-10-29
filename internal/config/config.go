@@ -80,6 +80,9 @@ type Config struct {
 	IntegrationGatewayPort   int
 	AmpConnectGatewayPort    int
 
+	ColdStorageHost      string
+	ColdStorageAfterStop bool
+
 	LogLevel string
 
 	dataDirAbs string
@@ -111,7 +114,7 @@ func Load() (Config, error) {
 	providerNodes := flag.String("provider-nodes", os.Getenv("SRV_PROVIDER_NODES"), "JSON object mapping stable Tailscale node IDs to service owner names")
 	imagesFile := flag.String("images-file", os.Getenv("SRV_IMAGES_FILE"), "JSON file mapping image names to kernel, initrd and rootfs paths")
 
-	flag.StringVar(&cfg.DataDir, "data-dir", getenv("SRV_DATA_DIR", defaultDataDir), "service state directory")
+	flag.StringVar(&cfg.DataDir, "data-dir", getenv("SRV_DATA_DIR", defaultDataDir), "service state directory (must be a btrfs subvolume root; requires btrfs-progs and user_subvol_rm_allowed)")
 	flag.StringVar(&cfg.Hostname, "hostname", getenv("SRV_HOSTNAME", defaultHostname), "tailscale hostname for the control plane")
 	flag.StringVar(&cfg.ListenAddr, "listen-addr", getenv("SRV_LISTEN_ADDR", defaultListenAddr), "tailnet TCP listen address for the SSH API")
 	flag.StringVar(&cfg.TailscaleAuthKey, "tailscale-auth-key", os.Getenv("TS_AUTHKEY"), "tailscale auth key for the control-plane node")
@@ -127,7 +130,7 @@ func Load() (Config, error) {
 
 	flag.StringVar(&cfg.BaseKernelPath, "base-kernel", getenv("SRV_BASE_KERNEL", ""), "path to the Firecracker kernel image")
 	flag.StringVar(&cfg.BaseInitrdPath, "base-initrd", getenv("SRV_BASE_INITRD", ""), "path to the optional initrd image")
-	flag.StringVar(&cfg.BaseRootFSPath, "base-rootfs", getenv("SRV_BASE_ROOTFS", ""), "path to the base rootfs image stored on the same reflink-capable filesystem as SRV_DATA_DIR, such as btrfs or reflink-enabled xfs")
+	flag.StringVar(&cfg.BaseRootFSPath, "base-rootfs", getenv("SRV_BASE_ROOTFS", ""), "path to the base rootfs image stored on the same btrfs filesystem as the SRV_DATA_DIR subvolume")
 	flag.StringVar(&cfg.NetHelperSocketPath, "net-helper-socket", getenv("SRV_NET_HELPER_SOCKET", defaultNetHelperSocket), "unix socket used to reach the privileged network helper")
 	flag.StringVar(&cfg.VMRunnerSocketPath, "vm-runner-socket", getenv("SRV_VM_RUNNER_SOCKET", defaultVMRunnerSocket), "unix socket used to reach the Firecracker runner helper")
 	flag.StringVar(&cfg.FirecrackerBinary, "firecracker-bin", getenv("SRV_FIRECRACKER_BIN", defaultFirecrackerBin), "firecracker binary path")
@@ -150,6 +153,8 @@ func Load() (Config, error) {
 	flag.IntVar(&cfg.AmpConnectGatewayPort, "amp-connect-gateway-port", getenvInt("SRV_AMP_CONNECT_GATEWAY_PORT", defaultAmpConnectPort), "TCP port exposed on each VM host/gateway IP for the Amp HTTP CONNECT gateway")
 	flag.Int64Var(&cfg.VCPUCount, "vm-vcpus", getenvInt64("SRV_VM_VCPUS", 1), "number of guest vCPUs")
 	flag.Int64Var(&cfg.MemoryMiB, "vm-memory-mib", getenvInt64("SRV_VM_MEMORY_MIB", 1024), "guest memory in MiB")
+	flag.StringVar(&cfg.ColdStorageHost, "cold-storage-host", os.Getenv("SRV_COLD_STORAGE_HOST"), "optional SSH destination for cold disks; runner must use the same setting")
+	flag.BoolVar(&cfg.ColdStorageAfterStop, "cold-storage-after-stop", os.Getenv("SRV_COLD_STORAGE_AFTER_STOP") == "true", "attempt cold offload after an explicit successful stop (requires cold-storage-host)")
 	flag.StringVar(&cfg.LogLevel, "log-level", getenv("SRV_LOG_LEVEL", "info"), "log level")
 
 	flag.Parse()
@@ -200,6 +205,9 @@ func Load() (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.ColdStorageAfterStop && c.ColdStorageHost == "" {
+		return errors.New("cold-storage-after-stop requires cold-storage-host")
+	}
 	if err := c.ProviderNodes.Validate(c.AdminUsers); err != nil {
 		return err
 	}

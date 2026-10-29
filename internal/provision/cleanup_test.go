@@ -36,6 +36,13 @@ func (r cleanupRunner) VerifyInstanceAbsent(context.Context, vmrunner.StartResul
 	return r.verify()
 }
 
+func (r cleanupRunner) ColdDisk(_ context.Context, req vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
+	if req.Action == "status" {
+		return vmrunner.ColdStatus{Phase: "hot"}, nil
+	}
+	return vmrunner.ColdStatus{Phase: "hot"}, r.verify()
+}
+
 func TestAuthoritativeOrbCleanup(t *testing.T) {
 	for _, scenario := range []string{"success", "template", "snapshot-template", "legacy-vm", "node", "key", "import", "backup", "runtime", "network", "disk"} {
 		t.Run(scenario, func(t *testing.T) {

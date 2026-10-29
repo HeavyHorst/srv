@@ -84,4 +84,48 @@ func TestCleanupProofOldRunnerFailsClosed(t *testing.T) {
 	if err := client.VerifyInstanceAbsent(context.Background(), resultRequest(receiptRequest(t))); err == nil {
 		t.Fatal("old runner 404 treated as absence")
 	}
+	if err := client.VerifyInstanceIdle(context.Background(), "demo"); err == nil {
+		t.Fatal("old runner 404 treated as idle")
+	}
+}
+
+func TestStorageIdleRequiresVacantName(t *testing.T) {
+	for _, scenario := range []string{"never-started", "active-receipt", "jail", "cgroup", "live-socket"} {
+		t.Run(scenario, func(t *testing.T) {
+			s, serviceRel, serviceCgroup := newRunnerShutdownTestServer(t)
+			s.config.CgroupRoot = serviceRel
+			s.config.InstancesDir = shortReceiptDir(t)
+			switch scenario {
+			case "active-receipt":
+				unlock, err := s.lockName("demo")
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = s.writeReceipt(startReceipt{StartResultRequest: resultRequest(receiptRequest(t)), State: "accepted", Digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"})
+				unlock()
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "jail":
+				paths, err := resolveJailerRuntimePaths(s.config.JailerBaseDir, s.config.FirecrackerBinary, "demo")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(paths.WorkspaceDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "cgroup":
+				if err := os.MkdirAll(filepath.Join(serviceCgroup, firecrackerVMRootCgroupName, "demo"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "live-socket":
+				receiptRuntime(t, s.config, "demo")
+			}
+			client := receiptHTTPClient(t, s.Handler())
+			err := client.VerifyInstanceIdle(context.Background(), "demo")
+			if (err == nil) != (scenario == "never-started") {
+				t.Fatalf("idle result: %v", err)
+			}
+		})
+	}
 }

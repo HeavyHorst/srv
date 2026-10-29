@@ -38,6 +38,22 @@ import (
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
+func TestNewRejectsUnsupportedStorageBeforeWritingState(t *testing.T) {
+	cfg := loadServiceTestConfig(t, nil)
+	dir := cfg.DataDirAbs()
+	if err := ensureBtrfsSubvolume(dir); err == nil {
+		t.Skip("fixture already is a supported btrfs subvolume")
+	}
+	_, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || !strings.Contains(err.Error(), "btrfs-only") {
+		t.Fatalf("unsupported storage accepted: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("rejected startup modified data directory: %v %v", entries, err)
+	}
+}
+
 func TestBackgroundReconciliationHonorsSnapshotAndBusyInstance(t *testing.T) {
 	ctx := context.Background()
 	st := newServiceTestStore(t)
@@ -359,18 +375,17 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	failed := serviceTestInstance("gamma", model.StateFailed, ready.CreatedAt.Add(2*time.Minute))
 	failed.RootFSPath = filepath.Join(cfg.InstancesDir(), failed.Name, "rootfs.img")
 	failed.RootFSSizeBytes = 2 << 30
-	failedAllocated := writeSparseServiceTestFile(t, failed.RootFSPath, failed.RootFSSizeBytes)
+	writeSparseServiceTestFile(t, failed.RootFSPath, failed.RootFSSizeBytes)
 	deleting := serviceTestInstance("epsilon", model.StateDeleting, ready.CreatedAt.Add(3*time.Minute))
 	deleting.RootFSPath = filepath.Join(cfg.InstancesDir(), deleting.Name, "rootfs.img")
 	deleting.RootFSSizeBytes = 2 << 30
-	deletingAllocated := writeSparseServiceTestFile(t, deleting.RootFSPath, deleting.RootFSSizeBytes)
+	writeSparseServiceTestFile(t, deleting.RootFSPath, deleting.RootFSSizeBytes)
 	deleted := serviceTestInstance("delta", model.StateDeleted, ready.CreatedAt.Add(3*time.Minute))
 	deleted.RootFSPath = filepath.Join(cfg.InstancesDir(), deleted.Name, "rootfs.img")
 	deleted.RootFSSizeBytes = 2 << 30
-	deletedAllocated := writeSparseServiceTestFile(t, deleted.RootFSPath, deleted.RootFSSizeBytes)
+	writeSparseServiceTestFile(t, deleted.RootFSPath, deleted.RootFSSizeBytes)
 	deletedAt := deleted.CreatedAt.Add(time.Minute)
 	deleted.DeletedAt = &deletedAt
-	expectedDiskAllocated := ready.RootFSSizeBytes + stopped.RootFSSizeBytes + failedAllocated + deletingAllocated + deletedAllocated
 
 	for _, inst := range []model.Instance{ready, stopped, failed, deleting, deleted} {
 		if err := st.CreateInstance(ctx, inst); err != nil {
@@ -391,7 +406,6 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 	}
 	expectedCPUUsage := ""
 	expectedMemoryUsage := ""
-	expectedDiskUsage := ""
 	for _, resource := range summary.Capacity {
 		pct := 0
 		if resource.Budget > 0 {
@@ -403,14 +417,13 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 		case "memory":
 			expectedMemoryUsage = formatStatusResourceLine(resource, pct)
 		case "disk":
-			if resource.Allocated != expectedDiskAllocated {
-				t.Fatalf("disk allocated = %d, want %d", resource.Allocated, expectedDiskAllocated)
+			if resource.Filesystem == nil || resource.Allocated != resource.Filesystem.Used {
+				t.Fatalf("disk allocation must reflect measured physical usage: %#v", resource)
 			}
-			expectedDiskUsage = formatStatusResourceLine(resource, pct)
 		}
 	}
-	if expectedCPUUsage == "" || expectedMemoryUsage == "" || expectedDiskUsage == "" {
-		t.Fatal("expected cpu, memory, and disk resources in CapacitySummary")
+	if expectedCPUUsage == "" || expectedMemoryUsage == "" {
+		t.Fatal("expected cpu and memory resources in CapacitySummary")
 	}
 	for _, want := range []string{
 		"srv",
@@ -425,7 +438,6 @@ func TestCmdStatusFormatsCapacitySummary(t *testing.T) {
 		"FS SPACE",
 		expectedCPUUsage,
 		expectedMemoryUsage,
-		expectedDiskUsage,
 		"┌",
 		"┬",
 		"┐",
@@ -522,18 +534,17 @@ func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
 	failed := serviceTestInstance("gamma", model.StateFailed, ready.CreatedAt.Add(2*time.Minute))
 	failed.RootFSPath = filepath.Join(cfg.InstancesDir(), failed.Name, "rootfs.img")
 	failed.RootFSSizeBytes = 2 << 30
-	failedAllocated := writeSparseServiceTestFile(t, failed.RootFSPath, failed.RootFSSizeBytes)
+	writeSparseServiceTestFile(t, failed.RootFSPath, failed.RootFSSizeBytes)
 	deleting := serviceTestInstance("epsilon", model.StateDeleting, ready.CreatedAt.Add(3*time.Minute))
 	deleting.RootFSPath = filepath.Join(cfg.InstancesDir(), deleting.Name, "rootfs.img")
 	deleting.RootFSSizeBytes = 2 << 30
-	deletingAllocated := writeSparseServiceTestFile(t, deleting.RootFSPath, deleting.RootFSSizeBytes)
+	writeSparseServiceTestFile(t, deleting.RootFSPath, deleting.RootFSSizeBytes)
 	deleted := serviceTestInstance("delta", model.StateDeleted, ready.CreatedAt.Add(3*time.Minute))
 	deleted.RootFSPath = filepath.Join(cfg.InstancesDir(), deleted.Name, "rootfs.img")
 	deleted.RootFSSizeBytes = 2 << 30
-	deletedAllocated := writeSparseServiceTestFile(t, deleted.RootFSPath, deleted.RootFSSizeBytes)
+	writeSparseServiceTestFile(t, deleted.RootFSPath, deleted.RootFSSizeBytes)
 	deletedAt := deleted.CreatedAt.Add(time.Minute)
 	deleted.DeletedAt = &deletedAt
-	expectedDiskAllocated := ready.RootFSSizeBytes + stopped.RootFSSizeBytes + failedAllocated + deletingAllocated + deletedAllocated
 
 	for _, inst := range []model.Instance{ready, stopped, failed, deleting, deleted} {
 		if err := st.CreateInstance(ctx, inst); err != nil {
@@ -581,11 +592,16 @@ func TestCmdStatusJSONReturnsStructuredSummary(t *testing.T) {
 		t.Fatalf("memory status = %#v", memory)
 	}
 	disk := resources["disk"]
-	if disk.Allocated != expectedDiskAllocated || disk.Reserve != 1<<30 || disk.Budget != max(disk.Total-disk.Reserve, int64(0)) || disk.Left != disk.Budget-disk.Allocated {
-		t.Fatalf("disk status = %#v", disk)
-	}
 	if disk.Filesystem == nil {
 		t.Fatalf("disk filesystem usage = %#v, want measured usage", disk)
+	}
+	// Compare fields from one measurement, not virtual disk sizes or a
+	// second statfs sample that other writers may have changed already.
+	if disk.Allocated != disk.Filesystem.Used || disk.Allocated < 0 || disk.Allocated > disk.Total || disk.Reserve != 1<<30 || disk.Budget != disk.Total-disk.Reserve || disk.Left != disk.Filesystem.Available-disk.Reserve {
+		t.Fatalf("disk status = %#v", disk)
+	}
+	if disk.Filesystem.Available < 0 || disk.Filesystem.Available > disk.Total || !strings.Contains(disk.Note, "no virtual disk capacity promise") {
+		t.Fatalf("disk must describe measured physical capacity: %#v", disk)
 	}
 }
 
@@ -1675,7 +1691,9 @@ func TestCmdResizeUpdatesStoppedInstance(t *testing.T) {
 	ctx := context.Background()
 	st := newServiceTestStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{Hostname: "srv", VCPUCount: 1, MemoryMiB: 1024}
+	cfg := loadServiceTestConfig(t, nil)
+	cfg.VMRunnerSocketPath = serviceTestHotColdDiskSocket(t)
+	cfg.Hostname, cfg.VCPUCount, cfg.MemoryMiB = "srv", 1, 1024
 	prov, err := provision.New(cfg, logger, st)
 	if err != nil {
 		t.Fatalf("provision.New(): %v", err)
@@ -1683,6 +1701,10 @@ func TestCmdResizeUpdatesStoppedInstance(t *testing.T) {
 	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
 
 	inst := serviceTestInstance("alpha", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
+	inst.RootFSPath = filepath.Join(t.TempDir(), "rootfs.img")
+	if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
@@ -1744,7 +1766,9 @@ func TestCmdFSCKChecksOwnedStoppedInstance(t *testing.T) {
 	ctx := context.Background()
 	st := newServiceTestStore(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{Hostname: "srv", VCPUCount: 1, MemoryMiB: 1024}
+	cfg := loadServiceTestConfig(t, nil)
+	cfg.VMRunnerSocketPath = serviceTestHotColdDiskSocket(t)
+	cfg.Hostname, cfg.VCPUCount, cfg.MemoryMiB = "srv", 1, 1024
 	prov, err := provision.New(cfg, logger, st)
 	if err != nil {
 		t.Fatalf("provision.New(): %v", err)

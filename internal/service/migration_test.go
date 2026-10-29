@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,12 +19,20 @@ import (
 func TestMigrationFenceSurvivesReopenAndRejectsRestart(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadServiceTestConfig(t, nil)
+	cfg.VMRunnerSocketPath = serviceTestHotColdDiskSocket(t)
 	path := filepath.Join(t.TempDir(), "state.db")
 	st, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	inst := serviceTestInstance("cold", model.StateStopped, time.Now().UTC())
+	inst.RootFSPath = filepath.Join(cfg.InstancesDir(), inst.Name, "rootfs.img")
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatal(err)
 	}

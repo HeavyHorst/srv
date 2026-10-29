@@ -39,6 +39,7 @@ import (
 	"srv/internal/host"
 	"srv/internal/model"
 	"srv/internal/provision"
+	"srv/internal/storage"
 	"srv/internal/store"
 )
 
@@ -429,6 +430,17 @@ func (a *App) inspectPayload(inst model.Instance, poolName string, integrations 
 }
 
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
+	// Validate before touching state. Legacy file layouts on btrfs migrate at
+	// start; unsupported filesystems require an explicit offline operator move.
+	if err := storage.ValidatePath(cfg.DataDirAbs()); err != nil {
+		return nil, err
+	}
+	if err := ensureBtrfsSubvolume(cfg.DataDirAbs()); err != nil {
+		return nil, fmt.Errorf("btrfs-only storage requires a prepared data subvolume; see the storage migration runbook: %w", err)
+	}
+	if _, err := storage.InspectSubvolume(context.Background(), cfg.DataDirAbs()); err != nil {
+		return nil, fmt.Errorf("inspect data subvolume identity: %w", err)
+	}
 	for _, dir := range []string{cfg.DataDirAbs(), cfg.StateDir(), cfg.ImagesDir(), cfg.InstancesDir(), cfg.BackupsDir(), cfg.TSNetDir()} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create %s: %w", dir, err)
@@ -748,6 +760,9 @@ func (a *App) handleSession(sess gssh.Session) {
 	audit.Command = command
 
 	allowed, reason := a.authorize(actor, command)
+	if command == "migration-disk" && via == "" {
+		allowed, reason = false, "native migration requires an authenticated trusted frontend"
+	}
 	if via != "" {
 		reason += "; forwarded by " + via
 	}
@@ -775,6 +790,17 @@ func (a *App) handleSession(sess gssh.Session) {
 		}
 		finalize(actor, true, reason, err)
 		_ = sess.Exit(result.exitCode)
+		return
+	}
+	stopKeepAlive := startCommandKeepAlive(sess, req.args, 30*time.Second)
+	defer stopKeepAlive()
+	if command == "migration-disk" {
+		code, err := a.handleMigrationDisk(sess, actor, req.args)
+		if err != nil {
+			_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
+		}
+		finalize(actor, true, reason, err)
+		_ = sess.Exit(code)
 		return
 	}
 	if len(req.args) >= 2 && req.args[0] == "orb" && req.args[1] == "bootstrap" {
@@ -867,6 +893,44 @@ func (a *App) handleSession(sess gssh.Session) {
 	_ = sess.Exit(result.exitCode)
 }
 
+// startCommandKeepAlive protects quiet cold-disk work, not idle shells or
+// unauthenticated sessions. Logs and top have their own keepalives.
+func startCommandKeepAlive(sess gssh.Session, args []string, interval time.Duration) context.CancelFunc {
+	if len(args) == 0 {
+		return func() {}
+	}
+	switch args[0] {
+	case "start", "stop", "restart", "disk", "delete", "delete-proof":
+	case "orb":
+		if len(args) < 2 || args[1] != "bootstrap" {
+			return func() {}
+		}
+	default:
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(sess.Context())
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if ctx.Err() != nil {
+					return
+				}
+				// Channel requests never alter stdout/stderr. Do not wait for a
+				// reply: a client ignoring requests must not pin this goroutine.
+				if _, err := sess.SendRequest("keepalive@openssh.com", false, nil); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	return cancel
+}
+
 func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandRequest) (commandResult, error) {
 	switch req.args[0] {
 	case "delete-proof":
@@ -904,6 +968,8 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 		return a.cmdFSCK(ctx, actor, req.args, req.format)
 	case "backup":
 		return a.cmdBackup(ctx, actor, req.args, req.format)
+	case "disk":
+		return a.cmdDisk(ctx, actor, req.args, req.format)
 	case "list":
 		if len(req.args) == 2 && req.args[1] == "--all" {
 			return a.cmdList(ctx, actor, req.format, "all")
@@ -2356,6 +2422,10 @@ func (a *App) handleExportSession(sess gssh.Session, actor model.Actor, args []s
 }
 
 func (a *App) handleImportSession(sess gssh.Session, actor model.Actor, args []string) (int, error) {
+	return a.handleImportSessionMode(sess, actor, args, false)
+}
+
+func (a *App) handleImportSessionMode(sess gssh.Session, actor model.Actor, args []string, native bool) (int, error) {
 	opts, err := parseImportOptions(args)
 	if err != nil {
 		_, _ = io.WriteString(sess.Stderr(), err.Error()+"\n")
@@ -2385,7 +2455,13 @@ func (a *App) handleImportSession(sess gssh.Session, actor model.Actor, args []s
 	}
 
 	reporter := newImportProgressReporter(sess.Stderr(), 350*time.Millisecond)
-	inst, info, err := a.provisioner.ImportInstanceWithOptions(sess.Context(), actor, stream, opts, reporter.Update)
+	var inst model.Instance
+	var info provision.PortableArtifactInfo
+	if native {
+		inst, info, err = a.provisioner.ImportNativeMetadata(sess.Context(), actor, stream, opts)
+	} else {
+		inst, info, err = a.provisioner.ImportInstanceWithOptions(sess.Context(), actor, stream, opts, reporter.Update)
+	}
 	reporter.Close(err == nil)
 	if err != nil {
 		wrapped := fmt.Errorf("import: %w", err)
@@ -2560,6 +2636,7 @@ func helpResult() commandResult {
 				{"restart <name>", "Restart an instance."},
 				{"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
 				{"fsck <name>", "Force-check and repair a stopped instance's rootfs."},
+				{"disk <status|offload|hydrate|purge> <name>", "Manage cold disk storage; mutations require a stopped instance (admin required for Orbs)."},
 				{"delete <name>", "Delete an instance."},
 			},
 		},
@@ -3045,10 +3122,46 @@ func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string, out
 	if err := a.finishOrbOperation(ctx, actor, args[2:]); err != nil {
 		return cleanupError(err)
 	}
+	if a.cfg.ColdStorageAfterStop && a.cfg.ColdStorageHost != "" {
+		if _, err := a.provisioner.ColdDisk(ctx, inst.Name, "offload"); err != nil {
+			a.log.Warn("cold disk offload after stop failed; stop succeeded", "name", inst.Name, "err", err)
+		}
+	}
 	if outFormat == outputFormatJSON {
 		return jsonResult(commandActionJSON{Action: "stopped", Instance: instanceSummaryPayload(a.cfg, inst, false)})
 	}
 	return commandResult{stdout: fmt.Sprintf("stopped: %s\nstate: %s\n", inst.Name, inst.State), exitCode: 0}, nil
+}
+
+func (a *App) cmdDisk(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
+	if len(args) != 3 || (args[1] != "status" && args[1] != "offload" && args[1] != "hydrate" && args[1] != "purge") {
+		err := errors.New("usage: disk <status|offload|hydrate|purge> <name>")
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+	// Status is an advisory journal read and must remain available during a
+	// transfer. Mutations still serialize with all other instance operations.
+	if args[1] != "status" {
+		unlock := a.lockInstance(args[2])
+		defer unlock()
+	}
+	inst, err := a.lookupVisibleInstance(ctx, actor, args[2])
+	if err != nil {
+		return missingInstanceResult("disk", args[2], err)
+	}
+	// Native Orb mutations normally require expectations. Only an admin may
+	// use this explicit recovery path outside the operation protocol.
+	if inst.KindName() == model.KindOrb && args[1] != "status" && !a.isAdmin(actor) {
+		err := errors.New("explicit disk mutations for native orbs require an admin")
+		return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
+	}
+	status, err := a.provisioner.ColdDisk(ctx, inst.Name, args[1])
+	if err != nil {
+		return commandResult{stderr: fmt.Sprintf("disk %s: %v\n", inst.Name, err), exitCode: 1}, err
+	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(status)
+	}
+	return commandResult{stdout: fmt.Sprintf("disk: %s\nphase: %s\nremote: %t\n", inst.Name, status.Phase, status.Remote)}, nil
 }
 
 func (a *App) cmdRestart(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {

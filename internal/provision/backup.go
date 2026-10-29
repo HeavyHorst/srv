@@ -19,6 +19,8 @@ import (
 
 	"srv/internal/format"
 	"srv/internal/model"
+	"srv/internal/storage"
+	"srv/internal/vmrunner"
 )
 
 const (
@@ -78,11 +80,12 @@ type backupFiles struct {
 }
 
 type portableManifest struct {
-	Version        int              `json:"version"`
-	MigrationToken string           `json:"migration_token,omitempty"`
-	ExportedAt     time.Time        `json:"exported_at"`
-	Instance       portableInstance `json:"instance"`
-	Files          backupFiles      `json:"files"`
+	Version        int                     `json:"version"`
+	MigrationToken string                  `json:"migration_token,omitempty"`
+	ExportedAt     time.Time               `json:"exported_at"`
+	Instance       portableInstance        `json:"instance"`
+	Files          backupFiles             `json:"files"`
+	NativeDisk     *vmrunner.MigrationDisk `json:"native_disk,omitempty"`
 }
 
 type portableInstance struct {
@@ -113,8 +116,19 @@ type replacedRestoreFile struct {
 }
 
 func (p *Provisioner) CreateBackup(ctx context.Context, name string) (BackupInfo, error) {
+	if err := p.ensureHostDiskCapacity(ctx, "", 0); err != nil {
+		return BackupInfo{}, err
+	}
 	inst, err := p.requireExistingInstance(ctx, name)
 	if err != nil {
+		return BackupInfo{}, err
+	}
+	legacy := inst.RootFSPath == filepath.Join(p.cfg.InstancesDir(), inst.Name, "rootfs.img")
+	if !legacy {
+		if err := p.ensureDiskLayout(ctx, &inst); err != nil {
+			return BackupInfo{}, err
+		}
+	} else if err := storage.ValidatePath(inst.RootFSPath); err != nil {
 		return BackupInfo{}, err
 	}
 	if inst.FirecrackerPID > 0 {
@@ -139,7 +153,7 @@ func (p *Provisioner) CreateBackup(ctx context.Context, name string) (BackupInfo
 	cleanup := true
 	defer func() {
 		if cleanup {
-			_ = os.RemoveAll(backupDir)
+			_ = removePathAll(backupDir)
 		}
 	}()
 
@@ -149,14 +163,33 @@ func (p *Provisioner) CreateBackup(ctx context.Context, name string) (BackupInfo
 		CreatedAt: createdAt,
 		Instance:  inst,
 		Files: backupFiles{
-			RootFS: backupRootFSName,
+			RootFS: filepath.Join("disk", backupRootFSName),
 		},
 	}
-	if err := reflinkCloneFile(ctx, inst.RootFSPath, filepath.Join(backupDir, manifest.Files.RootFS)); err != nil {
+	sourceDisk := filepath.Dir(inst.RootFSPath)
+	if legacy {
+		// A live legacy guest cannot be migrated. Keep its source untouched,
+		// capture a crash-consistent reflink into a visible backup-owned stage,
+		// and publish the same readonly disk layout as modern backups.
+		sourceDisk = filepath.Join(backupDir, "writable")
+		if err := storage.CreateSubvolume(ctx, sourceDisk); err != nil {
+			return BackupInfo{}, err
+		}
+		image := filepath.Join(sourceDisk, "rootfs.img")
+		if err := p.cloneRootFS(ctx, inst.RootFSPath, image); err != nil {
+			return BackupInfo{}, err
+		}
+		if err := storage.SyncPath(image); err != nil {
+			return BackupInfo{}, err
+		}
+	}
+	if err := storage.SnapshotSubvolume(ctx, sourceDisk, filepath.Join(backupDir, "disk"), true); err != nil {
 		return BackupInfo{}, fmt.Errorf("backup rootfs for %q: %w", name, err)
 	}
-	if err := os.Chmod(filepath.Join(backupDir, manifest.Files.RootFS), 0o660); err != nil {
-		return BackupInfo{}, fmt.Errorf("set backup rootfs permissions: %w", err)
+	if legacy {
+		if err := removePathAll(sourceDisk); err != nil {
+			return BackupInfo{}, err
+		}
 	}
 
 	serialCopied, err := cloneBackupFileIfPresent(ctx, inst.SerialLogPath, filepath.Join(backupDir, backupSerialLogName))
@@ -246,7 +279,7 @@ func (p *Provisioner) DeleteBackup(ctx context.Context, name, backupID string) (
 	}
 
 	info := backupInfoFromManifest(backupDir, manifest)
-	if err := os.RemoveAll(backupDir); err != nil {
+	if err := removePathAll(backupDir); err != nil {
 		return BackupInfo{}, fmt.Errorf("delete backup %q for %q: %w", backupID, name, err)
 	}
 	p.recordEvent(inst.ID, "backup", "instance backup deleted", map[string]any{"backup_id": info.ID, "path": info.Path})
@@ -254,11 +287,17 @@ func (p *Provisioner) DeleteBackup(ctx context.Context, name, backupID string) (
 }
 
 func (p *Provisioner) RestoreBackup(ctx context.Context, name, backupID string) (model.Instance, BackupInfo, error) {
+	if err := p.ensureHostDiskCapacity(ctx, "", 0); err != nil {
+		return model.Instance{}, BackupInfo{}, err
+	}
 	if err := p.migrationFence(ctx, name); err != nil {
 		return model.Instance{}, BackupInfo{}, err
 	}
 	inst, err := p.requireStoppedInstance(ctx, name)
 	if err != nil {
+		return model.Instance{}, BackupInfo{}, err
+	}
+	if err := p.ensureDiskLayout(ctx, &inst); err != nil {
 		return model.Instance{}, BackupInfo{}, err
 	}
 
@@ -321,7 +360,10 @@ func (p *Provisioner) RestoreBackup(ctx context.Context, name, backupID string) 
 	}
 	if err := p.store.UpdateInstance(ctx, restored); err != nil {
 		rollbackErr := rollbackCommittedRestoreFiles(replaced)
-		cleanupErr := cleanupReplacedRestoreFiles(replaced)
+		var cleanupErr error
+		if rollbackErr == nil {
+			cleanupErr = cleanupReplacedRestoreFiles(replaced)
+		}
 		if rollbackErr != nil || cleanupErr != nil {
 			return model.Instance{}, BackupInfo{}, fmt.Errorf("update instance after restore: %w (file rollback failed: %v)", err, errors.Join(rollbackErr, cleanupErr))
 		}
@@ -360,6 +402,9 @@ func (p *Provisioner) requireStoppedInstance(ctx context.Context, name string) (
 func (p *Provisioner) requireExistingInstance(ctx context.Context, name string) (model.Instance, error) {
 	inst, err := p.ReconcileInstanceRuntime(ctx, name)
 	if err != nil {
+		return model.Instance{}, err
+	}
+	if err := p.coldDiskFence(ctx, inst, false); err != nil {
 		return model.Instance{}, err
 	}
 	if inst.State == model.StateDeleted {
@@ -434,6 +479,16 @@ func backupInfoFromManifest(path string, manifest backupManifest) BackupInfo {
 }
 
 func (p *Provisioner) ExportInstance(ctx context.Context, name string, w io.Writer) (PortableArtifactInfo, error) {
+	return p.exportInstance(ctx, name, w, nil)
+}
+
+// ExportNativeMetadata retains the existing manifest/log framing. The disk
+// itself has already travelled through the privileged Send/Receive path.
+func (p *Provisioner) ExportNativeMetadata(ctx context.Context, name string, w io.Writer, transfer vmrunner.MigrationDisk) (PortableArtifactInfo, error) {
+	return p.exportInstance(ctx, name, w, &transfer)
+}
+
+func (p *Provisioner) exportInstance(ctx context.Context, name string, w io.Writer, native *vmrunner.MigrationDisk) (PortableArtifactInfo, error) {
 	inst, err := p.requireStoppedInstance(ctx, name)
 	if err != nil {
 		return PortableArtifactInfo{}, err
@@ -450,6 +505,12 @@ func (p *Provisioner) ExportInstance(ctx context.Context, name string, w io.Writ
 			return PortableArtifactInfo{}, fmt.Errorf("export requires a prepared migration, not %s", migration.Phase)
 		}
 		manifest.MigrationToken = migration.Token
+	}
+	if native != nil {
+		if manifest.MigrationToken == "" || native.Disk.ID != manifest.MigrationToken || native.Disk.Size != inst.RootFSSizeBytes {
+			return PortableArtifactInfo{}, errors.New("native metadata requires the prepared migration disk")
+		}
+		manifest.NativeDisk = native
 	}
 	serialPresent, err := regularFileExists(inst.SerialLogPath)
 	if err != nil {
@@ -479,9 +540,11 @@ func (p *Provisioner) ExportInstance(ctx context.Context, name string, w io.Writ
 		_ = closePortableArtifactTarWriter(tw, zw)
 		return PortableArtifactInfo{}, fmt.Errorf("write portable artifact manifest: %w", err)
 	}
-	if err := writeTarFile(tw, manifest.Files.RootFS, inst.RootFSPath, 0o660); err != nil {
-		_ = closePortableArtifactTarWriter(tw, zw)
-		return PortableArtifactInfo{}, fmt.Errorf("write rootfs to portable artifact: %w", err)
+	if native == nil {
+		if err := writeTarFile(tw, manifest.Files.RootFS, inst.RootFSPath, 0o660); err != nil {
+			_ = closePortableArtifactTarWriter(tw, zw)
+			return PortableArtifactInfo{}, fmt.Errorf("write rootfs to portable artifact: %w", err)
+		}
 	}
 	serialTruncated := false
 	if manifest.Files.SerialLog != "" {
@@ -536,8 +599,16 @@ func (p *Provisioner) ImportInstance(ctx context.Context, actor model.Actor, r i
 }
 
 type ImportOptions struct {
-	MemoryPoolName string
-	FixedMemory    bool
+	MemoryPoolName  string
+	FixedMemory     bool
+	nativeMigration bool
+}
+
+// ImportNativeMetadata is only called after trusted-frontend authentication.
+// Normal portable imports cannot select the privileged Btrfs receive path.
+func (p *Provisioner) ImportNativeMetadata(ctx context.Context, actor model.Actor, r io.Reader, opts ImportOptions) (model.Instance, PortableArtifactInfo, error) {
+	opts.nativeMigration = true
+	return p.ImportInstanceWithOptions(ctx, actor, r, opts)
 }
 
 func (opts ImportOptions) Validate(pooledSource bool) error {
@@ -559,6 +630,12 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 	manifest, err := readPortableManifest(tr)
 	if err != nil {
 		return model.Instance{}, PortableArtifactInfo{}, err
+	}
+	if opts.nativeMigration != (manifest.NativeDisk != nil) {
+		return model.Instance{}, PortableArtifactInfo{}, errors.New("native migration metadata requires the internal trusted-frontend path")
+	}
+	if manifest.NativeDisk != nil && (manifest.MigrationToken == "" || manifest.NativeDisk.Disk.ID != manifest.MigrationToken || manifest.NativeDisk.Disk.Size != manifest.Instance.RootFSSizeBytes) {
+		return model.Instance{}, PortableArtifactInfo{}, errors.New("native disk does not match the migration manifest")
 	}
 	var progress func(ImportProgress)
 	if len(progressFns) > 0 {
@@ -586,6 +663,39 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 		return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("portable artifact machine shape: %w", err)
 	}
 
+	if _, _, err := p.checkInstanceDirReusable(ctx, targetName); err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, err
+	}
+	// This host admits one bulk writer at a time. Wait without admissionMu:
+	// ordinary lifecycle work must remain available during long imports.
+	ctx, releasePayload, err := storage.AcquirePayload(ctx, p.cfg.DataDirAbs())
+	if err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, err
+	}
+	defer releasePayload()
+	payload := int64(0)
+	if manifest.NativeDisk == nil {
+		payload = manifest.Instance.RootFSSizeBytes
+	}
+	for _, log := range []string{manifest.Files.SerialLog, manifest.Files.FirecrackerLog} {
+		if log != "" {
+			if payload > int64(^uint64(0)>>1)-portableLogMaxSize {
+				return model.Instance{}, PortableArtifactInfo{}, errors.New("portable payload size overflows")
+			}
+			payload += portableLogMaxSize
+		}
+	}
+	usage, measured, err := p.filesystemUsage(p.cfg.InstancesDir())
+	if err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, err
+	}
+	if !measured {
+		return model.Instance{}, PortableArtifactInfo{}, errors.New("disk admission requires measured available space")
+	}
+	if err := storage.CheckAvailableSpace(usage.Available, payload); err != nil {
+		return model.Instance{}, PortableArtifactInfo{}, err
+	}
+
 	var (
 		instanceDir string
 		imported    model.Instance
@@ -605,26 +715,31 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 			}
 			memoryMode, poolID = "pool", pool.ID
 		}
-		if err := p.ensureHostDiskCapacity(ctx, "", manifest.Instance.RootFSSizeBytes); err != nil {
-			return err
-		}
 		preparedDir, err := p.prepareInstanceDir(ctx, targetName)
 		if err != nil {
 			return err
 		}
 		instanceDir = preparedDir
+		if manifest.NativeDisk == nil {
+			if err := storage.CreateSubvolume(ctx, filepath.Join(instanceDir, "disk")); err != nil {
+				return errors.Join(err, cleanupInstanceTree(ctx, instanceDir))
+			}
+		}
 
 		networkCIDR, hostAddr, guestAddr, gateway, err := p.allocateNetwork(ctx)
 		if err != nil {
-			_ = os.RemoveAll(instanceDir)
+			_ = cleanupInstanceTree(ctx, instanceDir)
 			return err
 		}
 
 		now := time.Now().UTC()
+		// An import is a new local incarnation, even when a migration returns
+		// to its original host. Never reuse an ID fenced by runner deletion;
+		// the receipt below retains the source ID for migration verification.
 		imported = model.Instance{
 			MemoryMode:      memoryMode,
 			MemoryPoolID:    poolID,
-			ID:              firstNonEmpty(manifest.Instance.ID, uuid.NewString()),
+			ID:              uuid.NewString(),
 			Kind:            manifest.Instance.Kind,
 			Name:            targetName,
 			Image:           manifest.Instance.Image,
@@ -636,7 +751,7 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 			VCPUCount:       resolvedVCPUCount,
 			MemoryMiB:       resolvedMemoryMiB,
 			RootFSSizeBytes: manifest.Instance.RootFSSizeBytes,
-			RootFSPath:      filepath.Join(instanceDir, backupRootFSName),
+			RootFSPath:      filepath.Join(instanceDir, "disk", backupRootFSName),
 			KernelPath:      image.Kernel,
 			InitrdPath:      image.Initrd,
 			SocketPath:      filepath.Join(instanceDir, "firecracker.sock"),
@@ -654,11 +769,11 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 		// Persist a destination fence before making the reservation visible.
 		// Crash recovery must never boot a partially imported rootfs.
 		if err := p.store.ReserveImportReceipt(ctx, model.ImportReceipt{InstanceID: imported.ID, Token: info.MigrationToken, SourceInstanceID: manifest.Instance.ID, ExportedAt: info.ExportedAt.Format(time.RFC3339Nano), Phase: "importing"}); err != nil {
-			_ = os.RemoveAll(instanceDir)
+			_ = cleanupInstanceTree(ctx, instanceDir)
 			return err
 		}
 		if err := p.store.CreateInstance(ctx, imported); err != nil {
-			_ = os.RemoveAll(instanceDir)
+			_ = cleanupInstanceTree(ctx, instanceDir)
 			return fmt.Errorf("create imported instance %q reservation: %w", targetName, err)
 		}
 		return nil
@@ -672,7 +787,7 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 			return
 		}
 		_ = p.store.DeleteInstance(context.Background(), imported.Name)
-		_ = os.RemoveAll(instanceDir)
+		_ = cleanupInstanceTree(ctx, instanceDir)
 	}()
 
 	staged := make([]stagedRestoreFile, 0, 3)
@@ -689,6 +804,9 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 		required bool
 	}{
 		manifest.Files.RootFS: {dest: imported.RootFSPath, label: "rootfs", required: true},
+	}
+	if manifest.NativeDisk != nil {
+		delete(targets, manifest.Files.RootFS)
 	}
 	if manifest.Files.SerialLog != "" {
 		targets[manifest.Files.SerialLog] = struct {
@@ -766,6 +884,11 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 		}
 	}
 
+	if manifest.NativeDisk != nil {
+		if _, err := p.migrationDiskRPC(ctx, vmrunner.MigrationDiskRequest{Action: "publish", Name: imported.Name, InstanceID: imported.ID, Token: manifest.MigrationToken, Transfer: *manifest.NativeDisk}, nil, nil); err != nil {
+			return model.Instance{}, PortableArtifactInfo{}, err
+		}
+	}
 	if _, err := commitStagedRestoreFiles(staged); err != nil {
 		return model.Instance{}, PortableArtifactInfo{}, fmt.Errorf("commit portable artifact files for %q: %w", targetName, err)
 	}
@@ -803,6 +926,13 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 	}
 
 	cleanupReservation = false
+	if manifest.NativeDisk != nil {
+		// Publication and the SQLite receipt are durable. Cleanup failure must
+		// not turn the committed import into an uncommitted result.
+		if _, err := p.migrationDiskRPC(ctx, vmrunner.MigrationDiskRequest{Action: "discard", Name: imported.Name, InstanceID: imported.ID, Token: manifest.MigrationToken, Transfer: *manifest.NativeDisk}, nil, nil); err != nil {
+			p.log.Warn("committed migration retains transfer object; administrator cleanup required", "name", imported.Name, "token", manifest.MigrationToken, "err", err)
+		}
+	}
 	p.recordEvent(imported.ID, "import", "instance imported from portable artifact", map[string]any{
 		"source_name":         manifest.Instance.Name,
 		"source_instance_id":  manifest.Instance.ID,
@@ -1132,21 +1262,23 @@ func (r *importProgressReader) Read(p []byte) (int, error) {
 
 func commitStagedRestoreFiles(files []stagedRestoreFile) ([]replacedRestoreFile, error) {
 	replaced := make([]replacedRestoreFile, 0, len(files))
+	rollback := func(commitErr error) ([]replacedRestoreFile, error) {
+		if rollbackErr := rollbackCommittedRestoreFiles(replaced); rollbackErr != nil {
+			// Keep every remaining recovery copy when rollback is uncertain.
+			return nil, errors.Join(commitErr, rollbackErr)
+		}
+		return nil, errors.Join(commitErr, cleanupReplacedRestoreFiles(replaced))
+	}
 
 	for _, file := range files {
 		replacedFile, err := moveAsideRestoreDestination(file.dest)
 		if err != nil {
-			return nil, errors.Join(err, rollbackCommittedRestoreFiles(replaced), cleanupReplacedRestoreFiles(replaced))
-		}
-		if err := os.Rename(file.tmp, file.dest); err != nil {
-			return nil, errors.Join(
-				fmt.Errorf("replace %s: %w", file.dest, err),
-				cleanupReplacedRestoreFiles([]replacedRestoreFile{replacedFile}),
-				rollbackCommittedRestoreFiles(replaced),
-				cleanupReplacedRestoreFiles(replaced),
-			)
+			return rollback(err)
 		}
 		replaced = append(replaced, replacedFile)
+		if err := os.Rename(file.tmp, file.dest); err != nil {
+			return rollback(fmt.Errorf("replace %s: %w", file.dest, err))
+		}
 	}
 	return replaced, nil
 }
@@ -1155,19 +1287,21 @@ func rollbackCommittedRestoreFiles(files []replacedRestoreFile) error {
 	var errs []error
 	for i := len(files) - 1; i >= 0; i-- {
 		file := files[i]
-		if err := os.Remove(file.dest); err != nil && !errors.Is(err, os.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("remove restored destination %s: %w", file.dest, err))
-			continue
-		}
 		if file.hadFile {
+			// Rename directly over the replacement: failure must leave both the
+			// destination and the recovery hardlink untouched.
 			if err := os.Rename(file.original, file.dest); err != nil {
-				errs = append(errs, fmt.Errorf("restore original destination %s: %w", file.dest, err))
+				errs = append(errs, fmt.Errorf("restore original destination %s from recovery copy %s: %w", file.dest, file.original, err))
 			}
+		} else if err := os.Remove(file.dest); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove restored destination %s: %w", file.dest, err))
 		}
 	}
 	return errors.Join(errs...)
 }
 
+// Call only after a successful commit or a fully successful rollback. Renaming
+// two links to the same inode can leave the recovery link in place.
 func cleanupReplacedRestoreFiles(files []replacedRestoreFile) error {
 	var errs []error
 	for _, file := range files {

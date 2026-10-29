@@ -9,10 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"srv/internal/model"
 	"srv/internal/nethelper"
+	"srv/internal/storage"
 	"srv/internal/vmrunner"
 )
 
@@ -26,7 +28,10 @@ func absentPath(path string) error {
 
 // recoveryCopiesAbsent never removes backup/snapshot data. The service's name
 // lock and snapshot lease exclude concurrent creation throughout deletion.
-func (p *Provisioner) recoveryCopiesAbsent(inst model.Instance) (string, error) {
+func (p *Provisioner) recoveryCopiesAbsent(ctx context.Context, inst model.Instance) (string, error) {
+	if err := p.coldDiskFence(ctx, inst, true); err != nil {
+		return "", err
+	}
 	backups, err := p.instanceBackupsDir(inst.Name)
 	if err != nil {
 		return "", err
@@ -42,12 +47,68 @@ func (p *Provisioner) recoveryCopiesAbsent(inst model.Instance) (string, error) 
 		if !entry.IsDir() {
 			return "", errors.New("unrecognized snapshot entry; operator inspection required")
 		}
+		root := filepath.Join(p.cfg.SnapshotsDir(), entry.Name())
+		if err := storage.ValidatePath(root); err != nil {
+			return "", err
+		}
+		data, manifestErr := os.ReadFile(filepath.Join(root, "manifest.json"))
+		if manifestErr == nil {
+			var m struct {
+				Version    int    `json:"version"`
+				ID         string `json:"id"`
+				Components []struct {
+					Source string `json:"source"`
+					Path   string `json:"path"`
+				} `json:"components"`
+			}
+			if err := json.Unmarshal(data, &m); err != nil {
+				return "", err
+			}
+			if m.Version != 1 || m.ID != entry.Name() || len(m.Components) == 0 || m.Components[0].Source != "." || m.Components[0].Path != "root" {
+				return "", errors.New("incomplete or invalid snapshot bundle; explicit disposition required")
+			}
+			contents, err := os.ReadDir(root)
+			if err != nil {
+				return "", err
+			}
+			if len(contents) != len(m.Components)+1 {
+				return "", errors.New("snapshot bundle has unmanifested or missing components")
+			}
+			seen := make(map[string]bool)
+			for n, component := range m.Components {
+				if n == 0 {
+					continue
+				}
+				if filepath.IsAbs(component.Source) || filepath.Clean(component.Source) != component.Source || strings.HasPrefix(component.Source, "../") || component.Path != fmt.Sprintf("disk-%06d", n-1) {
+					return "", errors.New("invalid snapshot component")
+				}
+				parts := strings.Split(component.Source, "/")
+				valid := len(parts) == 3 && (parts[0] == "instances" || parts[0] == "image-bases") && parts[2] == "disk"
+				valid = valid || (len(parts) == 4 && (parts[0] == "templates" || parts[0] == "backups") && parts[3] == "disk")
+				if !valid || seen[component.Source] {
+					return "", errors.New("unknown or duplicate snapshot component source")
+				}
+				seen[component.Source] = true
+				if strings.HasPrefix(component.Source, "instances/"+inst.Name+"/") || strings.HasPrefix(component.Source, "backups/"+inst.Name+"/") {
+					return "", errors.New("snapshot bundle retains instance disk; explicit disposition required")
+				}
+				if info, err := os.Lstat(filepath.Join(root, component.Path)); err != nil || !info.IsDir() {
+					return "", errors.New("snapshot disk component missing or invalid")
+				}
+			}
+			root = filepath.Join(root, "root")
+			if info, err := os.Lstat(root); err != nil || !info.IsDir() {
+				return "", errors.New("snapshot bundle root missing or invalid")
+			}
+		} else {
+			return "", errors.New("legacy or unresolved snapshot archive; explicit disposition required")
+		}
 		for _, sub := range []string{"instances", "backups"} {
-			if err := absentPath(filepath.Join(p.cfg.SnapshotsDir(), entry.Name(), sub, inst.Name)); err != nil {
+			if err := absentPath(filepath.Join(root, sub, inst.Name)); err != nil {
 				return "", err
 			}
 		}
-		copies, err := retainedTemplates(filepath.Join(p.cfg.SnapshotsDir(), entry.Name(), "templates"), inst)
+		copies, err := retainedTemplates(filepath.Join(root, "templates"), inst)
 		if err != nil {
 			return "", err
 		}
@@ -95,11 +156,12 @@ func (p *Provisioner) DeleteWithProof(ctx context.Context, inst model.Instance, 
 	}
 	runtimeProof, ok := p.vmRunner.(interface {
 		VerifyInstanceAbsent(context.Context, vmrunner.StartResultRequest) error
+		ColdDisk(context.Context, vmrunner.ColdRequest) (vmrunner.ColdStatus, error)
 	})
 	if !ok {
 		return r, errors.New("runtime proof helper unavailable")
 	}
-	backups, err := p.recoveryCopiesAbsent(inst)
+	backups, err := p.recoveryCopiesAbsent(ctx, inst)
 	if err != nil {
 		return r, err
 	}
@@ -115,11 +177,20 @@ func (p *Provisioner) DeleteWithProof(ctx context.Context, inst model.Instance, 
 	if err := closeGateways(ctx, inst); err != nil {
 		return r, err
 	}
-	if _, err := p.recoveryCopiesAbsent(inst); err != nil {
+	if _, err := p.recoveryCopiesAbsent(ctx, inst); err != nil {
 		return r, err
 	}
 	if err := p.stopFirecracker(ctx, inst); err != nil {
 		return r, err
+	}
+	// A momentary absence proof is insufficient: delayed offloads must remain
+	// fenced after the runner releases its lock and we remove the local disk.
+	cold, err := runtimeProof.ColdDisk(ctx, vmrunner.ColdRequest{Name: inst.Name, InstanceID: inst.ID, Action: "fence-delete"})
+	if err != nil {
+		return r, err
+	}
+	if cold.Phase != "hot" || cold.Remote || cold.Error != "" {
+		return r, errors.New("cold storage deletion fence was not established")
 	}
 	if err := runtimeProof.VerifyInstanceAbsent(ctx, vmrunner.StartResultRequest{Name: inst.Name, InstanceID: inst.ID, RequestID: inst.StartRequestID, HostBootID: inst.StartBootID}); err != nil {
 		return r, err
@@ -130,13 +201,13 @@ func (p *Provisioner) DeleteWithProof(ctx context.Context, inst model.Instance, 
 	if err := network.VerifyInstanceNetworkAbsent(ctx, nethelper.CleanupRequest{TapDevice: inst.TapDevice, NetworkCIDR: inst.NetworkCIDR}); err != nil {
 		return r, err
 	}
-	if _, err := p.recoveryCopiesAbsent(inst); err != nil {
+	if _, err := p.recoveryCopiesAbsent(ctx, inst); err != nil {
 		return r, err
 	}
 	if err := p.removeInstanceDir(inst.Name); err != nil {
 		return r, err
 	}
-	// Publish no durable tombstone ahead of durable directory removal.
+	// Publish no successful cleanup receipt ahead of durable directory removal.
 	if err := syncTemplatePath(p.cfg.InstancesDir()); err != nil {
 		return r, err
 	}
@@ -185,7 +256,7 @@ func retainedTemplates(root string, inst model.Instance) ([]string, error) {
 			if err := json.Unmarshal(data, &m); err != nil {
 				return nil, err
 			}
-			if m.Version != 1 || m.SourceID == "" || m.ID != entry.Name() || m.Owner == "" || m.Image == "" {
+			if (m.Version != 1 && m.Version != 2) || m.SourceID == "" || m.ID != entry.Name() || m.Owner == "" || m.Image == "" {
 				return nil, errors.New("invalid retained template manifest")
 			}
 			if m.SourceID == inst.ID {

@@ -535,6 +535,7 @@ func (a *App) Run(ctx context.Context) error {
 	a.tailscale = &tsnet.Server{
 		Dir:           a.cfg.TSNetDir(),
 		Hostname:      a.cfg.Hostname,
+		Port:          uint16(a.cfg.TailscalePort),
 		AuthKey:       a.cfg.TailscaleAuthKey,
 		ClientID:      a.cfg.TailscaleClientID,
 		ClientSecret:  a.cfg.TailscaleClientSecret,

@@ -68,6 +68,7 @@ Use either `TS_AUTHKEY` or `TS_CLIENT_ID`/`TS_CLIENT_SECRET` for the control-pla
 |----------|---------|-------------|
 | `SRV_HOSTNAME` | `srv` | Tailscale hostname for the control plane |
 | `SRV_LISTEN_ADDR` | `:22` | Tailnet TCP listen address for the SSH API |
+| `SRV_TAILSCALE_PORT` | `0` | Embedded Tailscale UDP transport port (0 selects automatically). Use a distinct fixed port from host tailscaled when applying an inbound firewall. |
 | `SRV_DATA_DIR` | `/var/lib/srv` | State directory; must be a btrfs subvolume root on the same filesystem as every base rootfs image. |
 | `SRV_NET_HELPER_SOCKET` | `/run/srv/net-helper.sock` | Unix socket for the privileged network helper |
 | `SRV_VM_RUNNER_SOCKET` | `/run/srv-vm-runner/vm-runner.sock` | Unix socket for the Firecracker VM runner |

@@ -23,6 +23,7 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_DATA_DIR", relDataDir)
 	t.Setenv("SRV_HOSTNAME", "control")
 	t.Setenv("SRV_LISTEN_ADDR", ":2222")
+	t.Setenv("SRV_TAILSCALE_PORT", "41642")
 	t.Setenv("SRV_ALLOWED_USERS", " alice@example.com, bob@example.com ")
 	t.Setenv("SRV_ADMIN_USERS", " ops@example.com, root@example.com ")
 	t.Setenv("SRV_ADVERTISE_TAGS", "tag:control, tag:ssh")
@@ -57,6 +58,9 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	}
 	if cfg.ListenAddr != ":2222" {
 		t.Fatalf("ListenAddr = %q, want %q", cfg.ListenAddr, ":2222")
+	}
+	if cfg.TailscalePort != 41642 {
+		t.Fatalf("TailscalePort = %d, want 41642", cfg.TailscalePort)
 	}
 	if cfg.DataDir != relDataDir {
 		t.Fatalf("DataDir = %q, want %q", cfg.DataDir, relDataDir)
@@ -178,6 +182,16 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 		mutate  func(*Config)
 		wantErr string
 	}{
+		{
+			name:    "negative tailscale port",
+			mutate:  func(cfg *Config) { cfg.TailscalePort = -1 },
+			wantErr: "tailscale port must be between 0 and 65535",
+		},
+		{
+			name:    "overflowing tailscale port",
+			mutate:  func(cfg *Config) { cfg.TailscalePort = 65536 },
+			wantErr: "tailscale port must be between 0 and 65535",
+		},
 		{
 			name:    "missing hostname",
 			mutate:  func(cfg *Config) { cfg.Hostname = "" },

@@ -40,6 +40,7 @@ type Config struct {
 	DataDir                string
 	Hostname               string
 	ListenAddr             string
+	TailscalePort          int
 	TailscaleAuthKey       string
 	TailscaleClientID      string
 	TailscaleClientSecret  string
@@ -117,6 +118,7 @@ func Load() (Config, error) {
 	flag.StringVar(&cfg.DataDir, "data-dir", getenv("SRV_DATA_DIR", defaultDataDir), "service state directory (must be a btrfs subvolume root; requires btrfs-progs and user_subvol_rm_allowed)")
 	flag.StringVar(&cfg.Hostname, "hostname", getenv("SRV_HOSTNAME", defaultHostname), "tailscale hostname for the control plane")
 	flag.StringVar(&cfg.ListenAddr, "listen-addr", getenv("SRV_LISTEN_ADDR", defaultListenAddr), "tailnet TCP listen address for the SSH API")
+	flag.IntVar(&cfg.TailscalePort, "tailscale-port", getenvInt("SRV_TAILSCALE_PORT", 0), "UDP port for the embedded Tailscale node (0 selects automatically)")
 	flag.StringVar(&cfg.TailscaleAuthKey, "tailscale-auth-key", os.Getenv("TS_AUTHKEY"), "tailscale auth key for the control-plane node")
 	flag.StringVar(&cfg.TailscaleClientID, "tailscale-client-id", getenv("TS_CLIENT_ID", os.Getenv("TS_API_CLIENT_ID")), "tailscale OAuth client id")
 	flag.StringVar(&cfg.TailscaleClientSecret, "tailscale-client-secret", getenv("TS_CLIENT_SECRET", os.Getenv("TS_API_CLIENT_SECRET")), "tailscale OAuth client secret")
@@ -205,6 +207,9 @@ func Load() (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.TailscalePort < 0 || c.TailscalePort > 65535 {
+		return errors.New("tailscale port must be between 0 and 65535")
+	}
 	if c.ColdStorageAfterStop && c.ColdStorageHost == "" {
 		return errors.New("cold-storage-after-stop requires cold-storage-host")
 	}

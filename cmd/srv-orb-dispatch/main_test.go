@@ -52,6 +52,7 @@ type testVM struct {
 type testServer struct {
 	Results         map[string]map[string]any
 	Proof           map[string]any
+	ProofVersion    int
 	ProxyBypass     *string
 	Creates         int
 	LateStop        bool
@@ -157,7 +158,11 @@ func fakeSSH() error {
 		}
 		return emit(result)
 	case "cleanup-receipt":
-		if s.Proof == nil || s.Proof["request_id"] != args[2] {
+		key, value := "request_id", args[2]
+		if len(args) == 4 && args[2] == "--instance" {
+			key, value = "instance_id", args[3]
+		}
+		if s.Proof == nil || s.Proof[key] != value {
 			return fmt.Errorf("receipt missing")
 		}
 		return emit(s.Proof)
@@ -291,6 +296,10 @@ func fakeSSH() error {
 		}
 		s.VM.State = "ready"
 	case "delete":
+		if len(args) == 3 && s.VM != nil && args[2] == s.VM.Name {
+			// Model ordinary SSH deletion independently of provider state.
+			args = append(args, "--expect", fmt.Sprintf("abcdefab-1234-4234-8234-%012x", s.Creates), s.VM.ID, s.VM.CreatedAt, s.VM.BackendID, s.VM.Image)
+		}
 		if len(args) != 9 || args[3] != "--expect" || s.VM == nil || args[2] != s.VM.Name || args[5] != s.VM.ID || args[6] != s.VM.CreatedAt || args[7] != s.VM.BackendID || args[8] != s.VM.Image {
 			return fmt.Errorf("unbound delete")
 		}
@@ -305,6 +314,12 @@ func fakeSSH() error {
 			return fmt.Errorf("cleanup preflight failed")
 		}
 		s.Proof = map[string]any{"version": 3, "gateways_absent": true, "kind": "orb", "image": s.VM.Image, "backend_id": s.VM.BackendID, "request_id": args[4], "instance_id": s.VM.ID, "name": s.VM.Name, "created_at": s.VM.CreatedAt, "deleted_at": "2026-01-02T04:04:05Z", "auth_key_disposition": "never-minted", "retained_templates": []string{}, "ingress_closed": true, "runtime_absent": true, "jailer_absent": true, "cgroup_absent": true, "network_absent": true, "storage_absent": true, "backups_absent": true, "snapshots_absent": true}
+		if s.ProofVersion >= 4 {
+			s.Proof["version"], s.Proof["snapshots_absent"], s.Proof["retained_templates"] = s.ProofVersion, false, nil
+		}
+		if s.ProofVersion == 5 {
+			s.Proof["backups_absent"] = false
+		}
 		s.VM, s.Disk, s.Environment = nil, "", ""
 		s.DeleteRequestID = ""
 		if err := write(); err != nil {
@@ -396,6 +411,20 @@ func (h harness) must(operation, token string, extra ...string) {
 	}
 }
 
+func (h harness) ssh(args ...string) (string, error) {
+	args = append([]string{"--json"}, args...)
+	if host := h.read().Host; host != "" {
+		args = append(args, "--host", host)
+	}
+	for i := range args {
+		args[i] = quote(args[i])
+	}
+	cmd := exec.Command(h.program, "srv", strings.Join(args, " "))
+	cmd.Env = []string{"SRV_ORB_TEST_MODE=ssh", "SRV_ORB_TEST_SERVER=" + filepath.Join(h.dir, "server.json")}
+	b, err := cmd.CombinedOutput()
+	return string(b), err
+}
+
 func TestDispatchLifecycle(t *testing.T) {
 	for _, host := range []string{"", "b"} {
 		t.Run("host="+host, func(t *testing.T) {
@@ -436,8 +465,9 @@ func TestDispatchLifecycle(t *testing.T) {
 			if h.read().VM != nil || h.read().Disk != "" {
 				t.Fatal("delete retained VM disk")
 			}
-			if _, err := h.run("spawn", "later-token"); err == nil {
-				t.Fatal("deleted orb was resurrected")
+			h.must("spawn", "later-token", "SRV_ORB_HOST="+host)
+			if s := h.read(); s.VM.Name == name || s.Creates != 2 || s.Disk != "fresh disk" {
+				t.Fatal("spawn after delete did not create a distinct fresh workspace")
 			}
 		})
 	}
@@ -514,30 +544,28 @@ func TestDispatchResumesSameDeleteIntent(t *testing.T) {
 			}
 			s = h.read()
 			s.RejectDelete = false
+			// v3 remains exercised by the other lifecycle tests.
+			s.ProofVersion = 4
 			if failure == "before-submit" {
 				s.DeleteRequestID = ""
+				s.ProofVersion = 5
 			}
 			s.LoseDelete = true
 			h.write(s)
-			if _, err := h.run("delete", ""); err == nil {
-				t.Fatal("expected lost success reply")
-			}
+			h.must("delete", "") // A separate receipt lookup confirms the lost reply.
 			s = h.read()
 			if s.VM != nil || s.Proof["request_id"] != original {
 				t.Fatal("retry lost binding or failed to delete")
 			}
-			// New backends retain shared copies; old v3 remains exercised by
-			// the other lifecycle tests, including retirement/fresh-start.
-			s.Proof["version"], s.Proof["snapshots_absent"], s.Proof["retained_templates"] = 4, false, nil
-			if failure == "before-submit" {
-				s.Proof["version"], s.Proof["backups_absent"] = 5, false
-			}
-			h.write(s)
 			h.must("delete", "")
 			data, err := os.ReadFile(filepath.Join(h.dir, "state", name+".json"))
 			var r record
 			if err != nil || json.Unmarshal(data, &r) != nil || r.Phase != "deleted" || r.RequestID != original {
 				t.Fatal("not finalized", string(data), err)
+			}
+			h.must("spawn", "after-cleanup-token")
+			if s := h.read(); s.Creates != 2 || s.VM.Name == name || s.Disk != "fresh disk" {
+				t.Fatal("valid v4/v5 receipt did not permit fresh compute")
 			}
 		})
 	}
@@ -746,8 +774,8 @@ func TestDispatchDoesNotReplaceMissingDisk(t *testing.T) {
 	}
 }
 
-func TestRetireCompute(t *testing.T) {
-	for _, scenario := range []string{"running", "paused", "lost-reply", "pending-bootstrap"} {
+func TestExternalDeleteCompute(t *testing.T) {
+	for _, scenario := range []string{"running", "paused", "lost-reply", "pending-bootstrap", "pending-stop", "pending-delete", "failed-delete"} {
 		t.Run(scenario, func(t *testing.T) {
 			host := "b"
 			if scenario == "paused" {
@@ -767,62 +795,150 @@ func TestRetireCompute(t *testing.T) {
 			}
 			s := h.read()
 			id, name := s.VM.ID, s.VM.Name
+			if scenario == "pending-stop" {
+				s.LateStop = true
+				h.write(s)
+				if _, err := h.run("pause", ""); err == nil {
+					t.Fatal("expected uncertain stop")
+				}
+				s = h.read()
+			}
 			s.Disk = "work deliberately discarded"
-			s.OtherDown = host != "" // Retirement must stay on the recorded backend.
+			s.OtherDown = host != "" // Reconciliation must use the recorded backend.
 			s.LoseDelete = scenario == "lost-reply"
+			s.RejectDelete = scenario == "failed-delete"
 			h.write(s)
-			args := []string{"retire", "amp-thread/with spaces and 'quotes'", id}
-			out, err := h.runArgs(args, "spawn", "unrelated-token", "ORB_SNAPSHOT_ID=unrelated")
-			if s.LoseDelete {
-				if err == nil {
-					t.Fatal("lost deletion reply reported success")
+			path := filepath.Join(h.dir, "state", name+".json")
+			if scenario == "pending-delete" {
+				// Crash after saving provider intent, before submitting it.
+				data, err := os.ReadFile(path)
+				var r record
+				if err != nil || json.Unmarshal(data, &r) != nil {
+					t.Fatal("cannot read provider state", err)
 				}
-				if _, err := h.run("spawn", "late"); err == nil {
-					t.Fatal("pending retirement allowed spawn")
+				r.Phase, r.RequestID = "deleting", "aaaaaaaa-1234-4234-8234-123456789abc"
+				if err := save(path, r); err != nil {
+					t.Fatal(err)
 				}
-				if _, err := h.runArgs([]string{"retire", args[1], "22222222-2222-4222-8222-222222222222"}, "", ""); err == nil {
-					t.Fatal("pending retirement accepted wrong identity")
-				}
-				out, err = h.runArgs(args, "", "")
 			}
-			if err != nil || !strings.Contains(out, "compute retired") {
-				t.Fatalf("retirement failed: %v %s", err, out)
-			}
-			if s := h.read(); s.VM != nil || s.Disk != "" || s.Environment != "" {
-				t.Fatal("retirement left compute or disk behind")
-			}
-			proofPath := filepath.Join(h.dir, "state", name+".json.cleanup")
-			before, err := os.ReadFile(proofPath)
+			before, err := os.ReadFile(path)
 			if err != nil {
-				t.Fatal("no retained cleanup receipt", err)
+				t.Fatal(err)
 			}
+			if out, err := h.ssh("delete", name); (err != nil) != (s.LoseDelete || s.RejectDelete) {
+				t.Fatal("unexpected SSH deletion result", err, out)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("manual deletion must leave provider state untouched", err)
+			}
+			if scenario == "failed-delete" {
+				// Model a failure after fencing but before receipt publication.
+				s = h.read()
+				s.VM.State = "deleting"
+				h.write(s)
+				if _, err := h.run("spawn", "blocked-token"); err == nil || h.read().Creates != 1 {
+					t.Fatal("unfinished manual deletion allowed fresh compute")
+				}
+				s.RejectDelete = false
+				h.write(s)
+				if out, err := h.ssh("delete", name); err != nil {
+					t.Fatal("manual deletion retry failed", err, out)
+				}
+			}
+			s = h.read()
+			s.FailGuest, s.LateStop = false, false
+			h.write(s)
+			if scenario == "paused" {
+				h.must("pause", "") // Reconcile without allocating anything.
+				h.must("pause", "")
+			} else if scenario == "lost-reply" {
+				h.must("delete", "")
+				h.must("delete", "")
+			}
+			if h.read().VM != nil {
+				t.Fatal("pause/delete recreated manually deleted compute")
+			}
+			h.must("spawn", "new-token", "SRV_ORB_HOST="+host)
+			h.must("spawn", "repeat-token")
+			if s := h.read(); s.Creates != 2 || s.VM.ID == id || s.VM.Name == name || s.Disk != "fresh disk" {
+				t.Fatal("manual deletion did not yield exactly one fresh successor")
+			}
+			data, err := os.ReadFile(path + ".cleanup")
 			var proof map[string]any
-			if err := json.Unmarshal(before, &proof); err != nil || proof["instance_id"] != id || proof["version"] != float64(3) || proof["gateways_absent"] != true || proof["storage_absent"] != true {
-				t.Fatal("retirement lacks bound v3 proof", err)
-			}
-			// Retrying the operator command and later Amp jobs cannot recreate
-			// compute or overwrite the retained disposition.
-			if out, err := h.runArgs(args, "", ""); err != nil {
-				t.Fatal(err, out)
-			}
-			if _, err := h.runArgs([]string{"retire", args[1], "22222222-2222-4222-8222-222222222222"}, "", ""); err == nil {
-				t.Fatal("completed retirement accepted wrong identity")
-			}
-			h.must("pause", "")
-			if out, err := h.run("spawn", "later"); err == nil || !strings.Contains(out, "intentionally retired") || !strings.Contains(out, "fresh-start") {
-				t.Fatalf("resume did not explain retirement: %v %s", err, out)
-			}
-			h.must("delete", "")
-			after, err := os.ReadFile(proofPath)
-			if err != nil || string(before) != string(after) || h.read().VM != nil {
-				t.Fatal("retirement disposition changed", err)
+			if err != nil || json.Unmarshal(data, &proof) != nil || proof["instance_id"] != id || proof["request_id"] != s.Proof["request_id"] {
+				t.Fatal("external cleanup receipt was not retained", err)
 			}
 		})
 	}
 }
 
-func TestRetireRejectsUnconfirmedCompute(t *testing.T) {
-	for _, scenario := range []string{"wrong-id", "invalid-uuid", "malformed-command", "env-only", "unknown-orb", "missing-vm", "replaced-vm", "pending-stop", "deleted"} {
+func TestExternalDeleteRequiresBoundReceipt(t *testing.T) {
+	for _, failure := range []string{"missing", "backend", "uuid", "created-at", "partial", "unreachable", "name-reused", "local-write"} {
+		t.Run(failure, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.must("spawn", "old-token")
+			old := *h.read().VM
+			path := filepath.Join(h.dir, "state", old.Name+".json")
+			if out, err := h.ssh("delete", old.Name); err != nil {
+				t.Fatal(err, out)
+			}
+			original := h.read()
+			s := h.read()
+			switch failure {
+			case "missing":
+				s.Proof = nil
+			case "backend":
+				s.Proof["backend_id"] = "other-backend"
+			case "uuid":
+				s.Proof["instance_id"] = "22222222-2222-4222-8222-222222222222"
+			case "created-at":
+				s.Proof["created_at"] = "2025-01-02T03:04:05Z"
+			case "partial":
+				s.Proof["storage_absent"] = false
+			case "unreachable":
+				s.Unreachable = true
+			case "name-reused":
+				s.VM = &old
+				s.VM.ID = "22222222-2222-4222-8222-222222222222"
+				s.Disk = "another instance must not be touched"
+			case "local-write":
+				if err := os.Mkdir(path+".cleanup", 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.write(s)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.run("spawn", "blocked-token"); err == nil {
+				t.Fatal("unproven deletion or lost local receipt accepted")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != string(before) || h.read().Creates != 1 {
+				t.Fatal("failed reconciliation replaced the recorded incarnation", err)
+			}
+			if failure == "name-reused" && (h.read().VM.ID != s.VM.ID || h.read().Disk != s.Disk) {
+				t.Fatal("replacement with reused name was changed")
+			}
+			if failure == "local-write" {
+				if err := os.Remove(path + ".cleanup"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.write(original)
+			h.must("spawn", "recovered-token")
+			h.must("spawn", "repeated-token")
+			if s := h.read(); s.Creates != 2 || s.VM.Name == old.Name || s.Disk != "fresh disk" {
+				t.Fatal("retry did not leave exactly one fresh successor")
+			}
+		})
+	}
+}
+
+func TestRetireCommandRemoved(t *testing.T) {
+	for _, scenario := range []string{"command", "env-only", "unknown-orb"} {
 		t.Run(scenario, func(t *testing.T) {
 			h := newHarness(t, "")
 			h.must("spawn", "token")
@@ -830,30 +946,10 @@ func TestRetireRejectsUnconfirmedCompute(t *testing.T) {
 			args := []string{"retire", "amp-thread/with spaces and 'quotes'", s.VM.ID}
 			operation := "delete"
 			switch scenario {
-			case "wrong-id":
-				args[2] = "22222222-2222-4222-8222-222222222222"
-			case "invalid-uuid":
-				args[2] = "not-a-uuid"
-			case "malformed-command":
-				args = args[:2]
 			case "env-only":
 				args, operation = nil, "retire"
 			case "unknown-orb":
 				args[1] = "unknown-orb"
-			case "missing-vm":
-				s.VM, s.Disk = nil, ""
-				h.write(s)
-			case "replaced-vm":
-				s.VM.ID = "22222222-2222-4222-8222-222222222222"
-				h.write(s)
-			case "pending-stop":
-				s.LateStop = true
-				h.write(s)
-				if _, err := h.run("pause", ""); err == nil {
-					t.Fatal("expected pending stop")
-				}
-			case "deleted":
-				h.must("delete", "")
 			}
 			before, err := os.ReadFile(filepath.Join(h.dir, "server.json"))
 			if err != nil {
@@ -862,7 +958,7 @@ func TestRetireRejectsUnconfirmedCompute(t *testing.T) {
 			// A malformed operator invocation must not fall back to an Amp
 			// delete job inherited from the environment.
 			if out, err := h.runArgs(args, operation, ""); err == nil {
-				t.Fatal("unconfirmed retirement succeeded", out)
+				t.Fatal("removed retirement command succeeded", out)
 			}
 			after, err := os.ReadFile(filepath.Join(h.dir, "server.json"))
 			if err != nil || string(before) != string(after) {
@@ -878,16 +974,14 @@ func TestRetireRejectsUnconfirmedCompute(t *testing.T) {
 	}
 }
 
-func TestFreshStartRejectsWaitingProviderJobs(t *testing.T) {
+func TestFreshComputeRejectsWaitingProviderJobs(t *testing.T) {
 	for _, operation := range []string{"spawn", "pause", "delete"} {
 		t.Run(operation, func(t *testing.T) {
 			h := newHarness(t, "b")
 			h.must("spawn", "first-token", "SRV_ORB_HOST=b")
 			old := h.read().VM
 			orbID := "amp-thread/with spaces and 'quotes'"
-			if out, err := h.runArgs([]string{"retire", orbID, old.ID}, "", ""); err != nil {
-				t.Fatal(err, out)
-			}
+			h.must("delete", "")
 			path := filepath.Join(h.dir, "state", old.Name+".json")
 			lock, err := os.OpenFile(path+".lock", os.O_RDWR, 0)
 			if err != nil {
@@ -920,16 +1014,9 @@ func TestFreshStartRejectsWaitingProviderJobs(t *testing.T) {
 			if n, err := unix.Poll(poll, 10000); err != nil || n != 1 {
 				t.Fatalf("provider did not reach the held lock: %d, %v", n, err)
 			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var retired record
-			if err := json.Unmarshal(data, &retired); err != nil {
-				t.Fatal(err)
-			}
-			c := config{directory: filepath.Dir(path), endpoint: "srv"}
-			if err := authorizeFreshStart(c, path, job{id: orbID, expected: old.ID}, retired); err != nil {
+			// Simulate a concurrent spawn having published its successor while
+			// the old job waits. It must not bootstrap, stop or delete that VM.
+			if err := save(path, record{OrbID: orbID, Endpoint: "srv", Name: orbName(orbID, old.ID), Host: "b", Phase: "new", PreviousInstanceID: old.ID}); err != nil {
 				t.Fatal(err)
 			}
 			read := func(path string) string {
@@ -955,13 +1042,12 @@ func TestFreshStartRejectsWaitingProviderJobs(t *testing.T) {
 	}
 }
 
-func TestFreshStartLifecycle(t *testing.T) {
+func TestFreshComputeLifecycle(t *testing.T) {
 	for _, template := range []bool{false, true} {
 		t.Run(fmt.Sprint(template), func(t *testing.T) {
 			h := newHarness(t, "b")
 			h.must("spawn", "first-token", "SRV_ORB_HOST=b")
 			statePath := filepath.Join(h.dir, "state", h.read().VM.Name+".json")
-			var authorizations [][]string
 			snapshot := "ORB_SNAPSHOT_ID="
 			wantDisk := "fresh disk"
 			if template {
@@ -978,50 +1064,49 @@ func TestFreshStartLifecycle(t *testing.T) {
 				oldID, oldName := s.VM.ID, s.VM.Name
 				s.Disk = "uncommitted work deliberately discarded"
 				h.write(s)
-				orbID := "amp-thread/with spaces and 'quotes'"
-				if out, err := h.runArgs([]string{"retire", orbID, oldID}, "", ""); err != nil {
-					t.Fatal(err, out)
+				if cycle == 0 {
+					if out, err := h.ssh("delete", oldName); err != nil {
+						t.Fatal(err, out)
+					}
+				} else {
+					h.must("delete", "")
 				}
-				retired, err := os.ReadFile(statePath)
-				if err != nil {
-					t.Fatal(err)
+				// Reconcile both entry points without creating compute yet.
+				h.must("delete", "")
+				h.must("delete", "")
+				if h.read().VM != nil {
+					t.Fatal("delete retry recreated compute")
 				}
 				proofPath := filepath.Join(h.dir, "state", oldName+".json.cleanup")
 				proof, err := os.ReadFile(proofPath)
 				if err != nil {
 					t.Fatal(err)
 				}
-				args := []string{"fresh-start", orbID, oldID}
-				authorizations = append(authorizations, args)
-				for i := 0; i < 2; i++ {
-					if out, err := h.runArgs(args, "delete", "inherited", "ORB_SNAPSHOT_ID=unrelated"); err != nil {
-						t.Fatal("fresh-start authorization failed", err, out)
-					}
-					if h.read().VM != nil {
-						t.Fatal("authorization started compute without an Amp spawn")
-					}
-				}
-				archive, err := os.ReadFile(statePath + ".retired-" + oldID)
-				if err != nil || string(archive) != string(retired) {
-					t.Fatal("prior identity/counter record was not retained exactly", err)
-				}
 				h.must("spawn", "fresh-token", snapshot)
 				s = h.read()
-				if s.VM.ID == oldID || s.VM.Name == oldName || s.VM.Generation != 1 || s.Disk != wantDisk || !strings.Contains(s.Environment, `ORB_TOKEN="fresh-token"`) {
+				if s.Creates != cycle+2 || s.VM.ID == oldID || s.VM.Name == oldName || s.VM.Generation != 1 || s.Disk != wantDisk || !strings.Contains(s.Environment, `ORB_TOKEN="fresh-token"`) {
 					t.Fatalf("fresh spawn did not create an independent workspace: %+v", s.VM)
+				}
+				// A damaged old archive must not block a healthy successor. No
+				// archive is created by the new lifecycle in the first place.
+				archive := statePath + ".retired-" + oldID
+				if _, err := os.Stat(archive); !os.IsNotExist(err) {
+					t.Fatal("unexpected predecessor archive", err)
+				}
+				if err := os.WriteFile(archive, []byte("legacy damaged archive"), 0600); err != nil {
+					t.Fatal(err)
 				}
 				newID := s.VM.ID
 				s.Disk = "new work survives resume"
 				h.write(s)
-				for _, old := range authorizations {
-					if out, err := h.runArgs(old, "", ""); err != nil {
-						t.Fatal("repeated authorization failed", err, out)
-					}
-				}
+				h.must("spawn", "repeat-token")
 				h.must("pause", "")
+				if err := os.Remove(archive); err != nil {
+					t.Fatal(err)
+				}
 				h.must("spawn", "resume-token")
 				s = h.read()
-				if s.VM.ID != newID || s.Disk != "new work survives resume" {
+				if s.Creates != cycle+2 || s.VM.ID != newID || s.Disk != "new work survives resume" {
 					t.Fatal("fresh workspace was reset instead of resumed")
 				}
 				retained, err := os.ReadFile(proofPath)
@@ -1029,83 +1114,93 @@ func TestFreshStartLifecycle(t *testing.T) {
 					t.Fatal("prior cleanup receipt was overwritten", err)
 				}
 			}
-			id := h.read().VM.ID
 			h.must("delete", "")
-			for _, old := range authorizations {
-				if out, err := h.runArgs(old, "", ""); err != nil || h.read().VM != nil {
-					t.Fatal("historical authorization did not remain a no-op", err, out)
-				}
-			}
-			if _, err := h.runArgs([]string{"fresh-start", "amp-thread/with spaces and 'quotes'", id}, "", ""); err == nil {
-				t.Fatal("ordinary deletion allowed fresh start")
-			}
 		})
 	}
 }
 
-func TestDeleteClosesRetirement(t *testing.T) {
-	for _, lostReply := range []bool{false, true} {
-		t.Run(fmt.Sprint(lostReply), func(t *testing.T) {
+func TestSpawnResumesDeletion(t *testing.T) {
+	for _, phase := range []string{"deleting", "retiring"} {
+		t.Run(phase, func(t *testing.T) {
 			h := newHarness(t, "")
 			h.must("spawn", "token")
 			s := h.read()
-			id := s.VM.ID
-			s.LoseDelete = lostReply
+			old := *s.VM
+			s.RejectDelete = true
 			h.write(s)
-			args := []string{"retire", "amp-thread/with spaces and 'quotes'", id}
-			if out, err := h.runArgs(args, "", ""); (err != nil) != lostReply {
-				t.Fatal("unexpected retirement result", err, out)
+			if _, err := h.run("delete", ""); err == nil {
+				t.Fatal("expected cleanup failure")
 			}
-			h.must("delete", "")
-			h.must("delete", "")
-			args[0] = "fresh-start"
-			if _, err := h.runArgs(args, "", ""); err == nil {
-				t.Fatal("Amp deletion left fresh-start permission")
+			request := h.read().DeleteRequestID
+			path := filepath.Join(h.dir, "state", old.Name+".json")
+			data, err := os.ReadFile(path)
+			var r record
+			if err != nil || json.Unmarshal(data, &r) != nil {
+				t.Fatal("cannot read pending deletion", err)
 			}
-			if _, err := h.run("spawn", "late"); err == nil || h.read().VM != nil {
-				t.Fatal("Amp deletion allowed recreation")
+			r.Phase = phase // Also exercise records left by older dispatchers.
+			if err := save(path, r); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.run("spawn", "blocked-token"); err == nil {
+				t.Fatal("spawn ignored cleanup failure")
+			}
+			s = h.read()
+			if s.Creates != 1 || s.VM.ID != old.ID || s.VM.Generation != old.Generation || s.DeleteRequestID != request {
+				t.Fatal("failed cleanup changed compute or its owning request")
+			}
+			s.RejectDelete, s.LoseDelete = false, true
+			h.write(s)
+			h.must("spawn", "lost-reply-token")
+			if s := h.read(); s.Creates != 2 || s.Proof["request_id"] != request {
+				t.Fatal("spawn did not finish the original deletion before replacement")
+			}
+			h.must("spawn", "repeat-token")
+			if s := h.read(); s.Creates != 2 || s.VM.ID == old.ID || s.VM.Name == old.Name || s.Disk != "fresh disk" {
+				t.Fatal("cleanup retry did not leave exactly one successor")
 			}
 		})
 	}
 }
 
-func TestFreshStartRequiresRetirementProof(t *testing.T) {
-	for _, scenario := range []string{"managed", "pending-retirement", "wrong-id", "env-only", "malformed-command", "missing-proof", "partial-proof", "archive-conflict"} {
+func TestFreshComputeRequiresCleanupProof(t *testing.T) {
+	for _, scenario := range []string{"missing-proof", "partial-proof", "wrong-id", "wrong-request", "missing-binding"} {
 		t.Run(scenario, func(t *testing.T) {
 			h := newHarness(t, "")
 			h.must("spawn", "token")
 			s := h.read()
-			id, name := s.VM.ID, s.VM.Name
+			name := s.VM.Name
 			path := filepath.Join(h.dir, "state", name+".json")
-			args := []string{"retire", "amp-thread/with spaces and 'quotes'", id}
-			if scenario != "managed" {
-				s.LoseDelete = scenario == "pending-retirement"
-				h.write(s)
-				if out, err := h.runArgs(args, "", ""); (err != nil) != s.LoseDelete {
-					t.Fatal(err, out)
-				}
+			h.must("delete", "")
+			original, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
 			}
-			args[0] = "fresh-start"
-			operation := "delete"
+			s = h.read()
 			switch scenario {
 			case "wrong-id":
-				args[2] = "22222222-2222-4222-8222-222222222222"
-			case "env-only":
-				args, operation = nil, "fresh-start"
-			case "malformed-command":
-				args = args[:2]
+				s.Proof["instance_id"] = "22222222-2222-4222-8222-222222222222"
+			case "wrong-request":
+				s.Proof["request_id"] = "22222222-2222-4222-8222-222222222222"
 			case "missing-proof":
 				if err := os.Remove(path + ".cleanup"); err != nil {
 					t.Fatal(err)
 				}
 			case "partial-proof":
-				s = h.read()
 				delete(s.Proof, "gateways_absent")
-				if err := save(path+".cleanup", s.Proof); err != nil {
+			case "missing-binding":
+				data, err := os.ReadFile(path)
+				var r record
+				if err != nil || json.Unmarshal(data, &r) != nil {
+					t.Fatal("cannot read deletion", err)
+				}
+				r.InstanceID, r.RequestID = "", ""
+				if err := save(path, r); err != nil {
 					t.Fatal(err)
 				}
-			case "archive-conflict":
-				if err := os.WriteFile(path+".retired-"+id, []byte("{}"), 0600); err != nil {
+			}
+			if scenario != "missing-proof" {
+				if err := save(path+".cleanup", s.Proof); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1117,8 +1212,8 @@ func TestFreshStartRequiresRetirementProof(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if out, err := h.runArgs(args, operation, ""); err == nil {
-				t.Fatal("unproven fresh start accepted", out)
+			if out, err := h.run("spawn", "blocked-token"); err == nil {
+				t.Fatal("unproven fresh compute accepted", out)
 			}
 			after, err := os.ReadFile(path)
 			if err != nil || string(before) != string(after) {
@@ -1128,16 +1223,115 @@ func TestFreshStartRequiresRetirementProof(t *testing.T) {
 			if err != nil || string(server) != string(after) {
 				t.Fatal("rejection changed backend state", err)
 			}
+			// Restoring the original evidence permits the same spawn to retry.
+			if err := os.WriteFile(path, original, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := save(path+".cleanup", h.read().Proof); err != nil {
+				t.Fatal(err)
+			}
+			h.must("spawn", "recovered-token")
+			if s := h.read(); s.Creates != 2 || s.Disk != "fresh disk" {
+				t.Fatal("restored evidence did not permit fresh compute")
+			}
 		})
 	}
 }
 
-func TestFreshStartDoesNotClaimOldSnapshots(t *testing.T) {
+func TestFreshComputeRecovery(t *testing.T) {
+	for _, scenario := range []string{"legacy-retired", "published", "unreachable", "lost-create", "rejected-create", "lost-bootstrap"} {
+		t.Run(scenario, func(t *testing.T) {
+			h := newHarness(t, "b")
+			h.must("spawn", "first-token", "SRV_ORB_HOST=b")
+			old := *h.read().VM
+			path := filepath.Join(h.dir, "state", old.Name+".json")
+			h.must("delete", "")
+			data, err := os.ReadFile(path)
+			var r record
+			if err != nil || json.Unmarshal(data, &r) != nil {
+				t.Fatal("cannot read completed deletion", err)
+			}
+			if scenario == "legacy-retired" {
+				r.Phase = "retired"
+			} else if scenario == "published" {
+				// Crash after durable successor publication, before create. This
+				// is also the state left by the removed fresh-start command.
+				r = record{OrbID: r.OrbID, Endpoint: "srv", Name: orbName(r.OrbID, old.ID), Host: "b", Phase: "new", PreviousInstanceID: old.ID}
+			}
+			if err := save(path, r); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "legacy-retired" {
+				if out, err := h.runArgs([]string{"fresh-start", r.OrbID, old.ID}, "delete", ""); err == nil || !strings.Contains(out, "usage:") {
+					t.Fatal("removed command accepted or fell through to inherited job", err, out)
+				}
+				if _, err := h.run("fresh-start", ""); err == nil {
+					t.Fatal("removed operation accepted through environment")
+				}
+			}
+			s := h.read()
+			s.Unreachable = scenario == "unreachable"
+			s.LoseCreate = scenario == "lost-create"
+			s.RejectCreate = scenario == "rejected-create"
+			s.LoseBootstrap = scenario == "lost-bootstrap"
+			h.write(s)
+			out, err := h.run("spawn", "new-token", "SRV_ORB_HOST=b")
+			if (err != nil) != (scenario != "legacy-retired" && scenario != "published") {
+				t.Fatal("unexpected first spawn result", err, out)
+			}
+			s = h.read()
+			s.Unreachable, s.LoseCreate, s.RejectCreate, s.LoseBootstrap = false, false, false, false
+			h.write(s)
+			if scenario == "lost-create" || scenario == "rejected-create" {
+				if _, err := h.run("spawn", "retry-token"); err == nil || h.read().Creates != s.Creates {
+					t.Fatal("uncertain successor creation was adopted or retried")
+				}
+				if scenario == "rejected-create" {
+					if s.VM != nil || s.Creates != 1 {
+						t.Fatal("rejected create unexpectedly allocated a successor")
+					}
+					return // Unknown outcome remains fenced; no safe automatic retry.
+				}
+				if out, err := h.runArgs([]string{"bind", r.OrbID, s.VM.ID}, "", ""); err != nil {
+					t.Fatal("cannot bind reconciled successor", err, out)
+				}
+			}
+			h.must("spawn", "retry-token")
+			s = h.read()
+			if s.Creates != 2 || s.VM.ID == old.ID || s.VM.Name == old.Name || s.Disk != "fresh disk" || !strings.Contains(s.Environment, `ORB_TOKEN="retry-token"`) {
+				t.Fatal("retry did not leave one independently bound successor")
+			}
+		})
+	}
+}
+
+func TestDeleteBeforeFirstSpawn(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprint(legacy), func(t *testing.T) {
+			h := newHarness(t, "")
+			h.must("delete", "")
+			h.must("delete", "")
+			if legacy {
+				id := "amp-thread/with spaces and 'quotes'"
+				r := record{OrbID: id, Endpoint: "srv", Name: orbName(id, ""), Phase: "deleted"}
+				if err := save(filepath.Join(h.dir, "state", r.Name+".json"), r); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.must("spawn", "first-token")
+			h.must("spawn", "repeat-token")
+			if s := h.read(); s.Creates != 1 || s.Disk != "fresh disk" {
+				t.Fatal("delete of unallocated orb prevented or duplicated creation")
+			}
+		})
+	}
+}
+
+func TestFreshComputeDoesNotClaimOldSnapshots(t *testing.T) {
 	for _, phase := range []string{"ready", "creating", "legacy-creating"} {
 		t.Run(phase, func(t *testing.T) {
 			h := newHarness(t, "")
 			h.must("spawn", "token")
-			id := h.read().VM.ID
 			h.must("pause", "", "ORB_SNAPSHOT_ID=old-template")
 			paths, err := filepath.Glob(filepath.Join(h.dir, "state", "project-*.json"))
 			if err != nil || len(paths) != 1 {
@@ -1160,12 +1354,7 @@ func TestFreshStartDoesNotClaimOldSnapshots(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			args := []string{"retire", "amp-thread/with spaces and 'quotes'", id}
-			if out, err := h.runArgs(args, "", ""); err != nil {
-				t.Fatal(err, out)
-			}
-			args[0] = "fresh-start"
-			if out, err := h.runArgs(args, "", ""); err != nil {
+			if out, err := h.ssh("delete", h.read().VM.Name); err != nil {
 				t.Fatal(err, out)
 			}
 			h.must("spawn", "new-token")

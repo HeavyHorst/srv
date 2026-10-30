@@ -117,25 +117,29 @@ func resolveOperation(ctx context.Context, c config, path string, r *record) err
 	return save(path, r)
 }
 
-func finishDelete(ctx context.Context, c config, path string, r record) error {
-	phase := "deleted"
-	if r.Phase == "retiring" {
-		phase = "retired"
-	} else if r.Phase != "deleting" {
-		return errors.New("cleanup requires pending deletion or retirement")
+func finishDelete(ctx context.Context, c config, path string, r *record) error {
+	if r.Phase != "deleting" {
+		return errors.New("cleanup requires pending deletion")
 	}
 	if r.RequestID == "" || r.InstanceID == "" {
 		return errors.New("delete binding missing; operator reconciliation required")
 	}
-	data, err := control(ctx, c, r, "cleanup-receipt", r.RequestID)
+	external := false
+	data, err := control(ctx, c, *r, "cleanup-receipt", r.RequestID)
 	if err != nil {
 		// Missing receipt is not success. Resume the same bound intent; the
 		// backend serializes it and returns an existing receipt without effects.
-		args := append([]string{"delete", r.Name, "--expect", r.RequestID}, identity(r)...)
-		if _, err := control(ctx, c, r, args...); err != nil {
-			return err
+		args := append([]string{"delete", r.Name, "--expect", r.RequestID}, identity(*r)...)
+		if _, submitErr := control(ctx, c, *r, args...); submitErr != nil {
+			// SSH deletion may have won before our intent reached srv.
+			data, err = control(ctx, c, *r, "cleanup-receipt", "--instance", r.InstanceID)
+			if err != nil {
+				return submitErr
+			}
+			external = true
+		} else {
+			data, err = control(ctx, c, *r, "cleanup-receipt", r.RequestID)
 		}
-		data, err = control(ctx, c, r, "cleanup-receipt", r.RequestID)
 		if err != nil {
 			return err
 		}
@@ -144,6 +148,13 @@ func finishDelete(ctx context.Context, c config, path string, r record) error {
 	if err := json.Unmarshal(data, &proof); err != nil {
 		return err
 	}
+	if external {
+		r.RequestID = proof.RequestID
+	}
+	return saveCleanup(path, *r, proof)
+}
+
+func saveCleanup(path string, r record, proof model.CleanupReceipt) error {
 	if err := validateCleanupReceipt(r, proof); err != nil {
 		return err
 	}
@@ -160,7 +171,7 @@ func finishDelete(ctx context.Context, c config, path string, r record) error {
 	if err := save(proofPath, proof); err != nil {
 		return err
 	}
-	r.Phase = phase
+	r.Phase = "deleted"
 	return save(path, r)
 }
 

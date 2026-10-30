@@ -2141,7 +2141,7 @@ func TestStartRejectsWhenHostMemoryIsLow(t *testing.T) {
 		t.Fatalf("CreateInstance(): %v", err)
 	}
 
-	if _, err := p.Start(ctx, inst.Name); err == nil || !strings.Contains(err.Error(), "insufficient host memory") {
+	if _, err := p.Start(ctx, inst.Name); !errors.Is(err, ErrStartRejected) || !strings.Contains(err.Error(), "insufficient host memory") {
 		t.Fatalf("Start() memory capacity error = %v", err)
 	}
 }

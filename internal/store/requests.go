@@ -63,6 +63,19 @@ func (s *Store) FinishLifecycleRequest(ctx context.Context, id, actor string, ex
 	return n == 1, err
 }
 
+// RejectLifecycleStart records a proven pre-launch rejection, not a generic
+// failure. Its tombstone still prevents the same request from executing again.
+func (s *Store) RejectLifecycleStart(ctx context.Context, id, actor string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE lifecycle_requests SET phase='rejected',exit_code=1 WHERE id=? AND actor=? AND command='start' AND phase='executing'`, id, actor)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		return fmt.Errorf("start request no longer executing: %v", err)
+	}
+	return nil
+}
+
 // Called once by the exclusive service owner before accepting commands, not by
 // Store.Open (which is also used by offline tools). Interrupted is uncertain.
 func (s *Store) InterruptLifecycleRequests(ctx context.Context) error {

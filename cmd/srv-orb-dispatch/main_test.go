@@ -67,6 +67,7 @@ type testServer struct {
 	OtherDown       bool
 	LoseCreate      bool
 	RejectCreate    bool
+	RejectStart     bool
 	LoseStop        bool
 	LoseDelete      bool
 	RejectDelete    bool
@@ -291,6 +292,13 @@ func fakeSSH() error {
 		if err := finish("start", 0); err != nil {
 			return err
 		}
+		if s.RejectStart {
+			s.Results[args[4]]["phase"], s.Results[args[4]]["exit_code"] = "rejected", 1
+			if err := write(); err != nil {
+				return err
+			}
+			return fmt.Errorf("insufficient host memory")
+		}
 		if s.VM.State != "stopped" {
 			return fmt.Errorf("already running")
 		}
@@ -423,6 +431,60 @@ func (h harness) ssh(args ...string) (string, error) {
 	cmd.Env = []string{"SRV_ORB_TEST_MODE=ssh", "SRV_ORB_TEST_SERVER=" + filepath.Join(h.dir, "server.json")}
 	b, err := cmd.CombinedOutput()
 	return string(b), err
+}
+
+func TestDispatchRetriesRejectedStart(t *testing.T) {
+	for _, phase := range []string{"rejected", "failed", "executing", "interrupted", "wrong-binding"} {
+		t.Run(phase, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.must("spawn", "initial-token")
+			h.must("pause", "")
+			s := h.read()
+			s.RejectStart, s.Disk = true, "saved workspace"
+			h.write(s)
+			if _, err := h.run("spawn", "rejected-token"); err == nil {
+				t.Fatal("rejected start reported success")
+			}
+			s = h.read()
+			var rejectedID string
+			for id, result := range s.Results {
+				if result["command"] == "start" {
+					rejectedID = id
+					if phase == "wrong-binding" {
+						result["arguments"] = `[]`
+					} else {
+						result["phase"] = phase
+					}
+				}
+			}
+			if rejectedID == "" {
+				t.Fatal("missing start request")
+			}
+			s.RejectStart = false
+			h.write(s)
+			_, err := h.run("spawn", "retry-token")
+			if (err == nil) != (phase == "rejected") {
+				t.Fatal("incorrect retry disposition", err)
+			}
+			s = h.read()
+			starts := 0
+			for id, result := range s.Results {
+				if result["command"] == "start" {
+					starts++
+					if id != rejectedID && result["phase"] != "done" {
+						t.Fatal("new start did not finish")
+					}
+				}
+			}
+			wantStarts, wantState := 1, "stopped"
+			if phase == "rejected" {
+				wantStarts, wantState = 2, "ready"
+			}
+			if starts != wantStarts || s.VM.State != wantState || s.Creates != 1 || s.Disk != "saved workspace" {
+				t.Fatal("retry replayed or replaced the workspace", starts, s.VM)
+			}
+		})
+	}
 }
 
 func TestDispatchLifecycle(t *testing.T) {

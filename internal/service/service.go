@@ -3077,6 +3077,11 @@ func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, ou
 
 	inst, err := a.provisioner.Start(ctx, args[1])
 	if err != nil {
+		if len(args) == 8 && errors.Is(err, provision.ErrStartRejected) {
+			if persistErr := a.store.RejectLifecycleStart(ctx, args[3], actor.UserLogin); persistErr != nil {
+				return cleanupError(persistErr)
+			}
+		}
 		stderr := fmt.Sprintf("start %s: %v\n", args[1], err)
 		if inst.Name != "" {
 			stderr += instanceDebugHints(a.cfg.Hostname, inst)

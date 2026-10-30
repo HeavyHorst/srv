@@ -185,6 +185,95 @@ func TestDeleteExpectedRejectsRemovedCommandAndMalformedBinding(t *testing.T) {
 	}
 }
 
+func TestBoundStartRejectionCanUseNewRequest(t *testing.T) {
+	inspect := storage.InspectSubvolume
+	t.Cleanup(func() { storage.InspectSubvolume = inspect })
+	storage.InspectSubvolume = func(_ context.Context, path string) (storage.SubvolumeIdentity, error) {
+		_, err := os.Stat(path)
+		return storage.SubvolumeIdentity{UUID: uuid.NewSHA1(uuid.NameSpaceURL, []byte(path)).String(), ID: "256"}, err
+	}
+	ctx := context.Background()
+	cfg := loadServiceTestConfig(t, nil)
+	st := newServiceTestStore(t)
+	dir, err := os.MkdirTemp("", "srv-reject-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, "helper.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var networkCalls atomic.Int32
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/vm/cold-disk-v1" {
+			io.WriteString(w, `{"phase":"hot","remote":false,"journal_present":false}`)
+			return
+		}
+		networkCalls.Add(1)
+		http.Error(w, "helper outcome unavailable", http.StatusServiceUnavailable)
+	})}
+	go server.Serve(ln)
+	defer server.Close()
+	cfg.VMRunnerSocketPath, cfg.NetHelperSocketPath, cfg.OutboundInterface = socket, socket, "fixture0"
+	a := &App{store: st, backendID: "backend-one", cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	a.provisioner, err = provision.New(cfg, a.log, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := serviceTestInstance("restart-orb", model.StateStopped, time.Now().UTC())
+	i.ID, i.Kind, i.Image = uuid.NewString(), model.KindOrb, "amp-orb"
+	i.RootFSPath = filepath.Join(cfg.InstancesDir(), i.Name, "disk", "rootfs.img")
+	i.KernelPath, i.InitrdPath = filepath.Join(dir, "kernel"), ""
+	for _, path := range []string{i.RootFSPath, i.KernelPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.CreateInstance(ctx, i); err != nil {
+		t.Fatal(err)
+	}
+	neighbor := serviceTestInstance("memory-reservation", model.StateProvisioning, time.Now().UTC())
+	neighbor.MemoryMiB = 1 << 30 // Exceed real host RAM without allocating it.
+	if err := st.CreateInstance(ctx, neighbor); err != nil {
+		t.Fatal(err)
+	}
+	actor := model.Actor{UserLogin: i.CreatedByUser}
+	args := []string{"start", i.Name, "--expect", uuid.NewString(), i.ID, i.CreatedAt.Format(time.RFC3339Nano), a.backendID, i.Image}
+	if _, err := a.dispatch(ctx, actor, commandRequest{args: args}); !errors.Is(err, provision.ErrStartRejected) {
+		t.Fatalf("expected capacity rejection, got %v", err)
+	}
+	if networkCalls.Load() != 0 {
+		t.Fatal("capacity rejection reached runtime/network mutation")
+	}
+	if err := st.InterruptLifecycleRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := a.dispatch(ctx, actor, commandRequest{args: []string{"operation-result", args[3]}})
+	var receipt store.LifecycleRequest
+	if err != nil || json.Unmarshal([]byte(result.stdout), &receipt) != nil || receipt.Phase != "rejected" || receipt.ExitCode == 0 {
+		t.Fatal("rejection was not durable across restart", result, err)
+	}
+	if err := st.DeleteInstance(ctx, neighbor.Name); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.dispatch(ctx, actor, commandRequest{args: args}); err == nil || networkCalls.Load() != 0 {
+		t.Fatal("old request executed after memory became available", err)
+	}
+	args[3] = uuid.NewString()
+	if _, err := a.dispatch(ctx, actor, commandRequest{args: args}); err == nil || errors.Is(err, provision.ErrStartRejected) || networkCalls.Load() == 0 {
+		t.Fatal("new request did not pass capacity validation or helper failure was misclassified", err)
+	}
+	result, err = a.dispatch(ctx, actor, commandRequest{args: []string{"operation-result", args[3]}})
+	if err != nil || json.Unmarshal([]byte(result.stdout), &receipt) != nil || receipt.Phase != "executing" {
+		t.Fatal("uncertain helper failure lost its execution fence", result, err)
+	}
+}
+
 func TestOrbCancellationAdmissionOrders(t *testing.T) {
 	for _, order := range []string{"cancel-first", "execute-first", "race"} {
 		t.Run(order, func(t *testing.T) {

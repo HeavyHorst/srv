@@ -45,6 +45,9 @@ const (
 )
 
 var (
+	// ErrStartRejected marks completed validation with no new runtime start
+	// submitted. Reconciliation, hydration and launch errors are not rejections.
+	ErrStartRejected  = errors.New("start rejected before runtime admission")
 	errGuestNotReady  = errors.New("guest never joined the tailnet before timeout")
 	errGuestExited    = errors.New("guest exited before joining the tailnet")
 	errStartUncertain = errors.New("VM start outcome is unknown; resources retained")
@@ -856,14 +859,14 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 			return fmt.Errorf("instance %q is already starting", name)
 		}
 		if err := p.ensureHostDiskCapacity(ctx, current.Name, current.RootFSSizeBytes); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrStartRejected, err)
 		}
 		if err := p.ensureDiskLayout(ctx, &current); err != nil {
 			return err
 		}
 		inst = current
 		if err := p.ensureStartPrereqs(current); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrStartRejected, err)
 		}
 		if current.FirecrackerPID > 0 && processExists(current.FirecrackerPID) {
 			return fmt.Errorf("instance %q is already running", name)
@@ -871,15 +874,15 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		if current.UsesMemoryPool() {
 			resolvedPool, err := p.requireMemoryPoolForInstance(ctx, current)
 			if err != nil {
-				return err
+				return fmt.Errorf("%w: %w", ErrStartRejected, err)
 			}
 			if err := ensureMemoryPoolSupportsGuestMemory(resolvedPool, p.effectiveMemoryMiB(current)); err != nil {
-				return err
+				return fmt.Errorf("%w: %w", ErrStartRejected, err)
 			}
 			pool = resolvedPool
 		} else {
 			if err := p.ensureHostMemoryCapacity(ctx, current.Name, p.effectiveMemoryMiB(current)); err != nil {
-				return err
+				return fmt.Errorf("%w: %w", ErrStartRejected, err)
 			}
 		}
 

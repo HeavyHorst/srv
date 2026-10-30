@@ -107,7 +107,11 @@ func resolveOperation(ctx context.Context, c config, path string, r *record) err
 		binding = append(binding, strconv.FormatInt(*r.BootstrapGeneration, 10))
 	}
 	expected, _ := json.Marshal(binding)
-	if result.ID != r.RequestID || result.Name != r.Name || result.Command != r.Pending || result.Arguments != string(expected) || (result.Phase != "done" && result.Phase != "cancelled") || result.ExitCode != 0 {
+	terminal := (result.Phase == "done" || result.Phase == "cancelled") && result.ExitCode == 0
+	// A proven start rejection releases only this attempt, never replays its
+	// ID. Generic failures and interrupted execution remain uncertain.
+	terminal = terminal || r.Pending == "start" && result.Phase == "rejected" && result.ExitCode != 0
+	if result.ID != r.RequestID || result.Name != r.Name || result.Command != r.Pending || result.Arguments != string(expected) || !terminal {
 		return errors.New("no bound terminal operation receipt; observation alone cannot clear pending execution")
 	}
 	if r.Pending == "bootstrap" {

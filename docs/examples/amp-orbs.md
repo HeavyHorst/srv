@@ -474,6 +474,14 @@ binding and admission under the instance lock. Repeating an admitted start/stop
 request never reexecutes it. `operation-result REQUEST` only reads its stored result.
 After a lost outer SSH reply, a matching `done` result is sufficient to recover.
 
+Known start-validation failures, such as insufficient memory, produce a durable
+`rejected` result with a nonzero exit code. The next spawn may clear that exact
+bound attempt and submit a new request ID after the problem is resolved; it never
+replays the rejected request. Generic helper, hydration, reconciliation or launch
+failures are not classified as rejections. Existing `executing`/`interrupted`
+records from older versions cannot be retrospectively classified from VM state.
+Upgrade srv and the dispatcher together to use this result.
+
 `srv-orb-dispatch cancel ORB_ID REQUEST` attempts cancellation of a pending
 **start or stop**. srv takes the same instance lock and installs an exactly bound
 cancel tombstone only if the request was never admitted. If the worker won the

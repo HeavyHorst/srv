@@ -105,8 +105,8 @@ func envDefault(key, fallback string) string {
 }
 
 // SRV_ORB_PROXY_BYPASS names the provider-owned destinations appended to the
-// guest's built-in NO_PROXY list. It is read and validated only here, inside
-// the bootstrap payload builder, and travels only in that payload: never in
+// guest's built-in NO_PROXY list. It is read and validated before spawn can
+// change compute, and travels only in the bootstrap payload: never in
 // SSH argv, state records, logs, or the SSH child environment. Unset omits
 // the field entirely, keeping the payload compatible with older srv backends
 // and guest images; an empty value is a configuration error, not "unset".
@@ -212,6 +212,14 @@ func dispatch(ctx context.Context, c config, j job) error {
 	}
 	if strings.ContainsAny(j.token+j.ampURL, "\x00\r\n") {
 		return errors.New("invalid bootstrap environment")
+	}
+	var bypass string
+	if j.operation == "spawn" {
+		var err error
+		bypass, err = proxyBypass()
+		if err != nil {
+			return err
+		}
 	}
 	marker, err := os.ReadFile(filepath.Join(c.directory, "provider.json"))
 	if err != nil || string(marker) != c.endpoint {
@@ -520,10 +528,6 @@ func dispatch(ctx context.Context, c config, j job) error {
 		case "ready":
 			if *r.BootstrapGeneration == int64(^uint64(0)>>1) {
 				return errors.New("bootstrap generation exhausted")
-			}
-			bypass, err := proxyBypass()
-			if err != nil {
-				return err
 			}
 			r.BootstrapFloor = *v.BootstrapGeneration
 			*r.BootstrapGeneration++

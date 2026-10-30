@@ -757,9 +757,7 @@ func TestDispatchProviderProxyBypass(t *testing.T) {
 	oversize := strings.TrimSuffix(strings.Repeat("e"+strings.Repeat("x", 61)+".example,", 8), ",")
 	for _, invalid := range []string{"", "a b", "a*b", `a"b`, "a\\b", "a\nb", "a:b", "a/b", "a?b", "a#b", "a@b", ".", "..", "-", "_", "http://internal", strings.Repeat("x", 254),
 		",a", "a,", "a,,b", "a, b", ".x.com,.x.com", "localhost", ".ts.net", nine, oversize} {
-		// Validation runs in the bootstrap payload builder, so it fails after
-		// inventory but before any credential SSH exchange: a bootstrapped orb
-		// keeps its generation and never sees the invalid value.
+		// A bootstrapped orb keeps its generation and never sees the invalid value.
 		h := newHarness(t, "")
 		h.must("spawn", "first")
 		before := h.read()
@@ -771,6 +769,46 @@ func TestDispatchProviderProxyBypass(t *testing.T) {
 		if after.VM == nil || after.VM.Generation != before.VM.Generation || after.ProxyBypass != nil {
 			t.Fatalf("invalid SRV_ORB_PROXY_BYPASS %q reached bootstrap", invalid)
 		}
+	}
+}
+
+func TestProxyBypassRejectedBeforeComputeChanges(t *testing.T) {
+	for _, state := range []string{"new", "stopped", "deleted"} {
+		t.Run(state, func(t *testing.T) {
+			h := newHarness(t, "")
+			if state != "new" {
+				h.must("spawn", "initial")
+				if state == "stopped" {
+					h.must("pause", "")
+				} else {
+					h.must("delete", "")
+				}
+			}
+			before, err := os.ReadFile(filepath.Join(h.dir, "server.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			invalid := "SRV_ORB_PROXY_BYPASS=http://internal"
+			out, err := h.run("spawn", "invalid-config", invalid)
+			if err == nil || !strings.Contains(out, "SRV_ORB_PROXY_BYPASS") {
+				t.Fatalf("invalid bypass was not rejected: %v %s", err, out)
+			}
+			after, err := os.ReadFile(filepath.Join(h.dir, "server.json"))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("invalid bypass changed backend state before rejection: %v", err)
+			}
+			// Correcting the configuration permits a normal retry. The invalid
+			// setting must never prevent stopping or deleting existing compute.
+			h.must("spawn", "corrected", "SRV_ORB_PROXY_BYPASS=.corp.example")
+			if s := h.read(); s.VM == nil || s.VM.State != "ready" || s.ProxyBypass == nil || *s.ProxyBypass != ".corp.example" {
+				t.Fatal("corrected spawn did not bootstrap compute")
+			}
+			h.must("pause", "", invalid)
+			h.must("delete", "", invalid)
+			if h.read().VM != nil {
+				t.Fatal("invalid bypass prevented deletion")
+			}
+		})
 	}
 }
 

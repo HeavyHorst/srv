@@ -207,8 +207,9 @@ ranges and IPv6 literals are not accepted in this field for the same reason:
 Python's urllib ignores CIDR entries entirely (including the built-in CGNAT
 entry), while curl and Go honor them for IP literals.
 Empty entries, duplicates and repeats of built-in entries are configuration
-errors. The dispatcher validates the list and the guest independently
-re-validates every entry, before any bootstrap generation is consumed, and
+errors. The dispatcher validates the list before spawn creates or starts
+compute; pause and delete remain available with an invalid list. The guest
+independently re-validates every entry before any bootstrap generation is consumed and
 appends the list to the unchanged built-in entries; unset keeps exactly the
 built-in list, and repository setup must not be used to repair this provider
 networking. Bypass only removes the gateway from the path: the guest still

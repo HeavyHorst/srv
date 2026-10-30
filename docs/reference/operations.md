@@ -266,6 +266,14 @@ media integrity; use filesystem scrubbing separately. These bounds are not a
 throughput guarantee. The remote namespace lock serializes transfers, so a long
 upload can delay another instance's hydration; deletion scans all manifests.
 Both hosts need `btrfs-progs`; the backend also needs OpenSSH client and `losetup`.
+The backend's `btrfs receive` needs **btrfs-progs 6.10.1 or newer**, or a
+distribution backport of [the reverse-receive fix](https://github.com/kdave/btrfs-progs/commit/28eb473c517551ae990ad16a698bedb366b8e189).
+Older versions can accept an incremental stream's snapshot parent but fail on
+shared file extents with `clone: cannot find source subvol`: clone lookup only
+checks received UUIDs, not the original local base UUID. Updating the receiver
+preserves incremental hydration; a kernel upgrade or full-transfer workaround
+is not required for this bug. Verify the two-filesystem integration test below
+with the actual receiver binary before enabling offload.
 The runner's private staging beneath `SRV_JAILER_BASE_DIR` must be on the same
 btrfs filesystem as the instance disks; keep its receipt directories root-owned.
 Allow transient space for receiving the full disk before publishing it. Disk

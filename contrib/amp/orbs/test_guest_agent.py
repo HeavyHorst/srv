@@ -211,6 +211,7 @@ class GuestTests(unittest.TestCase):
             def do_GET(self):
                 hits.append(self.headers.get("Host", "").split(":")[0])
                 self.send_response(200)
+                self.send_header("Content-Length", "2")
                 self.end_headers()
                 self.wfile.write(b"ok")
             def log_message(self, *args):

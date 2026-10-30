@@ -260,9 +260,39 @@ func TestBtrfsTwoFilesystems(t *testing.T) {
 			t.Fatalf("modified guest return contents: %q %v", got, err)
 		}
 	})
-	first, p1 := makeSnapshot("first", "first disk", "")
+	// Non-inline shared extents force CLONE commands in the return stream.
+	// Tiny, fully rewritten fixtures exercise only snapshot parent lookup.
+	baseContents := strings.Repeat("base disk data", 32768)
+	first, p1 := makeSnapshot("first", baseContents, "")
 	upload(first, p1, "")
-	second, p2 := makeSnapshot("second", "second disk", first.ID)
+	clone := filepath.Join(local, "clone")
+	if err := storage.SnapshotSubvolume(ctx, p1, clone, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(clone, "rootfs.img")); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, "cp", []string{"--reflink=always", filepath.Join(p1, "rootfs.img"), filepath.Join(clone, "rootfs.img")}, nil, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(clone, "rootfs.img"), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := f.WriteAt([]byte("changed"), 65536)
+	if err := errors.Join(writeErr, f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	p2 := filepath.Join(local, "second")
+	if err := storage.SnapshotSubvolume(ctx, clone, p2, true); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := storage.InspectSubvolume(ctx, p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := baseContents[:65536] + "changed" + baseContents[65543:]
+	second := Object{ID: uuid.NewString(), UUID: identity.UUID, Size: int64(len(contents)), SHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(contents))), Parent: first.ID}
 	upload(second, p2, p1)
 	if err := invoke(request{Operation: "delete", Object: Object{ID: first.ID}}, nil, io.Discard); err == nil {
 		t.Fatal("deleted referenced parent")

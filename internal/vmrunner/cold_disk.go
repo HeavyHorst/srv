@@ -348,6 +348,11 @@ func (s *Server) coldDiskLocked(ctx context.Context, q ColdRequest) (ColdStatus,
 		if s.config.ColdStorage.Host == "" {
 			return result, errors.New("cold storage is disabled")
 		}
+		// Finishing the previous generation's purge removes its staging
+		// directory, including when offload performs that purge in this call.
+		if err := os.Mkdir(stage, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+			return result, err
+		}
 		id, err := storage.ValidateDiskSubvolume(ctx, filepath.Join(dir, "disk"))
 		if err != nil {
 			return result, err

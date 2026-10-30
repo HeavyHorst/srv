@@ -94,6 +94,11 @@ func newColdFixture(t *testing.T) *coldFixture {
 		if err != nil {
 			return err
 		}
+		// Like btrfs snapshot, require the destination's parent to exist.
+		// volume's MkdirAll is only fixture setup, not snapshot behavior.
+		if _, err := os.Stat(filepath.Dir(dest)); err != nil {
+			return err
+		}
 		f.volume(dest, data, id.UUID, "")
 		return nil
 	}

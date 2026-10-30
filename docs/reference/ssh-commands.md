@@ -56,6 +56,7 @@ credentials are JSON on stdin, never command arguments; it does not accept `--js
 | `delete <name>` | Delete an instance's runtime, network, and local/cold disk allocation |
 | `delete <name> --expect REQUEST_ID UUID CREATED_AT BACKEND_ID IMAGE` | Delete the exact expected incarnation; return its durable JSON cleanup receipt |
 | `cleanup-receipt REQUEST_ID` | Read the stored cleanup receipt without executing deletion |
+| `cleanup-receipt --instance UUID` | Read the deleted incarnation's receipt as its original owner or an administrator, without knowing the deletion request ID |
 
 Deletion uses the same durable workflow for VMs and Orbs. It drains gateways,
 stops the runtime, removes any remote cold disk without hydration, and only marks
@@ -95,6 +96,12 @@ state: deleted
 Repeat `delete demo` to resume an incomplete deletion. It reports an error if the
 instance is already deleted. If the name has been reused, however, it selects the
 new instance. Use bound deletion for delayed jobs and automated retries.
+
+For an Amp-managed Orb, manual SSH deletion discards compute, not the Amp thread.
+The next Amp `spawn` retrieves the exact instance's cleanup receipt and creates
+fresh compute with a new name and UUID. No provider-side `retire` command is
+needed or accepted. Pause without deletion still retains the workspace. See
+[discard compute and continue the same thread](../examples/amp-orbs.md#discard-compute-and-continue-the-same-thread).
 
 ### Bound deletion and retries
 
@@ -151,6 +158,18 @@ This only reads the receipt; it does not execute deletion. A receipt establishes
 completion. An error means no receipt could be retrieved, not that deletion had
 no effects. If needed, resubmit the original bound request above.
 
+For manual deletion, or when another administrator performed deletion, query by
+the **original instance UUID saved before deletion** instead:
+
+```bash
+ssh srv-a cleanup-receipt --instance "$(jq -er '.instance.id' demo-before-delete.json)"
+```
+
+This lookup is available to the deleted instance's original owner and current
+administrators, even after name reuse. It does not grant the new same-name
+instance's owner access to the old receipt. Request-ID lookup still requires the
+user who owns that deletion request. Neither lookup starts or retries deletion.
+
 The backend's bound-deletion and receipt handlers return exit code 75 for handled
 errors, including an uncommitted receipt or mismatched request. Do not interpret
 that code as proof that nothing changed. Transport and frontend errors may use
@@ -175,6 +194,7 @@ ssh srv delete "$name" --host a --expect \
   "$request" "$id" "$created" "$backend" "$image"
 
 ssh srv cleanup-receipt "$(cat demo-delete-request.txt)" --host a
+ssh srv cleanup-receipt --instance "$id" --host a
 ```
 
 These are alternative operations, not a sequence to run together. Bound deletion

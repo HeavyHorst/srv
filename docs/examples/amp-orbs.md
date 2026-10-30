@@ -365,104 +365,105 @@ a record is not silently adopted: restore the state backup instead. An unknown
 allocation that cannot satisfy these checks remains unavailable pending a
 separate reconciliation design.
 
-### Retire compute and explicitly start a fresh workspace
+### Discard compute and continue the same thread
 
 An operator can permanently discard an old Orb's compute and workspace without
-requesting deletion of its Amp thread. Run this on the provider machine, using
-the **same account, endpoint and `SRV_ORB_STATE_DIR` as the provider**:
+requesting deletion of its Amp thread. Use the normal srv SSH API as the instance
+owner or an administrator. Here `srv-a` is the direct backend endpoint:
 
 ```bash
-srv-orb-dispatch retire ORB_ID EXPECTED_INSTANCE_UUID
+ssh srv-a orb list
+ssh srv-a -- --json inspect ORB_NAME
+ssh srv-a delete ORB_NAME
 ```
 
-Take `orb_id` and `instance_id` from the existing dispatch record and confirm
-that its `name`, `host` and instance identity match the intended Orb in srv
-inspection. The UUID is an explicit confirmation, not a name lookup or force
-option. Unknown, unbound or mismatched instances are rejected. This is an
-operator command, not an additional `ORB_OPERATION` value.
+Confirm that the name, backend and instance identity match the intended Orb.
+Through srv-front, add `--host HOST` to select its backend. For delayed automation
+or retries that must survive name reuse, use
+[`delete NAME --expect …`](../reference/ssh-commands.md#bound-deletion-and-retries)
+with the saved identity and request ID instead of bare deletion.
 
-**Retirement destroys the Orb's disk, including uncommitted work.** Save any
-required files first. Unlike `pause`, it is not resumable. Unlike deleting the
-thread in Amp, it makes no Amp API call: conversation history and attachments
+**Deletion destroys the Orb's disk, including uncommitted work.** Save any
+required files first. Unlike `pause`, it does not preserve the workspace. This
+SSH command makes no Amp API call: conversation history and attachments
 already stored by Amp remain subject to Amp's own access and retention rules.
 They are not a backup of the whole filesystem. Amp's UI may not immediately
-reflect provider-side retirement; subsequent dispatched spawn jobs explicitly
-refuse to resume until an operator authorizes a fresh workspace for that thread.
+reflect provider-side deletion. The next Amp `spawn` creates fresh compute for
+the same thread; no separate authorization command is needed.
 
-The command takes the existing per-Orb lock and uses srv's `delete NAME --expect …` API,
-including the complete backend identity and gateway/runtime/network/storage
-proof. It records `retiring` before sending the request and `retired` only after
-verifying and saving the exact cleanup receipt. Individual backups,
-project templates and shared host snapshots remain outside deletion scope. Ordinary
-Amp deletion records are not relabeled or upgraded to retirement.
+Manual SSH deletion leaves the dispatch record untouched. On the next Amp job,
+the dispatcher queries the recorded backend for `cleanup-receipt --instance UUID`
+when its managed VM is absent. Only the complete, matching receipt permits it to
+record deletion and release pending work. The query uses the original instance
+UUID, not a reused name; the original owner and administrators can read it even
+when a different administrator performed deletion. Amp `delete` still records its
+own deletion request before submission. Both paths save the authoritative receipt
+before publishing the deleted state.
+Individual backups, project templates and shared host snapshots remain outside
+deletion scope.
 
-If the reply is lost, repeat the **same command and UUID**. A pending retirement
-reads the original receipt or resubmits the exact same bound deletion request.
-Failed preflight is rechecked; incomplete cleanup resumes under its existing
-fence. An absent VM alone never reports success.
-Uncertain start/stop operations still block retirement. Later Amp `delete` may
-finish reading the same retirement receipt, but makes the disposition ordinary
-`deleted`, not eligible for fresh start. Amp `delete` after completed retirement
-also closes that lifecycle permanently. `pause` after retirement is a no-op.
-The original identity, receipt and lock files remain.
+Failed preflight is rechecked on retry; incomplete SSH deletion resumes under its
+existing fence through srv background reconciliation or another `delete`.
+For a lost reply, query `cleanup-receipt --instance UUID` or repeat the saved bound
+request. An absent VM alone never reports success. The dispatcher creates nothing
+until cleanup succeeds and its receipt is saved locally; lookup or persistence
+failures can be retried. A pending Amp deletion can also be completed by a later
+`delete` or `spawn`. Repeated Amp `delete` and `pause` after completed deletion are
+no-ops until another spawn. A saved bound deletion for the old instance never
+deletes the successor.
 
-To continue the **same retained thread** with a new workspace:
+To continue the **same retained thread**, send a new message in Amp. Its `spawn`
+supplies the fresh token. Following Amp's
+[dispatch contract](https://ampcode.com/docs/orbs/self-hosted#dispatch-contract),
+the dispatcher resumes an existing VM or creates a new one after confirmed
+deletion. This applies after both manual SSH deletion and ordinary Amp deletion.
 
-1. Quiesce the thread's upstream work and stop provider admission. With the example
-   service this requires stopping `srv-orbs` and ensuring its dispatcher children
-   and lock waiters have exited. Resolve outstanding srv operations and complete
-   retirement first; killing a client is not proof that its backend work stopped.
-2. While admission remains stopped, run under the same provider account/config:
-
-   ```bash
-   srv-orb-dispatch fresh-start ORB_ID RETIRED_INSTANCE_UUID
-   ```
-
-3. Resume provider admission only after old upstream work is drained. Send a new
-   message in the retained Amp thread to request a fresh `spawn` and token.
-
-The authorization command itself starts no VM and needs no token. It requires
-the completed retirement and its full v3, v4 or v5 receipt, then records one successor
-with a distinct srv name. The next spawn uses normal base-image or ready project
-snapshot selection, creates a new instance UUID, and bootstraps it with the new
-token. Amp's documented fresh-disk contract runs repository setup again when
-needed; prepared snapshots may skip setup. This does **not** restore the retired
-thread's uncommitted changes. Subsequent pause/wake retains the successor's own
-disk and follows normal resume behavior.
+The dispatcher validates the completed deletion's full v3, v4 or v5 receipt,
+then durably publishes one successor with a distinct srv name before attempting
+creation. The new VM uses normal base-image or ready project snapshot selection,
+gets a new instance UUID, and bootstraps with the new token. Amp runs repository
+setup again when needed; prepared snapshots may skip setup. This does **not**
+restore the discarded thread workspace's uncommitted changes. Subsequent
+pause/wake retains the successor's own disk and follows normal resume behavior.
 
 **Job-ordering limitation:** Amp's documented dispatch contract has no upstream
 incarnation or sequence field. A local job that observed the old incarnation
 before waiting for its lock is rejected after the switch; old identity-bound srv
 commands cannot target the new name/UUID. But an old upstream job first delivered
-after the switch is indistinguishable from a current job. Stopping the local
-provider alone does not prove the upstream queue is empty. Establish that drain
-boundary before using fresh start; if it cannot be established, leave the Orb
-retired. This is not a guarantee against arbitrary upstream reordering.
+after the switch is indistinguishable from a current job. Incoming Amp jobs are
+treated as current instructions, not subjected to a locally unverifiable queue
+drain requirement. This does not establish an upstream ordering guarantee or
+protect against arbitrary upstream reordering.
 
-Fresh authorization first archives the exact retired record as
-`orb-<original-hash>.json.retired-<UUID>`, leaving its cleanup receipt untouched,
-then atomically publishes the successor in the original root record. The stable
-lock is never replaced. Cleanup files are scoped to each incarnation's srv name;
-all predecessor identity/counter records and receipts must remain backed up.
-A crash before publication leaves the old retirement current; retry validates
-the archive and finishes publication. A lost reply after publication is safe to
-retry. Repeating any previous authorization never resets a successor, even after
-that successor has itself retired or been deleted. Each operation validates its
-immediate predecessor; fresh-start authorization also validates the history it
-traverses. Missing or conflicting records or proof on that path fail closed.
-Unknown create outcomes retain their existing fences.
+The stable root record and lock select the current incarnation. Cleanup receipts
+remain scoped to each incarnation's srv name and are not overwritten by its
+successor. No predecessor archives are created or traversed; existing archives
+are left untouched and are not required to operate a bound successor. A crash
+before publication leaves the completed deletion current. A crash after
+publication but before creation resumes the same successor. Unknown create
+outcomes retain their existing fences and require reconciliation, not another
+allocation. An unreachable backend is never treated as proof of absence.
 
 A successor can consume a ready project template but cannot capture into its
 predecessor's snapshot ID. New mappings bind snapshot authorship to the instance
 UUID. Legacy mappings may only be completed by the original, non-replacement
 incarnation; a successor must use a new snapshot ID for new content.
 
-Do not substitute bare `ssh srv delete NAME`, remove provider records, or reuse
-the managed instance name: those actions do not reconcile provider state.
-Neither operator command is an `ORB_OPERATION` value. There is no automatic
-expiry, bulk deletion or automatic recreation of missing disks. Older dispatchers
-reject the new phases or successor names; use the updated dispatcher after using
-these commands. See the coordinated deletion-protocol upgrade below.
+Do not remove provider records, manually remove disk files, or reuse the managed
+instance name. File removal does not produce a cleanup receipt. There is no
+automatic expiry, bulk deletion or recreation of unexpectedly missing managed
+disks without a matching receipt.
+
+**Upgrade:** the `retire` and `fresh-start` commands have been removed, without
+aliases. External deletion reconciliation requires the updated srv backend's
+`cleanup-receipt --instance UUID` query. Legacy
+`retiring` records resume as pending deletion, and `retired` or `deleted` records
+allow a later spawn only with a valid bound cleanup receipt. A legacy deletion
+before any allocation needs no receipt. Previously published successors continue
+without their predecessor archives. In particular, `deleted` no longer means a
+permanent ban on future compute for that Orb ID. Older dispatcher versions retain
+the old behavior; do not mix versions against the same provider state. See the
+coordinated deletion-protocol upgrade below.
 
 ### Operation receipts and bootstrap generations
 
@@ -554,9 +555,9 @@ must also be installed for storage deletion.
 The dispatcher accepts v3, v4 and v5 receipts. Stored v2 receipts remain readable,
 unchanged; they do **not** prove gateway quiescence and cannot finalize a
 `deleting` dispatcher record under the new version. Already-finalized `deleted`
-records still make repeat delete a no-op and reject spawn; that no-op does not
-upgrade the historical receipt. Do not rewrite receipts or tombstones to bypass
-this distinction.
+records backed by v2 receipts still make repeat delete a no-op but reject spawn;
+that no-op does not upgrade the historical receipt. Do not rewrite receipts or
+tombstones to bypass this distinction.
 The existing coordinated runner/nethelper/guest-image protocol requirements still
 apply; this change does not deploy or validate any installed host binary.
 
@@ -606,13 +607,13 @@ the backend tombstone prevents late host admission. A persisted start that never
 reached the runner is resolved into a closed exact-attempt receipt, fencing its
 late arrival. An outcome that remains unknown still blocks deletion.
 
-Do not manually migrate, delete/recreate or reuse managed orb names. A missing
-managed disk causes spawn to fail rather than creating an empty replacement.
-Migration state is rejected for operator recovery. Completed deletion records
-prevent a late spawn from resurrecting a deleted orb. Only a receipt-backed
-retirement can authorize a distinct successor through `fresh-start`; ordinary
-deletion cannot. This does not solve upstream reordering of jobs: the documented
-contract has no sequence number.
+Do not manually migrate, recreate or reuse managed orb names. A missing
+managed disk without a committed cleanup receipt causes spawn to fail rather
+than creating an empty replacement.
+Migration state is rejected for operator recovery. After receipt-backed deletion,
+a later Amp spawn can create a distinct successor for the same Orb ID. This does
+not solve upstream reordering of jobs: the documented contract has no sequence
+number.
 
 For bootstrap errors, inspect the VM and run, through a trusted guest session:
 
@@ -645,13 +646,14 @@ Before relying on this provider, create a disposable Amp thread and verify:
    template survives while the source VM/disk is removed.
 7. Under the configured service identity, verify foreign users' VMs are invisible
    and admin commands are rejected, both directly and through srv-front.
-8. On a disposable retained thread, follow the retirement and drain procedure,
-   then authorize fresh start. Verify the thread/history remain readable, the
-   replacement has a different name/UUID and fresh bootstrap credentials, old
+8. On a disposable retained thread, use SSH `delete NAME`, then send a new message.
+   Verify the thread/history remain readable, the replacement has a different
+   name/UUID and fresh bootstrap credentials, old
    disk-only files are absent, and repository setup or snapshot activation runs.
-   Change a replacement file, pause/wake and confirm it survives. Repeat the old
-   authorization and confirm no reset. Repeat retirement/fresh start, then delete
-   the thread and verify terminal cleanup with all prior receipts retained.
+   Change a replacement file, pause/wake and confirm it survives. Repeat the cycle
+   using bound deletion; replay its saved request after replacement and confirm
+   it returns the old receipt without resetting the workspace. Then delete the
+   thread and verify cleanup with all prior receipts retained.
 
 Local automated checks:
 

@@ -95,7 +95,7 @@ func TestRejectResponses(t *testing.T) {
 func TestBootstrapProxyBypassField(t *testing.T) {
 	// The field is optional on the wire: omitted when empty so older guest
 	// images that reject unknown bootstrap keys still accept the request.
-	for _, value := range []string{"", ".corp.example"} {
+	for _, value := range []string{"", ".corp.example", "localhost,.corp.example,.corp.example,a,b,c,d,e,f", strings.Repeat("a,", 255) + "aa"} {
 		requests := make(chan map[string]any, 1)
 		path := serve(t, func(c net.Conn) {
 			r := bufio.NewReader(c)
@@ -121,6 +121,9 @@ func TestBootstrapProxyBypassField(t *testing.T) {
 		_, present := req["proxy_bypass"]
 		if present != (value != "") {
 			t.Fatalf("proxy_bypass presence = %v for %q", present, value)
+		}
+		if present && req["proxy_bypass"] != value {
+			t.Fatalf("proxy_bypass changed in transit: got %q, want %q", req["proxy_bypass"], value)
 		}
 	}
 }

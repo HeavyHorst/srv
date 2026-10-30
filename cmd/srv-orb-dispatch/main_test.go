@@ -754,9 +754,15 @@ func TestDispatchProviderProxyBypass(t *testing.T) {
 		t.Fatalf("FQDN bypass destination not forwarded verbatim: %+v", s.ProxyBypass)
 	}
 	nine := strings.Join([]string{"e1.example", "e2.example", "e3.example", "e4.example", "e5.example", "e6.example", "e7.example", "e8.example", "e9.example"}, ",")
-	oversize := strings.TrimSuffix(strings.Repeat("e"+strings.Repeat("x", 61)+".example,", 8), ",")
+	limit := strings.Repeat("a,", 255) + "aa" // Exactly 512 bytes, all valid tokens.
+	for _, accepted := range []string{".x.com,.x.com", "localhost,127.0.0.1,169.254.169.254,.ts.net", nine, limit} {
+		h.must("spawn", "accepted-token", "SRV_ORB_PROXY_BYPASS="+accepted)
+		if s := h.read(); s.ProxyBypass == nil || *s.ProxyBypass != accepted {
+			t.Fatalf("bypass list not forwarded verbatim: want %q, got %+v", accepted, s.ProxyBypass)
+		}
+	}
 	for _, invalid := range []string{"", "a b", "a*b", `a"b`, "a\\b", "a\nb", "a:b", "a/b", "a?b", "a#b", "a@b", ".", "..", "-", "_", "http://internal", strings.Repeat("x", 254),
-		",a", "a,", "a,,b", "a, b", ".x.com,.x.com", "localhost", ".ts.net", nine, oversize} {
+		",a", "a,", "a,,b", "a, b", "::1", "100.64.0.0/10", "höst", limit + "a"} {
 		// A bootstrapped orb keeps its generation and never sees the invalid value.
 		h := newHarness(t, "")
 		h.must("spawn", "first")

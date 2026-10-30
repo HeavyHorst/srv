@@ -194,7 +194,8 @@ writes a fixed bypass list for guest-local services, MMDS, the CGNAT range and
 `.ts.net` tailnet MagicDNS names. To send additional destinations past the
 gateway — an internal registry, a private DNS suffix — set
 `SRV_ORB_PROXY_BYPASS` in the provider environment to a comma-separated list
-of up to eight entries (512 characters joined). Each entry is a hostname, an
+of at most 512 characters including commas, with no separate entry-count limit.
+Each entry is a hostname, an
 IPv4 literal, or a leading-dot DNS suffix; an optional trailing dot (the FQDN
 form) is accepted verbatim but only matches clients that compare the same
 form. The entries are client-native `NO_PROXY` tokens, not a universal
@@ -203,13 +204,16 @@ Go's `httpproxy` in the runs verified for this change, but apex handling does
 not — urllib and curl match the bare apex host for a leading-dot entry while
 Go's `httpproxy` does not, so configure the bare hostname (which matched apex
 and subdomains in all three) when the apex itself must be covered. CIDR
-ranges and IPv6 literals are not accepted in this field for the same reason:
+support differs between clients:
 Python's urllib ignores CIDR entries entirely (including the built-in CGNAT
-entry), while curl and Go honor them for IP literals.
-Empty entries, duplicates and repeats of built-in entries are configuration
-errors. The dispatcher validates the list before spawn creates or starts
+entry), while Go honors them for IP literals. CIDR ranges and IPv6 literals
+remain outside this field's supported syntax.
+Repeated supported entries, including built-in hostnames and IPv4 literals,
+are accepted and forwarded verbatim. Empty entries and an explicitly empty
+environment variable are configuration errors; unset the variable for no additions.
+The dispatcher validates the list before spawn creates or starts
 compute; pause and delete remain available with an invalid list. The guest
-independently re-validates every entry before any bootstrap generation is consumed and
+independently re-validates every entry before consuming its guest-side generation and
 appends the list to the unchanged built-in entries; unset keeps exactly the
 built-in list, and repository setup must not be used to repair this provider
 networking. Bypass only removes the gateway from the path: the guest still
@@ -221,6 +225,14 @@ against a new guest image, both keep working because the field is simply
 absent; but a *set* variable needs the dispatcher, srv backend and orb guest
 image upgraded together, since older components reject the extra field and the
 bootstrap fails rather than silently dropping the destination.
+
+Guests with the earlier bypass policy still reject repeated entries and lists
+longer than eight entries. Update guest agents/images before using those newly
+accepted configurations with an updated dispatcher. Otherwise bootstrap fails
+after backend request admission, even though guest-side validation precedes
+guest generation consumption. Existing accepted configurations remain compatible;
+a backend that already supports `proxy_bypass` needs no change for this relaxation.
+On the wire, an empty or absent `proxy_bypass` still means no additional destinations.
 
 The control endpoint's SSH host key must be installed in the service user's
 `known_hosts` through a trusted channel. Control connections use strict host-key

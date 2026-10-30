@@ -109,9 +109,9 @@ class GuestTests(unittest.TestCase):
                                  ("evilcorp.test", False), ("evil-ts.net", False),
                                  ("localhost", True), ("ampcode.com", False)]:
                 self.assertEqual(bool(urllib.request.proxy_bypass_environment(host, {"no": no_proxy})), bypass, host)
-            for bad in ["a,b,c,d,e,f,g,h,i", ",a", "a,", "a,,b", "a, b", "a b", 'a"b',
+            for bad in [",a", "a,", "a,,b", "a, b", "a b", 'a"b',
                         "a\\b", "a\nb", "a:b", "a/b", "a*b", "a?b", "a#b", "a@b", ".", "..",
-                        "-", "_", "*", 5, "x" * 254, ".x.com,.x.com", "localhost", ".ts.net",
+                        "-", "_", "*", 5, "x" * 254, "::1", "höst", "a," * 255 + "aaa",
                         "100.64.0.0/10", ",".join("e%d.%s" % (i, "x" * 64) for i in range(8))]:
                 with patch.object(guest, "RUNTIME", runtime), patch.object(guest, "UNIT", unit), \
                         patch.object(guest, "command", command), patch.object(guest, "stopped"):
@@ -131,6 +131,24 @@ class GuestTests(unittest.TestCase):
             no_proxy = re.search(r'^NO_PROXY="([^"]*)"$', seen["env"], re.M).group(1)
             self.assertTrue(no_proxy.endswith(",.example.com."))
             self.assertFalse(urllib.request.proxy_bypass_environment("a.example.com", {"no": no_proxy}))
+            # Older callers omit the field or send empty; both keep the
+            # exact built-in list. Supported repeats and >8 entries append
+            # verbatim, including at the 512-character boundary.
+            for generation, extra in enumerate([
+                    None, "", ".x.com,.x.com", "localhost,127.0.0.1,169.254.169.254,.ts.net",
+                    "a,b,c,d,e,f,g,h,i", "a," * 255 + "aa"], start=4):
+                with self.subTest(extra=extra), patch.object(guest, "RUNTIME", runtime), \
+                        patch.object(guest, "UNIT", unit), patch.object(guest, "command", command), \
+                        patch.object(guest, "stopped"):
+                    request = {"action": "bootstrap", "token": "t", "generation": generation}
+                    if extra is not None:
+                        request["proxy_bypass"] = extra
+                    result = self.exchange(json.dumps(request).encode() + b"\n")
+                    self.assertEqual(json.loads(result), {"ok": True, "generation": generation})
+                    self.assertEqual(guest.read_generation(), {"generation": generation, "phase": "done"})
+                    no_proxy = re.search(r'^NO_PROXY="([^"]*)"$', seen["env"], re.M).group(1)
+                    expected = "localhost,127.0.0.1,::1,169.254.169.254,100.64.0.0/10,.ts.net"
+                    self.assertEqual(no_proxy, expected + ("," + extra if extra else ""))
 
     def test_invalid_proxy_bypass_never_consumes_a_generation(self):
         # Validation happens in handle(), before bootstrap(): a malformed
@@ -139,7 +157,7 @@ class GuestTests(unittest.TestCase):
         # usable, with no bootstrap effects at all.
         with tempfile.TemporaryDirectory() as tmp, patch.object(guest, "RUNTIME", Path(tmp)):
             guest.initialize_generation()
-            for bad in ["a,b,", ",.good.example", "a,b,c,d,e,f,g,h,i", ".good.example,.good.example"]:
+            for bad in ["a,b,", ",.good.example", "a," * 255 + "aaa", ".good.example,::1"]:
                 with patch.object(guest, "apply_bootstrap") as apply:
                     payload = json.dumps({"action": "bootstrap", "token": "t", "proxy_bypass": bad,
                                           "generation": 1}).encode() + b"\n"
@@ -189,9 +207,11 @@ class GuestTests(unittest.TestCase):
             with patch.object(guest, "RUNTIME", runtime), patch.object(guest, "UNIT", unit), \
                     patch.object(guest, "command", command), patch.object(guest, "stopped"):
                 guest.initialize_generation()
+                # Repeats and >8 entries must preserve routing, including
+                # the final suffix rather than silently truncating the list.
                 result = self.exchange(json.dumps({"action": "bootstrap", "token": "t",
                                                    "proxy": proxy_url,
-                                                   "proxy_bypass": ".example.test,.corp.test",
+                                                   "proxy_bypass": "localhost,.ts.net,.example.test,.example.test,one,two,three,four,.corp.test",
                                                    "generation": 1}).encode() + b"\n")
             self.assertEqual(json.loads(result), {"ok": True, "generation": 1})
             def env_value(key):

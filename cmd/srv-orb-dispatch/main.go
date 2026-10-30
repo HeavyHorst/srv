@@ -110,10 +110,10 @@ func envDefault(key, fallback string) string {
 // SSH argv, state records, logs, or the SSH child environment. Unset omits
 // the field entirely, keeping the payload compatible with older srv backends
 // and guest images; an empty value is a configuration error, not "unset".
-// The value is a bounded list: one to eight comma-separated entries, at most
+// The value is a bounded list: comma-separated entries, at most
 // 512 characters joined, each a hostname, an IPv4 literal, or a leading-dot
 // DNS suffix with an optional trailing dot (FQDN form) kept verbatim. Empty
-// entries, duplicates, built-in repeats, whitespace, CIDR and IPv6 forms are
+// entries, whitespace, CIDR and IPv6 forms are
 // rejected: NO_PROXY handling differs between HTTP clients, so this is a
 // matching contract, not a DNS-name linter or a policy framework.
 func proxyBypass() (string, error) {
@@ -130,13 +130,6 @@ func proxyBypass() (string, error) {
 	return value, nil
 }
 
-// The guest's fixed bypass entries. Repeating one in the provider list cannot
-// disable it — appending only adds — but it is noise implying a second policy.
-var builtinNoProxyTokens = map[string]bool{
-	"localhost": true, "127.0.0.1": true, "::1": true,
-	"169.254.169.254": true, "100.64.0.0/10": true, ".ts.net": true,
-}
-
 func validateProxyBypassList(value string) error {
 	if len(value) > 512 {
 		return errors.New("SRV_ORB_PROXY_BYPASS must stay within 512 characters")
@@ -144,23 +137,13 @@ func validateProxyBypassList(value string) error {
 	if strings.ContainsAny(value, " \t\r\n\x00'\"\\") {
 		return errors.New("SRV_ORB_PROXY_BYPASS entries must not contain whitespace, quotes, or backslashes")
 	}
-	entries := strings.Split(value, ",")
-	if len(entries) > 8 {
-		return errors.New("SRV_ORB_PROXY_BYPASS accepts at most 8 entries")
-	}
-	seen := make(map[string]bool, len(entries))
-	for _, entry := range entries {
+	for _, entry := range strings.Split(value, ",") {
 		switch {
 		case entry == "":
 			return errors.New("SRV_ORB_PROXY_BYPASS must not contain empty entries (leading, trailing, or doubled commas)")
 		case !validProxyBypass(entry):
 			return errors.New("SRV_ORB_PROXY_BYPASS entries must each be a hostname, IPv4 literal, or leading-dot DNS suffix (no CIDR, IPv6, wildcard, scheme, or port)")
-		case builtinNoProxyTokens[entry]:
-			return errors.New("SRV_ORB_PROXY_BYPASS must not repeat a built-in bypass entry")
-		case seen[entry]:
-			return errors.New("SRV_ORB_PROXY_BYPASS must not contain duplicate entries")
 		}
-		seen[entry] = true
 	}
 	return nil
 }

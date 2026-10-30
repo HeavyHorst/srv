@@ -220,9 +220,9 @@ def handle(conn, peer_cid):
 
 def valid_proxy_bypass(value):
     # The provider's optional destination list, re-validated here because
-    # dispatcher validation is not the trust boundary: one to eight
+    # dispatcher validation is not the trust boundary:
     # comma-separated entries, at most 512 characters joined, no whitespace,
-    # empty entries, duplicates, or built-in repeats. Each entry is a
+    # or empty entries. Repeats are harmless additions. Each entry is a
     # hostname, IPv4 literal, or leading-dot DNS suffix with an optional
     # trailing dot kept verbatim — it only matches clients that compare the
     # same form. CIDR and IPv6 stay out: NO_PROXY handling differs between
@@ -232,15 +232,9 @@ def valid_proxy_bypass(value):
     if (not isinstance(value, str) or len(value) > 512 or not value.isascii()
             or any(c.isspace() or c in "\x00'\"\\\\" for c in value)):
         return False
-    seen = set()
-    entries = value.split(",")
-    if len(entries) > 8:
-        return False
-    for entry in entries:
-        if (not entry or entry in NO_PROXY_BASE.split(",") or entry in seen
-                or not valid_bypass_entry(entry)):
+    for entry in value.split(","):
+        if not entry or not valid_bypass_entry(entry):
             return False
-        seen.add(entry)
     return True
 
 

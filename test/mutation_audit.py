@@ -29,8 +29,8 @@ MUTANTS = [
     {
         "name": "cleanup-deleting-state",
         "file": "internal/store/cleanup.go",
-        "old": "AND state='deleting' AND NOT EXISTS",
-        "new": "AND state IN ('deleting','ready') AND NOT EXISTS",
+        "old": "AND state='deleting' AND (kind='vm' OR NOT EXISTS",
+        "new": "AND state IN ('deleting','ready') AND (kind='vm' OR NOT EXISTS",
         "package": "./internal/store",
         "run": "TestLifecycleStateMachine|TestCrashConsistency|TestCleanupCommitRejectsReadyInstanceWithFence",
     },
@@ -80,8 +80,8 @@ MUTANTS = [
     {
         "name": "policy-delete-migration",
         "file": "internal/provision/cleanup.go",
-        "old": 'if migration, err := p.store.GetMigration(ctx, inst.ID); err == nil && migration.Phase != "aborted" {',
-        "new": 'if migration, err := p.store.GetMigration(ctx, inst.ID); err == nil && migration.Phase == "never" {',
+        "old": 'if err == nil && !moved && migration.Phase != "aborted" {',
+        "new": 'if false && err == nil && !moved && migration.Phase != "aborted" {',
         "package": "./internal/provision",
         "run": "TestProvisionPolicyMatrix",
     },

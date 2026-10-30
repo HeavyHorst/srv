@@ -127,8 +127,23 @@ func (a *App) closeInstanceGateways(ctx context.Context, inst model.Instance) er
 }
 
 func (a *App) cmdCleanupReceipt(ctx context.Context, actor model.Actor, args []string) (commandResult, error) {
+	if len(args) == 3 && args[1] == "--instance" {
+		if _, err := uuid.Parse(args[2]); err != nil {
+			return cleanupError(err)
+		}
+		r, err := a.store.CleanupReceiptForInstance(ctx, args[2])
+		if err != nil {
+			return cleanupError(err)
+		}
+		// Authorize against the deleted incarnation, never a replacement with
+		// the same name or the operator who happened to perform the deletion.
+		if !a.canAccessInstance(actor, model.Instance{CreatedByUser: r.CreatedByUser}) {
+			return cleanupError(sql.ErrNoRows)
+		}
+		return jsonResult(r)
+	}
 	if len(args) != 2 {
-		return cleanupError(errors.New("usage: cleanup-receipt <request-id>"))
+		return cleanupError(errors.New("usage: cleanup-receipt REQUEST_ID | cleanup-receipt --instance UUID"))
 	}
 	r, err := a.store.CleanupReceipt(ctx, args[1], actor.UserLogin)
 	if err != nil {

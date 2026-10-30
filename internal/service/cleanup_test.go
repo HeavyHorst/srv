@@ -514,6 +514,13 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 			}
 			id := uuid.NewString()
 			actor := model.Actor{UserLogin: i.CreatedByUser}
+			if scenario == "success" {
+				actor.UserLogin = "cleanup-admin"
+				a.cfg.AdminUsers = append(a.cfg.AdminUsers, actor.UserLogin)
+			}
+			if _, err := a.dispatch(ctx, actor, commandRequest{args: []string{"cleanup-receipt", "--instance", i.ID}}); err == nil {
+				t.Fatal("receipt published before deletion")
+			}
 			args := []string{"delete", i.Name, "--expect", id, i.ID, i.CreatedAt.Format(time.RFC3339Nano), a.backendID, i.Image}
 			if scenario == "cold-preflight" {
 				args[5] = i.CreatedAt.Format("2006-01-02T15:04:05.999999999-07:00")
@@ -642,6 +649,30 @@ func TestDeleteProofQuiescesGatewaysBeforeReceipt(t *testing.T) {
 				t.Fatal("disk retained", err)
 			}
 			assertGatewayTraffic(t, neighbor, neighborPeer)
+			if scenario == "success" {
+				// Reusing the name must neither transfer old receipt ownership
+				// nor make its receipt inaccessible to the original owner.
+				if err := st.DeleteInstance(ctx, i.Name); err != nil {
+					t.Fatal(err)
+				}
+				replacement := serviceTestInstance(i.Name, model.StateStopped, time.Now().UTC())
+				replacement.ID, replacement.CreatedByUser = uuid.NewString(), "new-owner"
+				if err := st.CreateInstance(ctx, replacement); err != nil {
+					t.Fatal(err)
+				}
+				for _, login := range []string{i.CreatedByUser, "cleanup-admin", "new-owner", "unrelated"} {
+					result, err := a.dispatch(ctx, model.Actor{UserLogin: login}, commandRequest{args: []string{"cleanup-receipt", "--instance", i.ID}})
+					allowed := login == i.CreatedByUser || login == "cleanup-admin"
+					if (err == nil) != allowed || allowed && result.stdout != first.stdout || !allowed && result.stdout != "" {
+						t.Fatalf("wrong historical receipt access for %q: %v %+v", login, err, result)
+					}
+				}
+				for _, id := range []string{replacement.ID, uuid.NewString(), "not-a-uuid"} {
+					if result, err := a.dispatch(ctx, actor, commandRequest{args: []string{"cleanup-receipt", "--instance", id}}); err == nil || result.stdout != "" {
+						t.Fatal("receipt returned for an undeleted or unknown instance", id, result, err)
+					}
+				}
+			}
 		})
 	}
 }

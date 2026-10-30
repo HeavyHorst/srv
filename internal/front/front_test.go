@@ -450,6 +450,7 @@ func TestBoundOrbRoutesPreserveIdentityAndRequest(t *testing.T) {
 		{"orb", "bootstrap", "orb-name", "--expect", "request", "uuid", "created", "backend", "image"},
 		{"delete", "orb-name", "--expect", "request", "uuid", "created", "backend", "image"},
 		{"cleanup-receipt", "request"},
+		{"cleanup-receipt", "--instance", "uuid"},
 		{"operation-result", "request"},
 		{"operation-cancel", "request", "orb-name", "stop", "uuid", "created", "backend", "image"},
 	} {

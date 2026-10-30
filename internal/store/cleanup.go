@@ -170,3 +170,15 @@ func (s *Store) CleanupReceipt(ctx context.Context, requestID, actor string) (mo
 	}
 	return r, err
 }
+
+// CleanupReceiptForInstance survives name reuse and does not require the caller
+// to know which request deleted the instance. The service checks receipt ownership.
+func (s *Store) CleanupReceiptForInstance(ctx context.Context, instanceID string) (model.CleanupReceipt, error) {
+	var data string
+	var r model.CleanupReceipt
+	err := s.db.QueryRowContext(ctx, `SELECT receipt FROM cleanup_receipts WHERE json_extract(receipt, '$.instance_id')=?`, instanceID).Scan(&data)
+	if err == nil {
+		err = json.Unmarshal([]byte(data), &r)
+	}
+	return r, err
+}

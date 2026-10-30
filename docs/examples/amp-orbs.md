@@ -323,6 +323,14 @@ serializes same-orb jobs with local file locks; it is not an HA controller.
 Different orbs can run concurrently. Jobs time out after 270 seconds, including
 lock waits, leaving time inside Amp's five-minute dispatch limit.
 
+New Orb names use `orb-` plus 48 hex digits. With the default runner paths, the
+jailed API socket is 106 bytes long, below Linux's 107-byte pathname limit.
+Existing 60-character names and their provider records/locks are retained, not
+renamed; keep their working shortened `SRV_JAILER_BASE_DIR` configuration until
+their compute is deleted. Successors use the shorter names. Custom longer data
+or jailer paths can still exceed the limit and are rejected before launch.
+Do not mix dispatcher versions against the same state directory.
+
 ## Recovery and security
 
 The state directory contains an identity/host mapping, operation phase and deletion

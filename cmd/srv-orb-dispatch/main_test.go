@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,6 +57,7 @@ type testServer struct {
 	ProofVersion    int
 	ProxyBypass     *string
 	Creates         int
+	CreateAttempts  int
 	LateStop        bool
 	LoseBootstrap   bool
 	VM              *testVM
@@ -226,6 +229,10 @@ func fakeSSH() error {
 			map[string]any{"host": s.Host, "data": data},
 		}})
 	case "new":
+		s.CreateAttempts++
+		if err := write(); err != nil {
+			return err
+		}
 		if s.RejectCreate {
 			return fmt.Errorf("create rejected")
 		}
@@ -482,6 +489,99 @@ func TestDispatchRetriesRejectedStart(t *testing.T) {
 			}
 			if starts != wantStarts || s.VM.State != wantState || s.Creates != 1 || s.Disk != "saved workspace" {
 				t.Fatal("retry replayed or replaced the workspace", starts, s.VM)
+			}
+		})
+	}
+}
+
+func TestOrbNamesFitDefaultSocketPaths(t *testing.T) {
+	h := newHarness(t, "")
+	dir, err := os.MkdirTemp("", "sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	// Match the default jailer prefix length, but bind in disposable storage.
+	prefix := filepath.Join(dir, strings.Repeat("j", len("/var/lib/srv/jailer/firecracker")-len(dir)-1))
+	for cycle := 0; cycle < 2; cycle++ {
+		h.must("spawn", "token")
+		path := filepath.Join(prefix, h.read().VM.Name, "root", "firecracker.sock")
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		listener, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatalf("generated Orb name cannot bind default-length API socket (%d bytes): %v", len(path), err)
+		}
+		conn, err := net.Dial("unix", path)
+		listener.Close()
+		if err != nil {
+			t.Fatal("cannot dial API socket", err)
+		}
+		conn.Close()
+		h.must("delete", "")
+	}
+}
+
+func TestLegacyOrbNamesKeepStateAndLock(t *testing.T) {
+	for _, scenario := range []string{"managed", "missing-record", "missing-all", "new-record"} {
+		t.Run(scenario, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.must("spawn", "initial-token")
+			id := "amp-thread/with spaces and 'quotes'"
+			// Independent reproduction of the previous naming algorithm.
+			legacyName := fmt.Sprintf("orb-%x", sha256.Sum256([]byte(id)))[:60]
+			s := h.read()
+			oldPath := filepath.Join(h.dir, "state", s.VM.Name+".json")
+			legacyPath := filepath.Join(h.dir, "state", legacyName+".json")
+			data, err := os.ReadFile(oldPath)
+			var r record
+			if err != nil || json.Unmarshal(data, &r) != nil {
+				t.Fatal("cannot read state", err)
+			}
+			r.Name, s.VM.Name = legacyName, legacyName
+			s.Disk = "legacy workspace"
+			h.write(s)
+			if err := os.Rename(oldPath+".lock", legacyPath+".lock"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(oldPath); err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "managed" {
+				if scenario == "missing-all" {
+					if err := os.Remove(legacyPath + ".lock"); err != nil {
+						t.Fatal(err)
+					}
+				} else if scenario == "new-record" {
+					r = record{OrbID: id, Endpoint: "srv", Name: legacyName, Phase: "new"}
+					if err := save(legacyPath, r); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := h.run("spawn", "blocked"); err == nil {
+					t.Fatal("lost legacy record was recreated")
+				}
+				if current := h.read(); current.CreateAttempts != s.CreateAttempts || current.VM.ID != s.VM.ID || current.Disk != "legacy workspace" {
+					t.Fatal("state loss submitted a create or changed existing compute", current.CreateAttempts)
+				}
+				return
+			}
+			if err := save(legacyPath, r); err != nil {
+				t.Fatal(err)
+			}
+			h.must("pause", "")
+			h.must("spawn", "resume-token")
+			if s := h.read(); s.Creates != 1 || s.VM.Name != legacyName || s.Disk != "legacy workspace" {
+				t.Fatal("legacy instance was renamed or recreated")
+			}
+			h.must("delete", "")
+			h.must("spawn", "fresh-token")
+			if s := h.read(); s.Creates != 2 || len(s.VM.Name) > 53 {
+				t.Fatal("legacy deletion did not produce a shorter successor")
+			}
+			if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+				t.Fatal("provider root record moved", err)
 			}
 		})
 	}
@@ -1368,21 +1468,30 @@ func TestFreshComputeRecovery(t *testing.T) {
 }
 
 func TestDeleteBeforeFirstSpawn(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		t.Run(fmt.Sprint(legacy), func(t *testing.T) {
+	for _, phase := range []string{"current", "deleted", "new"} {
+		t.Run(phase, func(t *testing.T) {
 			h := newHarness(t, "")
 			h.must("delete", "")
 			h.must("delete", "")
-			if legacy {
+			if phase != "current" {
 				id := "amp-thread/with spaces and 'quotes'"
-				r := record{OrbID: id, Endpoint: "srv", Name: orbName(id, ""), Phase: "deleted"}
-				if err := save(filepath.Join(h.dir, "state", r.Name+".json"), r); err != nil {
+				name := fmt.Sprintf("orb-%x", sha256.Sum256([]byte(id)))[:60]
+				r := record{OrbID: id, Endpoint: "srv", Name: name, Phase: phase}
+				path := filepath.Join(h.dir, "state", orbName(id, "")+".json")
+				legacyPath := filepath.Join(h.dir, "state", name+".json")
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(path+".lock", legacyPath+".lock"); err != nil {
+					t.Fatal(err)
+				}
+				if err := save(legacyPath, r); err != nil {
 					t.Fatal(err)
 				}
 			}
 			h.must("spawn", "first-token")
 			h.must("spawn", "repeat-token")
-			if s := h.read(); s.Creates != 1 || s.Disk != "fresh disk" {
+			if s := h.read(); s.Creates != 1 || s.Disk != "fresh disk" || len(s.VM.Name) > 53 {
 				t.Fatal("delete of unallocated orb prevented or duplicated creation")
 			}
 		})

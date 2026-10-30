@@ -10,6 +10,12 @@ import (
 )
 
 func orbName(id, previous string) string {
+	// 48 hex digits retain 192 bits of identity while fitting the default
+	// jailer API socket path (106 bytes, below Unix's 107-byte limit).
+	return legacyOrbName(id, previous)[:52]
+}
+
+func legacyOrbName(id, previous string) string {
 	if previous != "" {
 		// Preserve names already published by older dispatchers.
 		id += "\x00fresh-start\x00" + previous

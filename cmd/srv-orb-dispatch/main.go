@@ -220,6 +220,17 @@ func dispatch(ctx context.Context, c config, j job) error {
 	// Hashing keeps arbitrary upstream IDs out of paths and within srv's name limit.
 	name := orbName(j.id, "")
 	path := filepath.Join(c.directory, name+".json")
+	// Existing providers retain their original root record and lock, including
+	// a lock whose record was lost. Never turn missing legacy state into create.
+	legacyPath := filepath.Join(c.directory, legacyOrbName(j.id, "")+".json")
+	for _, candidate := range []string{legacyPath, legacyPath + ".lock"} {
+		if _, err := os.Stat(candidate); err == nil {
+			path = legacyPath
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	providerJob := j.operation == "spawn" || j.operation == "pause" || j.operation == "delete"
 	admittedName := name
 	if providerJob {
@@ -260,7 +271,7 @@ func dispatch(ctx context.Context, c config, j job) error {
 		if err := json.Unmarshal(data, &r); err != nil {
 			return err
 		}
-		if r.OrbID != j.id || r.Endpoint != c.endpoint || r.Name != orbName(j.id, r.PreviousInstanceID) {
+		if r.OrbID != j.id || r.Endpoint != c.endpoint || (r.Name != orbName(j.id, r.PreviousInstanceID) && r.Name != legacyOrbName(j.id, r.PreviousInstanceID)) {
 			return errors.New("state identity/endpoint mismatch; restore the original provider configuration")
 		}
 		switch r.Phase {
@@ -326,11 +337,15 @@ func dispatch(ctx context.Context, c config, j job) error {
 				return err
 			}
 		}
-		if r.Phase == "new" && j.operation == "spawn" && snapshot != nil {
-			if snapshot.Phase != "ready" || snapshot.Image != c.image {
-				return errors.New("snapshot is incomplete or belongs to a different image; repair or retire its mapping")
+		if r.Phase == "new" && j.operation == "spawn" {
+			// No create was submitted yet, including legacy fresh-start records.
+			r.Name = orbName(j.id, r.PreviousInstanceID)
+			if snapshot != nil {
+				if snapshot.Phase != "ready" || snapshot.Image != c.image {
+					return errors.New("snapshot is incomplete or belongs to a different image; repair or retire its mapping")
+				}
+				r.Host = snapshot.Host
 			}
-			r.Host = snapshot.Host
 		}
 		v, host, err = locate(ctx, c, r)
 		if err != nil {
@@ -649,7 +664,9 @@ func locate(ctx context.Context, c config, r record) (*instance, string, error) 
 	host := r.Host
 	check := func(vs []instance, h string) error {
 		for _, v := range vs {
-			if v.Name == r.Name {
+			// Before allocation, an existing legacy name is also a conflict.
+			// Losing its record and lock must not silently replace its compute.
+			if v.Name == r.Name || r.Phase == "new" && v.Name == legacyOrbName(r.OrbID, r.PreviousInstanceID) {
 				if found != nil {
 					return errors.New("duplicate orb VM names; resolve manually")
 				}

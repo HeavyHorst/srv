@@ -3574,8 +3574,11 @@ func TestHelperFunctions(t *testing.T) {
 	if matched, _ := regexp.MatchString(`^02:fc:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$`, guestMAC("demo")); !matched {
 		t.Fatalf("guestMAC(demo) did not match expected format")
 	}
-	if got := kernelArgs("quiet loglevel=3"); got != "console=ttyS0 reboot=k panic=1 root=/dev/vda rw quiet loglevel=3" {
+	if got := kernelArgs(""); got != "console=ttyS0 reboot=k panic=1 root=/dev/vda rw TERM=dumb i8042.dumbkbd" {
 		t.Fatalf("kernelArgs() = %q", got)
+	}
+	if got := kernelArgs("quiet loglevel=3"); got != "console=ttyS0 reboot=k panic=1 root=/dev/vda rw TERM=dumb i8042.dumbkbd quiet loglevel=3" {
+		t.Fatalf("kernelArgs(extra) = %q", got)
 	}
 	if got, err := directChildPath("/tmp/srv", "demo"); err != nil || got != "/tmp/srv/demo" {
 		t.Fatalf("directChildPath() = (%q, %v)", got, err)

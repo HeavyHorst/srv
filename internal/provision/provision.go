@@ -2146,7 +2146,7 @@ func uint32ToIP(v uint32) net.IP {
 }
 
 func kernelArgs(extra string) string {
-	base := []string{"console=ttyS0", "reboot=k", "panic=1", "root=/dev/vda", "rw"}
+	base := []string{"console=ttyS0", "reboot=k", "panic=1", "root=/dev/vda", "rw", "TERM=dumb", "i8042.dumbkbd"}
 	if extra != "" {
 		base = append(base, strings.Fields(extra)...)
 	}

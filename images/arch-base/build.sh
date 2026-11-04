@@ -398,7 +398,10 @@ configure_rootfs() {
 		containerd.service \
 		getty@tty1.service \
 		serial-getty@ttyS0.service >/dev/null || true
+	# The pre-systemd-240 machines.raw compatibility mount delays local-fs.target
+	# under mount-event rate limiting, even though this image has no machines.raw.
 	systemctl --root="${ROOTFS_MOUNT_DIR}" mask \
+		var-lib-machines.mount \
 		getty.target \
 		getty@.service \
 		serial-getty@.service \
@@ -430,7 +433,8 @@ build_rootfs() {
 	pacstrap -C "${PACMAN_CONFIG_PATH}" -K -c "${ROOTFS_MOUNT_DIR}" "${ROOTFS_PACKAGES[@]}"
 	install_kernel_modules
 
-	rsync -a "${SCRIPT_DIR}/overlay/" "${ROOTFS_MOUNT_DIR}/"
+	# Overlay paths belong to root in the guest, regardless of checkout ownership.
+	rsync -a --chown=0:0 "${SCRIPT_DIR}/overlay/" "${ROOTFS_MOUNT_DIR}/"
 	install_pi
 	install_agent_browser
 	bootstrap_lazyvim

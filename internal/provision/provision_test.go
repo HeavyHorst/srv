@@ -493,6 +493,7 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 		t.Fatalf("CreateInstance(): %v", err)
 	}
 
+	offloadTestDisk(t, p, inst)
 	backup, err := p.CreateBackup(ctx, inst.Name)
 	if err != nil {
 		t.Fatalf("CreateBackup(): %v", err)
@@ -532,6 +533,7 @@ func TestCreateListAndRestoreBackup(t *testing.T) {
 		t.Fatalf("WriteFile(firecracker v2): %v", err)
 	}
 
+	offloadTestDisk(t, p, mutated)
 	restored, restoredBackup, err := p.RestoreBackup(ctx, inst.Name, backup.ID)
 	if err != nil {
 		t.Fatalf("RestoreBackup(): %v", err)
@@ -716,6 +718,7 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
 		t.Fatalf("PrepareMigration(): %v", err)
 	}
 
+	offloadTestDisk(t, source, sourceInst)
 	var stream bytes.Buffer
 	exportedInfo, err := source.ExportInstance(ctx, sourceInst.Name, &stream)
 	if err != nil {
@@ -2698,6 +2701,9 @@ func TestCheckRootFSRunsForcedRepairOnlyForStoppedInstance(t *testing.T) {
 			}
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+			if tt.name == "clean" {
+				offloadTestDisk(t, p, inst)
+			}
 			_, err := p.CheckRootFS(ctx, inst.Name)
 			if tt.wantErr == "" {
 				if err != nil {
@@ -2782,6 +2788,7 @@ func TestResizeStoppedInstanceUpdatesStoredConfigAndGrowsRootFS(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+	offloadTestDisk(t, p, inst)
 	resized, err := p.Resize(ctx, inst.Name, CreateOptions{VCPUCount: 4, MemoryMiB: 4096, RootFSSizeBytes: 12 * testMiB})
 	if err != nil {
 		t.Fatalf("Resize(): %v", err)

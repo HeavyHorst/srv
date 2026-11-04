@@ -682,9 +682,6 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 }
 
 func (p *Provisioner) CheckRootFS(ctx context.Context, name string) (model.Instance, error) {
-	p.admissionMu.Lock()
-	defer p.admissionMu.Unlock()
-
 	if err := p.migrationFence(ctx, name); err != nil {
 		return model.Instance{}, err
 	}
@@ -704,6 +701,9 @@ func (p *Provisioner) CheckRootFS(ctx context.Context, name string) (model.Insta
 	if err := p.diskMutationFence(ctx, inst); err != nil {
 		return inst, err
 	}
+	// The caller retains the lifecycle lock while hydration waits for payload.
+	p.admissionMu.Lock()
+	defer p.admissionMu.Unlock()
 	if _, err := exec.LookPath("e2fsck"); err != nil {
 		return inst, errors.New("fsck requires e2fsck on the host")
 	}
@@ -737,9 +737,6 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 		if current.FirecrackerPID > 0 && processExists(current.FirecrackerPID) {
 			return fmt.Errorf("instance %q must be stopped before resize", name)
 		}
-		if err := p.diskMutationFence(ctx, current); err != nil {
-			return err
-		}
 
 		resized := current
 		if resized.FirecrackerPID > 0 {
@@ -762,6 +759,14 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 		}
 		if err := validateMachineShape(p.effectiveVCPUCount(resized), p.effectiveMemoryMiB(resized)); err != nil {
 			return err
+		}
+		// Import/delete take payload before admission. Never wait for the
+		// runner's payload lock while holding admission; lifecycle stays locked.
+		p.admissionMu.Unlock()
+		hydrateErr := p.diskMutationFence(ctx, current)
+		p.admissionMu.Lock()
+		if hydrateErr != nil {
+			return hydrateErr
 		}
 		if opts.RootFSSizeBytes > 0 {
 			currentFileSize, err := p.rootFSSize(resized.RootFSPath)

@@ -1,17 +1,22 @@
 package provision
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"srv/internal/host"
 	"srv/internal/model"
+	"srv/internal/storage"
 	"srv/internal/vmrunner"
 )
 
@@ -22,6 +27,197 @@ type coldTestRunner struct {
 
 func (r coldTestRunner) ColdDisk(_ context.Context, req vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
 	return r.call(req)
+}
+
+// Keep disk consumers real; replace only the runner's privileged transfer.
+// The active disk is genuinely absent until the command requests hydration.
+func offloadTestDisk(t *testing.T, p *Provisioner, inst model.Instance) {
+	t.Helper()
+	remote := filepath.Join(t.TempDir(), "remote.img")
+	if err := os.Rename(inst.RootFSPath, remote); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(p.cfg.InstancesDir(), inst.Name, "cold-disk.json")
+	phase := "cold"
+	writeMarker := func() {
+		t.Helper()
+		data, err := json.Marshal(coldDiskMarker{InstanceID: inst.ID, Phase: phase, Remote: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(marker, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeMarker()
+	p.vmRunner = coldTestRunner{call: func(q vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
+		if q.InstanceID != inst.ID {
+			return vmrunner.ColdStatus{Phase: "hot"}, nil
+		}
+		switch q.Action {
+		case "status":
+		case "hydrate":
+			if phase == "cold" {
+				if err := os.Rename(remote, inst.RootFSPath); err != nil {
+					return vmrunner.ColdStatus{}, err
+				}
+				phase = "hot"
+				writeMarker()
+			}
+		default:
+			return vmrunner.ColdStatus{}, errors.New("unexpected cold operation: " + q.Action)
+		}
+		return vmrunner.ColdStatus{Phase: phase, Remote: true, JournalPresent: true}, nil
+	}}
+}
+
+func TestAutomaticHydrationDoesNotBlockImportOrHotResize(t *testing.T) {
+	for _, command := range []string{"migration", "fsck", "resize", "template"} {
+		t.Run(command, func(t *testing.T) {
+			templateTestTools(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cfg := loadProvisionTestConfig(t, nil)
+			st := newProvisionTestStore(t, cfg)
+			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			inst := provisionTestInstance(cfg, "cold-source", model.StateStopped, time.Now().UTC())
+			templateTestImage(t, inst.RootFSPath, map[string]string{"home/user/project/data": "preserved"})
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			offloadTestDisk(t, p, inst)
+			runner := p.vmRunner.(coldTestRunner)
+			hot := provisionTestInstance(cfg, "hot-neighbor", model.StateStopped, time.Now().UTC())
+			if err := os.MkdirAll(filepath.Dir(hot.RootFSPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(hot.RootFSPath, []byte("hot"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateInstance(ctx, hot); err != nil {
+				t.Fatal(err)
+			}
+
+			importHeld, allowImport := make(chan struct{}), make(chan struct{})
+			hydrateWaiting, downloading, allowHydrate := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var gateImport sync.Once
+			p.readFilesystemUsage = func(path string) (host.FilesystemUsage, error) {
+				gateImport.Do(func() {
+					close(importHeld) // Import owns payload but has not acquired admission.
+					select {
+					case <-allowImport:
+					case <-ctx.Done():
+					}
+				})
+				return host.DefaultReadFilesystemUsage(path)
+			}
+			p.vmRunner = coldTestRunner{call: func(q vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
+				if q.Action == "hydrate" {
+					close(hydrateWaiting)
+					// Match the runner's independent host payload lock, including real
+					// flock contention with the import (ownership checks are stubbed).
+					_, release, err := storage.AcquirePayload(ctx, cfg.DataDirAbs())
+					if err != nil {
+						return vmrunner.ColdStatus{}, err
+					}
+					defer release()
+					close(downloading)
+					select {
+					case <-allowHydrate:
+					case <-ctx.Done():
+						return vmrunner.ColdStatus{}, ctx.Err()
+					}
+				}
+				return runner.ColdDisk(ctx, q)
+			}}
+			var workers sync.WaitGroup
+			t.Cleanup(func() { cancel(); workers.Wait() })
+			manifest := portableManifest{Version: portableManifestVersion, ExportedAt: time.Now().UTC(), Instance: portableInstance{Name: "import-neighbor", CreatedAt: time.Now().UTC(), RootFSSizeBytes: 6}, Files: backupFiles{RootFS: backupRootFSName}}
+			stream := portableArtifactTestStream(t, manifest, map[string][]byte{backupRootFSName: []byte("import")})
+			importDone, commandDone := make(chan error, 1), make(chan error, 1)
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				_, _, err := p.ImportInstance(ctx, model.Actor{}, bytes.NewReader(stream))
+				importDone <- err
+			}()
+			select {
+			case <-importHeld:
+			case err := <-importDone:
+				t.Fatal("import did not reach payload gate", err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				var err error
+				switch command {
+				case "migration":
+					_, err = p.PrepareMigration(ctx, inst.Name, "destination", "token")
+				case "fsck":
+					_, err = p.CheckRootFS(ctx, inst.Name)
+				case "resize":
+					_, err = p.Resize(ctx, inst.Name, CreateOptions{VCPUCount: 4})
+				case "template":
+					err = p.CreateTemplate(ctx, inst.Name, "prepared", model.Actor{UserLogin: inst.CreatedByUser})
+				}
+				commandDone <- err
+			}()
+			select {
+			case <-hydrateWaiting:
+			case err := <-commandDone:
+				t.Fatal("command did not reach hydration", err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			close(allowImport)
+			select {
+			case err := <-importDone:
+				if err != nil {
+					t.Fatal("parallel import failed", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("hydration blocked import admission", ctx.Err())
+			}
+			select {
+			case <-downloading:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			// A long download must not hold up unrelated admission work either.
+			hotDone := make(chan error, 1)
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				_, err := p.Resize(ctx, hot.Name, CreateOptions{VCPUCount: 4})
+				hotDone <- err
+			}()
+			select {
+			case err := <-hotDone:
+				if err != nil {
+					t.Fatal("hot resize failed during download", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("download blocked unrelated admission", ctx.Err())
+			}
+			close(allowHydrate)
+			if err := <-commandDone; err != nil {
+				t.Fatal("cold command failed", err)
+			}
+			imported, err := st.GetInstance(ctx, manifest.Instance.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(imported.RootFSPath); err != nil || string(data) != "import" {
+				t.Fatalf("parallel import data = %q, %v", data, err)
+			}
+			resized, err := st.GetInstance(ctx, hot.Name)
+			if err != nil || resized.VCPUCount != 4 {
+				t.Fatalf("hot resize was not persisted: %+v, %v", resized, err)
+			}
+		})
+	}
 }
 
 func TestColdDiskHiddenJournal(t *testing.T) {

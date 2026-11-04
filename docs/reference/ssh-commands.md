@@ -212,8 +212,10 @@ direct `ssh srv-a delete` line with the frontend submission line.
 | `disk purge <name>` | Delete a retained remote generation; requires a valid local disk |
 
 Supports `--json` and backend-qualified names through srv-front. Mutations on
-native Orbs require admin access. `start` hydrates automatically when needed;
-other disk-consuming commands require explicit hydration. See
+native Orbs require admin access. `start`, migration preparation, export,
+backup/restore, template creation, resize and fsck hydrate automatically when
+needed. Offline commands still require a stopped instance; migration can stop
+the source itself. Host snapshots still require explicit hydration and purge. See
 [configuration, outage behavior and recovery](operations.md#optional-cold-disks-over-ssh).
 
 ## Resize command

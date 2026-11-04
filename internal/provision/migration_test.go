@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +29,12 @@ func TestCompletedMigrationDeletePreservesSharedTailnetIdentity(t *testing.T) {
 	p.SetCleanup("backend", func(context.Context, model.Instance) error { return nil })
 	inst := provisionTestInstance(cfg, "moved", model.StateStopped, time.Now().UTC())
 	inst.TailnetNodeID = "shared-node"
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("disk"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatal(err)
 	}
@@ -52,11 +59,41 @@ func TestRecoveredMigrationRequiresFreshToken(t *testing.T) {
 	st := newProvisionTestStore(t, cfg)
 	p := &Provisioner{cfg: cfg, store: st, vmRunner: noopVMRunner{}}
 	inst := provisionTestInstance(cfg, "retry", model.StateStopped, time.Now().UTC())
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("disk"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	offloadTestDisk(t, p, inst)
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatal(err)
 	}
+	available := p.vmRunner
+	p.vmRunner = coldTestRunner{call: func(q vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
+		if q.Action == "hydrate" {
+			return vmrunner.ColdStatus{}, errors.New("remote unavailable")
+		}
+		return vmrunner.ColdStatus{Phase: "cold", Remote: true, JournalPresent: true}, nil
+	}}
+	if _, err := p.PrepareMigration(ctx, inst.Name, "destination", "old"); err == nil || !strings.Contains(err.Error(), "remote unavailable") {
+		t.Fatalf("unavailable source must fail preparation: %v", err)
+	}
+	if m, err := p.MigrationStatus(ctx, inst.Name); err != nil || m.Phase != "preparing" {
+		t.Fatalf("failed hydration lost migration fence: %+v %v", m, err)
+	}
+	if _, err := os.Stat(inst.RootFSPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed hydration fabricated a disk: %v", err)
+	}
+	p.vmRunner = available
 	if _, err := p.PrepareMigration(ctx, inst.Name, "destination", "old"); err != nil {
 		t.Fatal(err)
+	}
+	if payload, err := os.ReadFile(inst.RootFSPath); err != nil || string(payload) != "disk" {
+		t.Fatalf("migration did not restore original disk: %q %v", payload, err)
+	}
+	if _, err := p.ColdDisk(ctx, inst.Name, "offload"); err == nil || !strings.Contains(err.Error(), "fenced by migration") {
+		t.Fatalf("prepared migration allowed retention offload: %v", err)
 	}
 	if _, err := p.FinishMigration(ctx, inst.Name, "old", true); err != nil {
 		t.Fatal(err)
@@ -81,6 +118,12 @@ func TestMigrationDestinationPolicyPersists(t *testing.T) {
 			p := &Provisioner{cfg: cfg, store: st, vmRunner: noopVMRunner{}}
 			inst := provisionTestInstance(cfg, "pooled", model.StateStopped, time.Now().UTC())
 			inst.MemoryMode, inst.MemoryPoolID = "pool", "source-local-id"
+			if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(inst.RootFSPath, []byte("disk"), 0600); err != nil {
+				t.Fatal(err)
+			}
 			if err := st.CreateInstance(ctx, inst); err != nil {
 				t.Fatal(err)
 			}

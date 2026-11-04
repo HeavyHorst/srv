@@ -144,6 +144,13 @@ the source runner for a readonly disk snapshot. The runners reuse coldstore's
 validated Btrfs send/receive, with streams relayed through the frontend's pinned
 SSH connections and bounded pipes. No additional host-to-host SSH key is needed.
 
+An offloaded source disk is automatically hydrated on the source host during
+preparation, before taking the transfer snapshot. Allow local space for the full
+disk and time for the download; this is not a direct cold-store-to-destination
+transfer. The migration fence prevents retention from offloading it again.
+If hydration fails, the source stays fenced in `preparing`; resolve the storage
+error and retry preparation with the same token, target and memory-policy flags.
+
 If the disk has a known readonly image base, the destination receives that base
 once, then receives each VM using `btrfs send -p BASE SNAPSHOT`. A matching stored
 base is reused by its UUID and exact manifest, not by an image name or a content

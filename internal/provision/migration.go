@@ -103,9 +103,6 @@ func (p *Provisioner) PrepareMigration(ctx context.Context, name, target, token 
 	if err != nil {
 		return model.Migration{}, err
 	}
-	if err := p.coldDiskFence(ctx, inst, false); err != nil {
-		return model.Migration{}, err
-	}
 	if target == "" || token == "" || inst.State == model.StateDeleted || inst.State == model.StateDeleting {
 		return model.Migration{}, fmt.Errorf("invalid migration source, target or token")
 	}
@@ -149,9 +146,20 @@ func (p *Provisioner) PrepareMigration(ctx context.Context, name, target, token 
 		return m, err
 	}
 	if inst.State != model.StateStopped || inst.FirecrackerPID != 0 {
-		if _, err := p.Stop(ctx, name); err != nil {
+		inst, err = p.Stop(ctx, name)
+		if err != nil {
 			return m, err
 		}
+	}
+	// The lifecycle lock and durable migration fence span hydration and transfer
+	// preparation, so retention cannot evict the restored disk between commands.
+	// Import/delete acquire payload before admission, so release admission while
+	// the runner waits for payload and downloads the disk.
+	p.admissionMu.Unlock()
+	hydrateErr := p.hydrateColdDisk(ctx, inst)
+	p.admissionMu.Lock()
+	if hydrateErr != nil {
+		return m, hydrateErr
 	}
 	m.Phase = "prepared"
 	return m, p.store.PutMigration(ctx, m)

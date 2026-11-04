@@ -385,7 +385,18 @@ namespace before retrying. Never delete unknown contents automatically or rename
 a valid interrupted `.stage-put-UUID` / `.stage-delete-UUID`; their recovery is
 managed by the helper.
 
-Disk mutations, export and backup/template creation require hydration first.
+Migration preparation, export, backup creation/restore, template creation,
+resize and fsck automatically hydrate a stopped cold disk before using it,
+just as start does. The instance lock covers hydration and the operation;
+migrations additionally retain their durable fence between transfer commands,
+so retention cannot offload the disk during migration. Hydration does not boot
+the guest or reset its stop time. After other operations finish, an overdue
+stopped disk may be offloaded again by retention. Existing hot disks do not
+require contacting remote storage. Missing or unavailable cold data fails the
+operation rather than substituting a base image. A failed migration hydration
+leaves the source in `preparing`; retry `migration prepare` with the same target,
+token and memory-policy flags after resolving the storage problem.
+
 Complete host snapshots reject cold/transitional disks **and hot disks with
 retained cold-storage state**: hydrate and purge them before taking a bundle.
 This preserves the self-contained snapshot contract rather than silently

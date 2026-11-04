@@ -908,7 +908,7 @@ func startCommandKeepAlive(sess gssh.Session, args []string, interval time.Durat
 		return func() {}
 	}
 	switch args[0] {
-	case "start", "stop", "restart", "disk", "delete":
+	case "start", "stop", "restart", "disk", "delete", "resize", "fsck", "backup", "restore", "export", "migration", "project-template":
 	case "orb":
 		if len(args) < 2 || args[1] != "bootstrap" {
 			return func() {}

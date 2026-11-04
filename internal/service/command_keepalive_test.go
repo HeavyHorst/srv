@@ -30,6 +30,13 @@ func TestCommandKeepAliveOverSSH(t *testing.T) {
 		{"disk hydrate vm", false, true},
 		{"delete vm", false, true},
 		{"orb bootstrap vm", false, true},
+		{"migration prepare vm destination token", false, true},
+		{"export vm", false, true},
+		{"backup vm", false, true},
+		{"restore vm backup-id", false, true},
+		{"resize vm --cpus 4", false, true},
+		{"fsck vm", false, true},
+		{"project-template create vm template-id", false, true},
 		{"list", false, false},    // Same quiet workload without keepalive times out.
 		{"start vm", true, false}, // Explicit stop restores the idle timeout.
 	} {

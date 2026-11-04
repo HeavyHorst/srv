@@ -69,8 +69,6 @@ func (p *Provisioner) VerifyTemplate(ctx context.Context, name, templateID strin
 }
 
 func (p *Provisioner) createTemplate(ctx context.Context, name, templateID string, actor model.Actor, mustExist bool) error {
-	p.admissionMu.Lock()
-	defer p.admissionMu.Unlock()
 	dest, err := p.templatePath(templateID, actor)
 	if err != nil {
 		return err
@@ -85,15 +83,19 @@ func (p *Provisioner) createTemplate(ctx context.Context, name, templateID strin
 	if !strings.EqualFold(inst.CreatedByUser, actor.UserLogin) {
 		return errors.New("template source belongs to another owner")
 	}
-	if err := p.coldDiskFence(ctx, inst, false); err != nil {
-		return err
-	}
 	if err := p.resolveRuntime(ctx, &inst); err != nil {
 		return err
 	}
 	if inst.State != model.StateStopped || (inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID)) {
 		return errors.New("template source must be stopped")
 	}
+	if err := p.hydrateColdDisk(ctx, inst); err != nil {
+		return err
+	}
+	// Keep the lifecycle lock, but acquire global admission only after the
+	// runner releases payload. Template publication is serialized below.
+	p.admissionMu.Lock()
+	defer p.admissionMu.Unlock()
 	if _, old, err := p.readTemplate(templateID, actor); err == nil {
 		if old.SourceID == inst.ID && old.Image == inst.ImageName() && (model.Instance{Kind: old.Kind}).KindName() == inst.KindName() {
 			info, err := os.Stat(templateDiskPath(dest, old))

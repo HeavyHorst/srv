@@ -95,6 +95,9 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 			if err := st.CreateInstance(ctx, inst); err != nil {
 				t.Fatal(err)
 			}
+			if state == "populated" {
+				offloadTestDisk(t, p, inst)
+			}
 			if err := p.CreateTemplate(ctx, inst.Name, "prepared", actor); err != nil {
 				t.Fatal(err)
 			}
@@ -166,6 +169,12 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 				t.Fatal("foreign delete removed template")
 			}
 			other := provisionTestInstance(cfg, "other", model.StateStopped, time.Now())
+			if err := os.MkdirAll(filepath.Dir(other.RootFSPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(other.RootFSPath, []byte("other disk"), 0600); err != nil {
+				t.Fatal(err)
+			}
 			if err := st.CreateInstance(ctx, other); err != nil {
 				t.Fatal(err)
 			}

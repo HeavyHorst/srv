@@ -426,14 +426,21 @@ func (p *Provisioner) requireExistingInstance(ctx context.Context, name string) 
 	if err != nil {
 		return model.Instance{}, err
 	}
-	if err := p.coldDiskFence(ctx, inst, false); err != nil {
-		return model.Instance{}, err
-	}
 	if inst.State == model.StateDeleted {
 		return model.Instance{}, fmt.Errorf("instance %q is deleted", name)
 	}
 	if inst.State == model.StateStopping || inst.State == model.StateDeleting {
 		return model.Instance{}, fmt.Errorf("instance %q has unfinished lifecycle cleanup (%s)", name, inst.State)
+	}
+	// Callers hold the lifecycle lock through hydration and disk consumption.
+	// Running backups may use a hot disk, but must never restore over a runtime.
+	if inst.State == model.StateStopped && inst.FirecrackerPID == 0 {
+		err = p.hydrateColdDisk(ctx, inst)
+	} else {
+		err = p.coldDiskFence(ctx, inst, false)
+	}
+	if err != nil {
+		return model.Instance{}, err
 	}
 	if inst.RootFSPath == "" {
 		return model.Instance{}, fmt.Errorf("instance %q is missing a rootfs path", name)

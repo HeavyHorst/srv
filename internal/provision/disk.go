@@ -322,9 +322,6 @@ func (p *Provisioner) ensureDiskLayout(ctx context.Context, inst *model.Instance
 // Offline mutations must not change the authoritative legacy file while a
 // durable staged copy is awaiting publication/recovery.
 func (p *Provisioner) diskMutationFence(ctx context.Context, inst model.Instance) error {
-	if err := p.coldDiskFence(ctx, inst, false); err != nil {
-		return err
-	}
 	dir, err := p.instanceDir(inst.Name)
 	if err != nil {
 		return err
@@ -332,5 +329,5 @@ func (p *Provisioner) diskMutationFence(ctx context.Context, inst model.Instance
 	if err := absentPath(filepath.Join(dir, "disk-migration.json")); err != nil {
 		return fmt.Errorf("disk migration recovery required before mutation: %w", err)
 	}
-	return nil
+	return p.hydrateColdDisk(ctx, inst)
 }

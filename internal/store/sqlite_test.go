@@ -14,6 +14,69 @@ import (
 	"srv/internal/model"
 )
 
+func TestStoppedSinceTracksContinuousStop(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "retention.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	start := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	inst := testInstance("retained", model.StateStopped, start)
+	inst.UpdatedAt = start
+	if err := s.CreateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	check := func(want time.Time) {
+		t.Helper()
+		got, err := s.StoppedSince(ctx, inst.ID)
+		if err != nil || !got.Equal(want) {
+			t.Fatalf("StoppedSince = %v, %v; want %v", got, err, want)
+		}
+	}
+	check(start)
+	inst.UpdatedAt = start.Add(24 * time.Hour)
+	inst.LastError = "metadata changed"
+	if err := s.UpdateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	check(start)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(start)
+	inst.State = model.StateReady
+	if err := s.UpdateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	check(time.Time{})
+	// Runtime reconciliation can also observe a stopped guest.
+	stopped := inst
+	stopped.State = model.StateStopped
+	stopped.UpdatedAt = start.Add(36 * time.Hour)
+	if err := s.UpdateInstanceRuntime(ctx, inst, stopped); err != nil {
+		t.Fatal(err)
+	}
+	check(stopped.UpdatedAt)
+	// Simulate a pre-retention record and verify conservative upgrade behavior.
+	if _, err := s.db.ExecContext(ctx, `UPDATE instances SET stopped_since = NULL WHERE id = ?`, inst.ID); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now().UTC()
+	if err := s.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.StoppedSince(ctx, inst.ID)
+	if err != nil || got.Before(before) || got.After(time.Now().UTC()) {
+		t.Fatalf("legacy stop time = %v, %v", got, err)
+	}
+}
+
 func TestStoreInstanceRoundTripAndListFiltering(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

@@ -716,12 +716,24 @@ func (s *Store) migrate(ctx context.Context) error {
 		{name: "tailnet_node_id", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "image", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "kind", decl: "TEXT NOT NULL DEFAULT 'vm' CHECK (kind IN ('vm', 'orb'))"},
+		{name: "stopped_since", decl: "TEXT"},
 	} {
 		if err := s.ensureColumn(ctx, "instances", column.name, column.decl); err != nil {
 			return err
 		}
 	}
 	for _, stmt := range []string{
+		// Track state transitions centrally, including runtime reconciliation and
+		// imports. Metadata-only updates must not extend the retention period.
+		`CREATE TRIGGER IF NOT EXISTS instances_stopped_insert AFTER INSERT ON instances
+		WHEN NEW.state = 'stopped' BEGIN
+			UPDATE instances SET stopped_since = NEW.updated_at WHERE id = NEW.id;
+		END;`,
+		`CREATE TRIGGER IF NOT EXISTS instances_stopped_update AFTER UPDATE OF state ON instances
+		WHEN OLD.state != NEW.state BEGIN
+			UPDATE instances SET stopped_since = CASE WHEN NEW.state = 'stopped' THEN NEW.updated_at ELSE NULL END
+			WHERE id = NEW.id;
+		END;`,
 		`CREATE INDEX IF NOT EXISTS idx_instance_integrations_integration_id
 			ON instance_integrations (integration_id)
 		;`,
@@ -733,7 +745,26 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("run migration %q: %w", stmt, err)
 		}
 	}
+	// Legacy records have no reliable stop timestamp. Give them a full retention
+	// period from the upgrade rather than guessing from mutable metadata.
+	if _, err := s.db.ExecContext(ctx, `UPDATE instances SET stopped_since = ? WHERE state = 'stopped' AND stopped_since IS NULL`, timeString(time.Now().UTC())); err != nil {
+		return err
+	}
 	return nil
+}
+
+// StoppedSince returns zero unless this incarnation is still stopped.
+// Callers performing lifecycle work must hold the instance lock when checking.
+func (s *Store) StoppedSince(ctx context.Context, id string) (time.Time, error) {
+	var value sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT stopped_since FROM instances WHERE id = ? AND state = 'stopped' AND firecracker_pid = 0 AND deleted_at IS NULL`, id).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !value.Valid) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parseTime(value.String)
 }
 
 func (s *Store) ensureColumn(ctx context.Context, table, column, decl string) error {

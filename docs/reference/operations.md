@@ -293,8 +293,24 @@ Explicit mutations on native Orbs require an admin; visible owners can inspect
 status. Automatic offload follows the existing authorized stop operation.
 The stop response may wait for the optional transfer; transfer failure is logged
 but does not turn a completed guest shutdown into failure. Restart, host drain,
-and migration shutdown do not automatically offload. Existing stopped instances
-can be offloaded explicitly; there is no periodic eviction scheduler.
+and migration shutdown do not trigger this immediate after-stop offload.
+
+For delayed automatic offload, set `SRV_COLD_STORAGE_RETENTION=48h` (or
+`--cold-storage-retention=48h`) on srv. This applies to both VMs and Orbs after
+two days continuously stopped, regardless of how they stopped. Leave
+`SRV_COLD_STORAGE_AFTER_STOP=false` to keep disks local during that period;
+enabling both options still permits immediate offload after an explicit stop.
+The default retention is `0`, which disables the scheduler. Durations use Go
+syntax (`48h`, not `2d`).
+
+The scheduler checks after startup recovery and every five minutes, transferring
+one disk at a time. Busy instances and host snapshots defer work. Stop times
+survive srv restarts; metadata changes do not reset them, but starting and
+stopping again does. Already stopped instances without a recorded stop time get
+a full retention period from the first startup after upgrading. Migration fences
+still apply. Already cold disks and incomplete recovery states are skipped;
+recover interrupted transfers as described below. Other failures are logged and
+retried on a later scan. Long transfers can delay later candidates.
 
 The runner keeps a durable incarnation-bound journal under its start receipts
 and a `cold-disk.json` fence beside instance runtime metadata. Upload publication,

@@ -83,6 +83,7 @@ type Config struct {
 
 	ColdStorageHost      string
 	ColdStorageAfterStop bool
+	ColdStorageRetention time.Duration
 
 	LogLevel string
 
@@ -157,6 +158,7 @@ func Load() (Config, error) {
 	flag.Int64Var(&cfg.MemoryMiB, "vm-memory-mib", getenvInt64("SRV_VM_MEMORY_MIB", 1024), "guest memory in MiB")
 	flag.StringVar(&cfg.ColdStorageHost, "cold-storage-host", os.Getenv("SRV_COLD_STORAGE_HOST"), "optional SSH destination for cold disks; runner must use the same setting")
 	flag.BoolVar(&cfg.ColdStorageAfterStop, "cold-storage-after-stop", os.Getenv("SRV_COLD_STORAGE_AFTER_STOP") == "true", "attempt cold offload after an explicit successful stop (requires cold-storage-host)")
+	coldRetention := flag.String("cold-storage-retention", getenv("SRV_COLD_STORAGE_RETENTION", "0"), "offload instances after this stopped duration, e.g. 48h (0 disables; requires cold-storage-host)")
 	flag.StringVar(&cfg.LogLevel, "log-level", getenv("SRV_LOG_LEVEL", "info"), "log level")
 
 	flag.Parse()
@@ -170,6 +172,9 @@ func Load() (Config, error) {
 	cfg.GuestTailscaleAuthOnce = true
 
 	var err error
+	if cfg.ColdStorageRetention, err = time.ParseDuration(*coldRetention); err != nil {
+		return Config{}, fmt.Errorf("parse cold storage retention: %w", err)
+	}
 	if *providerNodes != "" {
 		if err := json.Unmarshal([]byte(*providerNodes), &cfg.ProviderNodes); err != nil {
 			return Config{}, fmt.Errorf("parse provider nodes: %w", err)
@@ -212,6 +217,12 @@ func (c Config) Validate() error {
 	}
 	if c.ColdStorageAfterStop && c.ColdStorageHost == "" {
 		return errors.New("cold-storage-after-stop requires cold-storage-host")
+	}
+	if c.ColdStorageRetention < 0 {
+		return errors.New("cold-storage-retention must not be negative")
+	}
+	if c.ColdStorageRetention > 0 && c.ColdStorageHost == "" {
+		return errors.New("cold-storage-retention requires cold-storage-host")
 	}
 	if err := c.ProviderNodes.Validate(c.AdminUsers); err != nil {
 		return err

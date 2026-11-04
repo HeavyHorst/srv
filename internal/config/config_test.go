@@ -44,13 +44,14 @@ func TestLoadUsesEnvironmentValues(t *testing.T) {
 	t.Setenv("SRV_LOG_LEVEL", "debug")
 	t.Setenv("SRV_COLD_STORAGE_HOST", "storage.example")
 	t.Setenv("SRV_COLD_STORAGE_AFTER_STOP", "true")
+	t.Setenv("SRV_COLD_STORAGE_RETENTION", "48h")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load(): %v", err)
 	}
 
-	if cfg.ColdStorageHost != "storage.example" || !cfg.ColdStorageAfterStop {
+	if cfg.ColdStorageHost != "storage.example" || !cfg.ColdStorageAfterStop || cfg.ColdStorageRetention != 48*time.Hour {
 		t.Fatal("cold-storage environment configuration not loaded")
 	}
 	if cfg.Hostname != "control" {
@@ -182,6 +183,19 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 		mutate  func(*Config)
 		wantErr string
 	}{
+		{
+			name:    "negative cold retention",
+			mutate:  func(cfg *Config) { cfg.ColdStorageRetention = -time.Hour },
+			wantErr: "cold-storage-retention must not be negative",
+		},
+		{
+			name: "cold retention without host",
+			mutate: func(cfg *Config) {
+				cfg.ColdStorageRetention = 48 * time.Hour
+				cfg.ColdStorageHost = ""
+			},
+			wantErr: "cold-storage-retention requires cold-storage-host",
+		},
 		{
 			name:    "negative tailscale port",
 			mutate:  func(cfg *Config) { cfg.TailscalePort = -1 },

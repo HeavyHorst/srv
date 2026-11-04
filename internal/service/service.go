@@ -590,6 +590,12 @@ func (a *App) Run(ctx context.Context) error {
 	g.Go(func() error {
 		a.restoreInstances(groupCtx)
 		startupLease.Release()
+		if a.cfg.ColdStorageRetention > 0 {
+			g.Go(func() error {
+				a.runColdRetention(groupCtx)
+				return nil
+			})
+		}
 		a.runReconciliation(groupCtx)
 		return nil
 	})

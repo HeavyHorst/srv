@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -18,6 +19,69 @@ import (
 	"srv/internal/provision"
 	"srv/internal/vmrunner"
 )
+
+func TestColdRetentionEligibility(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		age      time.Duration
+		state    string
+		disabled bool
+		busy     bool
+		snapshot bool
+		wantDue  bool
+	}{
+		{name: "old", age: 72 * time.Hour, state: model.StateStopped, wantDue: true},
+		{name: "boundary", age: 48 * time.Hour, state: model.StateStopped, wantDue: true},
+		{name: "not-yet", age: 48*time.Hour - time.Nanosecond, state: model.StateStopped},
+		{name: "running", age: 72 * time.Hour, state: model.StateReady},
+		{name: "disabled", age: 72 * time.Hour, state: model.StateStopped, disabled: true},
+		{name: "busy", age: 72 * time.Hour, state: model.StateStopped, busy: true},
+		{name: "snapshot", age: 72 * time.Hour, state: model.StateStopped, snapshot: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := loadServiceTestConfig(t, nil)
+			cfg.ColdStorageHost = "storage.example"
+			cfg.ColdStorageRetention = 48 * time.Hour
+			if tc.disabled {
+				cfg.ColdStorageRetention = 0
+			}
+			// An unavailable runner must surface an error for due disks only.
+			cfg.VMRunnerSocketPath = filepath.Join(t.TempDir(), "absent.sock")
+			st := newServiceTestStore(t)
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			p, err := provision.New(cfg, logger, st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := &App{cfg: cfg, store: st, log: logger, provisioner: p, snapshotOn: tc.snapshot}
+			inst := serviceTestInstance("alpha", tc.state, now.Add(-tc.age))
+			inst.UpdatedAt = now.Add(-tc.age)
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			// Mutable metadata is not the retention clock.
+			inst.UpdatedAt = now
+			if err := st.UpdateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			if tc.busy {
+				unlock := a.lockInstance(inst.Name)
+				defer unlock()
+			}
+			a.offloadExpiredDisks(ctx, now)
+			if got := strings.Contains(logs.String(), "cold retention offload failed"); got != tc.wantDue {
+				t.Fatalf("due = %v, want %v; logs: %s", got, tc.wantDue, logs.String())
+			}
+			stored, err := st.GetInstance(ctx, inst.Name)
+			if err != nil || !reflect.DeepEqual(stored, inst) {
+				t.Fatalf("runner failure changed instance: %+v, %v", stored, err)
+			}
+		})
+	}
+}
 
 // Keep the real vmrunner.Client transport and its strict wire validation;
 // only the privileged runner is replaced. No journal means hot, not proof

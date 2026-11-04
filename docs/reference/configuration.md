@@ -87,6 +87,7 @@ the SSH credentials. Neither daemon formats storage or configures the remote hos
 | `SRV_COLD_STORAGE_KEY` | empty | Root-owned SSH identity file with no group/other permissions, with protected root-owned ancestors |
 | `SRV_COLD_STORAGE_KNOWN_HOSTS` | empty | Root-owned pinned host-key file, with protected root-owned ancestors |
 | `SRV_COLD_STORAGE_AFTER_STOP` | `false` | Set to `true` to attempt eviction after a successful explicit stop; errors retain local data and do not fail shutdown |
+| `SRV_COLD_STORAGE_RETENTION` | `0` (disabled) | Offload disks after this duration continuously stopped, e.g. `48h` for two days; requires a cold-storage host |
 
 The runner's `--cold-storage-timeout` defaults to `6h`, including checksum verification;
 the remote helper's `--timeout` must also cover the operation. Leaving after-stop off

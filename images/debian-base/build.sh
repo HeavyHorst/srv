@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Arch hosts may omit sbin, but Debian's chroot tools (including depmod) use it.
+export PATH="${PATH}:/usr/sbin:/sbin"
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 OVERLAY="${SCRIPT_DIR}/../arch-base/overlay"
 OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/out}"

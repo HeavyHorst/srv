@@ -9,18 +9,18 @@ ROOTFS_MOUNT_DIR="${WORK_DIR}/rootfs"
 ARCH="${ARCH:-x86_64}"
 ROOTFS_SIZE="${ROOTFS_SIZE:-10G}"
 ROOTFS_LABEL="${ROOTFS_LABEL:-srv-root}"
-# Use the current 6.12 longterm series by default to avoid older-kernel
-# toolchain friction on modern distros such as Arch with GCC 15.
-KERNEL_VERSION="${KERNEL_VERSION:-6.12.79}"
+# Pinned guest kernel tested with both Arch and Debian rootfs images.
+KERNEL_VERSION="${KERNEL_VERSION:-7.3.1}"
 FIRECRACKER_CONFIG_VERSION="${FIRECRACKER_CONFIG_VERSION:-6.1}"
+FIRECRACKER_CONFIG_REVISION="6ea6634994fa13473a0a8b61094989b6131f40d3"
 PI_VERSION="${PI_VERSION:-0.70.2}"
 AGENT_BROWSER_VERSION="${AGENT_BROWSER_VERSION:-0.32.0}"
 
 KERNEL_TARBALL="${WORK_DIR}/linux-${KERNEL_VERSION}.tar.xz"
 KERNEL_SOURCE_DIR="${WORK_DIR}/linux-${KERNEL_VERSION}"
-FIRECRACKER_CONFIG_PATH="${WORK_DIR}/microvm-kernel-ci-${ARCH}-${FIRECRACKER_CONFIG_VERSION}.config"
-KERNEL_TARBALL_URL="${KERNEL_TARBALL_URL:-https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz}"
-FIRECRACKER_CONFIG_URL="${FIRECRACKER_CONFIG_URL:-https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-${ARCH}-${FIRECRACKER_CONFIG_VERSION}.config}"
+FIRECRACKER_CONFIG_PATH="${WORK_DIR}/microvm-kernel-ci-${ARCH}-${FIRECRACKER_CONFIG_VERSION}-${FIRECRACKER_CONFIG_REVISION}.config"
+KERNEL_TARBALL_URL="${KERNEL_TARBALL_URL:-https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/linux-${KERNEL_VERSION}.tar.xz}"
+FIRECRACKER_CONFIG_URL="${FIRECRACKER_CONFIG_URL:-https://raw.githubusercontent.com/firecracker-microvm/firecracker/${FIRECRACKER_CONFIG_REVISION}/resources/guest_configs/microvm-kernel-ci-${ARCH}-${FIRECRACKER_CONFIG_VERSION}.config}"
 
 VMLINUX_OUTPUT="${OUTPUT_DIR}/vmlinux"
 ROOTFS_OUTPUT="${OUTPUT_DIR}/rootfs-base.img"
@@ -217,7 +217,10 @@ validate_kernel_config() {
 	require_kernel_config "${kernel_config}" 'CONFIG_PCI_MSI=y' 'PCI MSI support'
 	require_kernel_config "${kernel_config}" 'CONFIG_PCI_MMCONFIG=y' 'PCI MMCONFIG support'
 	require_kernel_config "${kernel_config}" 'CONFIG_PCIEPORTBUS=y' 'PCIe port bus support'
-	require_kernel_config "${kernel_config}" 'CONFIG_BLK_MQ_PCI=y' 'block multiqueue PCI helpers'
+	# Newer kernels removed this symbol; require it only where it exists.
+	if grep -q '^config BLK_MQ_PCI$' "${KERNEL_SOURCE_DIR}/block/Kconfig"; then
+		require_kernel_config "${kernel_config}" 'CONFIG_BLK_MQ_PCI=y' 'block multiqueue PCI helpers'
+	fi
 	require_kernel_config "${kernel_config}" 'CONFIG_VIRTIO=y' 'virtio core support'
 	require_kernel_config "${kernel_config}" 'CONFIG_VIRTIO_PCI=y' 'virtio PCI transport'
 	require_kernel_config "${kernel_config}" 'CONFIG_VIRTIO_BLK=y' 'virtio block support'
@@ -227,6 +230,7 @@ validate_kernel_config() {
 	require_kernel_config "${kernel_config}" 'CONFIG_MODULES=y' 'loadable module support'
 	require_kernel_config "${kernel_config}" 'CONFIG_NETFILTER=y' 'the netfilter core'
 	require_kernel_config "${kernel_config}" 'CONFIG_NF_CONNTRACK=[ym]' 'connection tracking'
+	require_kernel_config "${kernel_config}" 'CONFIG_NF_CT_NETLINK=[ym]' 'conntrack netlink support'
 	require_kernel_config "${kernel_config}" 'CONFIG_NF_NAT=[ym]' 'core NAT support'
 	require_kernel_config "${kernel_config}" 'CONFIG_NF_TABLES=y' 'the nf_tables core'
 	require_kernel_config "${kernel_config}" 'CONFIG_NF_TABLES_IPV4=y' 'IPv4 nf_tables support'

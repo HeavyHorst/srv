@@ -4,7 +4,7 @@ This directory builds the Arch guest image expected by `srv`.
 
 It produces two artifacts:
 
-- `vmlinux`: an x86_64 Firecracker-compatible kernel built from the upstream 6.12 LTS kernel using Firecracker's recommended 6.1 guest config as a seed plus a small fragment for Tailscale, Arch guest usability, Firecracker's current x86 ACPI boot requirements, and virtio balloon/page-reporting reclaim.
+- `vmlinux`: an x86_64 guest kernel built from upstream Linux 7.3.1 using Firecracker's recommended 6.1 guest config as a seed plus a small fragment for Tailscale, Arch guest usability, Firecracker's current x86 ACPI boot requirements, and virtio balloon/page-reporting reclaim.
 - `rootfs-base.img`: a sparse ext4 image populated with an Arch userspace via `pacstrap`, including Docker tooling with socket activation, Chromium and `agent-browser`, a small developer toolset (`go`, `gopls`, `lua-language-server`, `neovim`, `opencode`, `pi`, `odin`, `odinfmt`, `ols`, `shfmt`, `stylua`), a root LazyVim starter config preloaded with the BMW heritage amber theme assets mirrored from the `config` repo, default OpenCode and Pi configs that bootstrap rewrites to the per-VM host provider gateways when available, and a matching `/lib/modules/<kernel>` tree for the separately built guest kernel.
 
 The guest rootfs includes a boot-time `srv-bootstrap.service` that:
@@ -33,7 +33,9 @@ That `--ssh` flag is intentional: it makes the control plane's existing `connect
 sudo ./images/arch-base/build.sh
 ```
 
-By default this currently builds Linux `6.12.79` while reusing Firecracker's `microvm-kernel-ci-x86_64-6.1.config` as the baseline config.
+By default this builds Linux `7.3.1` while reusing Firecracker's `microvm-kernel-ci-x86_64-6.1.config` as the baseline config, pinned to revision `6ea6634994fa13473a0a8b61094989b6131f40d3`.
+
+This kernel was tested locally with Firecracker 1.17.0 and both Arch and Debian guests; Linux 7 is not listed in Firecracker's supported guest-kernel matrix. A known limitation remains: Docker can report `OOMKilled=false` after a real cgroup OOM kill (exit 137). The same event loss was reproduced under QEMU/KVM and with Linux 6.12.79, but occurred more often with 7.3.1 in these tests. Do not rely on that flag alone to diagnose OOM kills.
 
 The default guest rootfs size is `10G`. Override it with `ROOTFS_SIZE` if you want a different image size.
 
@@ -188,7 +190,7 @@ You can then point the service at those paths with `-base-kernel` and `-base-roo
 
 ## Notes
 
-- The kernel build starts from Firecracker's `microvm-kernel-ci-x86_64-6.1.config` and runs `olddefconfig` against the selected source tree, so newer longterm kernels can reuse Firecracker's known-good microVM baseline.
+- The kernel build starts from Firecracker's `microvm-kernel-ci-x86_64-6.1.config` and runs `olddefconfig` against the selected source tree, so newer kernels can reuse Firecracker's microVM baseline.
 - On current Firecracker x86 builds, srv launches Firecracker with PCI transport enabled. Because the image does not use an initramfs, the kernel fragment keeps the ACPI/PCI core and the virtio PCI block/network path built in (`CONFIG_ACPI=y`, `CONFIG_PCI=y`, `CONFIG_VIRTIO_PCI=y`, `CONFIG_VIRTIO_BLK=y`, `CONFIG_VIRTIO_NET=y`) so the guest can mount `/dev/vda` directly. The fragment also disables `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` so the kernel avoids the deprecated virtio-mmio command-line discovery path.
 - The builder now runs `make ... modules` and installs the resulting module tree into the guest rootfs with `modules_install` plus `depmod`, so guests have a matching `/lib/modules/<kernel>` tree for the separately booted custom kernel.
 - The Docker-related bridge and overlay pieces are built as loadable modules, while the kernel fragment also forces the nftables `ip`, `ip6`, and `inet` families on. That avoids the previous broken state where the guest only had depmod metadata and `nft add table ip ...` failed with `Operation not supported`.

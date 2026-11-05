@@ -58,10 +58,10 @@ The builder checks the vmlinux release banner and a module's vermagic, requires
 real .ko files, and regenerates depmod metadata in Debian.
 
 From the repository root, export modules from retained Arch build work (adjust
-6.12.79 if that build used another KERNEL_VERSION):
+7.3.1 if that build used another KERNEL_VERSION):
 
 ```bash
-kernel_work="$PWD/images/arch-base/out/work/linux-6.12.79"
+kernel_work="$PWD/images/arch-base/out/work/linux-7.3.1"
 module_stage="$PWD/images/debian-base/out/shared-kernel"
 kernel_release=$(cat "$kernel_work/include/config/kernel.release")
 sudo mkdir -p "$module_stage"
@@ -90,9 +90,9 @@ mount -o loop,ro images/arch-base/out/rootfs-base.img "$mnt"
 mkdir -p "$stage/lib/modules"
 cp -a "$mnt/lib/modules/." "$stage/lib/modules/"
 EOF
-# Substitute the release directory copied above, e.g. 6.12.79:
+# Substitute the release directory copied above, e.g. 7.3.1:
 sudo env KERNEL_IMAGE="$PWD/images/arch-base/out/vmlinux" \
-  KERNEL_MODULES_DIR="$PWD/images/debian-base/out/shared-kernel/lib/modules/6.12.79" \
+  KERNEL_MODULES_DIR="$PWD/images/debian-base/out/shared-kernel/lib/modules/7.3.1" \
   ./images/debian-base/build.sh
 ```
 

@@ -16,7 +16,7 @@ func TestUpgradeCommandAuthorizationAndArguments(t *testing.T) {
 		t.Fatal(err)
 	}
 	// No provisioner: a rejected request must not reach filesystem operations.
-	for _, args := range [][]string{{"upgrade"}, {"upgrade", "alpha", "--force"}, {"upgrade", "alpha"}, {"upgrade", "alpha", "--rollback"}} {
+	for _, args := range [][]string{{"upgrade"}, {"upgrade", "alpha", "--force"}, {"upgrade", "alpha"}, {"upgrade", "alpha", "--rollback"}, {"upgrade", "alpha", "--finalize"}, {"upgrade", "alpha", "--rollback", "--finalize"}} {
 		result, err := a.cmdUpgrade(context.Background(), model.Actor{UserLogin: "bob@example.com"}, args, outputFormatJSON)
 		if err == nil || result.exitCode == 0 {
 			t.Fatalf("accepted unauthorized/malformed command %v", args)

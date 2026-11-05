@@ -26,6 +26,7 @@ type upgradeJournal struct {
 	Initrd     string
 	RootFSSize int64
 	Pending    bool
+	Finalized  bool `json:",omitempty"`
 }
 
 func (p *Provisioner) readUpgrade(name string) (upgradeJournal, error) {
@@ -86,6 +87,94 @@ func writeUpgrade(path string, j upgradeJournal) error {
 	return storage.SyncPath(filepath.Dir(path))
 }
 
+// FinalizeKernelUpgrade discards the rollback disk without touching the running
+// guest. Keep boot files: the instance or a retained backup may reference them.
+// Callers hold the instance lifecycle lock, as for upgrade and rollback.
+func (p *Provisioner) FinalizeKernelUpgrade(ctx context.Context, name string) (model.Instance, error) {
+	inst, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return inst, err
+	}
+	if err := p.migrationOnlyFence(ctx, name); err != nil {
+		return inst, err
+	}
+	if inst.State != model.StateReady && inst.State != model.StateStopped {
+		return inst, errors.New("kernel upgrade finalization requires a ready or stopped instance")
+	}
+	j, err := p.readUpgrade(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return inst, errors.New("no kernel rollback available")
+	}
+	if err != nil {
+		return inst, err
+	}
+	if j.InstanceID != inst.ID {
+		return inst, errors.New("upgrade belongs to a different instance")
+	}
+	if j.Pending {
+		return inst, errors.New("cannot finalize an incomplete kernel upgrade; run --rollback first")
+	}
+	dir, err := p.instanceDir(name)
+	if err != nil {
+		return inst, err
+	}
+	saved := filepath.Join(dir, j.Directory, "rootfs.img")
+	if err := storage.ValidatePath(saved); err != nil {
+		return inst, err
+	}
+	info, err := os.Lstat(saved)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return inst, err
+	}
+	if err == nil {
+		if !info.Mode().IsRegular() {
+			return inst, errors.New("rollback disk must be a regular file")
+		}
+		for _, active := range []string{inst.RootFSPath, inst.KernelPath, inst.InitrdPath} {
+			if active == "" {
+				continue
+			}
+			current, err := os.Stat(active)
+			// Cold storage can remove the active local disk. An absent path
+			// cannot alias the rollback disk and need not be hydrated here.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return inst, err
+			}
+			if os.SameFile(info, current) {
+				return inst, errors.New("rollback disk is still an active instance artifact")
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return inst, err
+	}
+	// Persist the tombstone before unlinking. A crash at either boundary leaves
+	// rollback unavailable and --finalize able to resume the cleanup.
+	if !j.Finalized {
+		j.Finalized = true
+		if err := writeUpgrade(filepath.Join(dir, "upgrade.json"), j); err != nil {
+			return inst, err
+		}
+		p.recordEvent(inst.ID, "upgrade", "kernel upgrade finalized; rollback discarded", nil)
+	} else {
+		// A previous attempt may have renamed the tombstone but failed or
+		// stopped before syncing its directory. Make it durable before unlink.
+		if err := storage.SyncPath(dir); err != nil {
+			return inst, err
+		}
+	}
+	if err := os.Remove(saved); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return inst, err
+	}
+	if err := storage.SyncPath(filepath.Dir(saved)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return inst, err
+	}
+	return inst, nil
+}
+
 // UpgradeKernel deliberately does not stop or restart a VM. Readiness failures
 // leave the operator a stopped-VM rollback, rather than reverting guest writes
 // automatically. Rollback restores the entire pre-upgrade disk (including data).
@@ -98,6 +187,18 @@ func (p *Provisioner) UpgradeKernel(ctx context.Context, name string, rollback b
 	}
 	if err := p.migrationOnlyFence(ctx, name); err != nil {
 		return inst, err
+	}
+	if rollback {
+		j, err := p.readUpgrade(name)
+		if errors.Is(err, os.ErrNotExist) || (err == nil && j.Finalized) {
+			return inst, errors.New("no kernel rollback available")
+		}
+		if err != nil {
+			return inst, err
+		}
+		if j.InstanceID != inst.ID {
+			return inst, errors.New("upgrade belongs to a different instance")
+		}
 	}
 	// Do not reconcile an interrupted upgrade into a startable state.
 	if inst.State != model.StateStopped || inst.FirecrackerPID != 0 {

@@ -76,6 +76,21 @@ made since the upgrade are lost. It also restores private copies of the old
 kernel and optional initrd. There is no automatic restart or rollback after a
 failed boot; stop the VM before requesting rollback.
 
+After verifying the upgrade, permanently discard its rollback disk:
+
+```bash
+ssh srv upgrade demo --finalize
+```
+
+Finalization works on running (`ready`) and stopped VMs and Orbs. It leaves the
+current disk and all boot files untouched, including kernels referenced by
+retained backups. Repeating the command is safe, including after an interrupted
+cleanup. Subsequent `--rollback` requests report `no kernel rollback available`
+without fencing the VM. An incomplete upgrade must be rolled back before it can
+be finalized. Only the latest upgrade's rollback disk is removed; older
+generations are not swept. Reflinked disks share blocks, so freed space can be
+much smaller than the disk's logical size.
+
 Preparation failures leave the active disk and boot paths unchanged. Before
 replacing the disk, srv durably records a pending upgrade. If the process or
 host crashes during the disk/database switch, starts and disk-changing commands

@@ -2643,7 +2643,7 @@ func helpResult() commandResult {
 				{"stop <name>", "Stop a running instance."},
 				{"restart <name>", "Restart an instance."},
 				{"resize <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
-				{"upgrade <name> [--rollback]", "Upgrade kernel and modules (stopped VM); rollback restores the entire pre-upgrade disk."},
+				{"upgrade <name> [--rollback | --finalize]", "Upgrade/rollback a stopped VM; finalize permanently discards its rollback disk, even while running."},
 				{"fsck <name>", "Force-check and repair a stopped instance's rootfs."},
 				{"disk <status|offload|hydrate|purge> <name>", "Manage cold disk storage; mutations require a stopped instance (admin required for Orbs)."},
 				{"delete <name>", "Delete an instance."},

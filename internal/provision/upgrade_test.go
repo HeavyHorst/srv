@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,170 @@ func TestKernelUpgradeRequiresStoppedInstance(t *testing.T) {
 				if _, err := p.UpgradeKernel(context.Background(), inst.Name, rollback); err == nil {
 					t.Fatal("unsafe upgrade/rollback accepted")
 				}
+			}
+		})
+	}
+}
+
+func TestFinalizeKernelUpgrade(t *testing.T) {
+	for _, scenario := range []string{"running", "stopped", "orb", "rolled-back", "retry", "sync-retry", "cold", "cold-retry", "missing-disk", "pending", "foreign", "symlink", "active-disk"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := loadProvisionTestConfig(t, nil)
+			st := newProvisionTestStore(t, cfg)
+			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			inst := provisionTestInstance(cfg, "finalize", model.StateReady, time.Now())
+			inst.FirecrackerPID = 12345
+			if scenario == "stopped" || scenario == "rolled-back" || strings.HasPrefix(scenario, "cold") {
+				inst.State, inst.FirecrackerPID = model.StateStopped, 0
+			}
+			if scenario == "orb" {
+				inst.Kind = model.KindOrb
+			}
+			dir := filepath.Dir(filepath.Dir(inst.RootFSPath))
+			generation := filepath.Join(dir, "upgrade-current")
+			oldDisk := filepath.Join(generation, "rootfs.img")
+			inst.KernelPath = filepath.Join(generation, "vmlinux")
+			inst.InitrdPath = ""
+			j := upgradeJournal{InstanceID: inst.ID, Directory: "upgrade-current", Kernel: filepath.Join(generation, "old-vmlinux"), Initrd: filepath.Join(generation, "old-initrd")}
+			keep := map[string]string{
+				inst.RootFSPath: "current guest writes", inst.KernelPath: "current kernel",
+				j.Kernel: "previous kernel", j.Initrd: "previous initrd",
+				filepath.Join(dir, "upgrade-older", "rootfs.img"): "unrelated generation",
+			}
+			for path, data := range keep {
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(oldDisk, []byte("pre-upgrade disk"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			wantErr := ""
+			switch scenario {
+			case "rolled-back":
+				inst.KernelPath, inst.InitrdPath = j.Kernel, j.Initrd
+			case "retry":
+				j.Finalized = true // Crash after the durable tombstone, before unlink.
+			case "cold", "cold-retry":
+				j.Finalized = scenario == "cold-retry"
+				if err := os.RemoveAll(filepath.Dir(inst.RootFSPath)); err != nil {
+					t.Fatal(err)
+				}
+				delete(keep, inst.RootFSPath)
+			case "missing-disk":
+				j.Finalized = true // Crash after unlink, before the reply.
+				if err := os.Remove(oldDisk); err != nil {
+					t.Fatal(err)
+				}
+			case "pending":
+				j.Pending, wantErr = true, "incomplete"
+			case "foreign":
+				j.InstanceID, wantErr = "another-incarnation", "different instance"
+			case "symlink", "active-disk":
+				if err := os.Remove(oldDisk); err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "symlink" {
+					if err := os.Symlink(inst.RootFSPath, oldDisk); err != nil {
+						t.Fatal(err)
+					}
+					wantErr = "symlink"
+				} else {
+					if err := os.Link(inst.RootFSPath, oldDisk); err != nil {
+						t.Fatal(err)
+					}
+					wantErr = "active instance artifact"
+				}
+			}
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			before, err := st.GetInstance(ctx, inst.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			journal := filepath.Join(dir, "upgrade.json")
+			if err := writeUpgrade(journal, j); err != nil {
+				t.Fatal(err)
+			}
+			original, err := os.ReadFile(journal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "sync-retry" {
+				if os.Geteuid() == 0 {
+					t.Skip("directory permission failure requires an unprivileged user")
+				}
+				// Allow journal replacement but deny opening its parent for fsync.
+				if err := os.Chmod(dir, 0300); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
+				for attempt := 0; attempt < 2; attempt++ {
+					if _, err := p.FinalizeKernelUpgrade(ctx, inst.Name); !os.IsPermission(err) {
+						t.Fatalf("attempt %d: wanted directory sync denial, got %v", attempt, err)
+					}
+					if _, err := os.Stat(oldDisk); err != nil {
+						t.Fatal("deleted rollback before tombstone was durable", err)
+					}
+				}
+				if err := os.Chmod(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if j.Finalized {
+				if _, err := p.UpgradeKernel(ctx, inst.Name, true); err == nil || !strings.Contains(err.Error(), "no kernel rollback available") {
+					t.Fatalf("crashed finalization allowed rollback: %v", err)
+				}
+			}
+			_, err = p.FinalizeKernelUpgrade(ctx, inst.Name)
+			if wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), wantErr) {
+					t.Fatalf("wanted %s, got %v", wantErr, err)
+				}
+				after, err := os.ReadFile(journal)
+				if err != nil || string(after) != string(original) {
+					t.Fatal("rejected finalization changed journal", err)
+				}
+				if _, err := os.Lstat(oldDisk); err != nil {
+					t.Fatal("rejected finalization deleted disk", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				p = &Provisioner{cfg: cfg, store: st, log: p.log}
+				if _, err := p.FinalizeKernelUpgrade(ctx, inst.Name); err != nil {
+					t.Fatal("retry", err)
+				}
+				if _, err := os.Stat(oldDisk); !os.IsNotExist(err) {
+					t.Fatal("rollback disk retained", err)
+				}
+				if _, err := p.UpgradeKernel(ctx, inst.Name, true); err == nil || !strings.Contains(err.Error(), "no kernel rollback available") {
+					t.Fatal("rollback not disabled", err)
+				}
+				if err := p.upgradeFence(inst.Name); err != nil {
+					t.Fatal("finalization fenced normal operations", err)
+				}
+			}
+			if strings.HasPrefix(scenario, "cold") {
+				if _, err := os.Stat(inst.RootFSPath); !os.IsNotExist(err) {
+					t.Fatal("finalization recreated cold disk", err)
+				}
+			}
+			for path, want := range keep {
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != want {
+					t.Fatalf("protected file %s changed: %q %v", path, data, err)
+				}
+			}
+			after, err := st.GetInstance(ctx, inst.Name)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatal("finalization changed instance", err)
 			}
 		})
 	}

@@ -231,7 +231,7 @@ list / status                        Query all hosts
 new NAME [sizing/image options]       Automatically choose a host
 inspect / start / stop / restart NAME Route to the owning host
 resize / fsck / delete NAME           Manage a VM
-upgrade NAME [--rollback]             Upgrade kernel/modules or restore pre-upgrade disk
+upgrade NAME [--rollback | --finalize] Upgrade, roll back, or discard the rollback disk
 logs [-f] NAME [serial|firecracker]   Read or follow logs
 backup create|list NAME               Manage backups on the owning host
 backup delete NAME ID / restore NAME ID

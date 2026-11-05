@@ -2640,7 +2640,7 @@ func helpResult() commandResult {
 				{"start <name>", "Start a stopped instance or recheck a running awaiting-tailnet instance."},
 				{"stop <name>", "Stop a running instance."},
 				{"restart <name>", "Restart an instance."},
-				{"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
+				{"resize <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
 				{"fsck <name>", "Force-check and repair a stopped instance's rootfs."},
 				{"disk <status|offload|hydrate|purge> <name>", "Manage cold disk storage; mutations require a stopped instance (admin required for Orbs)."},
 				{"delete <name>", "Delete an instance."},
@@ -3331,7 +3331,7 @@ func parseResizeArgs(args []string) (string, provision.CreateOptions, error) {
 		return "", provision.CreateOptions{}, err
 	}
 	if opts == (provision.CreateOptions{}) {
-		return "", provision.CreateOptions{}, fmt.Errorf("resize requires at least one of --cpus, --ram, or --rootfs-size\n%s", resizeUsage())
+		return "", provision.CreateOptions{}, fmt.Errorf("resize requires at least one of --cpus, --ram, --pool, or --rootfs-size\n%s", resizeUsage())
 	}
 	return name, opts, nil
 }
@@ -3388,6 +3388,7 @@ func parseSizedInstanceArgs(args []string, usage string) (string, provision.Crea
 		opts           provision.CreateOptions
 		seenCPUs       bool
 		seenRAM        bool
+		seenPool       bool
 		seenRootFSSize bool
 	)
 
@@ -3431,6 +3432,15 @@ func parseSizedInstanceArgs(args []string, usage string) (string, provision.Crea
 				return "", provision.CreateOptions{}, fmt.Errorf("parse %s: %v\n%s", key, err, usage)
 			}
 			opts.MemoryMiB = bytesToMiBCeil(parsed)
+		case "--pool":
+			if seenPool {
+				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, usage)
+			}
+			seenPool = true
+			opts.MemoryPoolName = strings.TrimSpace(value)
+			if opts.MemoryPoolName == "" {
+				return "", provision.CreateOptions{}, fmt.Errorf("%s cannot be empty\n%s", key, usage)
+			}
 		case "--rootfs-size":
 			if seenRootFSSize {
 				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, usage)
@@ -3465,7 +3475,7 @@ func newUsage() string {
 }
 
 func resizeUsage() string {
-	return "usage: resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]"
+	return "usage: resize <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE]"
 }
 
 func backupUsage() string {

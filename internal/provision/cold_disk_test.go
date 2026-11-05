@@ -71,6 +71,84 @@ func offloadTestDisk(t *testing.T, p *Provisioner, inst model.Instance) {
 	}}
 }
 
+func TestResizePoolDeletedDuringHydration(t *testing.T) {
+	for _, recreate := range []bool{false, true} {
+		t.Run(map[bool]string{false: "deleted", true: "recreated"}[recreate], func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cfg := loadProvisionTestConfig(t, nil)
+			st := newProvisionTestStore(t, cfg)
+			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			inst := provisionTestInstance(cfg, "cold-source", model.StateStopped, time.Now().UTC())
+			inst.MemoryMiB = 1024
+			inst.MemoryMode = model.MemoryModeFixed
+			if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(inst.RootFSPath, []byte("disk"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			pool := model.MemoryPool{ID: "original", Name: "target", ReservedBytes: 2 << 30, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+			if err := st.CreateMemoryPool(ctx, pool); err != nil {
+				t.Fatal(err)
+			}
+			offloadTestDisk(t, p, inst)
+			runner := p.vmRunner.(coldTestRunner)
+			hydrating, resume := make(chan struct{}), make(chan struct{})
+			p.vmRunner = coldTestRunner{call: func(q vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
+				if q.Action == "hydrate" {
+					close(hydrating)
+					select {
+					case <-resume:
+					case <-ctx.Done():
+						return vmrunner.ColdStatus{}, ctx.Err()
+					}
+				}
+				return runner.ColdDisk(ctx, q)
+			}}
+			done := make(chan error, 1)
+			var workers sync.WaitGroup
+			workers.Add(1)
+			t.Cleanup(func() { cancel(); workers.Wait() })
+			go func() {
+				defer workers.Done()
+				_, err := p.Resize(ctx, inst.Name, CreateOptions{MemoryPoolName: pool.Name, MemoryMiB: 2048})
+				done <- err
+			}()
+			select {
+			case <-hydrating:
+			case err := <-done:
+				t.Fatal("resize did not reach hydration", err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			if _, err := p.DeleteMemoryPool(ctx, pool.Name); err != nil {
+				t.Fatal(err)
+			}
+			if recreate {
+				pool.ID = "replacement"
+				if err := st.CreateMemoryPool(ctx, pool); err != nil {
+					t.Fatal(err)
+				}
+			}
+			close(resume)
+			if err := <-done; err == nil || !strings.Contains(err.Error(), "load memory pool") {
+				t.Fatalf("resize error = %v, want missing resolved pool", err)
+			}
+			updated, err := st.GetInstance(ctx, inst.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.MemoryPoolID != inst.MemoryPoolID || updated.MemoryMode != inst.MemoryMode || updated.MemoryMiB != inst.MemoryMiB {
+				t.Fatalf("failed resize changed memory configuration: %+v", updated)
+			}
+		})
+	}
+}
+
 func TestAutomaticHydrationDoesNotBlockImportOrHotResize(t *testing.T) {
 	for _, command := range []string{"migration", "fsck", "resize", "template"} {
 		t.Run(command, func(t *testing.T) {

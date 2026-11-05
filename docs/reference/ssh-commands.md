@@ -224,11 +224,12 @@ the source itself. Host snapshots still require explicit hydration and purge. Se
 |---------|-------------|
 | `resize <name> --cpus <n>` | Resize vCPUs on a stopped VM |
 | `resize <name> --ram <size>` | Resize memory on a stopped VM |
+| `resize <name> --pool <pool>` | Assign a stopped VM or Orb to an existing memory pool, or switch pools |
 | `resize <name> --rootfs-size <size>` | Resize rootfs (stopped VM, grow-only) |
 
 All flags can be combined. Omitted flags keep the current value.
 
-For pooled VMs, `resize --ram` keeps the VM in the same pool. In v1 it is allowed only while the VM is stopped and only up to the pool's reserved size.
+For pooled VMs, `resize --ram` keeps the VM in the same pool unless `--pool` is also supplied. The VM or Orb must be stopped, and the final guest-visible RAM must fit within the target pool's reservation. `resize --pool` without `--ram` preserves the current RAM size.
 
 ## Backup commands
 
@@ -308,7 +309,7 @@ All integration commands are admin-only.
 - Fixed mode remains the default. Without `--pool`, `--ram` means guest-visible RAM; the hard per-VM host cgroup cap is that RAM plus `max(256 MiB, RAM/16)` Firecracker overhead reserve
 - In pooled mode, `--ram` means guest-visible RAM while host reservation comes from the pool created with `pool create`
 - `resize` requires the VM to be stopped; CPU and RAM may increase or decrease within limits, while rootfs is grow-only
-- Pooled VMs cannot move between pools or switch memory mode through `resize` in v1
+- `resize --pool <name>` moves a fixed-memory or pooled VM or Orb into an existing pool; switching back to fixed memory through `resize` is not supported
 - `resize`, `fsck`, `backup`, and `restore` all require the VM to be stopped
 - Backups are tied to the original VM record — they cannot be restored onto a different VM
 - Export requires the source VM to be stopped

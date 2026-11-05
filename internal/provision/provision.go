@@ -745,20 +745,28 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 		if opts.VCPUCount > 0 {
 			resized.VCPUCount = opts.VCPUCount
 		}
-		if opts.MemoryMiB > 0 {
-			if current.UsesMemoryPool() {
-				pool, err := p.requireMemoryPoolForInstance(ctx, current)
-				if err != nil {
-					return err
-				}
-				if err := ensureMemoryPoolSupportsGuestMemory(pool, opts.MemoryMiB); err != nil {
-					return err
-				}
+		if opts.MemoryPoolName != "" {
+			pool, err := p.requireMemoryPoolByName(ctx, opts.MemoryPoolName)
+			if err != nil {
+				return err
 			}
+			resized.MemoryMode = model.MemoryModePool
+			resized.MemoryPoolID = pool.ID
+		}
+		if opts.MemoryMiB > 0 {
 			resized.MemoryMiB = opts.MemoryMiB
 		}
 		if err := validateMachineShape(p.effectiveVCPUCount(resized), p.effectiveMemoryMiB(resized)); err != nil {
 			return err
+		}
+		if resized.UsesMemoryPool() && (opts.MemoryPoolName != "" || opts.MemoryMiB > 0) {
+			pool, err := p.requireMemoryPoolForInstance(ctx, resized)
+			if err != nil {
+				return err
+			}
+			if err := ensureMemoryPoolSupportsGuestMemory(pool, p.effectiveMemoryMiB(resized)); err != nil {
+				return err
+			}
 		}
 		// Import/delete take payload before admission. Never wait for the
 		// runner's payload lock while holding admission; lifecycle stays locked.
@@ -767,6 +775,17 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 		p.admissionMu.Lock()
 		if hydrateErr != nil {
 			return hydrateErr
+		}
+		// The destination may have been deleted while admission was unlocked.
+		// Check its ID, not its name: a recreated pool is a different pool.
+		if opts.MemoryPoolName != "" {
+			pool, err := p.requireMemoryPoolForInstance(ctx, resized)
+			if err != nil {
+				return err
+			}
+			if err := ensureMemoryPoolSupportsGuestMemory(pool, p.effectiveMemoryMiB(resized)); err != nil {
+				return err
+			}
 		}
 		if opts.RootFSSizeBytes > 0 {
 			currentFileSize, err := p.rootFSSize(resized.RootFSPath)
@@ -800,6 +819,7 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 		p.recordEvent(resized.ID, "resize", "instance config updated", map[string]any{
 			"vcpus":             p.effectiveVCPUCount(resized),
 			"memory_mib":        p.effectiveMemoryMiB(resized),
+			"memory_pool_id":    resized.MemoryPoolID,
 			"rootfs_size_bytes": resized.RootFSSizeBytes,
 		})
 		inst = resized

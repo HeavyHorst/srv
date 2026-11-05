@@ -1,6 +1,6 @@
 # Resize a VM
 
-Resize lets you change the vCPU count, memory, and rootfs size of a stopped VM.
+Resize lets you change the vCPU count, memory, memory pool, and rootfs size of a stopped VM or Orb.
 
 ## Prerequisites
 
@@ -26,10 +26,23 @@ ssh srv resize demo --ram 16G
 ssh srv start demo
 ```
 
+## Assign a memory pool
+
+Use `--pool` to move an existing VM or Orb into an existing memory pool, or to switch pools:
+
+```bash
+ssh srv stop demo
+ssh srv resize demo --pool shared
+ssh srv start demo
+```
+
+The guest-visible RAM stays unchanged unless you also pass `--ram`. It must fit within the target pool's reservation. For example, `resize demo --pool shared --ram 2G` changes both in one operation.
+
 ## How it works
 
 - **vCPU count**: stored in the instance record and applied on the next boot
 - **Memory**: stored in the instance record and applied on the next boot
+- **Memory pool**: the pool assignment is stored in the instance record and applied on the next boot
 - **Rootfs size**: runs `e2fsck -f -p` against the stopped ext4 image, expands the underlying file, and then uses `resize2fs` to grow the filesystem. Fatal or uncorrected filesystem errors stop the resize before the image is expanded. This operation only increases the filesystem — it never shrinks
 
 If an earlier attempt expanded the image file but did not finish growing the filesystem, retrying the same `resize` request checks the filesystem and resumes the pending filesystem grow.

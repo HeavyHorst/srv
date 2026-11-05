@@ -1293,7 +1293,7 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 		"new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]",
 		"project-template create <name> <id>",
 		"project-template delete <id>",
-		"resize <name> [--cpus N] [--ram SIZE] [--rootfs-size SIZE]",
+		"resize <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE]",
 		"backup create <name>",
 		"backup list <name>",
 		"backup delete <name> <backup-id>",
@@ -1797,6 +1797,78 @@ func TestCmdResizeUpdatesStoppedInstance(t *testing.T) {
 	}
 	if !updated.UpdatedAt.After(inst.UpdatedAt) {
 		t.Fatalf("updated timestamp did not advance: before=%s after=%s", inst.UpdatedAt, updated.UpdatedAt)
+	}
+}
+
+func TestCmdResizeMemoryPool(t *testing.T) {
+	for _, kind := range []string{model.KindVM, model.KindOrb} {
+		for _, tc := range []struct {
+			name       string
+			pooled     bool
+			state      string
+			flags      []string
+			wantMemory int64
+			wantErr    string
+		}{
+			{name: "join", flags: []string{"--pool", "target"}, wantMemory: 1024},
+			{name: "switch and grow", pooled: true, flags: []string{"--pool=target", "--ram", "2G"}, wantMemory: 2048},
+			{name: "missing pool", flags: []string{"--pool", "missing"}, wantErr: "does not exist"},
+			{name: "too small", flags: []string{"--pool", "small"}, wantErr: "exceeds memory pool"},
+			{name: "running", state: model.StateReady, flags: []string{"--pool", "target"}, wantErr: "must be stopped"},
+		} {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				ctx := context.Background()
+				st := newServiceTestStore(t)
+				logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+				cfg := loadServiceTestConfig(t, nil)
+				cfg.VMRunnerSocketPath = serviceTestHotColdDiskSocket(t)
+				prov, err := provision.New(cfg, logger, st)
+				if err != nil {
+					t.Fatal(err)
+				}
+				app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+				now := time.Now().UTC()
+				for name, size := range map[string]int64{"old": 1 << 30, "target": 2 << 30, "small": 512 << 20} {
+					if err := st.CreateMemoryPool(ctx, model.MemoryPool{ID: name, Name: name, ReservedBytes: size, CreatedAt: now, UpdatedAt: now}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				inst := serviceTestInstance("alpha", model.StateStopped, now)
+				inst.Kind, inst.MemoryMiB = kind, 1024
+				if tc.state != "" {
+					inst.State = tc.state
+				}
+				if tc.pooled {
+					inst.MemoryMode, inst.MemoryPoolID = model.MemoryModePool, "old"
+				}
+				inst.RootFSPath = filepath.Join(t.TempDir(), "rootfs.img")
+				if err := os.WriteFile(inst.RootFSPath, []byte("rootfs"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.CreateInstance(ctx, inst); err != nil {
+					t.Fatal(err)
+				}
+				_, err = app.cmdResize(ctx, model.Actor{UserLogin: "alice@example.com"}, append([]string{"resize", inst.Name}, tc.flags...), outputFormatText)
+				if tc.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("error = %v, want %q", err, tc.wantErr)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				updated, err := st.GetInstance(ctx, inst.Name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.wantErr != "" {
+					if updated.MemoryPoolID != inst.MemoryPoolID || updated.MemoryMode != inst.MemoryMode || updated.MemoryMiB != inst.MemoryMiB {
+						t.Fatalf("failed resize changed memory: %+v", updated)
+					}
+				} else if updated.MemoryPoolID != "target" || !updated.UsesMemoryPool() || updated.MemoryMiB != tc.wantMemory {
+					t.Fatalf("unexpected memory configuration: %+v", updated)
+				}
+			})
+		}
 	}
 }
 
@@ -2554,7 +2626,13 @@ func TestParseResizeArgs(t *testing.T) {
 		{
 			name:    "requires at least one option",
 			args:    []string{"resize", "demo"},
-			wantErr: "resize requires at least one of --cpus, --ram, or --rootfs-size",
+			wantErr: "resize requires at least one of --cpus, --ram, --pool, or --rootfs-size",
+		},
+		{
+			name: "empty pool", args: []string{"resize", "demo", "--pool="}, wantErr: "--pool cannot be empty",
+		},
+		{
+			name: "duplicate pool", args: []string{"resize", "demo", "--pool=a", "--pool=b"}, wantErr: "--pool specified more than once",
 		},
 	}
 

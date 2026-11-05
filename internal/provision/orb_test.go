@@ -23,6 +23,7 @@ import (
 // transport and independently implements Firecracker's vsock handshake.
 type orbLifecycleRunner struct {
 	noopVMRunner
+	templateTestBootResolver
 	running bool
 	starts  []vmrunner.StartRequest
 }

@@ -22,6 +22,7 @@ import (
 
 type coldTestRunner struct {
 	noopVMRunner
+	templateTestBootResolver
 	call func(vmrunner.ColdRequest) (vmrunner.ColdStatus, error)
 }
 
@@ -160,6 +161,7 @@ func TestAutomaticHydrationDoesNotBlockImportOrHotResize(t *testing.T) {
 			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 			inst := provisionTestInstance(cfg, "cold-source", model.StateStopped, time.Now().UTC())
 			templateTestImage(t, inst.RootFSPath, map[string]string{"home/user/project/data": "preserved"})
+			templateTestBootFiles(t, inst)
 			if err := st.CreateInstance(ctx, inst); err != nil {
 				t.Fatal(err)
 			}

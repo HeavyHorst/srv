@@ -14,15 +14,18 @@ import (
 
 	"srv/internal/model"
 	"srv/internal/storage"
+	"srv/internal/vmrunner"
 )
 
 type templateManifest struct {
-	Version  int
-	ID       string
-	Owner    string
-	SourceID string
-	Image    string
-	Kind     string
+	Version      int
+	ID           string
+	Owner        string
+	SourceID     string
+	Image        string
+	Kind         string
+	KernelDigest string `json:",omitempty"`
+	InitrdDigest string `json:",omitempty"`
 }
 
 func (p *Provisioner) templatePath(id string, actor model.Actor) (string, error) {
@@ -46,7 +49,7 @@ func (p *Provisioner) readTemplate(id string, actor model.Actor) (string, templa
 	if err := json.Unmarshal(b, &m); err != nil {
 		return "", m, err
 	}
-	if (m.Version != 1 && m.Version != 2) || m.ID != id || !strings.EqualFold(m.Owner, actor.UserLogin) || m.SourceID == "" || m.Image == "" {
+	if (m.Version != 1 && m.Version != 2 && m.Version != 3) || m.ID != id || !strings.EqualFold(m.Owner, actor.UserLogin) || m.SourceID == "" || m.Image == "" {
 		return "", m, errors.New("invalid template manifest or owner")
 	}
 	return dir, m, nil
@@ -105,6 +108,11 @@ func (p *Provisioner) createTemplate(ctx context.Context, name, templateID strin
 			if !info.Mode().IsRegular() || info.Size() == 0 {
 				return errors.New("published template disk is invalid")
 			}
+			if old.Version == 3 {
+				if _, err := templateBootFiles(ctx, dest, old); err != nil {
+					return err
+				}
+			}
 			// Also finish a publication whose final directory fsync failed.
 			for _, path := range []string{filepath.Dir(dest), filepath.Dir(filepath.Dir(dest)), p.cfg.DataDirAbs()} {
 				if err := syncTemplatePath(path); err != nil {
@@ -153,7 +161,35 @@ func (p *Provisioner) createTemplate(ctx context.Context, name, templateID strin
 		return err
 	}
 	disk = filepath.Join(stage, "disk", "rootfs.img")
-	m := templateManifest{Version: 2, ID: templateID, Owner: actor.UserLogin, SourceID: inst.ID, Image: inst.ImageName(), Kind: inst.KindName()}
+	m := templateManifest{Version: 3, ID: templateID, Owner: actor.UserLogin, SourceID: inst.ID, Image: inst.ImageName(), Kind: inst.KindName()}
+	resolver, ok := p.vmRunner.(interface {
+		ResolveBootArtifacts(context.Context, vmrunner.StartRequest) (vmrunner.BootFiles, error)
+	})
+	if !ok {
+		return errors.New("template creation requires runner boot-artifact resolution")
+	}
+	boot, err := resolver.ResolveBootArtifacts(ctx, vmrunner.StartRequest{Name: name, KernelPath: inst.KernelPath, InitrdPath: inst.InitrdPath})
+	if err != nil {
+		return err
+	}
+	for _, file := range []struct {
+		source, name string
+		digest       *string
+	}{
+		{boot.KernelPath, "vmlinux", &m.KernelDigest},
+		{boot.InitrdPath, "old-initrd", &m.InitrdDigest},
+	} {
+		if file.source == "" && file.name == "old-initrd" {
+			continue
+		}
+		target := filepath.Join(stage, file.name)
+		if err := cloneUpgradeFile(ctx, file.source, target, false); err != nil {
+			return err
+		}
+		if *file.digest, err = diskDigest(ctx, target); err != nil {
+			return err
+		}
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -231,10 +267,38 @@ func (p *Provisioner) DeleteTemplate(ctx context.Context, templateID string, act
 }
 
 func templateDiskPath(dir string, m templateManifest) string {
-	if m.Version == 2 {
+	if m.Version >= 2 {
 		return filepath.Join(dir, "disk", "rootfs.img")
 	}
 	return filepath.Join(dir, "rootfs.img")
+}
+
+// Fixed filenames and digests bind a snapshot to its source's boot pair, not
+// whatever kernel the mutable image catalog selects when a clone is created.
+func templateBootFiles(ctx context.Context, dir string, m templateManifest) (vmrunner.BootFiles, error) {
+	files := vmrunner.BootFiles{KernelPath: filepath.Join(dir, "vmlinux")}
+	if m.KernelDigest == "" {
+		return files, errors.New("template has no kernel binding")
+	}
+	if m.InitrdDigest != "" {
+		files.InitrdPath = filepath.Join(dir, "old-initrd")
+	}
+	for path, want := range map[string]string{files.KernelPath: m.KernelDigest, files.InitrdPath: m.InitrdDigest} {
+		if path == "" {
+			continue
+		}
+		if err := storage.ValidatePath(path); err != nil {
+			return files, err
+		}
+		got, err := diskDigest(ctx, path)
+		if err != nil {
+			return files, err
+		}
+		if got != want {
+			return files, errors.New("template boot artifact checksum mismatch")
+		}
+	}
+	return files, nil
 }
 
 func syncTemplatePath(path string) error {

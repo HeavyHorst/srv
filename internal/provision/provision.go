@@ -246,6 +246,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if err != nil {
 		return model.Instance{}, err
 	}
+	var template templateManifest
 	if opts.Template != "" {
 		dir, manifest, err := p.readTemplate(opts.Template, actor)
 		if err != nil {
@@ -256,6 +257,14 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		}
 		if manifest.Image != imageName {
 			return model.Instance{}, fmt.Errorf("template image %q does not match requested image %q", manifest.Image, imageName)
+		}
+		template = manifest
+		if manifest.Version == 3 {
+			boot, err := templateBootFiles(ctx, dir, manifest)
+			if err != nil {
+				return model.Instance{}, err
+			}
+			image.Kernel, image.Initrd = boot.KernelPath, boot.InitrdPath
 		}
 		image.RootFS = templateDiskPath(dir, manifest)
 	}
@@ -296,6 +305,34 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		instanceDir, err := p.prepareInstanceDir(ctx, name)
 		if err != nil {
 			return err
+		}
+		if template.Version == 3 {
+			bootDir, err := os.MkdirTemp(instanceDir, "upgrade-template-")
+			if err == nil {
+				for _, source := range []string{image.Kernel, image.Initrd} {
+					if source != "" {
+						err = cloneUpgradeFile(ctx, source, filepath.Join(bootDir, filepath.Base(source)), false)
+						if err != nil {
+							break
+						}
+					}
+				}
+			}
+			if err == nil {
+				var boot vmrunner.BootFiles
+				boot, err = templateBootFiles(ctx, bootDir, template)
+				image.Kernel, image.Initrd = boot.KernelPath, boot.InitrdPath
+			}
+			if err == nil {
+				err = storage.SyncPath(bootDir)
+			}
+			if err == nil {
+				err = storage.SyncPath(instanceDir)
+			}
+			if err != nil {
+				_ = removePathAll(instanceDir)
+				return err
+			}
 		}
 
 		networkCIDR, hostAddr, guestAddr, gateway, err := p.allocateNetwork(ctx)

@@ -16,8 +16,35 @@ import (
 	"srv/internal/host"
 	"srv/internal/model"
 	"srv/internal/storage"
+	"srv/internal/vmrunner"
 	"tailscale.com/client/tailscale/v2"
 )
+
+type templateTestBootResolver struct{}
+
+func (templateTestBootResolver) ResolveBootArtifacts(_ context.Context, req vmrunner.StartRequest) (vmrunner.BootFiles, error) {
+	return vmrunner.BootFiles{KernelPath: req.KernelPath, InitrdPath: req.InitrdPath}, nil
+}
+
+type templateTestRunner struct {
+	noopVMRunner
+	templateTestBootResolver
+}
+
+func templateTestBootFiles(t *testing.T, inst model.Instance) {
+	t.Helper()
+	for path, data := range map[string]string{inst.KernelPath: "source-kernel", inst.InitrdPath: "source-initrd"} {
+		if path == "" {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func templateTestTools(t *testing.T) {
 	t.Helper()
@@ -71,8 +98,9 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 			ctx := context.Background()
 			cfg := loadProvisionTestConfig(t, nil)
 			st := newProvisionTestStore(t, cfg)
-			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: noopVMRunner{}}
+			p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)), vmRunner: templateTestRunner{}}
 			inst := provisionTestInstance(cfg, "source", model.StateStopped, time.Now())
+			templateTestBootFiles(t, inst)
 			actor := model.Actor{UserLogin: inst.CreatedByUser}
 			removed := []string{"var/lib/dbus/machine-id", "var/lib/tailscale/tailscaled.state", "var/lib/tailscale/ssh/ssh_host_ed25519_key", "var/lib/tailscale/My Notes Grüße", "var/lib/srv/bootstrap.done", "var/lib/systemd/random-seed", "root/.config/amp/secrets.json", "root/.local/share/amp/session.json", "home/user/.local/share/amp/device-id.json", "home/user/.local/share/amp/secrets.json"}
 			kept := []string{"home/user/.amp/bin/amp", "root/.amp/bin/amp", "home/user/.config/amp/settings.json", "home/user/.config/amp/skills/custom/SKILL.md", "home/user/.local/share/amp/prepared-state", "home/user/My Notes Grüße", "home/user/project/.agents/setup", "home/user/project/code.go", "etc/hostname"}
@@ -133,6 +161,27 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 			again, err := os.ReadFile(disk)
 			if err != nil || sha256.Sum256(again) != sha256.Sum256(snapshot) {
 				t.Fatal("retry changed snapshot")
+			}
+			if state == "populated" {
+				for _, filename := range []string{"vmlinux", "old-initrd"} {
+					path := filepath.Join(dir, filename)
+					original, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte("wrong boot artifact"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := p.VerifyTemplate(ctx, inst.Name, "prepared", actor); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+						t.Fatal("verification did not reject changed", filename, err)
+					}
+					if _, err := p.Create(ctx, "corrupt", actor, CreateOptions{Template: "prepared"}); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+						t.Fatal("clone did not reject changed", filename, err)
+					}
+					if err := os.WriteFile(path, original, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
 			}
 			if err := os.Rename(disk, disk+".missing"); err != nil {
 				t.Fatal(err)
@@ -255,6 +304,7 @@ func TestCreateUsesOwnerTemplateWithFreshInstanceIdentity(t *testing.T) {
 	})
 	st := newProvisionTestStore(t, cfg)
 	p := &Provisioner{cfg: cfg, store: st, tsClient: &tailscale.Client{}, networkHelper: noopNetworkHelper{}, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		vmRunner:            templateTestRunner{},
 		readHostMemoryBytes: func() (int64, error) { return 64 << 30, nil },
 		readFilesystemUsage: func(string) (host.FilesystemUsage, error) {
 			return host.FilesystemUsage{Total: 128 << 30, Used: 1 << 30, Available: 127 << 30}, nil
@@ -262,12 +312,26 @@ func TestCreateUsesOwnerTemplateWithFreshInstanceIdentity(t *testing.T) {
 	}
 	inst := provisionTestInstance(cfg, "source", model.StateStopped, time.Now())
 	actor := model.Actor{UserLogin: inst.CreatedByUser}
+	templateTestBootFiles(t, inst)
 	templateTestImage(t, inst.RootFSPath, map[string]string{"etc/machine-id": "old", "home/user/project/prepared": "prepared"})
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.CreateTemplate(ctx, inst.Name, "prepared", actor); err != nil {
 		t.Fatal(err)
+	}
+	// Neither replacing the catalog kernel nor deleting the source's boot files
+	// may change the boot pair saved with the template's module tree.
+	if err := os.WriteFile(kernel, []byte("new-catalog-kernel"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{inst.KernelPath, inst.InitrdPath} {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.VerifyTemplate(ctx, inst.Name, "prepared", actor); err != nil {
+		t.Fatal("source boot files still required", err)
 	}
 	if _, err := p.Create(ctx, "foreign", model.Actor{UserLogin: "bob"}, CreateOptions{Template: "prepared"}); err == nil {
 		t.Fatal("foreign create accepted")
@@ -295,6 +359,19 @@ func TestCreateUsesOwnerTemplateWithFreshInstanceIdentity(t *testing.T) {
 			return err
 		}
 		if dest == filepath.Join(cfg.InstancesDir(), "fresh", "disk") {
+			fresh, err := st.GetInstance(ctx, "fresh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for path, want := range map[string]string{fresh.KernelPath: "source-kernel", fresh.InitrdPath: "source-initrd"} {
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != want || !strings.HasPrefix(path, filepath.Join(cfg.InstancesDir(), "fresh")+"/") {
+					t.Fatalf("clone lost its independent boot pair: %s: %q %v", path, data, err)
+				}
+			}
+			if _, err := (vmrunner.ServerConfig{InstancesDir: cfg.InstancesDir(), ImagesDir: cfg.ImagesDir()}).ResolveBootConfig(vmrunner.StartRequest{Name: "fresh", KernelPath: fresh.KernelPath, InitrdPath: fresh.InitrdPath}); err != nil {
+				t.Fatal("runner rejected template clone boot pair", err)
+			}
 			dest = filepath.Join(dest, "rootfs.img")
 			observed = true
 			out, err := exec.Command("debugfs", "-R", "cat /home/user/project/prepared", dest).Output()
@@ -313,13 +390,14 @@ func TestCreateUsesOwnerTemplateWithFreshInstanceIdentity(t *testing.T) {
 	if fresh.ID == "" || fresh.ID == inst.ID || fresh.GuestMAC == inst.GuestMAC || fresh.NetworkCIDR == inst.NetworkCIDR || fresh.TailnetNodeID != "" {
 		t.Fatalf("identity reused: %+v", fresh)
 	}
-	if fresh.KernelPath != kernel || fresh.Image != "arch" {
+	if fresh.KernelPath == kernel || fresh.Image != "arch" {
 		t.Fatalf("image contract changed: %+v", fresh)
 	}
 	// A different catalog identity cannot consume this template, even if its
 	// rootfs is otherwise bootable. No external services are reached.
 	mismatch := inst
 	mismatch.Image = "debian"
+	templateTestBootFiles(t, inst)
 	if err := st.UpdateInstance(ctx, mismatch); err != nil {
 		t.Fatal(err)
 	}

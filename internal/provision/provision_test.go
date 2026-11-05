@@ -2623,7 +2623,7 @@ func TestInterruptedStopCannotBePromotedOrAutoStarted(t *testing.T) {
 	}
 }
 
-func TestEnsureStartPrereqsUsesCurrentBaseKernelPath(t *testing.T) {
+func TestEnsureStartPrereqsPreservesStoredKernelPath(t *testing.T) {
 	currentKernel := filepath.Join(t.TempDir(), "images", "current-vmlinux")
 	cfg := loadProvisionTestConfig(t, map[string]string{
 		"SRV_BASE_KERNEL": currentKernel,
@@ -2631,6 +2631,7 @@ func TestEnsureStartPrereqsUsesCurrentBaseKernelPath(t *testing.T) {
 	p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
 	inst := provisionTestInstance(cfg, "demo", model.StateStopped, time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC))
 	inst.KernelPath = filepath.Join(t.TempDir(), "images", "old-vmlinux")
+	storedKernel := inst.KernelPath
 	inst.TailscaleName = "demo.tailnet"
 	p.applyConfiguredBootArtifacts(&inst)
 
@@ -2647,8 +2648,8 @@ func TestEnsureStartPrereqsUsesCurrentBaseKernelPath(t *testing.T) {
 		t.Fatalf("ensureStartPrereqs() with refreshed base kernel: %v", err)
 	}
 
-	if inst.KernelPath != currentKernel {
-		t.Fatalf("applyConfiguredBootArtifacts() kernel path = %q, want %q", inst.KernelPath, currentKernel)
+	if inst.KernelPath != storedKernel {
+		t.Fatalf("applyConfiguredBootArtifacts() kernel path = %q, want %q", inst.KernelPath, storedKernel)
 	}
 }
 

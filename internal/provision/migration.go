@@ -63,6 +63,13 @@ func (p *Provisioner) MigrationStatus(ctx context.Context, name string) (model.M
 }
 
 func (p *Provisioner) migrationFence(ctx context.Context, name string) error {
+	if err := p.upgradeFence(name); err != nil {
+		return err
+	}
+	return p.migrationOnlyFence(ctx, name)
+}
+
+func (p *Provisioner) migrationOnlyFence(ctx context.Context, name string) error {
 	inst, err := p.store.GetInstance(ctx, name)
 	if err != nil {
 		return err

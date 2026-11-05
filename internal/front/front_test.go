@@ -383,6 +383,8 @@ func TestReservedIdentityWrapper(t *testing.T) {
 
 func TestBackendArgumentContracts(t *testing.T) {
 	for _, tc := range []struct{ args, want []string }{
+		{[]string{"upgrade", "a/demo"}, []string{"upgrade", "demo"}},
+		{[]string{"upgrade", "a/demo", "--rollback"}, []string{"upgrade", "demo", "--rollback"}},
 		{[]string{"backup", "create", "a/demo"}, []string{"backup", "create", "demo"}},
 		{[]string{"backup", "list", "a/demo"}, []string{"backup", "list", "demo"}},
 		{[]string{"backup", "delete", "a/demo", "backup-id"}, []string{"backup", "delete", "demo", "backup-id"}},

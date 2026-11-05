@@ -908,7 +908,7 @@ func startCommandKeepAlive(sess gssh.Session, args []string, interval time.Durat
 		return func() {}
 	}
 	switch args[0] {
-	case "start", "stop", "restart", "disk", "delete", "resize", "fsck", "backup", "restore", "export", "migration", "project-template":
+	case "start", "stop", "restart", "disk", "delete", "resize", "upgrade", "fsck", "backup", "restore", "export", "migration", "project-template":
 	case "orb":
 		if len(args) < 2 || args[1] != "bootstrap" {
 			return func() {}
@@ -970,6 +970,8 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 		return a.cmdIntegration(ctx, actor, req.args, req.format)
 	case "resize":
 		return a.cmdResize(ctx, actor, req.args, req.format)
+	case "upgrade":
+		return a.cmdUpgrade(ctx, actor, req.args, req.format)
 	case "fsck":
 		return a.cmdFSCK(ctx, actor, req.args, req.format)
 	case "backup":
@@ -2641,6 +2643,7 @@ func helpResult() commandResult {
 				{"stop <name>", "Stop a running instance."},
 				{"restart <name>", "Restart an instance."},
 				{"resize <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
+				{"upgrade <name> [--rollback]", "Upgrade kernel and modules (stopped VM); rollback restores the entire pre-upgrade disk."},
 				{"fsck <name>", "Force-check and repair a stopped instance's rootfs."},
 				{"disk <status|offload|hydrate|purge> <name>", "Manage cold disk storage; mutations require a stopped instance (admin required for Orbs)."},
 				{"delete <name>", "Delete an instance."},

@@ -29,6 +29,63 @@ Control-plane examples omit a username because authorization is based on that Ta
 
 Most non-streaming instance and backup commands accept a global `--json` flag. With OpenSSH, terminate local ssh option parsing first, for example `ssh srv -- --json inspect demo` or `ssh srv -- --json list`.
 
+## Upgrade a VM's kernel and modules
+
+Install a complete new build in a **new image directory**, including `vmlinux`,
+`rootfs-base.img`, and `manifest.txt`, then point the VM's image configuration at
+that directory. Do not overwrite old image artifacts: existing VMs may still
+reference them. Both builders produce SHA-256 entries binding the kernel and
+base disk in the manifest. Older Arch builds without those entries must be
+rebuilt. Deploy matching versions of `srv` and `srv-vm-runner` first.
+
+Upgrade asks the running helper to authorize and resolve boot files using its
+effective `--images-dir` and legacy boot configuration. An older helper without
+this API rejects the upgrade before the active disk is changed. Private upgrade
+and rollback kernels do not require a configured images directory.
+
+```bash
+ssh srv stop demo
+ssh srv upgrade demo
+ssh srv start demo
+```
+
+`upgrade` copies only `/usr/lib/modules` from the configured base image into a
+private copy of the VM disk, checks the filesystem, then switches to that disk
+and a private kernel copy. Guest packages and data stay unchanged. Normal starts
+keep the stored kernel/initrd paths; changing the configured default no longer
+silently changes an existing Arch VM's kernel. The command supports stopped
+VMs and Orbs with merged `/usr` and an initrd-free target image. Hydrate
+and purge retained cold-storage state before upgrading.
+
+For Orbs, use the same `upgrade NAME` command with the local instance name.
+The configured image for that Orb supplies the kernel and modules; its instance
+identity and other guest files are retained. Coordinate with the Orb provider
+so it does not resume the instance during maintenance. This does not upgrade
+the Amp CLI or register the Orb again.
+
+To undo the latest upgrade:
+
+```bash
+ssh srv stop demo
+ssh srv upgrade demo --rollback
+ssh srv start demo
+```
+
+**Rollback restores the entire pre-upgrade disk, including guest data.** Writes
+made since the upgrade are lost. It also restores private copies of the old
+kernel and optional initrd. There is no automatic restart or rollback after a
+failed boot; stop the VM before requesting rollback.
+
+Preparation failures leave the active disk and boot paths unchanged. Before
+replacing the disk, srv durably records a pending upgrade. If the process or
+host crashes during the disk/database switch, starts and disk-changing commands
+remain fenced; `upgrade NAME --rollback` restores the saved pair and clears the
+fence. A failed rollback can be retried. Upgrade recovery lives in the instance
+directory, separately from `backup list`; older generations remain there until
+the instance is deleted, so retained backups can still reference their kernels.
+The most recent upgrade is the rollback target. Include the instance directory
+and database together in host snapshots; a guest disk alone is not a boot pair.
+
 ## Use Cases
 
 - **Throwaway debug VMs** — spin up an isolated environment, break things, and delete it without affecting the host

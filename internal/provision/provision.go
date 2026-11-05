@@ -1252,24 +1252,10 @@ func (p *Provisioner) ensureRootFSReflinkSupport(ctx context.Context, rootfs str
 }
 
 func (p *Provisioner) configuredKernelPath(inst model.Instance) string {
-	if inst.ImageName() != "arch" {
-		return inst.KernelPath
-	}
-	image, _ := p.cfg.ResolveImage("arch")
-	if path := strings.TrimSpace(image.Kernel); path != "" {
-		return path
-	}
 	return strings.TrimSpace(inst.KernelPath)
 }
 
 func (p *Provisioner) configuredInitrdPath(inst model.Instance) string {
-	if inst.ImageName() != "arch" {
-		return inst.InitrdPath
-	}
-	image, _ := p.cfg.ResolveImage("arch")
-	if path := strings.TrimSpace(image.Initrd); path != "" {
-		return path
-	}
 	return strings.TrimSpace(inst.InitrdPath)
 }
 
@@ -1282,6 +1268,9 @@ func (p *Provisioner) applyConfiguredBootArtifacts(inst *model.Instance) {
 }
 
 func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
+	if err := p.upgradeFence(inst.Name); err != nil {
+		return err
+	}
 	if inst.State == model.StateStopping {
 		return fmt.Errorf("instance %q has an incomplete stop; retry stop before starting", inst.Name)
 	}

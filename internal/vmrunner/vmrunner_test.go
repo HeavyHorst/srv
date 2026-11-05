@@ -223,6 +223,47 @@ func TestImageAwareStartRejectsUntrustedBootFiles(t *testing.T) {
 	}
 }
 
+func TestPrivateUpgradeBootArtifacts(t *testing.T) {
+	cfg := ServerConfig{ImagesDir: t.TempDir(), InstancesDir: t.TempDir()}
+	for _, name := range []string{"demo", "neighbor"} {
+		dir := filepath.Join(cfg.InstancesDir, name, "upgrade-123")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range []string{"vmlinux", "old-vmlinux", "old-initrd", "rootfs.img"} {
+			if err := os.WriteFile(filepath.Join(dir, file), []byte("artifact"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, imagesDir := range []string{cfg.ImagesDir, "", filepath.Join(t.TempDir(), "absent")} {
+		cfg.ImagesDir = imagesDir
+		for _, tc := range []struct {
+			name, file string
+			allowed    bool
+		}{
+			{"demo", "vmlinux", true}, {"demo", "old-vmlinux", true},
+			{"neighbor", "vmlinux", false}, {"demo", "rootfs.img", false},
+		} {
+			path := filepath.Join(cfg.InstancesDir, tc.name, "upgrade-123", tc.file)
+			_, err := cfg.ResolveBootConfig(StartRequest{Name: "demo", KernelPath: path})
+			if (err == nil) != tc.allowed {
+				t.Fatalf("%s: allowed=%v err=%v", path, tc.allowed, err)
+			}
+		}
+		if _, err := cfg.ResolveBootConfig(StartRequest{Name: "demo", KernelPath: filepath.Join(cfg.InstancesDir, "demo", "upgrade-123", "old-vmlinux"), InitrdPath: filepath.Join(cfg.InstancesDir, "demo", "upgrade-123", "old-initrd")}); err != nil {
+			t.Fatalf("private rollback pair with images dir %q: %v", imagesDir, err)
+		}
+	}
+	path := filepath.Join(cfg.InstancesDir, "demo", "upgrade-escape")
+	if err := os.Symlink(filepath.Join(cfg.InstancesDir, "neighbor", "upgrade-123"), path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.ResolveBootConfig(StartRequest{Name: "demo", KernelPath: filepath.Join(path, "vmlinux")}); err == nil {
+		t.Fatal("cross-instance symlink accepted")
+	}
+}
+
 func TestCreateBalloonDeviceEnablesFreePageReporting(t *testing.T) {
 	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{})
 	socketPath := filepath.Join(t.TempDir(), "firecracker.sock")

@@ -231,6 +231,7 @@ list / status                        Query all hosts
 new NAME [sizing/image options]       Automatically choose a host
 inspect / start / stop / restart NAME Route to the owning host
 resize / fsck / delete NAME           Manage a VM
+upgrade NAME [--rollback]             Upgrade kernel/modules or restore pre-upgrade disk
 logs [-f] NAME [serial|firecracker]   Read or follow logs
 backup create|list NAME               Manage backups on the owning host
 backup delete NAME ID / restore NAME ID
@@ -322,7 +323,7 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 		} else if hostName == "" {
 			h, err = r.choose(ctx, a, args[1:])
 		}
-	case "inspect", "start", "stop", "restart", "delete", "resize", "fsck", "restore", "backup", "disk", "logs", "export", "bootstrap":
+	case "inspect", "start", "stop", "restart", "delete", "resize", "upgrade", "fsck", "restore", "backup", "disk", "logs", "export", "bootstrap":
 		if cmd == "delete" && len(args) > 2 && args[2] == "--expect" && hostName == "" {
 			return fmt.Errorf("delete --expect requires --host")
 		}

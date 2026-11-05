@@ -157,6 +157,11 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type BootFiles struct {
+	KernelPath string `json:"kernel_path"`
+	InitrdPath string `json:"initrd_path,omitempty"`
+}
+
 type Client struct {
 	socketPath string
 	httpClient *http.Client
@@ -178,6 +183,14 @@ func NewClient(socketPath string) *Client {
 		httpClient: &http.Client{Transport: transport},
 		baseURL:    "http://srv-vm-runner",
 	}
+}
+
+// ResolveBootArtifacts authorizes paths using the running helper's effective
+// configuration, including command-line overrides unknown to the control plane.
+func (c *Client) ResolveBootArtifacts(ctx context.Context, req StartRequest) (BootFiles, error) {
+	var files BootFiles
+	err := c.post(ctx, "/vm/boot-artifacts-v1", req, &files)
+	return files, err
 }
 
 func (c *Client) StartInstanceVM(ctx context.Context, req StartRequest) (StartResponse, error) {
@@ -375,6 +388,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vm/start", s.handleStart)
 	mux.HandleFunc("/vm/start-v2", s.handleStart)
+	mux.HandleFunc("/vm/boot-artifacts-v1", s.handleBootArtifacts)
 	mux.HandleFunc("/vm/start-result", s.handleStartResult)
 	mux.HandleFunc("/vm/stop", s.handleStop)
 	mux.HandleFunc("/vm/cleanup-proof-v1", s.handleCleanupProof)
@@ -703,6 +717,47 @@ func maxInt64(a, b int64) int64 {
 	return b
 }
 
+func (s *Server) handleBootArtifacts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, errors.New("POST required"))
+		return
+	}
+	var req StartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !validName.MatchString(req.Name) || !filepath.IsAbs(req.KernelPath) || (req.InitrdPath != "" && !filepath.IsAbs(req.InitrdPath)) {
+		respondError(w, http.StatusBadRequest, errors.New("valid instance name and absolute boot paths required"))
+		return
+	}
+	selected, err := s.config.ResolveBootConfig(req)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	files := BootFiles{KernelPath: selected.KernelPath, InitrdPath: selected.InitrdPath}
+	// The explicit legacy pair is trusted without image-root containment and
+	// is the only pair the policy does not already resolve.
+	if req.KernelPath == s.config.KernelPath && req.InitrdPath == s.config.InitrdPath {
+		for _, path := range []*string{&files.KernelPath, &files.InitrdPath} {
+			if *path == "" {
+				continue
+			}
+			*path, err = filepath.EvalSymlinks(*path)
+			if err != nil {
+				respondError(w, http.StatusBadRequest, err)
+				return
+			}
+			info, err := os.Stat(*path)
+			if err != nil || !info.Mode().IsRegular() {
+				respondError(w, http.StatusBadRequest, errors.New("boot artifact must be a regular file"))
+				return
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(files); err != nil {
+		s.log.Error("encode boot artifacts", "err", err)
+	}
+}
+
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondError(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s is not allowed", r.Method))
@@ -817,7 +872,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	if err := s.config.Validate(); err != nil {
 		return StartResponse{}, err
 	}
-	bootConfig, err := s.config.bootConfig(req)
+	bootConfig, err := s.config.ResolveBootConfig(req)
 	if err != nil {
 		return StartResponse{}, err
 	}
@@ -1434,20 +1489,18 @@ func (c ServerConfig) Validate() error {
 	return c.ColdStorage.Validate()
 }
 
-// Requests may select boot files only from the administrator-managed images
-// tree, or use the exact legacy pair configured by the administrator. Resolve
-// symlinks before checking containment so guests cannot expose other host files.
-func (c ServerConfig) bootConfig(req StartRequest) (ServerConfig, error) {
+// ResolveBootConfig selects boot files only from the administrator-managed images
+// tree, the requesting instance's private upgrade generations, or the exact
+// legacy pair. Resolve symlinks before checking containment so guests cannot
+// expose other host files.
+func (c ServerConfig) ResolveBootConfig(req StartRequest) (ServerConfig, error) {
 	if req.KernelPath == "" {
 		return c, nil
 	}
 	if req.KernelPath == c.KernelPath && req.InitrdPath == c.InitrdPath {
 		return c, nil
 	}
-	root, err := filepath.EvalSymlinks(c.ImagesDir)
-	if err != nil || !filepath.IsAbs(root) {
-		return ServerConfig{}, errors.New("selected boot artifacts require a configured images directory")
-	}
+	root, rootErr := filepath.EvalSymlinks(c.ImagesDir)
 	paths := []*string{&req.KernelPath, &req.InitrdPath}
 	for _, path := range paths {
 		if *path == "" {
@@ -1458,8 +1511,17 @@ func (c ServerConfig) bootConfig(req StartRequest) (ServerConfig, error) {
 			return ServerConfig{}, fmt.Errorf("resolve boot artifact: %w", err)
 		}
 		rel, err := filepath.Rel(root, resolved)
-		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return ServerConfig{}, fmt.Errorf("boot artifact %q is outside images directory %q", *path, root)
+		if rootErr != nil || !filepath.IsAbs(root) || err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			instance, pathErr := directChildPath(c.InstancesDir, req.Name)
+			if pathErr != nil {
+				return ServerConfig{}, pathErr
+			}
+			private, pathErr := filepath.Rel(instance, resolved)
+			parts := strings.Split(private, string(filepath.Separator))
+			if pathErr != nil || resolved != *path || len(parts) != 2 || !strings.HasPrefix(parts[0], "upgrade-") ||
+				(parts[1] != "vmlinux" && parts[1] != "old-vmlinux" && parts[1] != "old-initrd") {
+				return ServerConfig{}, fmt.Errorf("boot artifact %q is outside images directory %q and private upgrade generations", *path, root)
+			}
 		}
 		info, err := os.Stat(resolved)
 		if err != nil || !info.Mode().IsRegular() {

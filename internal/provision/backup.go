@@ -422,6 +422,9 @@ func (p *Provisioner) requireStoppedInstance(ctx context.Context, name string) (
 }
 
 func (p *Provisioner) requireExistingInstance(ctx context.Context, name string) (model.Instance, error) {
+	if err := p.upgradeFence(name); err != nil {
+		return model.Instance{}, err
+	}
 	inst, err := p.ReconcileInstanceRuntime(ctx, name)
 	if err != nil {
 		return model.Instance{}, err

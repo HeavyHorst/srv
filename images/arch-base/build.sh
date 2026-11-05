@@ -91,6 +91,7 @@ require_commands() {
 		pacstrap \
 		perl \
 		rsync \
+		sha256sum \
 		systemctl \
 		tar \
 		truncate \
@@ -470,6 +471,7 @@ EOF
 	if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
 		echo 'srv_amp_orb=1' >>"${MANIFEST_OUTPUT}"
 	fi
+	(cd "${OUTPUT_DIR}" && sha256sum vmlinux rootfs-base.img) >>"${MANIFEST_OUTPUT}"
 }
 
 main() {

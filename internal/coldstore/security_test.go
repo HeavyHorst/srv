@@ -81,7 +81,7 @@ func TestConfigValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
-	for _, name := range []string{"ssh", "btrfs"} {
+	for _, name := range []string{"ssh", "btrfs", "zstd"} {
 		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), name) {
 			t.Fatalf("missing %s not diagnosed: %v", name, err)
 		}

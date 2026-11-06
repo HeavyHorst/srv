@@ -39,9 +39,10 @@ type Object struct {
 }
 
 type request struct {
-	Operation string `json:"operation"`
-	Object    Object `json:"object"`
-	Parent    string `json:"parent,omitempty"`
+	Operation   string `json:"operation"`
+	Object      Object `json:"object"`
+	Parent      string `json:"parent,omitempty"`
+	Compression string `json:"compression,omitempty"`
 }
 
 func validID(s string) bool {
@@ -80,6 +81,9 @@ func decode(r io.Reader, dst any) error {
 }
 
 func (r request) validate() error {
+	if r.Compression != "" && (r.Compression != "zstd" || (r.Operation != "put" && r.Operation != "get")) {
+		return errors.New("unsupported transfer compression")
+	}
 	if !validID(r.Object.ID) {
 		return errors.New("invalid object ID")
 	}

@@ -24,6 +24,14 @@ import (
 // test creates/deletes only private children; it does not mount or format disks.
 // It exercises actual kernel send/receive, not SSH authentication or sshd setup.
 func TestBtrfsTwoFilesystems(t *testing.T) {
+	for _, compression := range []string{"", "zstd"} {
+		t.Run("compression="+compression, func(t *testing.T) {
+			testBtrfsTwoFilesystems(t, compression)
+		})
+	}
+}
+
+func testBtrfsTwoFilesystems(t *testing.T, compression string) {
 	source, remote := os.Getenv("COLDSTORE_TEST_SOURCE"), os.Getenv("COLDSTORE_TEST_REMOTE")
 	if source == "" || remote == "" {
 		t.Skip("set COLDSTORE_TEST_SOURCE and COLDSTORE_TEST_REMOTE for privileged btrfs integration")
@@ -74,6 +82,9 @@ func TestBtrfsTwoFilesystems(t *testing.T) {
 		return Object{ID: uuid.NewString(), UUID: id.UUID, Size: int64(len(contents)), SHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(contents))), Parent: parent}, p
 	}
 	invoke := func(r request, in io.Reader, out io.Writer) error {
+		if r.Operation == "put" || r.Operation == "get" {
+			r.Compression = compression
+		}
 		command, err := encodeRequest(r)
 		if err != nil {
 			return err
@@ -92,8 +103,27 @@ func TestBtrfsTwoFilesystems(t *testing.T) {
 			args = append(args, "-p", parent)
 		}
 		args = append(args, p)
-		if err := run(ctx, "btrfs", args, nil, stream); err != nil {
+		commands := [][]string{append([]string{"btrfs"}, args...)}
+		if compression == "zstd" {
+			commands = append(commands, []string{"zstd", "-q", "-c"})
+		}
+		if err := pipeline(ctx, nil, stream, commands...); err != nil {
 			t.Fatal(err)
+		}
+		if compression == "zstd" {
+			// A complete btrfs stream with a broken zstd checksum must not
+			// publish, even if btrfs receive has already consumed its END.
+			compressed, err := os.ReadFile(stream.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			compressed[len(compressed)-1] ^= 1
+			if err := invoke(request{Operation: "put", Object: o}, bytes.NewReader(compressed), io.Discard); err == nil {
+				t.Fatal("accepted corrupt compressed stream")
+			}
+			if _, err := os.Stat(filepath.Join(root, "objects", o.ID)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("published corrupt compressed stream: %v", err)
+			}
 		}
 		if _, err := stream.Seek(0, 0); err != nil {
 			t.Fatal(err)
@@ -332,7 +362,11 @@ func TestBtrfsTwoFilesystems(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := run(ctx, "btrfs", []string{"receive", dest}, stream, io.Discard); err != nil {
+		commands := [][]string{{"btrfs", "receive", dest}}
+		if compression == "zstd" {
+			commands = append([][]string{{"zstd", "-q", "-d", "-c"}}, commands...)
+		}
+		if err := pipeline(ctx, stream, io.Discard, commands...); err != nil {
 			stream.Close()
 			t.Fatal(err)
 		}

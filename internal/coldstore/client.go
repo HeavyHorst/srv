@@ -69,7 +69,7 @@ func (c Config) Validate() error {
 	if err := c.validateSSH(); err != nil {
 		return err
 	}
-	for _, name := range []string{"ssh", "btrfs"} {
+	for _, name := range []string{"ssh", "btrfs", "zstd"} {
 		if _, err := exec.LookPath(name); err != nil {
 			return fmt.Errorf("cold store requires %s: %w", name, err)
 		}
@@ -153,51 +153,66 @@ func run(ctx context.Context, name string, args []string, in io.Reader, out io.W
 	return nil
 }
 
-// pipeline waits for both processes, cancelling the sibling immediately on
+// pipeline waits for all processes, cancelling the others immediately on
 // failure. OS pipes avoid uninterruptible Go copier goroutines on broken peers.
-func pipeline(ctx context.Context, leftName string, leftArgs []string, rightName string, rightArgs []string) error {
+func pipeline(ctx context.Context, in io.Reader, out io.Writer, commands ...[]string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	r, w, err := os.Pipe()
-	if err != nil {
-		return err
+	cmds := make([]*exec.Cmd, len(commands))
+	stderrs := make([]limitBuffer, len(commands))
+	var pipes []*os.File
+	closePipes := func() {
+		for _, p := range pipes {
+			_ = p.Close()
+		}
 	}
-	defer r.Close()
-	defer w.Close()
-	left := exec.CommandContext(ctx, leftName, leftArgs...)
-	right := exec.CommandContext(ctx, rightName, rightArgs...)
-	if leftName == "btrfs" {
-		storage.InheritLocks(ctx, left)
+	defer closePipes()
+	for i, command := range commands {
+		cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+		if command[0] == "btrfs" {
+			storage.InheritLocks(ctx, cmd)
+		}
+		cmd.Stderr = &stderrs[i]
+		cmd.WaitDelay = time.Second
+		cmds[i] = cmd
+		if i == 0 {
+			cmd.Stdin = in
+		} else {
+			r, w, err := os.Pipe()
+			if err != nil {
+				return err
+			}
+			pipes = append(pipes, r, w)
+			cmds[i-1].Stdout, cmd.Stdin = w, r
+		}
 	}
-	if rightName == "btrfs" {
-		storage.InheritLocks(ctx, right)
+	cmds[len(cmds)-1].Stdout = out
+	results := make(chan error, len(cmds))
+	started := 0
+	var failures []error
+	for i := len(cmds) - 1; i >= 0; i-- {
+		if err := cmds[i].Start(); err != nil {
+			failures = append(failures, err)
+			cancel()
+			break
+		}
+		started++
+		go func(i int) {
+			err := cmds[i].Wait()
+			if err != nil {
+				err = fmt.Errorf("%s: %w: %s", commands[i][0], err, stderrs[i].String())
+			}
+			results <- err
+		}(i)
 	}
-	var le, re limitBuffer
-	left.Stdout, left.Stderr = w, &le
-	right.Stdin, right.Stderr = r, &re
-	left.WaitDelay, right.WaitDelay = time.Second, time.Second
-	if err := right.Start(); err != nil {
-		return err
+	closePipes()
+	for range started {
+		if err := <-results; err != nil {
+			failures = append(failures, err)
+			cancel()
+		}
 	}
-	if err := left.Start(); err != nil {
-		cancel()
-		_ = right.Wait()
-		return err
-	}
-	_ = r.Close()
-	_ = w.Close()
-	results := make(chan error, 2)
-	go func() { results <- left.Wait() }()
-	go func() { results <- right.Wait() }()
-	a := <-results
-	if a != nil {
-		cancel()
-	}
-	b := <-results
-	if a != nil || b != nil {
-		return fmt.Errorf("transfer: %w; sender: %s; receiver: %s", errors.Join(a, b), le.String(), re.String())
-	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func (c Client) stat(ctx context.Context, id string) (Object, error) {
@@ -243,7 +258,7 @@ func (c Client) Put(ctx context.Context, o Object, snapshotPath, parentPath stri
 	if err := verifyDiskIdentity(ctx, snapshotPath, o, false); err != nil {
 		return err
 	}
-	args, err := c.sshArgs(request{Operation: "put", Object: o})
+	args, err := c.sshArgs(request{Operation: "put", Object: o, Compression: "zstd"})
 	if err != nil {
 		return err
 	}
@@ -264,7 +279,7 @@ func (c Client) Put(ctx context.Context, o Object, snapshotPath, parentPath stri
 			return err
 		}
 	}
-	if err := pipeline(ctx, "btrfs", sendArgs(snapshotPath, parentPath), "ssh", args); err != nil {
+	if err := pipeline(ctx, nil, nil, append([]string{"btrfs"}, sendArgs(snapshotPath, parentPath)...), []string{"zstd", "-q", "-c"}, append([]string{"ssh"}, args...)); err != nil {
 		// Do not delete an object after a lost acknowledgement: it may already
 		// have been durably published. A later exact Stat/Put resolves ambiguity.
 		return err
@@ -285,7 +300,7 @@ func (c Client) Get(ctx context.Context, o Object, destDir, parentID string) (st
 	if err := o.validate(); err != nil {
 		return "", err
 	}
-	args, err := c.sshArgs(request{Operation: "get", Object: Object{ID: o.ID}, Parent: parentID})
+	args, err := c.sshArgs(request{Operation: "get", Object: Object{ID: o.ID}, Parent: parentID, Compression: "zstd"})
 	if err != nil {
 		return "", err
 	}
@@ -315,7 +330,7 @@ func (c Client) Get(ctx context.Context, o Object, destDir, parentID string) (st
 		defer cancel()
 		_ = storage.RemoveTree(cleanupCtx, stage)
 	}()
-	if err := pipeline(ctx, "ssh", args, "btrfs", []string{"receive", stage}); err != nil {
+	if err := pipeline(ctx, nil, nil, append([]string{"ssh"}, args...), []string{"zstd", "-q", "-d", "-c"}, []string{"btrfs", "receive", stage}); err != nil {
 		return "", err
 	}
 	disk, err := receivedDisk(ctx, stage, o)

@@ -210,7 +210,10 @@ external configuration, binaries, receipts and `/boot` where applicable.
 
 Cold storage is disabled by default and applies to both VMs and Orbs. It uses
 `btrfs send/receive` through the root VM runner, without adding capabilities to
-the `srv` service. There is no demand paging: `start` restores the entire disk
+the `srv` service. Uploads and downloads compress the send stream with zstd
+before SSH and decompress it before `btrfs receive`. This also applies to
+incremental transfers; stored snapshots and their checksums are unchanged.
+There is no demand paging: `start` restores the entire disk
 before booting. A cold instance remains `stopped` in the instance lifecycle.
 
 Use a dedicated, trusted btrfs storage server. Build `./cmd/srv-cold-store` and
@@ -236,6 +239,11 @@ directories such as `/etc/srv/cold-storage/` (not `/tmp` or a user home).
 
 Upgrade the storage helper and `srv-vm-runner` before enabling cold storage in
 `srv`. The runner validates credentials and required executables at startup.
+For the zstd transport, install `zstd` on both hosts and upgrade the storage
+helper before the runner. The new helper still accepts older uncompressed
+clients; the new runner requires zstd transfers and fails against an old helper
+without falling back to uncompressed transfers. Existing stored disks need no
+migration.
 An old runner's missing API fails closed with upgrade advice; never bypass it
 to delete an instance whose remote state is unknown. Configure the backend's
 `/etc/srv/srv.env` and restart both matching binaries:
@@ -265,7 +273,7 @@ received disk locally. `Stat` checks immutable publication and identity, not
 media integrity; use filesystem scrubbing separately. These bounds are not a
 throughput guarantee. The remote namespace lock serializes transfers, so a long
 upload can delay another instance's hydration; deletion scans all manifests.
-Both hosts need `btrfs-progs`; the backend also needs OpenSSH client and `losetup`.
+Both hosts need `btrfs-progs` and `zstd`; the backend also needs OpenSSH client and `losetup`.
 The backend's `btrfs receive` needs **btrfs-progs 6.10.1 or newer**, or a
 distribution backport of [the reverse-receive fix](https://github.com/kdave/btrfs-progs/commit/28eb473c517551ae990ad16a698bedb366b8e189).
 Older versions can accept an incremental stream's snapshot parent but fail on

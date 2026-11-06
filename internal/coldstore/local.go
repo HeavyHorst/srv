@@ -45,7 +45,7 @@ func Receive(ctx context.Context, root string, o Object, in io.Reader) error {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		return s.put(ctx, o, in)
+		return s.put(ctx, o, in, "")
 	})
 }
 

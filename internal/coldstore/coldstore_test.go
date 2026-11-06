@@ -25,7 +25,7 @@ func testObject() Object {
 }
 
 func TestProtocol(t *testing.T) {
-	for _, r := range []request{{Operation: "put", Object: testObject()}, {Operation: "stat", Object: Object{ID: testID}}, {Operation: "get", Object: Object{ID: testID}}, {Operation: "delete", Object: Object{ID: testID}}} {
+	for _, r := range []request{{Operation: "put", Object: testObject()}, {Operation: "stat", Object: Object{ID: testID}}, {Operation: "get", Object: Object{ID: testID}}, {Operation: "delete", Object: Object{ID: testID}}, {Operation: "put", Object: testObject(), Compression: "zstd"}, {Operation: "get", Object: Object{ID: testID}, Compression: "zstd"}} {
 		encoded, err := encodeRequest(r)
 		if err != nil {
 			t.Fatal(err)
@@ -43,6 +43,16 @@ func TestProtocol(t *testing.T) {
 	for _, s := range []string{"", "sh -c id", protocol + " ../disk", protocol + " " + strings.Repeat("a", maxMetadata*2)} {
 		if _, err := parseRequest(s); err == nil {
 			t.Fatalf("accepted %q", s)
+		}
+	}
+	for _, r := range []request{
+		{Operation: "put", Object: testObject(), Compression: "gzip"},
+		{Operation: "get", Object: Object{ID: testID}, Compression: "gzip"},
+		{Operation: "stat", Object: Object{ID: testID}, Compression: "zstd"},
+		{Operation: "delete", Object: Object{ID: testID}, Compression: "zstd"},
+	} {
+		if _, err := encodeRequest(r); err == nil {
+			t.Fatalf("accepted invalid compression: %+v", r)
 		}
 	}
 	for _, json := range []string{`{"operation":"stat","object":{"id":"` + testID + `"},"path":"/etc"}`, `{"operation":"exec","object":{"id":"` + testID + `"}}`, `{} {}`} {
@@ -146,11 +156,11 @@ func TestProcessHelper(t *testing.T) {
 
 func TestPipeline(t *testing.T) {
 	t.Setenv("COLDSTORE_HELPER", "1")
-	args := func(mode string) []string { return []string{"-test.run=^TestProcessHelper$", "--", mode} }
+	args := func(mode string) []string { return []string{os.Args[0], "-test.run=^TestProcessHelper$", "--", mode} }
 	for _, pair := range [][2]string{{"fail", "wait"}, {"wait", "fail"}, {"write", "read"}} {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		start := time.Now()
-		err := pipeline(ctx, os.Args[0], args(pair[0]), os.Args[0], args(pair[1]))
+		err := pipeline(ctx, nil, nil, args(pair[0]), args(pair[1]))
 		cancel()
 		if pair[0] == "write" {
 			if err != nil {
@@ -165,13 +175,24 @@ func TestPipeline(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if err := pipeline(ctx, os.Args[0], args("wait"), os.Args[0], args("wait")); err == nil {
+	if err := pipeline(ctx, nil, nil, args("wait"), args("wait")); err == nil {
 		t.Fatal("deadline ignored")
 	}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel2()
-	if err := pipeline(ctx2, "/nonexistent-coldstore-test", nil, os.Args[0], args("wait")); err == nil {
+	if err := pipeline(ctx2, nil, nil, []string{"/nonexistent-coldstore-test"}, args("wait")); err == nil {
 		t.Fatal("startup error ignored")
+	}
+	for i := range 3 {
+		commands := [][]string{args("wait"), args("wait"), args("wait")}
+		commands[i] = args("fail")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		start := time.Now()
+		err := pipeline(ctx, nil, nil, commands...)
+		cancel()
+		if err == nil || !strings.Contains(err.Error(), "intentional failure") || time.Since(start) > 4*time.Second {
+			t.Fatalf("stage %d did not cancel its peers promptly: %v", i, err)
+		}
 	}
 }
 
@@ -492,7 +513,7 @@ func TestInterruptedDeletionRecordPublication(t *testing.T) {
 			if before.Size() != 0 {
 				t.Fatal("record must contain only its UUID filename")
 			}
-			if err := s.put(ctx, testObject(), strings.NewReader("")); !errors.Is(err, errObjectDeleted) {
+			if err := s.put(ctx, testObject(), strings.NewReader(""), ""); !errors.Is(err, errObjectDeleted) {
 				t.Fatalf("interrupted publication did not fail closed: %v", err)
 			}
 			// Simulate a fresh invocation after the interrupted create/sync. It

@@ -119,9 +119,9 @@ func Serve(ctx context.Context, root, command string, in io.Reader, out io.Write
 			}
 			return json.NewEncoder(out).Encode(o)
 		case "put":
-			return s.put(ctx, r.Object, in)
+			return s.put(ctx, r.Object, in, r.Compression)
 		case "get":
-			return s.get(ctx, r.Object.ID, r.Parent, out)
+			return s.get(ctx, r.Object.ID, r.Parent, out, r.Compression)
 		case "delete":
 			return s.delete(ctx, r.Object.ID)
 		}
@@ -319,7 +319,7 @@ func (s server) stat(ctx context.Context, id string) (Object, error) {
 	return o, verifyDiskIdentity(ctx, filepath.Join(s.path(id), "disk"), o, true)
 }
 
-func (s server) put(ctx context.Context, o Object, in io.Reader) error {
+func (s server) put(ctx context.Context, o Object, in io.Reader, compression string) error {
 	ctx = storage.WithInheritedLock(ctx, s.namespaceLock)
 	if deleted, err := s.deletionRecord(o.ID, false); err != nil {
 		return err
@@ -344,7 +344,11 @@ func (s server) put(ctx context.Context, o Object, in io.Reader) error {
 		defer cancel()
 		_ = storage.RemoveTree(cleanupCtx, stage)
 	}()
-	if err := run(ctx, "btrfs", []string{"receive", stage}, in, io.Discard); err != nil {
+	commands := [][]string{{"btrfs", "receive", stage}}
+	if compression == "zstd" {
+		commands = append([][]string{{"zstd", "-q", "-d", "-c"}}, commands...)
+	}
+	if err := pipeline(ctx, in, io.Discard, commands...); err != nil {
 		return err
 	}
 	disk, err := receivedDisk(ctx, stage, o)
@@ -382,7 +386,7 @@ func (s server) put(ctx context.Context, o Object, in io.Reader) error {
 	return errors.Join(storage.SyncPath(s.objects), storage.SyncPath(s.root))
 }
 
-func (s server) get(ctx context.Context, id, parent string, out io.Writer) error {
+func (s server) get(ctx context.Context, id, parent string, out io.Writer, compression string) error {
 	ctx = storage.WithInheritedLock(ctx, s.namespaceLock)
 	if _, err := s.stat(ctx, id); err != nil {
 		return err
@@ -395,7 +399,11 @@ func (s server) get(ctx context.Context, id, parent string, out io.Writer) error
 			return err
 		}
 	}
-	return run(ctx, "btrfs", sendArgs(filepath.Join(s.path(id), "disk"), parentPath), nil, out)
+	commands := [][]string{append([]string{"btrfs"}, sendArgs(filepath.Join(s.path(id), "disk"), parentPath)...)}
+	if compression == "zstd" {
+		commands = append(commands, []string{"zstd", "-q", "-c"})
+	}
+	return pipeline(ctx, nil, out, commands...)
 }
 
 func (s server) delete(ctx context.Context, id string) error {

@@ -360,6 +360,62 @@ func (s *Store) CountMemoryPoolMembers(ctx context.Context, poolID string) (int,
 	return count, nil
 }
 
+type MemoryPoolResize struct {
+	RequestID string
+	SizeBytes int64
+	Running   bool
+}
+
+func (s *Store) PendingMemoryPoolResize(ctx context.Context, poolID string) (MemoryPoolResize, error) {
+	var op MemoryPoolResize
+	err := s.db.QueryRowContext(ctx, `SELECT request_id, size_bytes, running FROM memory_pool_resizes WHERE pool_id = ?`, poolID).Scan(&op.RequestID, &op.SizeBytes, &op.Running)
+	if errors.Is(err, sql.ErrNoRows) {
+		return op, nil
+	}
+	return op, err
+}
+
+func (s *Store) CheckMemoryPoolResize(ctx context.Context, poolID string) error {
+	op, err := s.PendingMemoryPoolResize(ctx, poolID)
+	if err != nil {
+		return err
+	}
+	if op.RequestID != "" {
+		return fmt.Errorf("memory pool resize pending; retry pool resize with --size %dB", op.SizeBytes)
+	}
+	return nil
+}
+
+func (s *Store) BeginMemoryPoolResize(ctx context.Context, pool model.MemoryPool, op MemoryPoolResize) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO memory_pool_resizes (pool_id, request_id, size_bytes, running) VALUES (?, ?, ?, ?)`, pool.ID, op.RequestID, op.SizeBytes, op.Running); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE memory_pools SET reserved_bytes = ?, updated_at = ? WHERE id = ?`, pool.ReservedBytes, timeString(pool.UpdatedAt), pool.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) FinishMemoryPoolResize(ctx context.Context, pool model.MemoryPool, requestID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM memory_pool_resizes WHERE pool_id = ? AND request_id = ?`, pool.ID, requestID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE memory_pools SET reserved_bytes = ?, updated_at = ? WHERE id = ?`, pool.ReservedBytes, timeString(pool.UpdatedAt), pool.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) DeleteMemoryPool(ctx context.Context, id string) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM memory_pools WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("delete memory pool %s: %w", id, err)
@@ -632,6 +688,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			updated_at TEXT NOT NULL,
 			created_by_user TEXT NOT NULL,
 			created_by_node TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS memory_pool_resizes (
+			pool_id TEXT PRIMARY KEY REFERENCES memory_pools(id),
+			request_id TEXT NOT NULL UNIQUE,
+			size_bytes INTEGER NOT NULL,
+			running INTEGER NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS instance_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,

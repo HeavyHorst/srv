@@ -1829,6 +1829,232 @@ func TestCreateMemoryPoolRejectsWhenHostMemoryBudgetIsExceeded(t *testing.T) {
 	}
 }
 
+func TestResizeMemoryPool(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		size      int64
+		state     string
+		pid       int
+		runnerErr error
+		wantErr   string
+	}{
+		{name: "shrink to largest member", size: 768 * format.MiB, state: model.StateStopped},
+		{name: "below largest member", size: 768*format.MiB - 1, state: model.StateStopped, wantErr: "exceeds memory pool"},
+		{name: "grow to budget", size: 1536 * format.MiB, state: model.StateStopped},
+		{name: "over budget", size: 1536*format.MiB + 1, state: model.StateStopped, wantErr: "insufficient host memory"},
+		{name: "running", size: 768 * format.MiB, state: model.StateReady},
+		{name: "grow running", size: 1536 * format.MiB, state: model.StateReady},
+		{name: "starting", size: 768 * format.MiB, state: model.StateProvisioning, wantErr: "must be ready or stopped"},
+		{name: "stopping", size: 768 * format.MiB, state: model.StateStopping, wantErr: "must be ready or stopped"},
+		{name: "failed", size: 768 * format.MiB, state: model.StateFailed, wantErr: "must be ready or stopped"},
+		{name: "stale pid", size: 768 * format.MiB, state: model.StateStopped, pid: 123, wantErr: "must be ready or stopped"},
+		{name: "no-op running", size: 1024 * format.MiB, state: model.StateReady},
+		{name: "zero", size: 0, state: model.StateStopped, wantErr: "must be positive"},
+		{name: "negative", size: -1, state: model.StateStopped, wantErr: "must be positive"},
+		{name: "busy pool", size: 768 * format.MiB, state: model.StateReady, runnerErr: &vmrunner.MemoryPoolResizeRejected{Reason: "too busy to shrink"}, wantErr: "too busy to shrink"},
+		{name: "empty pool", size: 1},
+		{name: "deleted member", size: 1, state: model.StateDeleted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := loadProvisionTestConfig(t, nil)
+			st := newProvisionTestStore(t, cfg)
+			p := &Provisioner{cfg: cfg, store: st, vmRunner: &recordingVMRunner{resizeMemoryPoolErr: tc.runnerErr},
+				readHostMemoryBytes: func() (int64, error) { return (hostMemoryReserveMiB + 1536) * format.MiB, nil },
+			}
+			now := time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC)
+			pool := model.MemoryPool{ID: "pool-id", Name: "pool-a", ReservedBytes: 1024 * format.MiB, CreatedAt: now, UpdatedAt: now, CreatedByUser: "alice"}
+			if err := st.CreateMemoryPool(ctx, pool); err != nil {
+				t.Fatal(err)
+			}
+			if tc.state != "" {
+				// Their sum exceeds the shrink target; each guest must fit independently.
+				for i, ram := range []int64{512, 768} {
+					inst := provisionTestInstance(cfg, fmt.Sprintf("member-%d", i), tc.state, now)
+					inst.MemoryMode, inst.MemoryPoolID, inst.MemoryMiB = model.MemoryModePool, pool.ID, ram
+					inst.FirecrackerPID = tc.pid
+					if err := st.CreateInstance(ctx, inst); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			resized, err := p.ResizeMemoryPool(ctx, pool.Name, tc.size)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.CheckMemoryPoolResize(ctx, pool.ID); err != nil {
+				t.Fatalf("terminal result left a pending operation: %v", err)
+			}
+			stored, err := st.GetMemoryPoolByName(ctx, pool.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantErr != "" || tc.size == pool.ReservedBytes {
+				if !reflect.DeepEqual(stored, pool) {
+					t.Fatalf("pool changed on failure/no-op: %+v", stored)
+				}
+			} else {
+				if stored.ReservedBytes != tc.size || !stored.UpdatedAt.After(now) || !reflect.DeepEqual(stored, resized) {
+					t.Fatalf("unexpected pool: %+v, returned %+v", stored, resized)
+				}
+				stored.ReservedBytes, stored.UpdatedAt = pool.ReservedBytes, pool.UpdatedAt
+				if !reflect.DeepEqual(stored, pool) {
+					t.Fatalf("resize changed pool identity: %+v", stored)
+				}
+				reserved, err := p.totalReservedHostMemoryBytes(ctx, "")
+				if err != nil || reserved != tc.size {
+					t.Fatalf("reserved = %d, %v; want %d", reserved, err, tc.size)
+				}
+			}
+		})
+	}
+}
+
+type delayedPoolRunner struct {
+	noopVMRunner
+	resize func(context.Context, vmrunner.ResizeMemoryPoolRequest) error
+}
+
+func (r delayedPoolRunner) ResizeMemoryPool(ctx context.Context, req vmrunner.ResizeMemoryPoolRequest) error {
+	return r.resize(ctx, req)
+}
+
+func TestCanceledPoolResizeFencesLaterOperations(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	now := time.Now().UTC()
+	pool := model.MemoryPool{ID: "pool-id", Name: "pool-a", ReservedBytes: 1 << 30, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateMemoryPool(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	inst := provisionTestInstance(cfg, "member", model.StateStopped, now)
+	inst.MemoryMode, inst.MemoryPoolID, inst.MemoryMiB = model.MemoryModePool, pool.ID, 512
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	arrived := make(chan struct{})
+	first := true
+	var original vmrunner.ResizeMemoryPoolRequest
+	runner := delayedPoolRunner{resize: func(ctx context.Context, req vmrunner.ResizeMemoryPoolRequest) error {
+		if first {
+			first = false
+			original = req
+			close(arrived)
+			<-ctx.Done() // The server may still apply this request after the client returns.
+			return ctx.Err()
+		}
+		if req.SizeBytes == 2<<30 && req != original {
+			return errors.New("retry changed operation identity")
+		}
+		return nil
+	}}
+	p := &Provisioner{cfg: cfg, store: st, vmRunner: runner, readHostMemoryBytes: func() (int64, error) { return 8 << 30, nil }}
+	requestCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := p.ResizeMemoryPool(requestCtx, pool.Name, 2<<30); done <- err }()
+	<-arrived
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("canceled resize succeeded")
+	}
+	// Reconstruct the control plane: the fence must survive its restart.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st = newProvisionTestStore(t, cfg)
+	p = &Provisioner{cfg: cfg, store: st, vmRunner: runner, readHostMemoryBytes: func() (int64, error) { return 8 << 30, nil }}
+	if _, err := p.ResizeMemoryPool(ctx, pool.Name, 1<<30); err == nil || !strings.Contains(err.Error(), "pending") {
+		t.Fatalf("later resize was not fenced: %v", err)
+	}
+	if _, err := p.DeleteMemoryPool(ctx, pool.Name); err == nil || !strings.Contains(err.Error(), "pending") {
+		t.Fatalf("delete was not fenced: %v", err)
+	}
+	if _, err := p.Resize(ctx, inst.Name, CreateOptions{MemoryMiB: 768}); err == nil || !strings.Contains(err.Error(), "pending") {
+		t.Fatalf("member RAM change was not fenced: %v", err)
+	}
+	stored, err := st.GetMemoryPoolByName(ctx, pool.Name)
+	if err != nil || stored.ReservedBytes != 2<<30 {
+		t.Fatalf("reservation released: %+v, %v", stored, err)
+	}
+	if _, err := p.ResizeMemoryPool(ctx, pool.Name, 2<<30); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ResizeMemoryPool(ctx, pool.Name, 1<<30); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResizeMemoryPoolRetriesFailedGrowth(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	runner := &recordingVMRunner{resizeMemoryPoolErr: errors.New("runner unavailable"), livePoolSize: 1024 * format.MiB}
+	p := &Provisioner{cfg: cfg, store: st, vmRunner: runner,
+		readHostMemoryBytes: func() (int64, error) { return (hostMemoryReserveMiB + 1536) * format.MiB, nil },
+	}
+	now := time.Now().UTC()
+	pool := model.MemoryPool{ID: "pool-id", Name: "pool-a", ReservedBytes: 1024 * format.MiB, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateMemoryPool(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ResizeMemoryPool(ctx, pool.Name, 1536*format.MiB); err == nil || !strings.Contains(err.Error(), "reservation retained") {
+		t.Fatalf("error = %v", err)
+	}
+	stored, err := st.GetMemoryPoolByName(ctx, pool.Name)
+	if err != nil || stored.ReservedBytes != 1536*format.MiB || runner.livePoolSize != 1024*format.MiB {
+		t.Fatalf("reservation not retained: %+v, live %d, %v", stored, runner.livePoolSize, err)
+	}
+	if _, err := p.CreateMemoryPool(ctx, "other", model.Actor{}, 1); err == nil {
+		t.Fatal("uncertain growth released host budget")
+	}
+	runner.resizeMemoryPoolErr = nil
+	if _, err := p.ResizeMemoryPool(ctx, pool.Name, 1536*format.MiB); err != nil {
+		t.Fatal(err)
+	}
+	if runner.livePoolSize != 1536*format.MiB {
+		t.Fatalf("retry did not apply live limit: %d", runner.livePoolSize)
+	}
+}
+
+func TestRejectedPoolGrowthRetainsReservation(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	runner := &recordingVMRunner{resizeMemoryPoolErr: &vmrunner.MemoryPoolResizeRejected{Reason: "cannot read limit"}}
+	p := &Provisioner{cfg: cfg, store: st, vmRunner: runner,
+		readHostMemoryBytes: func() (int64, error) { return 8 << 30, nil },
+	}
+	now := time.Now().UTC()
+	pool := model.MemoryPool{ID: "pool-id", Name: "pool-a", ReservedBytes: 1 << 30, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateMemoryPool(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ResizeMemoryPool(ctx, pool.Name, 2<<30); err == nil {
+		t.Fatal("rejected growth succeeded")
+	}
+	stored, err := st.GetMemoryPoolByName(ctx, pool.Name)
+	if err != nil || stored.ReservedBytes != 2<<30 {
+		t.Fatalf("reservation = %+v, %v", stored, err)
+	}
+	if err := st.CheckMemoryPoolResize(ctx, pool.ID); err != nil {
+		t.Fatalf("confirmed rejection left fence: %v", err)
+	}
+	runner.resizeMemoryPoolErr = nil
+	if _, err := p.ResizeMemoryPool(ctx, pool.Name, 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = st.GetMemoryPoolByName(ctx, pool.Name)
+	if err != nil || stored.ReservedBytes != 1<<30 {
+		t.Fatalf("reservation not recovered: %+v, %v", stored, err)
+	}
+}
+
 func TestDeleteMemoryPoolKeepsStoreRecordWhenVMRunnerCleanupFails(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadProvisionTestConfig(t, nil)
@@ -3835,6 +4061,11 @@ func (r panicVMRunner) DeleteMemoryPool(context.Context, vmrunner.MemoryPoolRequ
 	return nil
 }
 
+func (r panicVMRunner) ResizeMemoryPool(context.Context, vmrunner.ResizeMemoryPoolRequest) error {
+	r.t.Fatalf("ResizeMemoryPool() should not be called")
+	return nil
+}
+
 type noopVMRunner struct{}
 
 func (noopVMRunner) VerifyInstanceAbsent(context.Context, vmrunner.StartResultRequest) error {
@@ -3870,10 +4101,16 @@ func (noopVMRunner) DeleteMemoryPool(context.Context, vmrunner.MemoryPoolRequest
 	return nil
 }
 
+func (noopVMRunner) ResizeMemoryPool(context.Context, vmrunner.ResizeMemoryPoolRequest) error {
+	return nil
+}
+
 type recordingVMRunner struct {
 	noopVMRunner
 	deletedPools        []vmrunner.MemoryPoolRequest
 	deleteMemoryPoolErr error
+	resizeMemoryPoolErr error
+	livePoolSize        int64
 	started             []vmrunner.StartRequest
 	startPID            int
 }
@@ -3898,4 +4135,11 @@ func (*recordingVMRunner) ReadInstanceMetrics(context.Context, vmrunner.MetricsR
 func (r *recordingVMRunner) DeleteMemoryPool(_ context.Context, req vmrunner.MemoryPoolRequest) error {
 	r.deletedPools = append(r.deletedPools, req)
 	return r.deleteMemoryPoolErr
+}
+
+func (r *recordingVMRunner) ResizeMemoryPool(_ context.Context, req vmrunner.ResizeMemoryPoolRequest) error {
+	if r.resizeMemoryPoolErr == nil {
+		r.livePoolSize = req.SizeBytes
+	}
+	return r.resizeMemoryPoolErr
 }

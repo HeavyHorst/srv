@@ -1800,6 +1800,73 @@ func TestCmdResizeUpdatesStoppedInstance(t *testing.T) {
 	}
 }
 
+func TestCmdPoolResize(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	cfg := loadServiceTestConfig(t, nil)
+	dir, err := os.MkdirTemp("", "srv-pool-command-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	cfg.VMRunnerSocketPath = filepath.Join(dir, "runner.sock")
+	listener, err := net.Listen("unix", cfg.VMRunnerSocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/pool/resize" {
+			http.NotFound(w, r)
+			return
+		}
+		var request json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"done": true, "request": request})
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: cfg, store: st, provisioner: prov}
+	now := time.Now().UTC()
+	if err := st.CreateMemoryPool(ctx, model.MemoryPool{ID: "pool-id", Name: "pool-a", ReservedBytes: 2 << 30, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []outputFormat{outputFormatText, outputFormatJSON} {
+		result, err := app.cmdPool(ctx, model.Actor{}, []string{"pool", "resize", "pool-a", "--size=1G"}, format)
+		if err != nil || result.exitCode != 0 {
+			t.Fatalf("result = %+v, %v", result, err)
+		}
+		if format == outputFormatJSON {
+			var payload memoryPoolActionJSON
+			if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Action != "pool-resized" || payload.Pool.ReservedBytes != 1<<30 || payload.Pool.Name != "pool-a" {
+				t.Fatalf("payload = %+v", payload)
+			}
+		} else if !strings.Contains(result.stdout, "pool-resized: pool-a") {
+			t.Fatalf("stdout = %s", result.stdout)
+		}
+	}
+	for _, flags := range [][]string{nil, {"--size"}, {"--size", "0"}, {"--size", "bad"}, {"--size=1G", "--size=2G"}, {"--unknown=1G"}} {
+		result, err := app.cmdPool(ctx, model.Actor{}, append([]string{"pool", "resize", "pool-a"}, flags...), outputFormatText)
+		if err == nil || result.exitCode == 0 {
+			t.Fatalf("flags %v accepted: %+v", flags, result)
+		}
+	}
+	pool, err := st.GetMemoryPoolByName(ctx, "pool-a")
+	if err != nil || pool.ReservedBytes != 1<<30 {
+		t.Fatalf("stored pool = %+v, %v", pool, err)
+	}
+}
+
 func TestCmdResizeMemoryPool(t *testing.T) {
 	for _, kind := range []string{model.KindVM, model.KindOrb} {
 		for _, tc := range []struct {

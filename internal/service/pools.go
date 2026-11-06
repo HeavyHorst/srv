@@ -45,6 +45,8 @@ func (a *App) cmdPool(ctx context.Context, actor model.Actor, args []string, out
 	switch args[1] {
 	case "create":
 		return a.cmdPoolCreate(ctx, actor, args, outFormat)
+	case "resize":
+		return a.cmdPoolResize(ctx, args, outFormat)
 	case "list":
 		return a.cmdPoolList(ctx, args, outFormat)
 	case "inspect":
@@ -58,7 +60,7 @@ func (a *App) cmdPool(ctx context.Context, actor model.Actor, args []string, out
 }
 
 func (a *App) cmdPoolCreate(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
-	name, sizeBytes, err := parsePoolCreateArgs(args)
+	name, sizeBytes, err := parsePoolSizeArgs(args, poolCreateUsage())
 	if err != nil {
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
@@ -77,6 +79,25 @@ func (a *App) cmdPoolCreate(ctx context.Context, actor model.Actor, args []strin
 	}
 	stdout := fmt.Sprintf("pool-created: %s\nreserved: %s\nmembers: %d\n", pool.Name, format.BinarySize(pool.ReservedBytes), members)
 	return commandResult{stdout: stdout, exitCode: 0}, nil
+}
+
+func (a *App) cmdPoolResize(ctx context.Context, args []string, outFormat outputFormat) (commandResult, error) {
+	name, sizeBytes, err := parsePoolSizeArgs(args, poolResizeUsage())
+	if err != nil {
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+	pool, err := a.provisioner.ResizeMemoryPool(ctx, name, sizeBytes)
+	if err != nil {
+		return commandResult{stderr: fmt.Sprintf("pool resize %s: %v\n", name, err), exitCode: 1}, err
+	}
+	members, err := a.store.CountMemoryPoolMembers(ctx, pool.ID)
+	if err != nil {
+		return commandResult{stderr: fmt.Sprintf("count pool members: %v\n", err), exitCode: 1}, err
+	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(memoryPoolActionJSON{Action: "pool-resized", Pool: memoryPoolSummaryPayload(pool, members)})
+	}
+	return commandResult{stdout: fmt.Sprintf("pool-resized: %s\nreserved: %s\nmembers: %d\n", pool.Name, format.BinarySize(pool.ReservedBytes), members)}, nil
 }
 
 func (a *App) cmdPoolList(ctx context.Context, args []string, outFormat outputFormat) (commandResult, error) {
@@ -189,9 +210,9 @@ func memoryPoolSummaryPayload(pool model.MemoryPool, members int) memoryPoolSumm
 	}
 }
 
-func parsePoolCreateArgs(args []string) (string, int64, error) {
+func parsePoolSizeArgs(args []string, usage string) (string, int64, error) {
 	if len(args) < 4 {
-		return "", 0, errors.New(poolCreateUsage())
+		return "", 0, errors.New(usage)
 	}
 	var (
 		name     string
@@ -202,7 +223,7 @@ func parsePoolCreateArgs(args []string) (string, int64, error) {
 		arg := args[i]
 		if !strings.HasPrefix(arg, "--") {
 			if name != "" {
-				return "", 0, fmt.Errorf("unexpected argument %q\n%s", arg, poolCreateUsage())
+				return "", 0, fmt.Errorf("unexpected argument %q\n%s", arg, usage)
 			}
 			name = arg
 			continue
@@ -211,33 +232,37 @@ func parsePoolCreateArgs(args []string) (string, int64, error) {
 		if !hasValue {
 			i++
 			if i >= len(args) {
-				return "", 0, fmt.Errorf("missing value for %s\n%s", key, poolCreateUsage())
+				return "", 0, fmt.Errorf("missing value for %s\n%s", key, usage)
 			}
 			value = args[i]
 		}
 		switch key {
 		case "--size":
 			if seenSize {
-				return "", 0, fmt.Errorf("%s specified more than once\n%s", key, poolCreateUsage())
+				return "", 0, fmt.Errorf("%s specified more than once\n%s", key, usage)
 			}
 			seenSize = true
 			parsed, err := parseSize(value, mib)
 			if err != nil {
-				return "", 0, fmt.Errorf("parse %s: %v\n%s", key, err, poolCreateUsage())
+				return "", 0, fmt.Errorf("parse %s: %v\n%s", key, err, usage)
 			}
 			size = parsed
 		default:
-			return "", 0, fmt.Errorf("unknown option %q\n%s", key, poolCreateUsage())
+			return "", 0, fmt.Errorf("unknown option %q\n%s", key, usage)
 		}
 	}
 	if name == "" || !seenSize {
-		return "", 0, errors.New(poolCreateUsage())
+		return "", 0, errors.New(usage)
 	}
 	return name, size, nil
 }
 
 func poolUsage() string {
-	return "usage: pool <create|list|inspect|delete> ..."
+	return "usage: pool <create|resize|list|inspect|delete> ..."
+}
+
+func poolResizeUsage() string {
+	return "usage: pool resize <name> --size SIZE"
 }
 
 func poolCreateUsage() string {

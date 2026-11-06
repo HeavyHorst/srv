@@ -278,11 +278,47 @@ cold migration, host-qualified names, and `node list` across servers, see the
 | Command | Description |
 |---------|-------------|
 | `pool create <name> --size <size>` | Admin-only create a reserved memory pool |
+| `pool resize <name> --size <size>` | Admin-only shrink or grow a memory pool live, with usage checks before shrinking |
 | `pool list` | Admin-only list reserved memory pools |
 | `pool inspect <name>` | Admin-only show a memory pool and its member VMs |
 | `pool delete <name>` | Admin-only delete an empty memory pool |
 | `status` | Admin-only host capacity and allocation summary |
 | `snapshot create` | Admin-only host-local [readonly root-and-disk snapshot bundle](../tasks/host-snapshots.md) with a manifest |
+
+`pool resize` sets the total reservation, not a size delta. The size must be
+positive and at least as large as each member's configured guest RAM, not the
+sum of their RAM. Growing also requires enough host reservation budget.
+Shrinking releases reservation budget without changing VM RAM or membership.
+
+Members may be running (`ready`) or stopped. Retry after any start, stop,
+failure cleanup, or migration has finished. Before lowering a live cgroup limit,
+srv requires the target to exceed its current usage by at least 256 MiB or 10%
+of the target, whichever is larger. An unused pool with zero usage needs no
+headroom. Missing or invalid usage readings reject the shrink. There is no
+force option and no forced reclaim or balloon inflation.
+
+The check is a snapshot: concurrent allocations and later workload growth can
+still reach the new hard limit and trigger the OOM killer. A successful resize
+does not guarantee that future workloads fit.
+
+Growth reserves host budget before raising the live limit; shrinking releases
+budget only after the runner durably confirms the lower limit. If a request's
+outcome is unknown, srv keeps the reservation and a persistent pending operation.
+Other resize targets, pool deletion, and new VM starts or assignments into that
+pool are blocked until the outcome is resolved. Retry the same resize command
+and target size, including after a control-plane restart.
+
+Even a confirmed rejection of growth keeps the increased reservation: a runner
+error does not always prove that the limit was unchanged. After fixing the
+runner error, resize to the desired size again to apply it or recover the budget.
+
+The runner stores operation receipts in `instances/.pool-resizes/`, including
+rejections. Retries return the recorded result instead of changing the limit
+again. Receipts survive pool deletion and runner restarts; do not remove them
+while the host is in use. A confirmed rejection clears the pending operation,
+so a later command can try again after usage falls. Repeating the current size
+with no pending operation synchronizes the live limit. Both the control plane
+and VM runner need the updated binary and the `/pool/resize` protocol.
 
 ## Integration commands
 

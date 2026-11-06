@@ -25,6 +25,7 @@ import (
 
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
 	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
+	"github.com/google/uuid"
 )
 
 func TestRequestsValidate(t *testing.T) {
@@ -1678,6 +1679,185 @@ func TestServerDeleteMemoryPoolCgroupRemovesPoolParent(t *testing.T) {
 
 	if err := server.deleteMemoryPoolCgroup(context.Background(), MemoryPoolRequest{Name: "pool-a"}); err != nil {
 		t.Fatalf("deleteMemoryPoolCgroup() should ignore missing pools: %v", err)
+	}
+}
+
+func TestResizeMemoryPoolOverUnixSocket(t *testing.T) {
+	oldRoot, oldCurrent := cgroupFSRoot, currentCgroupPath
+	t.Cleanup(func() { cgroupFSRoot, currentCgroupPath = oldRoot, oldCurrent })
+	cgroupFSRoot = t.TempDir()
+	currentCgroupPath = func() (string, error) { return "/runner", nil }
+	server := NewServer(nil, ServerConfig{InstancesDir: t.TempDir()})
+	dir, err := os.MkdirTemp("", "srv-pool-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "runner.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := &http.Server{Handler: server.Handler()}
+	go func() { _ = httpServer.Serve(listener) }()
+	t.Cleanup(func() { _ = httpServer.Close() })
+	client := NewClient(socket)
+	for _, tc := range []struct {
+		name                                   string
+		limit, current                         string
+		target                                 int64
+		running, absent, missingUsage, wantErr bool
+	}{
+		{name: "floor boundary", limit: "1073741824", current: "536870912", target: 768 * miBBytes, running: true},
+		{name: "one byte too busy", limit: "1073741824", current: "536870913", target: 768 * miBBytes, running: true, wantErr: true},
+		{name: "percentage boundary", limit: "10737418240", current: "4831838208", target: 5 * 1024 * miBBytes, running: true},
+		{name: "percentage exceeded", limit: "10737418240", current: "4831838209", target: 5 * 1024 * miBBytes, running: true, wantErr: true},
+		{name: "grow busy", limit: "1073741824", current: "1073741824", target: 1536 * miBBytes, running: true},
+		{name: "same size busy", limit: "1073741824", current: "1073741824", target: 1024 * miBBytes, running: true},
+		{name: "unlimited busy", limit: "max", current: "1073741824", target: 768 * miBBytes, running: true, wantErr: true},
+		{name: "missing usage", limit: "1073741824", target: 768 * miBBytes, missingUsage: true, wantErr: true},
+		{name: "invalid usage", limit: "1073741824", current: "max", target: 768 * miBBytes, wantErr: true},
+		{name: "negative usage", limit: "1073741824", current: "-1", target: 768 * miBBytes, wantErr: true},
+		{name: "empty tiny pool", limit: "1073741824", current: "0", target: 1},
+		{name: "never started", target: 768 * miBBytes, absent: true},
+		{name: "missing live cgroup", target: 768 * miBBytes, absent: true, running: true, wantErr: true},
+		{name: "zero", limit: "1073741824", current: "0", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(cgroupFSRoot, "runner", firecrackerPoolRootCgroupName, "pool-a")
+			if err := os.RemoveAll(path); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.absent {
+				if err := os.MkdirAll(path, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "memory.max"), []byte(tc.limit), 0644); err != nil {
+					t.Fatal(err)
+				}
+				if !tc.missingUsage {
+					if err := os.WriteFile(filepath.Join(path, "memory.current"), []byte(tc.current), 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			err := client.ResizeMemoryPool(context.Background(), ResizeMemoryPoolRequest{RequestID: uuid.NewString(), Name: "pool-a", SizeBytes: tc.target, Running: tc.running})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.absent {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("unexpected cgroup creation: %v", err)
+				}
+				return
+			}
+			limit, err := os.ReadFile(filepath.Join(path, "memory.max"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := tc.limit
+			if !tc.wantErr {
+				want = fmt.Sprint(tc.target)
+			}
+			if string(limit) != want {
+				t.Fatalf("limit = %s, want %s", limit, want)
+			}
+		})
+	}
+}
+
+func TestCanceledPoolResizeCannotOverwriteNewerLimit(t *testing.T) {
+	oldRoot, oldCurrent := cgroupFSRoot, currentCgroupPath
+	t.Cleanup(func() { cgroupFSRoot, currentCgroupPath = oldRoot, oldCurrent })
+	cgroupFSRoot = t.TempDir()
+	currentCgroupPath = func() (string, error) { return "/runner", nil }
+	cfg := ServerConfig{InstancesDir: t.TempDir()}
+	path := filepath.Join(cgroupFSRoot, "runner", firecrackerPoolRootCgroupName, "pool-a")
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "memory.max"), []byte("1073741824"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "memory.current"), []byte("0"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	arrived, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	first := true
+	server := NewServer(nil, cfg)
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		delay := first
+		first = false
+		mu.Unlock()
+		if delay {
+			// Consume the request before canceling the connection. Hold it before
+			// the operation lock, so a retry can complete ahead of this handler.
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			close(arrived)
+			<-release
+			// A fresh server also proves receipts survive runner restart.
+			NewServer(nil, cfg).Handler().ServeHTTP(w, r)
+			close(finished)
+			return
+		}
+		server.Handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(httpServer.Close)
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	client := NewClient("")
+	client.baseURL, client.httpClient = httpServer.URL, httpServer.Client()
+	a := ResizeMemoryPoolRequest{RequestID: uuid.NewString(), Name: "pool-a", SizeBytes: 2 << 30, Running: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- client.ResizeMemoryPool(ctx, a) }()
+	<-arrived
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("canceled request succeeded")
+	}
+	if err := client.ResizeMemoryPool(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	b := ResizeMemoryPoolRequest{RequestID: uuid.NewString(), Name: "pool-a", SizeBytes: 1 << 30, Running: true}
+	if err := client.ResizeMemoryPool(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	<-finished
+	limit, err := os.ReadFile(filepath.Join(path, "memory.max"))
+	if err != nil || string(limit) != "1073741824" {
+		t.Fatalf("stale request overwrote newer limit: %s, %v", limit, err)
+	}
+	// A replacement pool must also be immune to old requests by name.
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "memory.max"), []byte("3221225472"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ResizeMemoryPool(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	limit, err = os.ReadFile(filepath.Join(path, "memory.max"))
+	if err != nil || string(limit) != "3221225472" {
+		t.Fatalf("old request modified replacement pool: %s, %v", limit, err)
+	}
+	changed := a
+	changed.SizeBytes = 4 << 30
+	if err := client.ResizeMemoryPool(context.Background(), changed); err == nil {
+		t.Fatal("reused operation ID accepted different target")
 	}
 }
 

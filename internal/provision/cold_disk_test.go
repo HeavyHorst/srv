@@ -72,6 +72,50 @@ func offloadTestDisk(t *testing.T, p *Provisioner, inst model.Instance) {
 	}}
 }
 
+func TestResizePoolShrunkDuringHydration(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadProvisionTestConfig(t, nil)
+	st := newProvisionTestStore(t, cfg)
+	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	now := time.Now().UTC()
+	pool := model.MemoryPool{ID: "pool-id", Name: "pool-a", ReservedBytes: 2 << 30, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateMemoryPool(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	inst := provisionTestInstance(cfg, "member", model.StateStopped, now)
+	inst.MemoryMode, inst.MemoryPoolID, inst.MemoryMiB = model.MemoryModePool, pool.ID, 1024
+	if err := os.MkdirAll(filepath.Dir(inst.RootFSPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inst.RootFSPath, []byte("disk"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateInstance(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	offloadTestDisk(t, p, inst)
+	runner := p.vmRunner.(coldTestRunner)
+	p.vmRunner = coldTestRunner{call: func(q vmrunner.ColdRequest) (vmrunner.ColdStatus, error) {
+		if q.Action == "hydrate" {
+			if _, err := p.ResizeMemoryPool(ctx, pool.Name, 1<<30); err != nil {
+				return vmrunner.ColdStatus{}, err
+			}
+		}
+		return runner.ColdDisk(ctx, q)
+	}}
+	if _, err := p.Resize(ctx, inst.Name, CreateOptions{MemoryMiB: 1536}); err == nil || !strings.Contains(err.Error(), "exceeds memory pool") {
+		t.Fatalf("resize error = %v", err)
+	}
+	stored, err := st.GetInstance(ctx, inst.Name)
+	if err != nil || stored.MemoryMiB != 1024 {
+		t.Fatalf("guest RAM changed: %+v, %v", stored, err)
+	}
+	storedPool, err := st.GetMemoryPoolByName(ctx, pool.Name)
+	if err != nil || storedPool.ReservedBytes != 1<<30 {
+		t.Fatalf("pool did not shrink during hydration: %+v, %v", storedPool, err)
+	}
+}
+
 func TestResizePoolDeletedDuringHydration(t *testing.T) {
 	for _, recreate := range []bool{false, true} {
 		t.Run(map[bool]string{false: "deleted", true: "recreated"}[recreate], func(t *testing.T) {

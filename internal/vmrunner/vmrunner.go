@@ -356,6 +356,7 @@ type Server struct {
 	startAdmission     sync.RWMutex
 	draining           bool
 	cgroupMu           sync.Mutex
+	poolMu             sync.Mutex
 	delegatedCgroupRel string
 	firecrackerClients sync.Map
 }
@@ -399,6 +400,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vm/drain", s.handleDrain)
 	mux.HandleFunc("/vm/metrics", s.handleMetrics)
 	mux.HandleFunc("/pool/delete", s.handleDeleteMemoryPool)
+	mux.HandleFunc("/pool/resize", s.handleResizeMemoryPool)
 	return mux
 }
 
@@ -1906,6 +1908,8 @@ func (s *Server) prepareFirecrackerCgroupParent() (string, error) {
 }
 
 func (s *Server) prepareMemoryPoolCgroupParent(poolName string, poolSizeBytes int64) (string, error) {
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
 	if !validName.MatchString(strings.TrimSpace(poolName)) {
 		return "", fmt.Errorf("invalid memory pool name %q", poolName)
 	}
@@ -2294,6 +2298,8 @@ func cleanupFirecrackerCgroupPath(name, cgroupPath string) error {
 }
 
 func (s *Server) deleteMemoryPoolCgroup(_ context.Context, req MemoryPoolRequest) error {
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
 	rootRel, err := s.delegatedCgroupRoot()
 	if err != nil {
 		return fmt.Errorf("delete memory pool cgroup for %q: %w", req.Name, err)

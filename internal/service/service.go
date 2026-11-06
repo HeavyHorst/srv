@@ -2687,6 +2687,7 @@ func helpResult() commandResult {
 			header: "ADMIN COMMANDS",
 			entries: []helpEntry{
 				{"pool create <name> --size SIZE", "Create a reserved memory pool."},
+				{"pool resize <name> --size SIZE", "Resize a memory pool live (shrink requires usage headroom)."},
 				{"pool list", "List reserved memory pools."},
 				{"pool inspect <name>", "Show memory pool details and member VMs."},
 				{"pool delete <name>", "Delete an empty memory pool."},

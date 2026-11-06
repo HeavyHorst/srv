@@ -101,6 +101,7 @@ type vmRunner interface {
 	StopInstanceVM(ctx context.Context, req vmrunner.StopRequest) error
 	ReadInstanceMetrics(ctx context.Context, req vmrunner.MetricsRequest) (vmrunner.MetricsResponse, error)
 	DeleteMemoryPool(ctx context.Context, req vmrunner.MemoryPoolRequest) error
+	ResizeMemoryPool(ctx context.Context, req vmrunner.ResizeMemoryPoolRequest) error
 }
 
 type guestBootstrap = vmrunner.Bootstrap
@@ -192,6 +193,87 @@ func (p *Provisioner) CreateMemoryPool(ctx context.Context, name string, actor m
 	return pool, nil
 }
 
+func (p *Provisioner) ResizeMemoryPool(ctx context.Context, name string, sizeBytes int64) (model.MemoryPool, error) {
+	if sizeBytes <= 0 {
+		return model.MemoryPool{}, errors.New("memory pool size must be positive")
+	}
+	p.admissionMu.Lock()
+	defer p.admissionMu.Unlock()
+
+	pool, err := p.store.GetMemoryPoolByName(ctx, name)
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	if p.vmRunner == nil {
+		return model.MemoryPool{}, errors.New("memory pool resize requires the VM runner")
+	}
+	op, err := p.store.PendingMemoryPoolResize(ctx, pool.ID)
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	if op.RequestID != "" {
+		if op.SizeBytes != sizeBytes {
+			return model.MemoryPool{}, fmt.Errorf("memory pool resize pending; retry pool resize %s --size %dB", name, op.SizeBytes)
+		}
+		return p.finishMemoryPoolResize(ctx, pool, op)
+	}
+	previousSize := pool.ReservedBytes
+	pool.ReservedBytes = sizeBytes
+	running := false
+	instances, err := p.store.ListInstances(ctx, false)
+	if err != nil {
+		return model.MemoryPool{}, err
+	}
+	for _, inst := range instances {
+		if inst.MemoryPoolID != pool.ID {
+			continue
+		}
+		if inst.State != model.StateReady && (inst.State != model.StateStopped || inst.FirecrackerPID != 0) {
+			return model.MemoryPool{}, fmt.Errorf("memory pool %q member %q must be ready or stopped before resizing (state: %s)", name, inst.Name, inst.State)
+		}
+		running = running || inst.State == model.StateReady
+		if err := p.migrationFence(ctx, inst.Name); err != nil {
+			return model.MemoryPool{}, err
+		}
+		if err := ensureMemoryPoolSupportsGuestMemory(pool, p.effectiveMemoryMiB(inst)); err != nil {
+			return model.MemoryPool{}, err
+		}
+	}
+	if sizeBytes > previousSize {
+		if err := p.ensureHostMemoryReservationCapacity(ctx, "", sizeBytes-previousSize); err != nil {
+			return model.MemoryPool{}, err
+		}
+	}
+	pool.ReservedBytes = max(previousSize, sizeBytes)
+	if sizeBytes > previousSize {
+		pool.UpdatedAt = time.Now().UTC()
+	}
+	op = store.MemoryPoolResize{RequestID: uuid.NewString(), SizeBytes: sizeBytes, Running: running}
+	// Persist the fence and reserve growth atomically, before sending anything.
+	if err := p.store.BeginMemoryPoolResize(ctx, pool, op); err != nil {
+		return model.MemoryPool{}, err
+	}
+	return p.finishMemoryPoolResize(ctx, pool, op)
+}
+
+func (p *Provisioner) finishMemoryPoolResize(ctx context.Context, pool model.MemoryPool, op store.MemoryPoolResize) (model.MemoryPool, error) {
+	err := p.vmRunner.ResizeMemoryPool(ctx, vmrunner.ResizeMemoryPoolRequest{RequestID: op.RequestID, Name: pool.Name, SizeBytes: op.SizeBytes, Running: op.Running})
+	var rejected *vmrunner.MemoryPoolResizeRejected
+	if err != nil && !errors.As(err, &rejected) {
+		return model.MemoryPool{}, fmt.Errorf("pool resize pending, reservation retained; retry pool resize %s --size %dB: %w", pool.Name, op.SizeBytes, err)
+	}
+	if err == nil && pool.ReservedBytes != op.SizeBytes {
+		pool.ReservedBytes = op.SizeBytes
+		pool.UpdatedAt = time.Now().UTC()
+	}
+	// Only a durable runner outcome permits clearing the fence. A canceled DB
+	// write leaves the same operation recoverable, including terminal rejection.
+	if finishErr := p.store.FinishMemoryPoolResize(ctx, pool, op.RequestID); finishErr != nil {
+		return model.MemoryPool{}, errors.Join(err, finishErr)
+	}
+	return pool, err
+}
+
 func (p *Provisioner) DeleteMemoryPool(ctx context.Context, name string) (model.MemoryPool, error) {
 	var pool model.MemoryPool
 	err := func() error {
@@ -204,6 +286,9 @@ func (p *Provisioner) DeleteMemoryPool(ctx context.Context, name string) (model.
 		}
 		if !found {
 			return fmt.Errorf("memory pool %q does not exist", name)
+		}
+		if err := p.store.CheckMemoryPoolResize(ctx, current.ID); err != nil {
+			return err
 		}
 		members, err := p.store.CountMemoryPoolMembers(ctx, current.ID)
 		if err != nil {
@@ -821,9 +906,9 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 		if hydrateErr != nil {
 			return hydrateErr
 		}
-		// The destination may have been deleted while admission was unlocked.
+		// The pool may have been resized or deleted while admission was unlocked.
 		// Check its ID, not its name: a recreated pool is a different pool.
-		if opts.MemoryPoolName != "" {
+		if resized.UsesMemoryPool() {
 			pool, err := p.requireMemoryPoolForInstance(ctx, resized)
 			if err != nil {
 				return err
@@ -1917,6 +2002,9 @@ func (p *Provisioner) requireMemoryPoolByName(ctx context.Context, name string) 
 	if !found {
 		return model.MemoryPool{}, fmt.Errorf("memory pool %q does not exist", name)
 	}
+	if err := p.store.CheckMemoryPoolResize(ctx, pool.ID); err != nil {
+		return model.MemoryPool{}, err
+	}
 	return pool, nil
 }
 
@@ -1938,6 +2026,9 @@ func (p *Provisioner) requireMemoryPoolForInstance(ctx context.Context, inst mod
 	}
 	if !ok {
 		return model.MemoryPool{}, fmt.Errorf("instance %q does not use a memory pool", inst.Name)
+	}
+	if err := p.store.CheckMemoryPoolResize(ctx, pool.ID); err != nil {
+		return model.MemoryPool{}, err
 	}
 	return pool, nil
 }

@@ -329,6 +329,7 @@ amp -ox "Inspect this repository" --orb-provider YOUR_PROVIDER_NAME
 | `SRV_ORB_HOST` | Optional srv-front host name; omit for automatic placement. Do not set for direct backend access. |
 | `SRV_ORB_CPUS` | `2`; new VM vCPUs. |
 | `SRV_ORB_RAM` | `4G`; new VM memory. |
+| `SRV_ORB_POOL` | Optional existing memory pool for new VMs (`new --pool`); `SRV_ORB_RAM` stays the guest-visible RAM. Unset creates fixed-memory VMs. |
 | `SRV_ORB_DISK` | `20G`; new VM rootfs size. |
 
 Sizes are operator configuration, not dispatch fields supplied by Amp. Changing

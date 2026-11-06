@@ -74,6 +74,7 @@ type testServer struct {
 	LoseBootstrap   bool
 	VM              *testVM
 	Disk            string
+	Pool            string
 	Templates       map[string]string
 	LoseTemplate    bool
 	Environment     string
@@ -258,7 +259,11 @@ func fakeSSH() error {
 		s.Creates++
 		s.VM = &testVM{ID: fmt.Sprintf("12345678-1234-4234-8234-%012x", s.Creates), CreatedAt: "2026-01-02T03:04:05Z", BackendID: "backend-one", Name: args[2], Kind: "orb", Image: "amp-orb", State: "ready", Proxy: "http://10.0.0.1:8080"}
 		s.Disk = "fresh disk"
+		s.Pool = ""
 		for i, arg := range args {
+			if arg == "--pool" {
+				s.Pool = args[i+1]
+			}
 			if arg == "--template" {
 				var ok bool
 				s.Disk, ok = s.Templates[args[i+1]]
@@ -611,6 +616,9 @@ func TestDispatchLifecycle(t *testing.T) {
 			h.must("spawn", "first-token")
 			s := h.read()
 			name := s.VM.Name
+			if s.Pool != "" {
+				t.Fatalf("unset SRV_ORB_POOL created a pooled VM in %q", s.Pool)
+			}
 			s.Disk = "uncommitted work survives pause"
 			s.OtherDown = host != ""
 			h.write(s)
@@ -643,9 +651,12 @@ func TestDispatchLifecycle(t *testing.T) {
 			if h.read().VM != nil || h.read().Disk != "" {
 				t.Fatal("delete retained VM disk")
 			}
-			h.must("spawn", "later-token", "SRV_ORB_HOST="+host)
+			h.must("spawn", "later-token", "SRV_ORB_HOST="+host, "SRV_ORB_POOL=orbs")
 			if s := h.read(); s.VM.Name == name || s.Creates != 2 || s.Disk != "fresh disk" {
 				t.Fatal("spawn after delete did not create a distinct fresh workspace")
+			}
+			if s := h.read(); s.Pool != "orbs" {
+				t.Fatalf("SRV_ORB_POOL not passed to orb new: %q", s.Pool)
 			}
 		})
 	}

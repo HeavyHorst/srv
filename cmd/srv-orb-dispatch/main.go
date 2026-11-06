@@ -21,7 +21,7 @@ import (
 )
 
 type config struct {
-	endpoint, directory, image, host, cpus, ram, disk, ssh string
+	endpoint, directory, image, host, cpus, ram, pool, disk, ssh string
 }
 
 type job struct {
@@ -66,7 +66,7 @@ func main() {
 	c := config{
 		endpoint: envDefault("SRV_ORB_ENDPOINT", "srv"), directory: os.Getenv("SRV_ORB_STATE_DIR"),
 		image: envDefault("SRV_ORB_IMAGE", "amp-orb"), host: os.Getenv("SRV_ORB_HOST"),
-		cpus: envDefault("SRV_ORB_CPUS", "2"), ram: envDefault("SRV_ORB_RAM", "4G"),
+		cpus: envDefault("SRV_ORB_CPUS", "2"), ram: envDefault("SRV_ORB_RAM", "4G"), pool: os.Getenv("SRV_ORB_POOL"),
 		disk: envDefault("SRV_ORB_DISK", "20G"), ssh: "ssh",
 	}
 	j := job{operation: os.Getenv("ORB_OPERATION"), id: os.Getenv("ORB_ID"), image: os.Getenv("ORB_IMAGE"), token: os.Getenv("ORB_TOKEN"), ampURL: os.Getenv("AMP_URL"), snapshot: os.Getenv("ORB_SNAPSHOT_ID")}
@@ -407,6 +407,9 @@ func dispatch(ctx context.Context, c config, j job) error {
 			return nil
 		}
 		args := []string{"orb", "new", r.Name, "--image", c.image, "--cpus", c.cpus, "--ram", c.ram, "--rootfs-size", c.disk}
+		if c.pool != "" {
+			args = append(args, "--pool", c.pool)
+		}
 		if snapshot != nil {
 			args = append(args, "--template", snapshot.Name)
 		}

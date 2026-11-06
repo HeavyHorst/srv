@@ -117,6 +117,7 @@ type CreateOptions struct {
 	VCPUCount       int64
 	MemoryMiB       int64
 	MemoryPoolName  string
+	FixedMemory     bool
 	RootFSSizeBytes int64
 }
 
@@ -752,6 +753,9 @@ func (p *Provisioner) CheckRootFS(ctx context.Context, name string) (model.Insta
 }
 
 func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOptions) (model.Instance, error) {
+	if opts.FixedMemory && opts.MemoryPoolName != "" {
+		return model.Instance{}, errors.New("--pool and --fixed-memory are mutually exclusive")
+	}
 	if err := p.migrationFence(ctx, name); err != nil {
 		return model.Instance{}, err
 	}
@@ -789,6 +793,10 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 			}
 			resized.MemoryMode = model.MemoryModePool
 			resized.MemoryPoolID = pool.ID
+		}
+		if opts.FixedMemory {
+			resized.MemoryMode = model.MemoryModeFixed
+			resized.MemoryPoolID = ""
 		}
 		if opts.MemoryMiB > 0 {
 			resized.MemoryMiB = opts.MemoryMiB

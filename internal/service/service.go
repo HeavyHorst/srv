@@ -2642,7 +2642,7 @@ func helpResult() commandResult {
 				{"start <name>", "Start a stopped instance or recheck a running awaiting-tailnet instance."},
 				{"stop <name>", "Stop a running instance."},
 				{"restart <name>", "Restart an instance."},
-				{"resize <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
+				{"resize <name> [--cpus N] [--ram SIZE] [--pool NAME | --fixed-memory] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
 				{"upgrade <name> [--rollback | --finalize]", "Upgrade/rollback a stopped VM; finalize permanently discards its rollback disk, even while running."},
 				{"fsck <name>", "Force-check and repair a stopped instance's rootfs."},
 				{"disk <status|offload|hydrate|purge> <name>", "Manage cold disk storage; mutations require a stopped instance (admin required for Orbs)."},
@@ -3334,7 +3334,10 @@ func parseResizeArgs(args []string) (string, provision.CreateOptions, error) {
 		return "", provision.CreateOptions{}, err
 	}
 	if opts == (provision.CreateOptions{}) {
-		return "", provision.CreateOptions{}, fmt.Errorf("resize requires at least one of --cpus, --ram, --pool, or --rootfs-size\n%s", resizeUsage())
+		return "", provision.CreateOptions{}, fmt.Errorf("resize requires at least one of --cpus, --ram, --pool, --fixed-memory, or --rootfs-size\n%s", resizeUsage())
+	}
+	if opts.FixedMemory && opts.MemoryPoolName != "" {
+		return "", provision.CreateOptions{}, errors.New("--pool and --fixed-memory are mutually exclusive")
 	}
 	return name, opts, nil
 }
@@ -3406,6 +3409,16 @@ func parseSizedInstanceArgs(args []string, usage string) (string, provision.Crea
 		}
 
 		key, value, hasValue := strings.Cut(arg, "=")
+		if key == "--fixed-memory" {
+			if hasValue {
+				return "", provision.CreateOptions{}, fmt.Errorf("%s does not take a value\n%s", key, usage)
+			}
+			if opts.FixedMemory {
+				return "", provision.CreateOptions{}, fmt.Errorf("%s specified more than once\n%s", key, usage)
+			}
+			opts.FixedMemory = true
+			continue
+		}
 		if !hasValue {
 			i++
 			if i >= len(args) {
@@ -3478,7 +3491,7 @@ func newUsage() string {
 }
 
 func resizeUsage() string {
-	return "usage: resize <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE]"
+	return "usage: resize <name> [--cpus N] [--ram SIZE] [--pool NAME | --fixed-memory] [--rootfs-size SIZE]"
 }
 
 func backupUsage() string {

@@ -17,7 +17,7 @@ ssh srv resize demo --cpus 4 --ram 8G --rootfs-size 20G
 ssh srv start demo
 ```
 
-You can specify any combination of flags. Omitted flags keep the current value:
+You can combine flags except `--pool` and `--fixed-memory`, which are mutually exclusive. Omitted flags keep the current value:
 
 ```bash
 # Only increase RAM
@@ -37,6 +37,18 @@ ssh srv start demo
 ```
 
 The guest-visible RAM stays unchanged unless you also pass `--ram`. It must fit within the target pool's reservation. For example, `resize demo --pool shared --ram 2G` changes both in one operation.
+
+## Return to fixed memory
+
+Use `--fixed-memory` to remove a stopped VM or Orb from its pool:
+
+```bash
+ssh srv stop demo
+ssh srv resize demo --fixed-memory
+ssh srv start demo
+```
+
+RAM stays unchanged unless you also pass `--ram`, for example `resize demo --fixed-memory --ram 4G`. The old pool remains available and keeps its reservation. As with other fixed-memory resizes, host memory capacity is checked on the next start. Using `--fixed-memory` on an already fixed-memory instance is allowed.
 
 ## How it works
 

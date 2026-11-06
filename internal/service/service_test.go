@@ -1293,7 +1293,7 @@ func TestHelpResultIncludesLifecycleCommands(t *testing.T) {
 		"new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]",
 		"project-template create <name> <id>",
 		"project-template delete <id>",
-		"resize <name> [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE]",
+		"resize <name> [--cpus N] [--ram SIZE] [--pool NAME | --fixed-memory] [--rootfs-size SIZE]",
 		"backup create <name>",
 		"backup list <name>",
 		"backup delete <name> <backup-id>",
@@ -1805,12 +1805,18 @@ func TestCmdResizeMemoryPool(t *testing.T) {
 		for _, tc := range []struct {
 			name       string
 			pooled     bool
+			wantFixed  bool
 			state      string
 			flags      []string
 			wantMemory int64
 			wantErr    string
 		}{
 			{name: "join", flags: []string{"--pool", "target"}, wantMemory: 1024},
+			{name: "leave", pooled: true, flags: []string{"--fixed-memory"}, wantFixed: true, wantMemory: 1024},
+			{name: "leave and grow beyond pool", pooled: true, flags: []string{"--fixed-memory", "--ram", "3G"}, wantFixed: true, wantMemory: 3072},
+			{name: "already fixed", flags: []string{"--fixed-memory"}, wantFixed: true, wantMemory: 1024},
+			{name: "running cannot leave", pooled: true, state: model.StateReady, flags: []string{"--fixed-memory"}, wantErr: "must be stopped"},
+			{name: "conflicting modes", pooled: true, flags: []string{"--pool", "target", "--fixed-memory"}, wantErr: "mutually exclusive"},
 			{name: "switch and grow", pooled: true, flags: []string{"--pool=target", "--ram", "2G"}, wantMemory: 2048},
 			{name: "missing pool", flags: []string{"--pool", "missing"}, wantErr: "does not exist"},
 			{name: "too small", flags: []string{"--pool", "small"}, wantErr: "exceeds memory pool"},
@@ -1863,6 +1869,10 @@ func TestCmdResizeMemoryPool(t *testing.T) {
 				if tc.wantErr != "" {
 					if updated.MemoryPoolID != inst.MemoryPoolID || updated.MemoryMode != inst.MemoryMode || updated.MemoryMiB != inst.MemoryMiB {
 						t.Fatalf("failed resize changed memory: %+v", updated)
+					}
+				} else if tc.wantFixed {
+					if updated.MemoryPoolID != "" || updated.MemoryMode != model.MemoryModeFixed || updated.MemoryMiB != tc.wantMemory {
+						t.Fatalf("unexpected fixed memory configuration: %+v", updated)
 					}
 				} else if updated.MemoryPoolID != "target" || !updated.UsesMemoryPool() || updated.MemoryMiB != tc.wantMemory {
 					t.Fatalf("unexpected memory configuration: %+v", updated)
@@ -2626,7 +2636,7 @@ func TestParseResizeArgs(t *testing.T) {
 		{
 			name:    "requires at least one option",
 			args:    []string{"resize", "demo"},
-			wantErr: "resize requires at least one of --cpus, --ram, --pool, or --rootfs-size",
+			wantErr: "resize requires at least one of --cpus, --ram, --pool, --fixed-memory, or --rootfs-size",
 		},
 		{
 			name: "empty pool", args: []string{"resize", "demo", "--pool="}, wantErr: "--pool cannot be empty",
@@ -2634,6 +2644,10 @@ func TestParseResizeArgs(t *testing.T) {
 		{
 			name: "duplicate pool", args: []string{"resize", "demo", "--pool=a", "--pool=b"}, wantErr: "--pool specified more than once",
 		},
+		{name: "fixed before name", args: []string{"resize", "--fixed-memory", "demo"}, wantName: "demo", wantOpts: provision.CreateOptions{FixedMemory: true}},
+		{name: "duplicate fixed", args: []string{"resize", "demo", "--fixed-memory", "--fixed-memory"}, wantErr: "specified more than once"},
+		{name: "fixed value", args: []string{"resize", "demo", "--fixed-memory=false"}, wantErr: "does not take a value"},
+		{name: "fixed then pool", args: []string{"resize", "demo", "--fixed-memory", "--pool=target"}, wantErr: "mutually exclusive"},
 	}
 
 	for _, tt := range tests {

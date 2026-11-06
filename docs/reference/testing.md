@@ -102,7 +102,8 @@ disables one durable guard at a time. Each mutant must fail with a focused test
 assertion; a surviving mutant, missing anchor, build/setup failure, or timeout
 fails the audit. It covers cleanup fence deletion, deleting-state commit, request
 rebinding, begin-phase gating, reserve collision, finalize receipt publication,
-and the migration import-fence policy guard. The original worktree is not
+the migration import-fence policy guard, and the dispatcher rule that only
+srv's explicit create refusal (exit status 3) releases a `creating` fence. The original worktree is not
 modified.
 
 ## Benchmarks

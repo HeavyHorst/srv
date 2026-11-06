@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/anmitsu/go-shlex"
 	"golang.org/x/sys/unix"
+
+	"srv/internal/model"
 )
 
 // Exercise the executable contract, including process restarts and SSH argv /
@@ -30,12 +33,21 @@ func TestMain(m *testing.M) {
 	case "ssh":
 		if err := fakeSSH(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
+			var code exitCode
+			if errors.As(err, &code) {
+				os.Exit(int(code))
+			}
 			os.Exit(1)
 		}
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
+
+// exitCode makes the stand-in server exit with a specific SSH status.
+type exitCode int
+
+func (c exitCode) Error() string { return fmt.Sprintf("exit status %d", int(c)) }
 
 // Keep the server's wire schema independent of the dispatcher's response types.
 type testVM struct {
@@ -70,6 +82,7 @@ type testServer struct {
 	OtherDown       bool
 	LoseCreate      bool
 	RejectCreate    bool
+	RefuseCreate    bool
 	RejectStart     bool
 	LoseStop        bool
 	LoseDelete      bool
@@ -235,6 +248,9 @@ func fakeSSH() error {
 		}
 		if s.RejectCreate {
 			return fmt.Errorf("create rejected")
+		}
+		if s.RefuseCreate {
+			return exitCode(model.ExitCreateRejected)
 		}
 		if s.VM != nil {
 			return fmt.Errorf("duplicate VM")
@@ -632,6 +648,28 @@ func TestDispatchLifecycle(t *testing.T) {
 				t.Fatal("spawn after delete did not create a distinct fresh workspace")
 			}
 		})
+	}
+}
+
+func TestDispatchAdmissionRefusedCreate(t *testing.T) {
+	h := newHarness(t, "b")
+	s := h.read()
+	s.RefuseCreate = true
+	h.write(s)
+	if _, err := h.run("spawn", "token", "SRV_ORB_HOST=b"); err == nil {
+		t.Fatal("refused create not reported")
+	}
+	// A refusal allocated nothing, so delete needs no VM and no receipt.
+	h.must("delete", "")
+	if _, err := h.run("spawn", "token", "SRV_ORB_HOST=b"); err == nil {
+		t.Fatal("refused create not reported after delete")
+	}
+	s = h.read()
+	s.RefuseCreate = false
+	h.write(s)
+	h.must("spawn", "retry-token", "SRV_ORB_HOST=b")
+	if s := h.read(); s.CreateAttempts != 3 || s.Creates != 1 || s.VM == nil {
+		t.Fatal("retry after admission refusal did not create exactly one orb", s.CreateAttempts, s.Creates)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"reflect"
@@ -108,6 +109,9 @@ func TestSSHTransport(t *testing.T) {
 		var exit *ssh.ExitError
 		if !errors.As(err, &exit) || exit.ExitStatus() != 23 || !strings.Contains(stderr.String(), "backend rejected") {
 			t.Fatalf("err=%v stderr=%s", err, stderr.String())
+		}
+		if got := front.ExitStatus(fmt.Errorf("host a: outcome may be uncertain; not retried: %w", err)); got != 23 {
+			t.Fatalf("frontend exit status = %d, want the backend's 23", got)
 		}
 	})
 	t.Run("wrong pin", func(t *testing.T) {

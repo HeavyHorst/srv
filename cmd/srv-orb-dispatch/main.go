@@ -416,6 +416,16 @@ func dispatch(ctx context.Context, c config, j job) error {
 		}
 		_, err := control(ctx, c, r, args...)
 		if err != nil {
+			// Only srv's explicit admission refusal proves nothing was
+			// allocated; every other failure, including a lost reply, stays fenced.
+			var exit *exec.ExitError
+			if errors.As(err, &exit) && exit.ExitCode() == model.ExitCreateRejected {
+				r.Phase = "new"
+				if saveErr := save(path, r); saveErr != nil {
+					return saveErr
+				}
+				return fmt.Errorf("create rejected, nothing allocated; a later spawn retries: %w", err)
+			}
 			return fmt.Errorf("create may have succeeded; repeat the job to reconcile, not recreate: %w", err)
 		}
 		v, host, err = locate(ctx, c, r)

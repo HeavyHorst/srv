@@ -1050,7 +1050,11 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string, outF
 		if inst.Name != "" {
 			stderr += instanceDebugHints(a.cfg.Hostname, inst)
 		}
-		return commandResult{stderr: stderr, exitCode: 1}, err
+		exitCode := 1
+		if errors.Is(err, provision.ErrCreateRejected) {
+			exitCode = model.ExitCreateRejected
+		}
+		return commandResult{stderr: stderr, exitCode: exitCode}, err
 	}
 	for _, integration := range requestedIntegrations {
 		if err := a.store.BindIntegrationToInstance(ctx, model.InstanceIntegrationBinding{

@@ -376,7 +376,17 @@ trusted transport/runtime boundary. Avoid diagnostic dumps of those processes.
 
 The adapter records `creating` **before** sending `orb new`. If the SSH response is
 lost, a later job refuses automatic adoption or replay. It never automatically
-retries a missing, uncertain create. Initial discovery through srv-front requires
+retries a missing, uncertain create. The one exception is srv's explicit admission
+refusal (exit status 3, for example a full host memory budget): nothing was
+allocated, so the record returns to `new` and a later spawn or delete proceeds normally.
+Only admission refusals qualify: host memory budget, pool lookup and pool size,
+and the disk floor. Other errors before `orb new` reaches admission (invalid
+size, unknown image, template mismatch, authorization) still exit 1 and fence.
+
+Records fenced in `creating` before this rule existed are not healed by it. To
+repair one, first confirm that `orb list` on every backend shows no VM with the
+record's name, then stop the provider and remove both `<name>.json` and
+`<name>.json.lock`. Removing only the `.json` is reported as a lost record. Initial discovery through srv-front requires
 every host to answer; after placement is recorded, only the selected host is
 queried, so an unrelated backend outage does not prevent wake-up.
 
@@ -386,7 +396,8 @@ with no import/migration history and bootstrap generation zero. A lost reply to
 automatic frontend placement has no recorded host and cannot use this escape
 hatch. Use a pinned host when deterministic create reconciliation is required.
 Missing dispatch records, counters or lock-associated records fail closed.
-Do not delete or hand-edit JSON/lock files to release a fence. A VM found without
+Do not delete or hand-edit JSON/lock files to release a fence, except for the
+pre-refusal-rule `creating` repair described above. A VM found without
 a record is not silently adopted: restore the state backup instead. An unknown
 allocation that cannot satisfy these checks remains unavailable pending a
 separate reconciliation design.

@@ -99,6 +99,14 @@ MUTANTS = [
         "package": "./internal/provision",
         "run": "TestProvisionPolicyMatrix",
     },
+    {
+        "name": "dispatch-create-refusal-only",
+        "file": "cmd/srv-orb-dispatch/main.go",
+        "old": "if errors.As(err, &exit) && exit.ExitCode() == model.ExitCreateRejected {",
+        "new": "if errors.As(err, &exit) {",
+        "package": "./cmd/srv-orb-dispatch",
+        "run": "^(TestDispatchUncertainOutcomes|TestFreshComputeRecovery)$",
+    },
 ]
 
 

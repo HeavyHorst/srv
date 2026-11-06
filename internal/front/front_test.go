@@ -94,6 +94,19 @@ func TestPlacementEligibilityAndNoRetry(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not retried") || len(creates) != 1 || creates[0] != "b" {
 		t.Fatalf("creates=%v err=%v", creates, err)
 	}
+	if got := front.ExitStatus(err); got == model.ExitCreateRejected {
+		t.Fatal("a lost submission must not report a clean create refusal")
+	}
+	full := router(func(h front.Host, args []string, _ io.Reader, out io.Writer) error {
+		if args[0] != "--json" {
+			t.Fatalf("create sent to %s although no host was eligible", h.Name)
+		}
+		io.WriteString(out, `{"eligible":false,"reason":"memory"}`)
+		return nil
+	})
+	if _, _, err := run(full, "new", "vm"); front.ExitStatus(err) != model.ExitCreateRejected {
+		t.Fatalf("placement refusal exit = %d, err=%v", front.ExitStatus(err), err)
+	}
 }
 func TestMigrationCompletionOrdering(t *testing.T) {
 	for _, policy := range [][]string{nil, {"--fixed-memory"}, {"--pool", "destination"}} {

@@ -47,7 +47,10 @@ const (
 var (
 	// ErrStartRejected marks completed validation with no new runtime start
 	// submitted. Reconciliation, hydration and launch errors are not rejections.
-	ErrStartRejected  = errors.New("start rejected before runtime admission")
+	ErrStartRejected = errors.New("start rejected before runtime admission")
+	// ErrCreateRejected marks a create refused by admission before any
+	// instance directory, disk or record was allocated.
+	ErrCreateRejected = errors.New("create rejected before allocation")
 	errGuestNotReady  = errors.New("guest never joined the tailnet before timeout")
 	errGuestExited    = errors.New("guest exited before joining the tailnet")
 	errStartUncertain = errors.New("VM start outcome is unknown; resources retained")
@@ -373,19 +376,19 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		if resolved.MemoryPoolName != "" {
 			resolvedPool, err := p.requireMemoryPoolByName(ctx, resolved.MemoryPoolName)
 			if err != nil {
-				return err
+				return fmt.Errorf("%w: %w", ErrCreateRejected, err)
 			}
 			if err := ensureMemoryPoolSupportsGuestMemory(resolvedPool, resolved.MemoryMiB); err != nil {
-				return err
+				return fmt.Errorf("%w: %w", ErrCreateRejected, err)
 			}
 			pool = resolvedPool
 		} else {
 			if err := p.ensureHostMemoryCapacity(ctx, "", resolved.MemoryMiB); err != nil {
-				return err
+				return fmt.Errorf("%w: %w", ErrCreateRejected, err)
 			}
 		}
 		if err := p.ensureHostDiskCapacity(ctx, "", resolved.RootFSSizeBytes); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrCreateRejected, err)
 		}
 
 		instanceDir, err := p.prepareInstanceDir(ctx, name)

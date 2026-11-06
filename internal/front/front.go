@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -22,6 +23,9 @@ import (
 	"srv/internal/model"
 	"srv/internal/vmrunner"
 )
+
+// errNoEligibleHost means placement refused a create before any host received it.
+var errNoEligibleHost = errors.New("no eligible host")
 
 type Host struct {
 	Name    string `json:"name"`
@@ -175,7 +179,7 @@ func (r *Router) choose(ctx context.Context, a model.Actor, args []string) (Host
 		return x.h.Name < y.h.Name
 	})
 	if len(candidates) == 0 {
-		return Host{}, fmt.Errorf("no eligible host: %s", strings.Join(failures, "; "))
+		return Host{}, fmt.Errorf("%w: %s", errNoEligibleHost, strings.Join(failures, "; "))
 	}
 	return candidates[0].h, nil
 }

@@ -342,6 +342,7 @@ All integration commands are admin-only.
 
 - `new` accepts `--cpus`, `--ram`, `--pool`, and `--rootfs-size` in any combination that matches the memory mode contract
 - `new --pool <name>` requires `--ram <size>` because guest-visible RAM stays explicit in pooled mode
+- `new` and `orb new` exit with status 3 when admission refuses the create (host memory budget, pool size or disk floor) before anything is allocated; srv-front passes that status through and also uses it when no host is eligible. Other failures keep exit status 1
 - `new` also accepts repeated `--integration <name>` flags; the create request fails if any requested integration cannot be enabled
 - Fixed mode remains the default. Without `--pool`, `--ram` means guest-visible RAM; the hard per-VM host cgroup cap is that RAM plus `max(256 MiB, RAM/16)` Firecracker overhead reserve
 - In pooled mode, `--ram` means guest-visible RAM while host reservation comes from the pool created with `pool create`

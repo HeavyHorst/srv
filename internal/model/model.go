@@ -21,6 +21,10 @@ const (
 
 	MemoryModeFixed = "fixed"
 	MemoryModePool  = "pool"
+
+	// ExitCreateRejected is the SSH exit status of a create refused at
+	// admission, before anything was allocated. srv-front passes it through.
+	ExitCreateRejected = 3
 )
 
 type Actor struct {

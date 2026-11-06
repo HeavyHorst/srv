@@ -853,3 +853,65 @@ func readGatewayUntilClose(t *testing.T, conn net.Conn) []byte {
 	}
 	return data
 }
+
+func TestOrbNewAdmissionRefusalExitStatus(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	kernel, rootfs := filepath.Join(dir, "vmlinux"), filepath.Join(dir, "rootfs.img")
+	for _, path := range []string{kernel, rootfs} {
+		if err := os.WriteFile(path, []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Get through the pre-admission host checks without btrfs or losetup: the
+	// base image is unattached, and the reflink probe gets a plain copy.
+	requireBtrfs := storage.RequireBtrfs
+	t.Cleanup(func() { storage.RequireBtrfs = requireBtrfs })
+	storage.RequireBtrfs = storage.ValidatePath
+	bin := t.TempDir()
+	for name, script := range map[string]string{
+		"losetup": "#!/bin/sh\nexit 0\n",
+		"cp":      "#!/bin/sh\n[ \"$1\" = --reflink=always ] && shift\nexec /bin/cp \"$@\"\n",
+	} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	cfg := loadServiceTestConfig(t, map[string]string{"SRV_BASE_KERNEL": kernel, "SRV_BASE_ROOTFS": rootfs})
+	if err := os.MkdirAll(cfg.InstancesDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	st := newServiceTestStore(t)
+	a := &App{store: st, backendID: "backend-one", cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	var err error
+	if a.provisioner, err = provision.New(cfg, a.log, st); err != nil {
+		t.Fatal(err)
+	}
+	neighbor := serviceTestInstance("memory-reservation", model.StateProvisioning, time.Now().UTC())
+	neighbor.MemoryMiB = 1 << 30 // Exceed real host RAM without allocating it.
+	if err := st.CreateInstance(ctx, neighbor); err != nil {
+		t.Fatal(err)
+	}
+	actor := model.Actor{UserLogin: "alice@example.com"}
+	args := []string{"orb", "new", "refused-orb", "--ram", "1G"}
+	result, err := a.dispatch(ctx, actor, commandRequest{args: args})
+	if !errors.Is(err, provision.ErrCreateRejected) || result.exitCode != model.ExitCreateRejected {
+		t.Fatalf("admission refusal: exit=%d err=%v", result.exitCode, err)
+	}
+	if _, found, err := st.FindInstance(ctx, "refused-orb"); err != nil || found {
+		t.Fatal("refused create persisted an instance", found, err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.InstancesDir(), "refused-orb")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("refused create allocated an instance directory", err)
+	}
+	// Once admission passes, a later failure must keep the generic status:
+	// the dispatcher treats only exit 3 as proof that nothing was allocated.
+	if err := st.DeleteInstance(ctx, neighbor.Name); err != nil {
+		t.Fatal(err)
+	}
+	result, err = a.dispatch(ctx, actor, commandRequest{args: args})
+	if err == nil || errors.Is(err, provision.ErrCreateRejected) || result.exitCode != 1 {
+		t.Fatalf("post-admission failure: exit=%d err=%v", result.exitCode, err)
+	}
+}

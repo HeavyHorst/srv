@@ -2157,8 +2157,11 @@ func TestCreateRejectsPooledInstanceLargerThanPoolReservation(t *testing.T) {
 		t.Fatalf("CreateMemoryPool(): %v", err)
 	}
 
-	if _, err := p.Create(ctx, "demo", model.Actor{UserLogin: "alice@example.com", NodeName: "laptop"}, CreateOptions{MemoryMiB: 2048, MemoryPoolName: pool.Name}); err == nil || !strings.Contains(err.Error(), "exceeds memory pool") {
+	if _, err := p.Create(ctx, "demo", model.Actor{UserLogin: "alice@example.com", NodeName: "laptop"}, CreateOptions{MemoryMiB: 2048, MemoryPoolName: pool.Name}); !errors.Is(err, ErrCreateRejected) || !strings.Contains(err.Error(), "exceeds memory pool") {
 		t.Fatalf("Create() pooled capacity error = %v", err)
+	}
+	if _, err := p.Create(ctx, "demo", model.Actor{UserLogin: "alice@example.com", NodeName: "laptop"}, CreateOptions{MemoryMiB: 512, MemoryPoolName: "missing"}); !errors.Is(err, ErrCreateRejected) || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("Create() missing pool error = %v", err)
 	}
 	if _, found, err := st.FindInstance(ctx, "demo"); err != nil {
 		t.Fatalf("FindInstance(): %v", err)

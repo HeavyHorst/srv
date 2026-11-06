@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -257,7 +258,7 @@ func Serve(ctx context.Context, c Config) error {
 		}()
 		if err := router.Run(ctx, actor, s.Command(), s, s, s.Stderr()); err != nil {
 			fmt.Fprintln(s.Stderr(), err)
-			s.Exit(1)
+			s.Exit(ExitStatus(err))
 			return
 		}
 		s.Exit(0)
@@ -269,4 +270,17 @@ func Serve(ctx context.Context, c Config) error {
 		return nil
 	}
 	return err
+}
+
+// ExitStatus passes a backend's own exit status through, so callers can tell
+// a clean create refusal from a lost or failed command; everything else is 1.
+func ExitStatus(err error) int {
+	var exit *ssh.ExitError
+	if errors.As(err, &exit) {
+		return exit.ExitStatus()
+	}
+	if errors.Is(err, errNoEligibleHost) {
+		return model.ExitCreateRejected
+	}
+	return 1
 }

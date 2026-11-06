@@ -1269,7 +1269,6 @@ func TestBuildJailedVMCommandIncludesResourceLimits(t *testing.T) {
 		"--cgroup", "memory.swap.max=0",
 		"--cgroup", "pids.max=321",
 		"--",
-		"--no-seccomp",
 		"--enable-pci",
 		"--api-sock", "firecracker.sock",
 	}

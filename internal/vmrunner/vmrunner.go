@@ -1359,7 +1359,7 @@ func (s *Server) buildJailedVMCommand(ctx context.Context, req StartRequest, api
 	if strings.TrimSpace(parentCgroup) == "" {
 		return nil, errors.New("parent cgroup is required")
 	}
-	fcArgs := []string{"--no-seccomp", "--enable-pci", "--api-sock", apiSocketPath}
+	fcArgs := []string{"--enable-pci", "--api-sock", apiSocketPath}
 	builder := firecracker.NewJailerCommandBuilder().
 		WithID(req.Name).
 		WithUID(s.config.JailerUID).

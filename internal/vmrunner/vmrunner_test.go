@@ -621,7 +621,8 @@ func TestReconcileBalloonsDoesNotBlockPeers(t *testing.T) {
 
 	instancesDir := filepath.Join(t.TempDir(), "instances")
 	server := NewServer(slog.New(slog.NewTextHandler(io.Discard, nil)), ServerConfig{
-		InstancesDir: instancesDir,
+		InstancesDir:  instancesDir,
+		JailerBaseDir: filepath.Join(t.TempDir(), "jailer"),
 	})
 
 	for _, name := range []string{"a-slow", "z-fast"} {
@@ -634,6 +635,12 @@ func TestReconcileBalloonsDoesNotBlockPeers(t *testing.T) {
 		}
 		if err := os.MkdirAll(filepath.Join(instancesDir, name), 0o755); err != nil {
 			t.Fatalf("MkdirAll(instance %s): %v", name, err)
+		}
+	}
+	poolPath := filepath.Join(cgroupFSRoot, "system.slice", "srv-vm-runner.service", firecrackerPoolRootCgroupName, "pool-a")
+	for name, value := range map[string]string{"memory.max": "17179869184", "memory.current": "15032385536"} {
+		if err := os.WriteFile(filepath.Join(poolPath, name), []byte(value), 0600); err != nil {
+			t.Fatal(err)
 		}
 	}
 
@@ -689,9 +696,12 @@ func TestReconcileBalloonsDoesNotBlockPeers(t *testing.T) {
 		}
 	})
 
+	now := time.Now()
+	// Observe both runtimes once before testing the next round's slow peer.
+	server.reconcileBalloonsAt(context.Background(), now)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
-	server.reconcileBalloons(ctx)
+	server.reconcileBalloonsAt(ctx, now.Add(15*time.Second))
 
 	select {
 	case got := <-fastPatched:

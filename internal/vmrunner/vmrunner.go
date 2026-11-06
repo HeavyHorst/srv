@@ -330,6 +330,7 @@ type balloonVM struct {
 	CgroupPath string
 	SocketPath string
 	UseTarget  bool
+	PoolPath   string
 }
 
 type runningVM struct {
@@ -367,6 +368,8 @@ type Server struct {
 	poolMu             sync.Mutex
 	delegatedCgroupRel string
 	firecrackerClients sync.Map
+	balloonMu          sync.Mutex
+	balloonPools       map[string]*balloonPool
 }
 
 func NewServer(logger *slog.Logger, cfg ServerConfig) *Server {
@@ -483,6 +486,12 @@ func (s *Server) runBalloonLoop(ctx context.Context) {
 }
 
 func (s *Server) reconcileBalloons(ctx context.Context) {
+	s.reconcileBalloonsAt(ctx, time.Now())
+}
+
+func (s *Server) reconcileBalloonsAt(ctx context.Context, now time.Time) {
+	s.balloonMu.Lock()
+	defer s.balloonMu.Unlock()
 	rootRel, err := s.delegatedCgroupRoot()
 	if err != nil {
 		if ctx.Err() == nil {
@@ -497,6 +506,7 @@ func (s *Server) reconcileBalloons(ctx context.Context) {
 		}
 		return
 	}
+	pools := s.prepareBalloonPools(vms)
 	var wg sync.WaitGroup
 	for _, vm := range vms {
 		vm := vm
@@ -505,7 +515,12 @@ func (s *Server) reconcileBalloons(ctx context.Context) {
 			defer wg.Done()
 			reqCtx, cancel := context.WithTimeout(ctx, balloonRequestTimeout)
 			defer cancel()
-			err := s.reconcileBalloon(reqCtx, vm)
+			var err error
+			if vm.UseTarget {
+				err = s.reconcilePoolBalloon(reqCtx, vm, pools[vm.PoolPath], now)
+			} else {
+				err = s.reconcileBalloon(reqCtx, vm)
+			}
 			if err == nil || errors.Is(err, os.ErrNotExist) || ctx.Err() != nil {
 				return
 			}
@@ -513,6 +528,7 @@ func (s *Server) reconcileBalloons(ctx context.Context) {
 		}()
 	}
 	wg.Wait()
+	s.reportBalloonPools(now)
 }
 
 func (s *Server) listBalloonVMs(rootRel string) ([]balloonVM, error) {
@@ -567,6 +583,7 @@ func (s *Server) listBalloonVMs(rootRel string) ([]balloonVM, error) {
 				CgroupPath: filepath.Join(poolPath, vmEntry.Name()),
 				SocketPath: paths.SocketPath,
 				UseTarget:  true,
+				PoolPath:   poolPath,
 			})
 		}
 	}
@@ -634,7 +651,8 @@ func desiredBalloonTargetMiB(stats firecrackerBalloonStats) (int64, int64, bool)
 	maxTargetMiB := maxInt64(guestTotalMiB/balloonMaxTargetDivisor, 1)
 	stepMiB := balloonAdjustmentStepMiB(guestTotalMiB)
 	desiredTargetMiB = minInt64(desiredTargetMiB, maxTargetMiB)
-	desiredTargetMiB = roundDownToMultiple(desiredTargetMiB, stepMiB)
+	// Quantize movements, not this safety bound: pool-sized steps can leave
+	// actual targets off the guest's usual 64-MiB grid without any guest deficit.
 	// Never pile a new increase onto an unfinished adjustment. A lower safety
 	// bound may still cancel inflation or return memory to a pressured guest.
 	if *stats.ActualMiB != *stats.TargetMiB {

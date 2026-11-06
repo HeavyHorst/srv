@@ -179,6 +179,9 @@ func (p *Provisioner) FinalizeKernelUpgrade(ctx context.Context, name string) (m
 // leave the operator a stopped-VM rollback, rather than reverting guest writes
 // automatically. Rollback restores the entire pre-upgrade disk (including data).
 func (p *Provisioner) UpgradeKernel(ctx context.Context, name string, rollback bool) (model.Instance, error) {
+	if err := p.ramStateFence(name); err != nil {
+		return model.Instance{}, err
+	}
 	// Read without reconciliation or the upgrade fence: rollback must remain
 	// available after an interrupted commit, for both normal VMs and Orbs.
 	inst, err := p.store.GetInstance(ctx, name)

@@ -69,10 +69,12 @@ func validateStartResponse(r StartResponse) error {
 // All reads and writes hold the name flock, including drain in another process.
 type startReceipt struct {
 	StartResultRequest
-	Digest string
-	State  string
-	PID    int
-	Ticks  uint64
+	Digest       string
+	State        string
+	PID          int
+	Ticks        uint64
+	ResumeConfig string `json:",omitempty"`
+	SaveState    bool   `json:",omitempty"`
 }
 
 func receiptKey(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
@@ -486,7 +488,14 @@ func (s *Server) receiptStart(ctx context.Context, req StartRequest) (StartRespo
 			return StartResponse{}, err
 		}
 	}
+	if _, err := s.checkRAMState(req); err != nil {
+		if writeErr := s.writeReceipt(*r); writeErr != nil {
+			return StartResponse{}, errors.Join(err, writeErr)
+		}
+		return StartResponse{Outcome: StartAbsent, Reason: err.Error()}, nil
+	}
 	r.State = "accepted"
+	r.ResumeConfig = resumeConfig(req)
 	if err := s.writeReceipt(*r); err != nil {
 		return StartResponse{}, err
 	}
@@ -553,6 +562,9 @@ func (s *Server) resolveStartContext(ctx context.Context, q StartResultRequest) 
 }
 
 func (s *Server) receiptStop(ctx context.Context, req StopRequest) error {
+	if req.SaveState && req.RequestID == "" {
+		return errors.New("saving RAM requires a managed start attempt")
+	}
 	if req.RequestID == "" && s.config.JailerBaseDir == "" {
 		return s.stop(ctx, req)
 	}
@@ -595,7 +607,31 @@ func (s *Server) receiptStop(ctx context.Context, req StopRequest) error {
 	if r == nil {
 		return errors.New("start receipt not found")
 	}
-	return s.stopReceiptLocked(ctx, *r)
+	if req.SaveState && !r.SaveState {
+		if r.State != "started" || r.ResumeConfig == "" {
+			return errors.New("saving RAM requires a running VM started with RAM-state support")
+		}
+		if err := s.checkRAMStateLayout(r.Name); err != nil {
+			return err
+		}
+		r.SaveState = true
+		if err := s.writeReceipt(*r); err != nil {
+			return err
+		}
+	}
+	if err := s.stopReceiptLocked(ctx, *r); err != nil {
+		return err
+	}
+	if req.SaveState {
+		state, err := s.readRAMState(r.Name)
+		if err != nil {
+			return err
+		}
+		if state == nil || state.Attempt != r.StartResultRequest {
+			return errors.New("no saved RAM for this attempt: source exited before capture, or snapshot was already consumed")
+		}
+	}
+	return nil
 }
 
 func (s *Server) stopReceiptLocked(ctx context.Context, r startReceipt) error {
@@ -640,10 +676,18 @@ func (s *Server) stopReceiptLocked(ctx context.Context, r startReceipt) error {
 		return err
 	}
 	// Signals target the stable pidfd, never a caller-supplied or reused PID.
-	stopCtx, cancel := context.WithTimeout(context.Background(), gracefulStopRequestTimeout)
-	_ = requestGuestShutdown(stopCtx, filepath.Join(s.config.InstancesDir, r.Name, "firecracker.sock"))
-	cancel()
-	if err := waitPidfd(fd, gracefulStopTimeout); err != nil {
+	grace := gracefulStopTimeout
+	if r.SaveState {
+		if err := s.saveRAMState(ctx, r); err != nil {
+			return err
+		}
+		grace = 0 // Never run guest shutdown after capturing RAM and disk state.
+	} else {
+		stopCtx, cancel := context.WithTimeout(context.Background(), gracefulStopRequestTimeout)
+		_ = requestGuestShutdown(stopCtx, filepath.Join(s.config.InstancesDir, r.Name, "firecracker.sock"))
+		cancel()
+	}
+	if err := waitPidfd(fd, grace); err != nil {
 		if !errors.Is(err, errProcessExitTimeout) {
 			return err
 		}

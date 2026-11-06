@@ -259,14 +259,29 @@ func (s *Server) coldDiskLocked(ctx context.Context, q ColdRequest) (ColdStatus,
 		if err := s.coldDeletionFence(q); err != nil {
 			return result, err
 		}
+		if _, err := os.Lstat(s.ramStateDir(q.Name)); err == nil {
+			return result, errors.New("cold disk operation would invalidate saved RAM; resume or discard it first")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return result, err
+		}
 	}
 	if err := s.storageIdleLocked(q.Name); err != nil {
 		return result, err
 	}
 	if q.Action == "delete" || q.Action == "fence-delete" {
+		state, err := s.readRAMState(q.Name)
+		if err != nil {
+			return result, err
+		}
+		if state != nil && state.Attempt.InstanceID != q.InstanceID {
+			return result, errors.New("saved RAM belongs to another incarnation")
+		}
 		// Keep a small incarnation tombstone after clearing the generation
 		// journal. An older offload must not publish after delete was acknowledged.
 		if err := atomicColdJSON(s.coldDeletedPath(q), q.InstanceID, 0600); err != nil {
+			return result, err
+		}
+		if err := s.discardRAMState(q.Name); err != nil {
 			return result, err
 		}
 	}

@@ -21,8 +21,8 @@ Use `--json` with the non-streaming instance and backup commands when you need m
 | `status` | Admin-only host capacity and allocation summary |
 | `inspect <name>` | Show VM details and status |
 | `logs <name>` | View serial or firecracker logs |
-| `start <name>` | Start a stopped VM |
-| `stop <name>` | Stop VM (graceful shutdown) |
+| `start <name> [--discard-state]` | Resume saved RAM if present; optionally discard it and cold boot |
+| `stop <name> [--save-state]` | Graceful shutdown, or explicitly save RAM and stop |
 | `restart <name>` | Restart VM |
 | `fsck <name>` | Force-check and repair stopped VM rootfs |
 | `delete <name>` | Remove VM |

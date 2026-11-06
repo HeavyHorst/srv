@@ -104,6 +104,7 @@ type Metadata struct {
 }
 
 type StartRequest struct {
+	DiscardState        bool      `json:"discard_state,omitempty"`
 	Kind                string    `json:"kind,omitempty"`
 	KernelPath          string    `json:"kernel_path,omitempty"`
 	InitrdPath          string    `json:"initrd_path,omitempty"`
@@ -132,6 +133,7 @@ type StartResponse struct {
 }
 
 type StopRequest struct {
+	SaveState  bool   `json:"save_state,omitempty"`
 	InstanceID string `json:"instance_id"`
 	RequestID  string `json:"request_id"`
 	HostBootID string `json:"host_boot_id"`
@@ -203,6 +205,9 @@ func (c *Client) StartInstanceVM(ctx context.Context, req StartRequest) (StartRe
 		// Old runners must reject image-aware starts, not silently use Arch.
 		endpoint = "/vm/start-v2"
 	}
+	if req.DiscardState {
+		endpoint = "/vm/start-state-v1"
+	}
 	if err := c.post(ctx, endpoint, req, &resp); err != nil {
 		return StartResponse{}, err
 	}
@@ -217,6 +222,9 @@ func (c *Client) StartInstanceVM(ctx context.Context, req StartRequest) (StartRe
 func (c *Client) StopInstanceVM(ctx context.Context, req StopRequest) error {
 	if err := req.Validate(); err != nil {
 		return err
+	}
+	if req.SaveState {
+		return c.post(ctx, "/vm/stop-state-v1", req, nil)
 	}
 	return c.post(ctx, "/vm/stop", req, nil)
 }
@@ -389,9 +397,11 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vm/start", s.handleStart)
 	mux.HandleFunc("/vm/start-v2", s.handleStart)
+	mux.HandleFunc("/vm/start-state-v1", s.handleStart)
 	mux.HandleFunc("/vm/boot-artifacts-v1", s.handleBootArtifacts)
 	mux.HandleFunc("/vm/start-result", s.handleStartResult)
 	mux.HandleFunc("/vm/stop", s.handleStop)
+	mux.HandleFunc("/vm/stop-state-v1", s.handleStop)
 	mux.HandleFunc("/vm/cleanup-proof-v1", s.handleCleanupProof)
 	mux.HandleFunc("/vm/cleanup-proof-v2", s.handleCleanupProof)
 	mux.HandleFunc("/vm/storage-idle-v1", s.handleStorageIdle)
@@ -889,6 +899,10 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	if err := validateStartRuntimeFiles(bootConfig, paths); err != nil {
 		return StartResponse{}, err
 	}
+	resume, err := s.checkRAMState(req)
+	if err != nil {
+		return StartResponse{}, err
+	}
 	if err := os.MkdirAll(s.config.JailerBaseDir, 0o755); err != nil {
 		return StartResponse{}, fmt.Errorf("create jailer base dir: %w", err)
 	}
@@ -978,12 +992,20 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	// Mounts must exist before the jailer creates its private mount namespace.
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Remove(firecracker.CreateLogFilesHandlerName).
 		Prepend(prepareJailedRuntimeHandler(paths, jailerPaths, s.config.JailerGID))
+	if resume != nil {
+		if err := s.configureRAMRestore(machine, req, jailerPaths); err != nil {
+			return StartResponse{}, err
+		}
+	}
 	if req.Kind != "orb" {
 		machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.NewSetMetadataHandler(Metadata{SRV: req.Bootstrap}))
 	}
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Append(firecracker.Handler{
 		Name: "srv.CreateBalloonDevice",
 		Fn: func(ctx context.Context, _ *firecracker.Machine) error {
+			if resume != nil {
+				return s.doFirecrackerAPIRequest(ctx, paths.SocketPath, http.MethodPatch, "/vm", map[string]string{"state": "Resumed"}, http.StatusNoContent, nil)
+			}
 			if err := s.createBalloonDevice(ctx, paths.SocketPath); err != nil {
 				return fmt.Errorf("create balloon device: %w", err)
 			}

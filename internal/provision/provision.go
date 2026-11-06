@@ -553,7 +553,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	}
 	p.recordEvent(inst.ID, "bootstrap", "guest bootstrap metadata written", map[string]any{"tailscale_tags": guestAuthTags})
 
-	pid, err := p.startFirecracker(ctx, &inst, pool, bootstrap)
+	pid, err := p.startFirecracker(ctx, &inst, pool, bootstrap, false)
 	if err != nil {
 		inst.LastError = err.Error()
 		return inst, err
@@ -758,6 +758,12 @@ func (p *Provisioner) reconcileRuntime(ctx context.Context, inst model.Instance)
 }
 
 func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, error) {
+	return p.StopWithOptions(ctx, name, StopOptions{})
+}
+
+type StopOptions struct{ SaveState bool }
+
+func (p *Provisioner) StopWithOptions(ctx context.Context, name string, opts StopOptions) (model.Instance, error) {
 	inst, err := p.store.GetInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, err
@@ -784,7 +790,7 @@ func (p *Provisioner) Stop(ctx context.Context, name string) (model.Instance, er
 	if err := p.resolveRuntime(ctx, &inst); err != nil {
 		return inst, err
 	}
-	if err := p.stopFirecracker(ctx, inst); err != nil {
+	if err := p.stopFirecrackerWithState(ctx, inst, opts.SaveState); err != nil {
 		return inst, err
 	}
 	if err := p.cleanupNetworking(inst); err != nil {
@@ -962,6 +968,12 @@ func (p *Provisioner) Resize(ctx context.Context, name string, opts CreateOption
 }
 
 func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instance, err error) {
+	return p.StartWithOptions(ctx, name, StartOptions{})
+}
+
+type StartOptions struct{ DiscardState bool }
+
+func (p *Provisioner) StartWithOptions(ctx context.Context, name string, opts StartOptions) (inst model.Instance, err error) {
 	if err := p.migrationFence(ctx, name); err != nil {
 		return inst, err
 	}
@@ -1116,7 +1128,7 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 		ZenGatewayPort:      zenGatewayPort,
 		DeepSeekGatewayPort: deepseekGatewayPort,
 	}
-	pid, err := p.startFirecracker(ctx, &inst, pool, bootstrap)
+	pid, err := p.startFirecracker(ctx, &inst, pool, bootstrap, opts.DiscardState)
 	if err != nil {
 		inst.LastError = err.Error()
 		return inst, err
@@ -1906,7 +1918,7 @@ func (p *Provisioner) writeMetadataFile(inst model.Instance, bootstrap guestBoot
 	return nil
 }
 
-func (p *Provisioner) startFirecracker(ctx context.Context, inst *model.Instance, pool model.MemoryPool, bootstrap guestBootstrap) (int, error) {
+func (p *Provisioner) startFirecracker(ctx context.Context, inst *model.Instance, pool model.MemoryPool, bootstrap guestBootstrap, discardState bool) (int, error) {
 	if p.vmRunner == nil {
 		return 0, errors.New("vm runner client is unavailable")
 	}
@@ -1924,6 +1936,7 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst *model.Instance
 	}
 	resp, err := p.vmRunner.StartInstanceVM(ctx, vmrunner.StartRequest{
 		InstanceID: inst.ID, RequestID: inst.StartRequestID, HostBootID: inst.StartBootID,
+		DiscardState:        discardState,
 		Kind:                inst.KindName(),
 		KernelPath:          inst.KernelPath,
 		InitrdPath:          inst.InitrdPath,
@@ -2141,16 +2154,25 @@ func deviceIdentifier(device tailscale.Device) string {
 	return device.ID
 }
 
-func (p *Provisioner) stopFirecracker(_ context.Context, inst model.Instance) error {
+func (p *Provisioner) stopFirecracker(ctx context.Context, inst model.Instance) error {
+	return p.stopFirecrackerWithState(ctx, inst, false)
+}
+
+func (p *Provisioner) stopFirecrackerWithState(_ context.Context, inst model.Instance, saveState bool) error {
 	if p.vmRunner == nil {
 		return errors.New("vm runner client is unavailable")
 	}
-	stopCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	timeout := 20 * time.Second
+	if saveState {
+		timeout = 10 * time.Minute
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if err := p.vmRunner.StopInstanceVM(stopCtx, vmrunner.StopRequest{
 		InstanceID: inst.ID, RequestID: inst.StartRequestID, HostBootID: inst.StartBootID,
-		Name: inst.Name,
-		PID:  inst.FirecrackerPID,
+		SaveState: saveState,
+		Name:      inst.Name,
+		PID:       inst.FirecrackerPID,
 	}); err != nil {
 		return fmt.Errorf("stop firecracker for %q: %w", inst.Name, err)
 	}

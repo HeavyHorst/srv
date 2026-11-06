@@ -401,6 +401,9 @@ func (p *Provisioner) requireBackupVM(ctx context.Context, name string) (model.I
 }
 
 func (p *Provisioner) requireStoppedInstance(ctx context.Context, name string) (model.Instance, error) {
+	if err := p.ramStateFence(name); err != nil {
+		return model.Instance{}, err
+	}
 	inst, err := p.requireExistingInstance(ctx, name)
 	if err != nil {
 		return model.Instance{}, err

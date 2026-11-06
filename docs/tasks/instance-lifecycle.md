@@ -85,6 +85,33 @@ ssh srv stop <name>
 
 Performs a graceful shutdown through Firecracker. The rootfs is preserved on disk.
 
+### Save RAM before stopping
+
+For a VM or Orb that should continue its running processes after host maintenance:
+
+```bash
+ssh srv stop <name> --save-state
+```
+
+This pauses the guest, saves its RAM and device state, then terminates the VMM
+without running guest shutdown. Wait for the command to succeed before restarting
+the runner or host. Ordinary stop, restart, and runner shutdown do not create RAM
+snapshots. The VM must have been started by a runner with RAM-state support.
+
+There is one host-local saved state per instance, with no snapshot names or
+history. The disk stays in place and must not change while RAM is saved. Resize,
+fsck, kernel upgrades, restore, migration, and cold-disk offload are blocked until
+the state is resumed or discarded. Deleting the instance removes its saved RAM.
+
+Allow disk space for the guest's configured RAM plus at least 256 MiB. An error
+after pausing can leave the guest paused; retry `stop <name> --save-state` after
+fixing the error. Never interpret a failed save as permission to reboot the host.
+Saving RAM requires the jailer and instance directories to share a filesystem
+and subvolume that permits atomic rename between them. Unsupported layouts are
+rejected before pausing or recording save intent. A repeated save request only
+succeeds while that attempt's saved image still exists; an already consumed image
+is not reported as a successful new save.
+
 ## Start
 
 ```bash
@@ -92,6 +119,50 @@ ssh srv start <name>
 ```
 
 Boots a previously stopped VM. Stopped guests pick up the currently configured `SRV_BASE_KERNEL` and optional `SRV_BASE_INITRD` on their next start.
+
+If saved RAM exists, start resumes it automatically. To discard it and boot fresh:
+
+```bash
+ssh srv start <name> --discard-state
+```
+
+Restore consumes the saved state before guest execution resumes, so a lost response
+cannot replay the same execution state. A failed restore does not fall back to a
+cold boot. Configuration or disk mismatches detected before restore leave the saved
+state intact and require an explicit `--discard-state` to proceed. A cold start
+with that flag removes the saved state as well.
+
+Resume requires the same host, unchanged disk and VM configuration, and compatible
+host software. A different Firecracker binary is rejected by comparing its content
+with the executable that produced the snapshot, even if it was upgraded while the
+VM was running. Existing network connections may break, and vsock connections are
+reset; applications must reconnect. The guest needs clock synchronization after a
+long pause.
+
+The saved files disappear on resume. Firecracker still holds a private memory
+mapping of the unlinked RAM file, so its disk blocks remain allocated until that
+VMM exits. This is not a reusable backup or an Amp project-template snapshot.
+
+### Runner API
+
+The privileged runner uses HTTP over its local Unix socket (normally
+`/run/srv-vm-runner/vm-runner.sock`). Use the SSH commands for normal operation;
+they also update instance state, networking, and readiness in the control plane.
+
+| Request | Body | Result |
+|---------|------|--------|
+| `POST /vm/stop-state-v1` | Existing stop request plus `"save_state": true` | `204` after durable save, VMM termination, and runtime cleanup |
+| `POST /vm/start-state-v1` | Existing full start request; omit `discard_state` or set it to `false` | Resume if present, otherwise cold boot; existing `outcome`, `reason`, `pid` response |
+| `POST /vm/start-state-v1` | Existing full start request plus `"discard_state": true` | Remove saved RAM and cold boot |
+
+Stop must identify the running attempt with `name`, `instance_id`, `request_id`,
+and `host_boot_id`; a PID alone cannot authorize saving RAM. Start supplies a new
+request ID and the current host boot ID, along with the usual boot, network, CPU,
+and memory configuration. Retry the same start request to recover its outcome,
+or use `POST /vm/start-result`; do not invent a new attempt after an unknown result.
+The existing `/vm/start` and `/vm/start-v2` routes also resume saved RAM by default.
+The versioned state endpoints make an older runner reject unsupported requests
+instead of silently ignoring the save/discard flag.
 
 ## Restart
 

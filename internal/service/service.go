@@ -2639,8 +2639,8 @@ func helpResult() commandResult {
 				{"orb list", "List Orb workloads."},
 				{"orb bootstrap <name>", "Bootstrap an Orb workload using a request on stdin."},
 				{"inspect <name>", "Show instance details and recent events."},
-				{"start <name>", "Start a stopped instance or recheck a running awaiting-tailnet instance."},
-				{"stop <name>", "Stop a running instance."},
+				{"start <name> [--discard-state]", "Resume saved RAM automatically, or discard it and cold-start."},
+				{"stop <name> [--save-state]", "Stop a running instance; optionally save RAM for one resume."},
 				{"restart <name>", "Restart an instance."},
 				{"resize <name> [--cpus N] [--ram SIZE] [--pool NAME | --fixed-memory] [--rootfs-size SIZE]", "Change instance resources (must be stopped)."},
 				{"upgrade <name> [--rollback | --finalize]", "Upgrade/rollback a stopped VM; finalize permanently discards its rollback disk, even while running."},
@@ -3067,8 +3067,12 @@ func (a *App) cmdRestore(ctx context.Context, actor model.Actor, args []string, 
 }
 
 func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
+	discardState := len(args) > 2 && args[2] == "--discard-state"
+	if discardState {
+		args = append(args[:2:2], args[3:]...)
+	}
 	if len(args) != 2 && len(args) != 8 {
-		err := errors.New("usage: start <name>")
+		err := errors.New("usage: start <name> [--discard-state]")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
@@ -3086,7 +3090,7 @@ func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, ou
 		return cleanupError(err)
 	}
 
-	inst, err := a.provisioner.Start(ctx, args[1])
+	inst, err := a.provisioner.StartWithOptions(ctx, args[1], provision.StartOptions{DiscardState: discardState})
 	if err != nil {
 		if len(args) == 8 && errors.Is(err, provision.ErrStartRejected) {
 			if persistErr := a.store.RejectLifecycleStart(ctx, args[3], actor.UserLogin); persistErr != nil {
@@ -3109,8 +3113,12 @@ func (a *App) cmdStart(ctx context.Context, actor model.Actor, args []string, ou
 }
 
 func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
+	saveState := len(args) > 2 && args[2] == "--save-state"
+	if saveState {
+		args = append(args[:2:2], args[3:]...)
+	}
 	if len(args) != 2 && len(args) != 8 {
-		err := errors.New("usage: stop <name>")
+		err := errors.New("usage: stop <name> [--save-state]")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 
@@ -3128,7 +3136,7 @@ func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string, out
 		return cleanupError(err)
 	}
 
-	inst, err := a.provisioner.Stop(ctx, args[1])
+	inst, err := a.provisioner.StopWithOptions(ctx, args[1], provision.StopOptions{SaveState: saveState})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = fmt.Errorf("instance %q does not exist", args[1])
@@ -3138,7 +3146,7 @@ func (a *App) cmdStop(ctx context.Context, actor model.Actor, args []string, out
 	if err := a.finishOrbOperation(ctx, actor, args[2:]); err != nil {
 		return cleanupError(err)
 	}
-	if a.cfg.ColdStorageAfterStop && a.cfg.ColdStorageHost != "" {
+	if !saveState && a.cfg.ColdStorageAfterStop && a.cfg.ColdStorageHost != "" {
 		if _, err := a.provisioner.ColdDisk(ctx, inst.Name, "offload"); err != nil {
 			a.log.Warn("cold disk offload after stop failed; stop succeeded", "name", inst.Name, "err", err)
 		}

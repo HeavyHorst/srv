@@ -326,8 +326,22 @@ func (p *Provisioner) diskMutationFence(ctx context.Context, inst model.Instance
 	if err != nil {
 		return err
 	}
+	if err := p.ramStateFence(inst.Name); err != nil {
+		return err
+	}
 	if err := absentPath(filepath.Join(dir, "disk-migration.json")); err != nil {
 		return fmt.Errorf("disk migration recovery required before mutation: %w", err)
 	}
 	return p.hydrateColdDisk(ctx, inst)
+}
+
+func (p *Provisioner) ramStateFence(name string) error {
+	dir, err := p.instanceDir(name)
+	if err != nil {
+		return err
+	}
+	if err := absentPath(filepath.Join(dir, "ram-state")); err != nil {
+		return fmt.Errorf("saved RAM requires an unchanged disk; start %s (or start %s --discard-state), then stop before modifying it: %w", name, name, err)
+	}
+	return nil
 }

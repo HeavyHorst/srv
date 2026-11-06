@@ -277,6 +277,23 @@ func TestReceiptRuntimeProcess(t *testing.T) {
 		os.Exit(2)
 	}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if stage := os.Getenv("SRV_RECEIPT_RAM_STAGE"); stage != "" {
+			switch r.URL.Path {
+			case "/machine-config":
+				_ = json.NewEncoder(w).Encode(map[string]int{"mem_size_mib": 1})
+				return
+			case "/snapshot/create":
+				for _, name := range []string{"memory", "vmstate"} {
+					if err := os.WriteFile(filepath.Join(stage, name), []byte("saved guest "+name), 0600); err != nil {
+						http.Error(w, err.Error(), 500)
+						return
+					}
+				}
+			case "/actions":
+				// Observable corruption if suspend accidentally runs guest shutdown.
+				_ = os.WriteFile(filepath.Join(filepath.Dir(path), "disk", "rootfs.img"), []byte("guest shutdown changed disk"), 0600)
+			}
+		}
 		w.WriteHeader(http.StatusNoContent)
 		if r.URL.Path == "/actions" {
 			go func() { time.Sleep(20 * time.Millisecond); os.Exit(0) }()
@@ -755,7 +772,7 @@ func TestManagedOldBootAcceptedReceiptCloses(t *testing.T) {
 	}
 }
 
-func startReceiptSocketProcess(t *testing.T, cfg ServerConfig, name string) (int, <-chan struct{}) {
+func startReceiptSocketProcess(t *testing.T, cfg ServerConfig, name string, env ...string) (int, <-chan struct{}) {
 	t.Helper()
 	dir := filepath.Join(cfg.InstancesDir, name)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -764,6 +781,7 @@ func startReceiptSocketProcess(t *testing.T, cfg ServerConfig, name string) (int
 	path := filepath.Join(dir, "firecracker.sock")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestReceiptRuntimeProcess$")
 	cmd.Env = append(os.Environ(), "SRV_RECEIPT_TEST_SOCKET="+path)
+	cmd.Env = append(cmd.Env, env...)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

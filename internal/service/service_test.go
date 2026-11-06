@@ -38,6 +38,72 @@ import (
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
+func TestStopSaveStateCommand(t *testing.T) {
+	for _, save := range []bool{false, true} {
+		t.Run(strconv.FormatBool(save), func(t *testing.T) {
+			ctx := context.Background()
+			st := newServiceTestStore(t)
+			inst := serviceTestInstance("saved-orb", model.StateReady, time.Now().UTC())
+			inst.Kind = model.KindOrb
+			inst.StartRequestID, inst.StartBootID, inst.FirecrackerPID = "start-attempt", "host-boot", os.Getpid()
+			if err := st.CreateInstance(ctx, inst); err != nil {
+				t.Fatal(err)
+			}
+			dir, err := os.MkdirTemp("", "srv-ram-cli-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+			socket := filepath.Join(dir, "helper.sock")
+			ln, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/vm/start-result":
+					_ = json.NewEncoder(w).Encode(vmrunner.StartResponse{Outcome: vmrunner.StartRunning, PID: os.Getpid()})
+				case "/vm/stop", "/vm/stop-state-v1":
+					var req vmrunner.StopRequest
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						t.Error(err)
+					}
+					if req.SaveState != save || req.InstanceID != inst.ID || (r.URL.Path == "/vm/stop-state-v1") != save {
+						t.Errorf("wrong stop contract: %s %+v", r.URL.Path, req)
+					}
+					w.WriteHeader(http.StatusNoContent)
+				case "/network/cleanup-v2":
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Errorf("unexpected operation: %s", r.URL.Path)
+					http.Error(w, "unexpected", 500)
+				}
+			})}
+			go server.Serve(ln)
+			t.Cleanup(func() { _ = server.Close() })
+			cfg := loadServiceTestConfig(t, nil)
+			cfg.VMRunnerSocketPath, cfg.NetHelperSocketPath = socket, socket
+			app := &App{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			app.provisioner, err = provision.New(cfg, app.log, st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"stop", inst.Name}
+			if save {
+				args = append(args, "--save-state")
+			}
+			result, err := app.dispatch(ctx, model.Actor{UserLogin: inst.CreatedByUser}, commandRequest{args: args})
+			if err != nil || result.exitCode != 0 {
+				t.Fatalf("stop: %+v %v", result, err)
+			}
+			got, err := st.GetInstance(ctx, inst.Name)
+			if err != nil || got.State != model.StateStopped || got.FirecrackerPID != 0 {
+				t.Fatalf("stop state: %+v %v", got, err)
+			}
+		})
+	}
+}
+
 func TestNewRejectsUnsupportedStorageBeforeWritingState(t *testing.T) {
 	cfg := loadServiceTestConfig(t, nil)
 	dir := cfg.DataDirAbs()

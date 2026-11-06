@@ -49,8 +49,8 @@ credentials are JSON on stdin, never command arguments; it does not accept `--js
 
 | Command | Description |
 |---------|-------------|
-| `start <name>` | Start a stopped instance, or recheck readiness in `awaiting-tailnet` / `awaiting-guest` |
-| `stop <name>` | Stop a running VM (graceful shutdown) |
+| `start <name> [--discard-state]` | Resume saved RAM automatically; optionally discard it and cold boot. Also rechecks readiness in `awaiting-tailnet` / `awaiting-guest` |
+| `stop <name> [--save-state]` | Graceful shutdown by default; optionally save RAM and device state for one resume |
 | `restart <name>` | Stop and start a VM |
 | `fsck <name>` | Force-check and repair the rootfs of a stopped VM |
 | `delete <name>` | Delete an instance's runtime, network, and local/cold disk allocation |

@@ -899,7 +899,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	if err := validateStartRuntimeFiles(bootConfig, paths); err != nil {
 		return StartResponse{}, err
 	}
-	resume, err := s.checkRAMState(req)
+	resume, err := s.checkRAMState(ctx, req)
 	if err != nil {
 		return StartResponse{}, err
 	}

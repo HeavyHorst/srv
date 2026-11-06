@@ -9,7 +9,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
@@ -20,10 +23,11 @@ import (
 // A suspend image belongs to one incarnation and one stopped attempt. It is
 // never a template or a backup: the disk must remain exactly as it was paused.
 type ramState struct {
-	Attempt StartResultRequest
-	Config  string
-	Disk    fileStamp
-	Binary  string
+	Attempt         StartResultRequest
+	Config          string
+	Disk            fileStamp
+	Binary          string
+	SnapshotVersion string
 }
 
 type fileStamp struct {
@@ -140,6 +144,29 @@ func ramBinaryDigest(f *os.File) (string, error) {
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
+var snapshotVersionOutput = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// Execute the opened inode, not its installation path. ExtraFiles keeps it
+// available even when the producer exits or the installed binary is replaced.
+// Firecracker prints v<snapshot-format-version>; compare it exactly, not by
+// Firecracker release or a semver compatibility heuristic.
+func ramSnapshotVersion(ctx context.Context, binary *os.File) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/proc/self/fd/3", "--snapshot-version")
+	cmd.ExtraFiles = []*os.File{binary}
+	cmd.WaitDelay = time.Second
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("query Firecracker snapshot format: %w", err)
+	}
+	version := strings.TrimSpace(string(out))
+	if !snapshotVersionOutput.MatchString(version) {
+		return "", fmt.Errorf("invalid Firecracker snapshot format output: %q", version)
+	}
+	return version, nil
+}
+
 // Called while holding the lifecycle lock and a verified pidfd. Persist the
 // complete image before killing the paused VM; retries never resume the source.
 func (s *Server) saveRAMState(ctx context.Context, r startReceipt) error {
@@ -190,6 +217,19 @@ func (s *Server) saveRAMState(ctx context.Context, r startReceipt) error {
 	if cfg.MemoryMiB <= 0 || uint64(cfg.MemoryMiB+256)*uint64(miBBytes) > space.Bavail*uint64(space.Bsize) {
 		return errors.New("insufficient disk space for full RAM state plus 256 MiB headroom")
 	}
+	runningBinary, err := os.Open(fmt.Sprintf("/proc/%d/exe", r.PID))
+	if err != nil {
+		return err
+	}
+	version, err := ramSnapshotVersion(ctx, runningBinary)
+	if err != nil {
+		runningBinary.Close()
+		return err
+	}
+	binary, err := ramBinaryDigest(runningBinary)
+	if err != nil {
+		return err
+	}
 	if err := s.doFirecrackerAPIRequest(ctx, socket, http.MethodPatch, "/vm", map[string]string{"state": "Paused"}, http.StatusNoContent, nil); err != nil {
 		return err
 	}
@@ -198,16 +238,8 @@ func (s *Server) saveRAMState(ctx context.Context, r startReceipt) error {
 	}, http.StatusNoContent, nil); err != nil {
 		return fmt.Errorf("VM remains paused; retry stop to finish saving RAM: %w", err)
 	}
-	state = &ramState{Attempt: r.StartResultRequest, Config: r.ResumeConfig}
+	state = &ramState{Attempt: r.StartResultRequest, Config: r.ResumeConfig, Binary: binary, SnapshotVersion: version}
 	state.Disk, err = stampFile(filepath.Join(s.config.InstancesDir, r.Name, "disk", "rootfs.img"))
-	if err != nil {
-		return err
-	}
-	runningBinary, err := os.Open(fmt.Sprintf("/proc/%d/exe", r.PID))
-	if err != nil {
-		return err
-	}
-	state.Binary, err = ramBinaryDigest(runningBinary)
 	if err != nil {
 		return err
 	}
@@ -231,7 +263,7 @@ func (s *Server) saveRAMState(ctx context.Context, r startReceipt) error {
 	return errors.Join(syncDirectory(jail.RootDir), syncDirectory(filepath.Join(s.config.InstancesDir, r.Name)))
 }
 
-func (s *Server) checkRAMState(req StartRequest) (*ramState, error) {
+func (s *Server) checkRAMState(ctx context.Context, req StartRequest) (*ramState, error) {
 	if req.DiscardState {
 		return nil, s.discardRAMState(req.Name)
 	}
@@ -253,16 +285,25 @@ func (s *Server) checkRAMState(req StartRequest) (*ramState, error) {
 	if err != nil {
 		return nil, err
 	}
+	if disk != state.Disk {
+		return nil, errors.New("disk changed since suspend; use start --discard-state")
+	}
+	if state.SnapshotVersion == "" {
+		s.log.Warn("discarding RAM snapshot; cold boot with existing disk", "name", req.Name, "reason", "snapshot manifest has no format version")
+		return nil, s.discardRAMState(req.Name)
+	}
 	f, err := storage.OpenNoSymlinks(s.config.FirecrackerBinary, unix.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
-	binary, err := ramBinaryDigest(f)
+	defer f.Close()
+	version, err := ramSnapshotVersion(ctx, f)
 	if err != nil {
 		return nil, err
 	}
-	if disk != state.Disk || binary != state.Binary {
-		return nil, errors.New("disk or Firecracker changed since suspend; use start --discard-state")
+	if version != state.SnapshotVersion {
+		s.log.Warn("discarding RAM snapshot; cold boot with existing disk", "name", req.Name, "reason", "Firecracker snapshot format mismatch", "saved_format", state.SnapshotVersion, "installed_format", version)
+		return nil, s.discardRAMState(req.Name)
 	}
 	return state, nil
 }

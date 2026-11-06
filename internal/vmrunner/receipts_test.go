@@ -282,6 +282,13 @@ func TestReceiptRuntimeProcess(t *testing.T) {
 			case "/machine-config":
 				_ = json.NewEncoder(w).Encode(map[string]int{"mem_size_mib": 1})
 				return
+			case "/vm":
+				if marker := os.Getenv("SRV_RECEIPT_PAUSE_MARKER"); marker != "" {
+					if err := os.WriteFile(marker, []byte("paused"), 0600); err != nil {
+						http.Error(w, err.Error(), 500)
+						return
+					}
+				}
 			case "/snapshot/create":
 				for _, name := range []string{"memory", "vmstate"} {
 					if err := os.WriteFile(filepath.Join(stage, name), []byte("saved guest "+name), 0600); err != nil {

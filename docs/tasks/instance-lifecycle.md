@@ -133,11 +133,30 @@ state intact and require an explicit `--discard-state` to proceed. A cold start
 with that flag removes the saved state as well.
 
 Resume requires the same host, unchanged disk and VM configuration, and compatible
-host software. A different Firecracker binary is rejected by comparing its content
-with the executable that produced the snapshot, even if it was upgraded while the
-VM was running. Existing network connections may break, and vsock connections are
-reset; applications must reconnect. The guest needs clock synchronization after a
-long pause.
+host software. Save records `--snapshot-version` from the producing executable
+opened through `/proc/PID/exe`, even if the installed Firecracker was replaced
+while the VM was running. Start uses the currently installed binary. Its snapshot
+format must match exactly; a changed SHA256 is allowed, but no compatibility is
+inferred from Firecracker release numbers or semver ranges. Old binaries are not
+retained.
+
+A different snapshot format causes start to delete the saved RAM and cold boot
+with the existing disk. Older manifests without a format version receive the same
+treatment, even if the recorded binary digest still matches. The runner logs a
+warning with the reason (and both versions for a format mismatch). Configuration,
+source-receipt and disk checks run first; their failures preserve the saved state.
+A failed or malformed version query also preserves it and rejects start. Unexpected
+restore failures remain quarantined, without an automatic cold fallback.
+
+Do not replace the installed Firecracker during a start operation. The version
+probe holds its executable open, but the jailer subsequently opens the installation
+path again. An upgrade between those steps can turn a compatible admission into
+a failed restore and quarantine; srv does not lock the host's package manager.
+
+Matching formats do not guarantee host-kernel/KVM compatibility. Host upgrades can
+still prevent restore. Existing network connections may break, and vsock
+connections are reset; applications must reconnect. The guest needs clock
+synchronization after a long pause.
 
 The saved files disappear on resume. Firecracker still holds a private memory
 mapping of the unlinked RAM file, so its disk blocks remain allocated until that

@@ -488,7 +488,7 @@ func (s *Server) receiptStart(ctx context.Context, req StartRequest) (StartRespo
 			return StartResponse{}, err
 		}
 	}
-	if _, err := s.checkRAMState(req); err != nil {
+	if _, err := s.checkRAMState(ctx, req); err != nil {
 		if writeErr := s.writeReceipt(*r); writeErr != nil {
 			return StartResponse{}, errors.Join(err, writeErr)
 		}

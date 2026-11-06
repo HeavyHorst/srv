@@ -38,7 +38,12 @@ snapshots are unchanged.
 Common `inspect`, `start`, `stop`, `delete` and capacity commands still
 operate on both kinds. The same list separation applies through srv-front.
 
-There is **no RAM suspend or automatic migration**. New orbs reuse a known
+Amp pause does not request RAM suspend, and there is no automatic migration.
+Manual `stop --save-state` and `start` use the same
+[single-use RAM state](../tasks/instance-lifecycle.md#save-ram-before-stopping)
+as ordinary VMs, including exact Firecracker snapshot-format matching and a cold
+boot with the existing disk when the format changes or is missing from the manifest.
+New orbs reuse a known
 `ORB_SNAPSHOT_ID` on its recorded backend; unknown IDs fall back to the base
 image. Existing orbs always retain their own disk and use Amp's resume workflow. Processes, Terminal
 sessions and in-memory state do not survive a pause. Let Amp manage development

@@ -336,18 +336,17 @@ func TestCreateBalloonDeviceEnablesFreePageReporting(t *testing.T) {
 func TestDesiredBalloonTargetMiB(t *testing.T) {
 	tests := []struct {
 		name          string
-		residentBytes int64
 		stats         firecrackerBalloonStats
 		wantTargetMiB int64
 		wantStepMiB   int64
 		wantOK        bool
 	}{
 		{
-			name:          "reclaims conservative slack",
-			residentBytes: 640 * miBBytes,
+			name: "reclaims conservative slack",
 			stats: firecrackerBalloonStats{
 				TargetMiB:       int64Ptr(0),
-				AvailableMemory: 640 * miBBytes,
+				ActualMiB:       int64Ptr(0),
+				AvailableMemory: int64Ptr(640 * miBBytes),
 				TotalMemory:     1024 * miBBytes,
 			},
 			wantTargetMiB: 384,
@@ -355,33 +354,30 @@ func TestDesiredBalloonTargetMiB(t *testing.T) {
 			wantOK:        true,
 		},
 		{
-			name:          "counts current target as already reclaimed resident memory",
-			residentBytes: 300 * miBBytes,
+			name: "adds remaining slack to actual balloon subject to cap",
 			stats: firecrackerBalloonStats{
 				TargetMiB:       int64Ptr(128),
-				AvailableMemory: 700 * miBBytes,
+				ActualMiB:       int64Ptr(128),
+				AvailableMemory: int64Ptr(700 * miBBytes),
 				TotalMemory:     1024 * miBBytes,
 			},
-			wantTargetMiB: 128,
+			wantTargetMiB: 512,
 			wantStepMiB:   64,
 			wantOK:        true,
 		},
 		{
-			name:          "falls back to free memory plus disk caches",
-			residentBytes: 768 * miBBytes,
+			name: "does not estimate missing available from free plus caches",
 			stats: firecrackerBalloonStats{
 				TargetMiB:   int64Ptr(0),
+				ActualMiB:   int64Ptr(0),
 				FreeMemory:  256 * miBBytes,
 				DiskCaches:  384 * miBBytes,
 				TotalMemory: 1024 * miBBytes,
 			},
-			wantTargetMiB: 384,
-			wantStepMiB:   64,
-			wantOK:        true,
+			wantOK: false,
 		},
 		{
-			name:          "skips when total guest memory is unavailable",
-			residentBytes: 768 * miBBytes,
+			name: "skips when total guest memory is unavailable",
 			stats: firecrackerBalloonStats{
 				TargetMiB: int64Ptr(0),
 			},
@@ -391,7 +387,7 @@ func TestDesiredBalloonTargetMiB(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotTargetMiB, gotStepMiB, gotOK := desiredBalloonTargetMiB(tc.residentBytes, tc.stats)
+			gotTargetMiB, gotStepMiB, gotOK := desiredBalloonTargetMiB(tc.stats)
 			if gotOK != tc.wantOK {
 				t.Fatalf("desiredBalloonTargetMiB() ok = %v, want %v", gotOK, tc.wantOK)
 			}
@@ -492,6 +488,57 @@ func TestReconcileBalloonUpdatesTarget(t *testing.T) {
 	}
 	if patchedAmountMiB != 384 {
 		t.Fatalf("patched amount_mib = %d, want 384", patchedAmountMiB)
+	}
+}
+
+func TestBalloonSettledAndPendingTargets(t *testing.T) {
+	server := NewServer(nil, ServerConfig{})
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "memory.current"), []byte("1073741824"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	vm := balloonVM{Name: "demo", CgroupPath: dir, SocketPath: filepath.Join(dir, "fc.sock"), UseTarget: true}
+	var sample string
+	var target int64
+	listener, err := net.Listen("unix", vm.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			io.WriteString(w, sample)
+			return
+		}
+		var body struct {
+			Amount int64 `json:"amount_mib"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		target = body.Amount
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go h.Serve(listener)
+	t.Cleanup(func() { h.Close(); server.closeFirecrackerClient(vm.SocketPath) })
+	for _, tc := range []struct {
+		name, sample  string
+		current, want int64
+	}{
+		{"incremental", `{"actual_mib":256,"target_mib":256,"available_memory":536870912,"total_memory":2147483648}`, 256, 512},
+		{"settled", `{"actual_mib":512,"target_mib":512,"available_memory":268435456,"total_memory":2147483648}`, 512, 512},
+		{"pending", `{"actual_mib":256,"target_mib":512,"available_memory":1073741824,"total_memory":2147483648}`, 512, 512},
+		{"zero available", `{"actual_mib":512,"target_mib":512,"available_memory":0,"free_memory":536870912,"disk_caches":536870912,"total_memory":2147483648}`, 512, 256},
+		{"missing available", `{"actual_mib":256,"target_mib":256,"free_memory":536870912,"disk_caches":536870912,"total_memory":2147483648}`, 256, 256},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sample, target = tc.sample, tc.current
+			if err := server.reconcileBalloon(context.Background(), vm); err != nil {
+				t.Fatal(err)
+			}
+			if target != tc.want {
+				t.Fatalf("target = %d, want %d", target, tc.want)
+			}
+		})
 	}
 }
 

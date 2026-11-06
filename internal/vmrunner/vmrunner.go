@@ -341,7 +341,7 @@ type runningVM struct {
 
 type firecrackerBalloonStats struct {
 	ActualMiB       *int64 `json:"actual_mib"`
-	AvailableMemory int64  `json:"available_memory,omitempty"`
+	AvailableMemory *int64 `json:"available_memory,omitempty"`
 	DiskCaches      int64  `json:"disk_caches,omitempty"`
 	FreeMemory      int64  `json:"free_memory,omitempty"`
 	TargetMiB       *int64 `json:"target_mib"`
@@ -588,7 +588,7 @@ func (s *Server) reconcileBalloon(ctx context.Context, vm balloonVM) error {
 	stepMiB := int64(1)
 	ok := stats.TargetMiB != nil
 	if vm.UseTarget {
-		desiredTargetMiB, stepMiB, ok = desiredBalloonTargetMiB(residentBytes, stats)
+		desiredTargetMiB, stepMiB, ok = desiredBalloonTargetMiB(stats)
 	}
 	if !ok {
 		return nil
@@ -615,30 +615,31 @@ func (s *Server) reconcileBalloon(ctx context.Context, vm balloonVM) error {
 	return nil
 }
 
-func desiredBalloonTargetMiB(residentBytes int64, stats firecrackerBalloonStats) (int64, int64, bool) {
-	if stats.TargetMiB == nil || stats.TotalMemory < 1 {
+func desiredBalloonTargetMiB(stats firecrackerBalloonStats) (int64, int64, bool) {
+	if stats.TargetMiB == nil || stats.ActualMiB == nil || stats.AvailableMemory == nil || stats.TotalMemory < 1 {
+		return 0, 0, false
+	}
+	if *stats.TargetMiB < 0 || *stats.ActualMiB < 0 || *stats.AvailableMemory < 0 || *stats.AvailableMemory > stats.TotalMemory {
 		return 0, 0, false
 	}
 	guestTotalMiB := bytesToMiBCeil(stats.TotalMemory)
-	if guestTotalMiB < 1 {
+	if *stats.ActualMiB > guestTotalMiB || *stats.TargetMiB > guestTotalMiB {
 		return 0, 0, false
 	}
 	headroomMiB := maxInt64(balloonGuestHeadroomFloorMiB, guestTotalMiB/balloonGuestHeadroomDivisor)
-	availableBytes := stats.AvailableMemory
-	if availableBytes <= 0 {
-		availableBytes = stats.FreeMemory + stats.DiskCaches
-	}
-	if availableBytes < 0 {
-		availableBytes = 0
-	}
-	reclaimableGuestMiB := maxInt64(bytesToMiBFloor(availableBytes)-headroomMiB, 0)
-	currentTargetMiB := maxInt64(*stats.TargetMiB, 0)
-	reclaimableResidentMiB := maxInt64(bytesToMiBFloor(residentBytes)+currentTargetMiB-headroomMiB, 0)
+	// Available is remaining guest slack, not an absolute balloon target. Host
+	// memory.current is not a reclaim bound: reporting may already have discarded
+	// these pages, and the cgroup also includes cache and VMM overhead.
+	desiredTargetMiB := maxInt64(0, *stats.ActualMiB+bytesToMiBFloor(*stats.AvailableMemory)-headroomMiB)
 	maxTargetMiB := maxInt64(guestTotalMiB/balloonMaxTargetDivisor, 1)
 	stepMiB := balloonAdjustmentStepMiB(guestTotalMiB)
-	desiredTargetMiB := minInt64(reclaimableGuestMiB, reclaimableResidentMiB)
 	desiredTargetMiB = minInt64(desiredTargetMiB, maxTargetMiB)
 	desiredTargetMiB = roundDownToMultiple(desiredTargetMiB, stepMiB)
+	// Never pile a new increase onto an unfinished adjustment. A lower safety
+	// bound may still cancel inflation or return memory to a pressured guest.
+	if *stats.ActualMiB != *stats.TargetMiB {
+		desiredTargetMiB = minInt64(desiredTargetMiB, *stats.TargetMiB)
+	}
 	return desiredTargetMiB, stepMiB, true
 }
 

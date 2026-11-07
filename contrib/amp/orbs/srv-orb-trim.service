@@ -1,0 +1,18 @@
+[Unit]
+Description=Best-effort root filesystem trim before Orb shutdown
+# Start before ordinary services so shutdown trims after they have stopped,
+# but while the root filesystem is still writable.
+DefaultDependencies=no
+After=local-fs.target
+Before=basic.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=-fstrim --verbose /
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target

@@ -393,9 +393,11 @@ configure_rootfs() {
 	if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
 		install -D -m 0755 "${SCRIPT_DIR}/../../contrib/amp/orbs/guest-agent.py" "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/orb-guest.py"
 		install -D -m 0644 "${SCRIPT_DIR}/../../contrib/amp/orbs/srv-orb-guest.service" "${ROOTFS_MOUNT_DIR}/etc/systemd/system/srv-orb-guest.service"
+		install -D -m 0644 "${SCRIPT_DIR}/../../contrib/amp/orbs/fstrim.timer.conf" "${ROOTFS_MOUNT_DIR}/etc/systemd/system/fstrim.timer.d/orb.conf"
+		install -D -m 0644 "${SCRIPT_DIR}/../../contrib/amp/orbs/srv-orb-trim.service" "${ROOTFS_MOUNT_DIR}/etc/systemd/system/srv-orb-trim.service"
 		rm -f "${ROOTFS_MOUNT_DIR}/etc/systemd/system/srv-bootstrap.service"
 		systemctl --root="${ROOTFS_MOUNT_DIR}" mask srv-bootstrap.service >/dev/null
-		systemctl --root="${ROOTFS_MOUNT_DIR}" enable srv-orb-guest.service >/dev/null
+		systemctl --root="${ROOTFS_MOUNT_DIR}" enable srv-orb-guest.service srv-orb-trim.service >/dev/null
 	else
 		systemctl --root="${ROOTFS_MOUNT_DIR}" enable tailscaled.service srv-bootstrap.service >/dev/null
 	fi

@@ -109,9 +109,11 @@ systemctl --root="$ROOT" enable systemd-resolved docker.socket fstrim.timer
 if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
   install -D -m 0755 "$SCRIPT_DIR/../../contrib/amp/orbs/guest-agent.py" "$ROOT/usr/local/lib/srv/orb-guest.py"
   install -D -m 0644 "$SCRIPT_DIR/../../contrib/amp/orbs/srv-orb-guest.service" "$ROOT/etc/systemd/system/srv-orb-guest.service"
+  install -D -m 0644 "$SCRIPT_DIR/../../contrib/amp/orbs/fstrim.timer.conf" "$ROOT/etc/systemd/system/fstrim.timer.d/orb.conf"
+  install -D -m 0644 "$SCRIPT_DIR/../../contrib/amp/orbs/srv-orb-trim.service" "$ROOT/etc/systemd/system/srv-orb-trim.service"
   rm -f "$ROOT/etc/systemd/system/srv-bootstrap.service"
   systemctl --root="$ROOT" mask srv-bootstrap.service
-  systemctl --root="$ROOT" enable srv-orb-guest.service
+  systemctl --root="$ROOT" enable srv-orb-guest.service srv-orb-trim.service
 else
   systemctl --root="$ROOT" enable tailscaled srv-bootstrap
 fi

@@ -1011,6 +1011,7 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	// Mounts must exist before the jailer creates its private mount namespace.
 	machine.Handlers.FcInit = machine.Handlers.FcInit.Remove(firecracker.CreateLogFilesHandlerName).
 		Prepend(prepareJailedRuntimeHandler(paths, jailerPaths, s.config.JailerGID))
+	machine.Handlers.FcInit = machine.Handlers.FcInit.Swap(s.attachDrivesHandler(paths.SocketPath))
 	if resume != nil {
 		if err := s.configureRAMRestore(machine, req, jailerPaths); err != nil {
 			return StartResponse{}, err
@@ -1053,6 +1054,28 @@ func (s *Server) startVM(ctx context.Context, req StartRequest) (StartResponse, 
 	}
 	cleanupRuntime = false
 	return StartResponse{PID: pid}, nil
+}
+
+// The SDK's Drive model predates discard. Keep its jail-adjusted paths,
+// but send the extra field ourselves. Retain the handler name so RAM
+// restore removes it along with the other cold-boot device setup.
+func (s *Server) attachDrivesHandler(socketPath string) firecracker.Handler {
+	return firecracker.Handler{
+		Name: firecracker.AttachDrivesHandlerName,
+		Fn: func(ctx context.Context, m *firecracker.Machine) error {
+			for _, drive := range m.Cfg.Drives {
+				drive.IoEngine = firecracker.String("Sync") // Discard requires synchronous I/O.
+				payload := struct {
+					models.Drive
+					Discard bool `json:"discard"`
+				}{Drive: drive, Discard: true}
+				if err := s.doFirecrackerAPIRequest(ctx, socketPath, http.MethodPut, "/drives/"+firecracker.StringValue(drive.DriveID), payload, http.StatusNoContent, nil); err != nil {
+					return fmt.Errorf("attach drive with discard: %w", err)
+				}
+			}
+			return nil
+		},
+	}
 }
 
 func newRootDrive(path string) models.Drive {

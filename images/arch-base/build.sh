@@ -388,6 +388,7 @@ configure_rootfs() {
 	arch-chroot "${ROOTFS_MOUNT_DIR}" chromium --version
 	systemctl --root="${ROOTFS_MOUNT_DIR}" enable \
 		docker.socket \
+		fstrim.timer \
 		systemd-resolved.service >/dev/null
 	if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
 		install -D -m 0755 "${SCRIPT_DIR}/../../contrib/amp/orbs/guest-agent.py" "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/orb-guest.py"

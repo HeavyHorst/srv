@@ -105,7 +105,7 @@ chroot "$ROOT" depmod "$KERNEL_RELEASE"
 cp -a "$OVERLAY/etc/." "$ROOT/etc/"
 install -D -m 0755 "$OVERLAY/usr/local/lib/srv/bootstrap.sh" "$ROOT/usr/local/lib/srv/bootstrap.sh"
 install -d "$ROOT/var/lib/srv"
-systemctl --root="$ROOT" enable systemd-resolved docker.socket
+systemctl --root="$ROOT" enable systemd-resolved docker.socket fstrim.timer
 if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
   install -D -m 0755 "$SCRIPT_DIR/../../contrib/amp/orbs/guest-agent.py" "$ROOT/usr/local/lib/srv/orb-guest.py"
   install -D -m 0644 "$SCRIPT_DIR/../../contrib/amp/orbs/srv-orb-guest.service" "$ROOT/etc/systemd/system/srv-orb-guest.service"

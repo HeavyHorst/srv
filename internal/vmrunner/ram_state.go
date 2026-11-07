@@ -160,7 +160,10 @@ func ramSnapshotVersion(ctx context.Context, binary *os.File) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("query Firecracker snapshot format: %w", err)
 	}
-	version := strings.TrimSpace(string(out))
+	// The version is the first line; recent Firecracker builds also print an
+	// exit log to stdout. Do not mistake that log for part of the format ID.
+	line, _, _ := strings.Cut(string(out), "\n")
+	version := strings.TrimSpace(line)
 	if !snapshotVersionOutput.MatchString(version) {
 		return "", fmt.Errorf("invalid Firecracker snapshot format output: %q", version)
 	}

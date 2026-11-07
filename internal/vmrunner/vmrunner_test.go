@@ -90,6 +90,96 @@ func TestNewRootDriveUsesWritebackCache(t *testing.T) {
 	}
 }
 
+func TestDriveAttachmentWithDiscard(t *testing.T) {
+	for _, mode := range []string{"cold-boot", "rejected", "ram-restore"} {
+		t.Run(mode, func(t *testing.T) {
+			root := shortReceiptDir(t)
+			s := NewServer(nil, ServerConfig{InstancesDir: root})
+			instance := filepath.Join(root, "demo")
+			if err := os.MkdirAll(instance, 0700); err != nil {
+				t.Fatal(err)
+			}
+			socket := filepath.Join(instance, "firecracker.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodies := make(chan map[string]any, 1)
+			api := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				wantPath := "/drives/rootfs"
+				if mode == "ram-restore" {
+					wantPath = "/snapshot/load" // A restore must not replace the saved device.
+				}
+				if r.Method != http.MethodPut || r.URL.Path != wantPath {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					http.Error(w, "unexpected device setup", http.StatusBadRequest)
+					return
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				bodies <- body
+				if mode == "rejected" {
+					http.Error(w, "discard unavailable", http.StatusBadRequest)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})}
+			go api.Serve(listener)
+			t.Cleanup(func() { api.Close(); s.closeFirecrackerClient(socket) })
+
+			m, err := firecracker.NewMachine(context.Background(), firecracker.Config{
+				Drives: []models.Drive{newRootDrive("/host/rootfs.img")},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.Handlers.FcInit = firecracker.HandlerList{}.Append(s.attachDrivesHandler(socket))
+			// The jail setup rewrites this after handler construction. Attachment
+			// must use the current machine config, not a captured host path.
+			m.Cfg.Drives[0].PathOnHost = firecracker.String("drive-0")
+			if mode == "ram-restore" {
+				if err := os.Mkdir(s.ramStateDir("demo"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.configureRAMRestore(m, StartRequest{Name: "demo"}, jailerRuntimePaths{RootDir: filepath.Join(root, "jail")}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = m.Handlers.FcInit.Run(context.Background(), m)
+			if mode == "rejected" {
+				if err == nil || !strings.Contains(err.Error(), "discard unavailable") {
+					t.Fatalf("drive rejection was not propagated: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case body := <-bodies:
+				if mode == "ram-restore" {
+					if body["snapshot_path"] != "ram-resume/vmstate" {
+						t.Fatalf("snapshot was not restored: %v", body)
+					}
+					return
+				}
+				want := map[string]any{
+					"drive_id": "rootfs", "path_on_host": "drive-0",
+					"is_root_device": true, "is_read_only": false,
+					"cache_type": "Writeback", "io_engine": "Sync", "discard": true,
+				}
+				if !reflect.DeepEqual(body, want) {
+					t.Fatalf("drive configuration = %#v, want %#v", body, want)
+				}
+			default:
+				t.Fatal("no device configuration received")
+			}
+		})
+	}
+}
+
 func TestClientAndServerOverUnixSocket(t *testing.T) {
 	valid := StartRequest{
 		KernelPath:  "/var/lib/srv/images/debian-base/vmlinux",

@@ -22,6 +22,7 @@ func TestMain(m *testing.M) {
 			os.Exit(2)
 		}
 		fmt.Println("v1.0.0")
+		fmt.Println("2026-11-07T09:30:55.867225122 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0")
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
@@ -175,7 +176,7 @@ func TestRAMStateLifecycle(t *testing.T) {
 				script := "#!/bin/sh\necho v1.0.1\n" // Even patch-level differences are incompatible.
 				switch mode {
 				case "compatible-update":
-					script = "#!/bin/sh\necho v1.0.0\n"
+					script = "#!/bin/sh\necho v1.0.0\necho '[anonymous-instance:main] Firecracker exiting successfully. exit_code=0'\n"
 				case "query-failure":
 					script = "#!/bin/sh\necho 'unexpected output'\n"
 				case "query-exit":

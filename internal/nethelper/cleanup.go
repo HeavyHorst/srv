@@ -268,6 +268,21 @@ func verifyNetworkAbsent(ctx context.Context, q CleanupRequest, output func(cont
 					return errors.New("null nft network proof rule")
 				}
 			}
+			omitSharedNFTPrefixes(value.Rules, prefix)
+			data, err = json.Marshal(value)
+			if err != nil {
+				return err
+			}
+		} else {
+			// iptables-save writes CIDRs as standalone arguments. Only a
+			// strict supernet is shared; exact allocations and host rules stay.
+			fields := strings.Fields(string(data))
+			for i, field := range fields {
+				if sharedFirewallPrefix(field, prefix) {
+					fields[i] = ""
+				}
+			}
+			data = []byte(strings.Join(fields, " "))
 		}
 		if ownedAddress.Match(data) {
 			return fmt.Errorf("network residual for %s", q.NetworkCIDR)
@@ -282,4 +297,37 @@ func verifyNetworkAbsent(ctx context.Context, q CleanupRequest, output func(cont
 		}
 	}
 	return nil
+}
+
+func sharedFirewallPrefix(text string, allocation netip.Prefix) bool {
+	prefix, err := netip.ParsePrefix(text)
+	return err == nil && prefix.Addr().Is4() && prefix == prefix.Masked() &&
+		prefix.Bits() < allocation.Bits() && prefix.Contains(allocation.Masked().Addr())
+}
+
+// nft represents CIDRs as {"prefix":{"addr":"172.28.0.0","len":15}}.
+// Remove only the address of a recognized shared prefix, never an enclosing
+// rule: that rule can still mention the VM's TAP or another owned address.
+func omitSharedNFTPrefixes(value any, allocation netip.Prefix) {
+	switch value := value.(type) {
+	case []map[string]any:
+		for _, child := range value {
+			omitSharedNFTPrefixes(child, allocation)
+		}
+	case []any:
+		for _, child := range value {
+			omitSharedNFTPrefixes(child, allocation)
+		}
+	case map[string]any:
+		if prefix, ok := value["prefix"].(map[string]any); ok && len(prefix) == 2 {
+			addr, addressOK := prefix["addr"].(string)
+			bits, bitsOK := prefix["len"].(float64)
+			if addressOK && bitsOK && sharedFirewallPrefix(fmt.Sprintf("%s/%v", addr, bits), allocation) {
+				prefix["addr"] = ""
+			}
+		}
+		for _, child := range value {
+			omitSharedNFTPrefixes(child, allocation)
+		}
+	}
 }

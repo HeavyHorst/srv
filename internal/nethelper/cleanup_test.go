@@ -320,3 +320,44 @@ func TestCleanupProofFindsIPv4InNATAndMappedAddresses(t *testing.T) {
 		})
 	}
 }
+
+func TestCleanupProofDistinguishesSharedFirewallPrefixes(t *testing.T) {
+	q := CleanupRequest{TapDevice: "tap-boards", NetworkCIDR: "172.28.0.0/30"}
+	for _, tc := range []struct {
+		name, tool, data string
+		residual         bool
+	}{
+		{"iptables shared", "iptables-save", "-A INPUT -s 172.28.0.0/15 -i tap+ -j ACCEPT", false},
+		{"iptables exact", "iptables-save", "-A INPUT -s 172.28.0.0/30 -j ACCEPT", true},
+		{"iptables narrower", "iptables-save", "-A INPUT -s 172.28.0.0/31 -j ACCEPT", true},
+		{"iptables shared with tap", "iptables-save", "-A INPUT -s 172.28.0.0/15 -i tap-boards -j ACCEPT", true},
+		{"iptables shared with host", "iptables-save", "-A INPUT -s 172.28.0.0/15 -d 172.28.0.2 -j ACCEPT", true},
+		{"nft shared", "nft", `{"nftables":[{"rule":{"expr":[{"match":{"right":{"set":[{"prefix":{"addr":"172.28.0.0","len":15}}]}}}]}}]}`, false},
+		{"nft exact", "nft", `{"nftables":[{"rule":{"prefix":{"addr":"172.28.0.0","len":30}}}]}`, true},
+		{"nft host", "nft", `{"nftables":[{"rule":{"prefix":{"addr":"172.28.0.2","len":32}}}]}`, true},
+		{"nft shared with tap", "nft", `{"nftables":[{"rule":{"prefix":{"addr":"172.28.0.0","len":15},"iifname":"tap-boards"}}]}`, true},
+		{"nft shared with host", "nft", `{"nftables":[{"rule":{"prefix":{"addr":"172.28.0.0","len":15},"addr":"172.28.0.2"}}]}`, true},
+		{"nft invalid length", "nft", `{"nftables":[{"rule":{"prefix":{"addr":"172.28.0.0","len":15.5}}}]}`, true},
+		{"nft unknown prefix", "nft", `{"nftables":[{"rule":{"prefix":{"addr":"172.28.0.0","len":"15"}}}]}`, true},
+		{"route remains conservative", "ip", `[{"dst":"172.28.0.0/15"}]`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyNetworkAbsent(context.Background(), q, func(_ context.Context, tool string, _ ...string) ([]byte, error) {
+				if tool == tc.tool {
+					return []byte(tc.data), nil
+				}
+				switch tool {
+				case "ip":
+					return []byte(`[]`), nil
+				case "nft":
+					return []byte(`{"nftables":[]}`), nil
+				default:
+					return nil, nil
+				}
+			})
+			if (err != nil) != tc.residual {
+				t.Fatalf("residual=%v: %v", tc.residual, err)
+			}
+		})
+	}
+}

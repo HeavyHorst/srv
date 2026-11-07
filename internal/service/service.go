@@ -1250,23 +1250,9 @@ func (a *App) cmdList(ctx context.Context, actor model.Actor, outFormat outputFo
 	if len(kinds) > 0 {
 		kind = kinds[0]
 	}
-	if a.provisioner != nil {
-		candidates, err := a.store.ListInstances(ctx, false)
-		if err != nil {
-			return commandResult{stderr: fmt.Sprintf("reconcile instances: %v\n", err), exitCode: 1}, err
-		}
-		for _, inst := range candidates {
-			if err := ctx.Err(); err != nil {
-				return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
-			}
-			unlock := a.lockInstance(inst.Name)
-			_, err := a.provisioner.ReconcileInstanceRuntime(ctx, inst.Name)
-			unlock()
-			if err != nil {
-				a.log.Warn("reconcile instance runtime", "name", inst.Name, "err", err)
-			}
-		}
-	}
+	// Listing also serves cross-host name resolution. Read persisted state only:
+	// an export's instance lock or a slow runtime helper must not stall inventory.
+	// Background reconciliation and inspect refresh runtime state separately.
 	instances, err := a.store.ListInstances(ctx, false)
 	if err != nil {
 		return commandResult{stderr: fmt.Sprintf("list instances: %v\n", err), exitCode: 1}, err

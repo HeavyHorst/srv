@@ -1232,7 +1232,7 @@ func TestCmdInspectAwaitingTailnetPointsToSerialLog(t *testing.T) {
 }
 
 func TestRuntimeReadersReloadAfterConcurrentLifecycleChange(t *testing.T) {
-	for _, command := range []string{"inspect", "list", "startup"} {
+	for _, command := range []string{"inspect", "startup"} {
 		t.Run(command, func(t *testing.T) {
 			ctx := context.Background()
 			st := newServiceTestStore(t)
@@ -1262,8 +1262,6 @@ func TestRuntimeReadersReloadAfterConcurrentLifecycleChange(t *testing.T) {
 				switch command {
 				case "inspect":
 					_, err = app.cmdInspect(ctx, model.Actor{UserLogin: "alice@example.com"}, []string{"inspect", inst.Name}, outputFormatJSON)
-				case "list":
-					_, err = app.cmdList(ctx, model.Actor{UserLogin: "alice@example.com"}, outputFormatJSON)
 				case "startup":
 					app.restoreInstances(ctx)
 				}
@@ -1316,6 +1314,75 @@ func TestRuntimeReadersReloadAfterConcurrentLifecycleChange(t *testing.T) {
 				t.Fatalf("reader overwrote newer lifecycle state: got %#v, want %#v", got, inst)
 			}
 		})
+	}
+}
+
+func TestCmdListReadsStoredStateDuringLifecycleOperation(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	cfg := loadServiceTestConfig(t, nil)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	prov, err := provision.New(cfg, logger, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: cfg, log: logger, store: st, provisioner: prov}
+	busy := serviceTestInstance("exporting", model.StateStopped, time.Now().UTC())
+	other := serviceTestInstance("other", model.StateReady, busy.CreatedAt.Add(time.Second))
+	other.Kind = model.KindOrb
+	// Listing must not reconcile even unlocked guests with an exited runtime.
+	other.FirecrackerPID = 1 << 30
+	for _, inst := range []model.Instance{busy, other} {
+		if err := st.CreateInstance(ctx, inst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unlock := app.lockInstance(busy.Name) // Held for the entire export stream.
+	defer unlock()
+	for _, tt := range []struct {
+		args []string
+		want []model.Instance
+	}{
+		{[]string{"list"}, []model.Instance{busy}},
+		{[]string{"list", "--all"}, []model.Instance{busy, other}},
+		// The Orb dispatcher uses this inventory before create, resume and pause.
+		{[]string{"orb", "list"}, []model.Instance{other}},
+	} {
+		done := make(chan struct{}, 1)
+		var result commandResult
+		var listErr error
+		go func() {
+			result, listErr = app.dispatch(ctx, model.Actor{UserLogin: busy.CreatedByUser}, commandRequest{args: tt.args, format: outputFormatJSON})
+			done <- struct{}{}
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%v blocked behind an unrelated lifecycle operation", tt.args)
+		}
+		if listErr != nil || result.exitCode != 0 {
+			t.Fatalf("%v: %+v, %v", tt.args, result, listErr)
+		}
+		var payload struct {
+			Instances []instanceSummaryJSON `json:"instances"`
+		}
+		if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.Instances) != len(tt.want) {
+			t.Fatalf("%v returned wrong inventory: %s", tt.args, result.stdout)
+		}
+		for i, inst := range tt.want {
+			if item := payload.Instances[i]; item.Name != inst.Name || item.State != inst.State {
+				t.Fatalf("list must report stored state for %s: %+v", inst.Name, item)
+			}
+		}
+	}
+	for _, inst := range []model.Instance{busy, other} {
+		got, err := st.GetInstance(ctx, inst.Name)
+		if err != nil || !reflect.DeepEqual(got, inst) {
+			t.Fatalf("list changed stored state: got %+v, want %+v, err=%v", got, inst, err)
+		}
 	}
 }
 

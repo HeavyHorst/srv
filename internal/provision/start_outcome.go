@@ -63,7 +63,7 @@ func (p *Provisioner) resolveRuntime(ctx context.Context, inst *model.Instance) 
 			inst.FirecrackerPID = 0
 			if inst.State != model.StateStopping && inst.State != model.StateDeleting {
 				inst.State = model.StateStopped
-				if inst.KindName() != model.KindOrb && !hasTailnetIdentity(*inst) {
+				if inst.GuestTailnet() && !hasTailnetIdentity(*inst) {
 					inst.State = model.StateFailed
 				}
 			}

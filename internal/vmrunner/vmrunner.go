@@ -89,9 +89,12 @@ var (
 var errProcessExitTimeout = errors.New("process did not exit before timeout")
 
 type Bootstrap struct {
-	Version             int      `json:"version"`
-	Hostname            string   `json:"hostname"`
-	EnrollmentNonce     string   `json:"enrollment_nonce,omitempty"`
+	Version         int    `json:"version"`
+	Hostname        string `json:"hostname"`
+	EnrollmentNonce string `json:"enrollment_nonce,omitempty"`
+	// Guests without Tailscale report BootNonce on serial once bootstrapped.
+	BootNonce           string   `json:"boot_nonce,omitempty"`
+	GuestNetwork        string   `json:"guest_network,omitempty"`
 	TailscaleAuthKey    string   `json:"tailscale_auth_key,omitempty"`
 	TailscaleControlURL string   `json:"tailscale_control_url,omitempty"`
 	TailscaleTags       []string `json:"tailscale_tags,omitempty"`

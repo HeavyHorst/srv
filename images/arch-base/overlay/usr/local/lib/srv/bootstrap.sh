@@ -272,6 +272,8 @@ fi
 hostname_value="$(jq -er '.srv.hostname' "${METADATA_FILE}")"
 auth_key="$(jq -r '.srv.tailscale_auth_key // empty' "${METADATA_FILE}")"
 enrollment_nonce="$(jq -r '.srv.enrollment_nonce // empty' "${METADATA_FILE}")"
+boot_nonce="$(jq -r '.srv.boot_nonce // empty' "${METADATA_FILE}")"
+guest_network="$(jq -r '.srv.guest_network // empty' "${METADATA_FILE}")"
 control_url="$(jq -r '.srv.tailscale_control_url // empty' "${METADATA_FILE}")"
 zen_gateway_port="$(jq -r '.srv.zen_gateway_port // empty' "${METADATA_FILE}")"
 deepseek_gateway_port="$(jq -r '.srv.deepseek_gateway_port // empty' "${METADATA_FILE}")"
@@ -310,6 +312,36 @@ fi
 # The cloned rootfs may carry restrictive ownership from the image build; keep
 # bootstrapping moving even if we can only set the transient hostname.
 hostnamectl set-hostname --transient "${hostname_value}"
+if [[ -n "${guest_network}" ]]; then
+	# This guest must not join a tailnet, even when the image includes Tailscale.
+	if systemctl cat tailscaled.service >/dev/null 2>&1; then
+		systemctl mask --runtime --now tailscaled.service
+	fi
+	ssh_unit=""
+	for unit in sshd.service ssh.service; do
+		if systemctl cat "${unit}" >/dev/null 2>&1; then
+			ssh_unit="${unit}"
+			break
+		fi
+	done
+	if [[ -z "${ssh_unit}" ]] || ! command -v ssh-keygen >/dev/null; then
+		error="guest network ${guest_network} requires an OpenSSH server in the image"
+		echo "srv-bootstrap: ${error}" >&2
+		# Tell the host this attempt cannot become ready, instead of timing out.
+		printf 'srv-boot: %s\n' "$(jq -cn --arg nonce "${boot_nonce}" --arg error "${error}" '{nonce:$nonce,error:$error}')" >/dev/ttyS0
+		exit 1
+	fi
+	# Host keys are per guest: images and templates ship without them.
+	ssh-keygen -A
+	systemctl restart "${ssh_unit}"
+	host_key="$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $2}')"
+	date --iso-8601=seconds >"${DONE_FILE}"
+	chmod 0600 "${DONE_FILE}"
+	# The host binds this serial-channel report to this launch attempt.
+	printf 'srv-boot: %s\n' "$(jq -cn --arg nonce "${boot_nonce}" --arg key "${host_key}" '{nonce:$nonce,ssh_host_key:$key}')" >/dev/ttyS0
+	log "bootstrap completed successfully without tailnet"
+	exit 0
+fi
 systemctl start tailscaled.service
 
 if [[ -n "${auth_key}" ]]; then

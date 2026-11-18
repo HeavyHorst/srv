@@ -517,6 +517,7 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, []string, err
 		seenPool       bool
 		seenRootFSSize bool
 		seenImage      bool
+		seenNetwork    bool
 	)
 
 	for i := 1; i < len(args); i++ {
@@ -545,6 +546,19 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, []string, err
 			}
 			seenImage = true
 			opts.Image = value
+		case "--guest-network":
+			if seenNetwork {
+				return "", provision.CreateOptions{}, nil, fmt.Errorf("%s specified more than once\n%s", key, newUsage())
+			}
+			seenNetwork = true
+			switch value {
+			case "tailnet":
+				opts.GuestNetwork = model.GuestNetworkTailnet
+			case model.GuestNetworkHost:
+				opts.GuestNetwork = value
+			default:
+				return "", provision.CreateOptions{}, nil, fmt.Errorf("--guest-network must be tailnet or host\n%s", newUsage())
+			}
 		case "--template":
 			if opts.Template != "" || !validIntegrationName.MatchString(value) {
 				return "", provision.CreateOptions{}, nil, errors.New("--template requires one valid project template ID")

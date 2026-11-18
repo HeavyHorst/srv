@@ -98,6 +98,7 @@ type commandActionJSON struct {
 type instanceSummaryJSON struct {
 	Name            string `json:"name"`
 	Kind            string `json:"kind"`
+	GuestNetwork    string `json:"guest_network,omitempty"`
 	Image           string `json:"image"`
 	State           string `json:"state"`
 	MigrationPhase  string `json:"migration_phase,omitempty"`
@@ -125,6 +126,7 @@ type inspectInstanceJSON struct {
 	BootstrapGeneration *int64          `json:"bootstrap_generation,omitempty"`
 	Name                string          `json:"name"`
 	Kind                string          `json:"kind"`
+	GuestNetwork        string          `json:"guest_network,omitempty"`
 	Image               string          `json:"image"`
 	State               string          `json:"state"`
 	MigrationPhase      string          `json:"migration_phase,omitempty"`
@@ -343,6 +345,7 @@ func instanceSummaryPayload(cfg config.Config, inst model.Instance, includeConne
 	payload := instanceSummaryJSON{
 		Name:            inst.Name,
 		Kind:            inst.KindName(),
+		GuestNetwork:    inst.GuestNetwork,
 		Image:           inst.ImageName(),
 		State:           inst.State,
 		VCPUCount:       effectiveInstanceVCPUCount(inst, cfg),
@@ -353,7 +356,7 @@ func instanceSummaryPayload(cfg config.Config, inst model.Instance, includeConne
 		TailscaleName:   inst.TailscaleName,
 		TailscaleIP:     inst.TailscaleIP,
 	}
-	if includeConnect && inst.KindName() == model.KindVM {
+	if includeConnect && inst.GuestTailnet() {
 		payload.Connect = fmt.Sprintf("ssh root@%s", inst.Name)
 	}
 	return payload
@@ -385,6 +388,7 @@ func (a *App) inspectPayload(inst model.Instance, poolName string, integrations 
 			BackendID:         a.backendID,
 			Name:              inst.Name,
 			Kind:              inst.KindName(),
+			GuestNetwork:      inst.GuestNetwork,
 			Image:             inst.ImageName(),
 			State:             inst.State,
 			CreatedByUser:     inst.CreatedByUser,
@@ -1390,6 +1394,9 @@ func (a *App) cmdInspect(ctx context.Context, actor model.Actor, args []string, 
 	fmt.Fprintf(&b, "image: %s\n", inst.ImageName())
 	fmt.Fprintf(&b, "state: %s\n", inst.State)
 	fmt.Fprintf(&b, "kind: %s\n", inst.KindName())
+	if inst.GuestNetwork != "" {
+		fmt.Fprintf(&b, "guest-network: %s\n", inst.GuestNetwork)
+	}
 	if migration.Phase != "" {
 		fmt.Fprintf(&b, "migration: %s\nmigration-target: %s\n", migration.Phase, migration.Target)
 	}
@@ -2623,7 +2630,7 @@ func helpResult() commandResult {
 		{
 			header: "INSTANCE COMMANDS",
 			entries: []helpEntry{
-				{"new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]", "Create a new microvm instance (default image: arch)."},
+				{"new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME] [--guest-network tailnet|host]", "Create a new microvm instance (default image: arch)."},
 				{"list [--all]", "List VMs; --all includes Orb workloads."},
 				{"orb new <name> [options]", "Create an Orb workload using the new command options."},
 				{"orb list", "List Orb workloads."},
@@ -2711,6 +2718,10 @@ func helpResult() commandResult {
 	fmt.Fprintln(&b, "        Select a configured image during create (default: arch).")
 	fmt.Fprintln(&b, "    --template ID")
 	fmt.Fprintln(&b, "        Clone an owner-scoped project template during create.")
+	fmt.Fprintln(&b, "    --guest-network tailnet|host")
+	fmt.Fprintln(&b, "        Guest networking of a new VM (default: tailnet).")
+	fmt.Fprintln(&b, "        host guests do not join the tailnet and are reached by")
+	fmt.Fprintln(&b, "        SSH from the host, by guest IP.")
 	fmt.Fprintln(&b, "    --cpus N")
 	fmt.Fprintln(&b, "        Number of vCPUs.")
 	fmt.Fprintln(&b, "    --ram SIZE")
@@ -3250,6 +3261,10 @@ func lifecycleReadyResult(action string, inst model.Instance) commandResult {
 	if inst.KindName() == model.KindOrb {
 		return commandResult{stdout: fmt.Sprintf("%s: %s\nkind: orb\nstate: %s\n", action, inst.Name, inst.State)}
 	}
+	if !inst.GuestTailnet() {
+		// No tailnet name: reach the guest from the host, e.g. via an SSH jump.
+		return commandResult{stdout: fmt.Sprintf("%s: %s\nstate: %s\nguest-network: %s\nguest-ip: %s\n", action, inst.Name, inst.State, inst.GuestNetwork, inst.GuestAddr)}
+	}
 	stdout := fmt.Sprintf("%s: %s\nstate: %s\ntailscale-name: %s\ntailscale-ip: %s\nconnect: ssh root@%s\n", action, inst.Name, inst.State, inst.TailscaleName, inst.TailscaleIP, inst.Name)
 	return commandResult{stdout: stdout, exitCode: 0}
 }
@@ -3486,7 +3501,7 @@ func importUsage() string {
 }
 
 func newUsage() string {
-	return "usage: new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME]"
+	return "usage: new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME] [--guest-network tailnet|host]"
 }
 
 func resizeUsage() string {

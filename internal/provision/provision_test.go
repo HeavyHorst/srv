@@ -1707,7 +1707,7 @@ func TestEnsureCreatePrereqsChecksReflinkCloneability(t *testing.T) {
 			return nil
 		}
 		p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
-		if err := p.ensureCreatePrereqs(context.Background(), false, config.Image{Kernel: kernelPath, RootFS: rootfsPath}, model.KindVM); err != nil {
+		if err := p.ensureCreatePrereqs(context.Background(), false, config.Image{Kernel: kernelPath, RootFS: rootfsPath}, model.Instance{Kind: model.KindVM}); err != nil {
 			t.Fatalf("ensureCreatePrereqs() error = %v", err)
 		}
 		if src != cfg.BaseRootFSPath {
@@ -1747,7 +1747,7 @@ func TestEnsureCreatePrereqsChecksReflinkCloneability(t *testing.T) {
 		}
 
 		p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
-		if err := p.ensureCreatePrereqs(context.Background(), false, config.Image{Kernel: kernelPath, RootFS: rootfsPath}, model.KindVM); err != nil {
+		if err := p.ensureCreatePrereqs(context.Background(), false, config.Image{Kernel: kernelPath, RootFS: rootfsPath}, model.Instance{Kind: model.KindVM}); err != nil {
 			t.Fatalf("ensureCreatePrereqs() with installer-style permissions error = %v", err)
 		}
 		if !strings.HasPrefix(dest, cfg.InstancesDir()+string(os.PathSeparator)) {
@@ -1760,7 +1760,7 @@ func TestEnsureCreatePrereqsChecksReflinkCloneability(t *testing.T) {
 			return errors.New("operation not supported")
 		}
 		p := &Provisioner{cfg: cfg, tsClient: &tailscale.Client{}}
-		err := p.ensureCreatePrereqs(context.Background(), false, config.Image{Kernel: kernelPath, RootFS: rootfsPath}, model.KindVM)
+		err := p.ensureCreatePrereqs(context.Background(), false, config.Image{Kernel: kernelPath, RootFS: rootfsPath}, model.Instance{Kind: model.KindVM})
 		if err == nil || !strings.Contains(err.Error(), "must be reflink-cloneable into data dir") {
 			t.Fatalf("ensureCreatePrereqs() error = %v", err)
 		}

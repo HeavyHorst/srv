@@ -94,6 +94,17 @@ When a VM is deleted, the network helper removes:
 - The FORWARD rule
 - The gateway address from the host interface
 
+## Guests without Tailscale
+
+`new <name> --guest-network host` creates an ordinary VM that never joins the tailnet. The default remains a Tailscale guest. The control plane is unchanged: commands still arrive over the embedded tsnet node and are authorized by Tailscale identity.
+
+The guest gets no enrollment key and Tailscale is masked in the guest even if the image contains it. Readiness is a nonce-bound report the guest bootstrap writes to the serial console for each start attempt, so a report from an earlier boot never makes a new start ready. Readiness proves that this boot completed its bootstrap, not that SSH or applications work. Otherwise the guest uses ordinary VM networking, including NAT and host-side gateways.
+
+Manage the guest over SSH from the host, for example `ssh -J <host> root@<guest-ip>`. Take the guest IP from `inspect`; the ED25519 host key fingerprint the guest reported at boot appears in its `inspect` events. Authorized keys come from the image; srv does not relay SSH or manage guest keys.
+
+- `stop --save-state` is refused for guests without Tailscale: a RAM resume skips the bootstrap and could not report a fresh boot nonce. `start` refuses to resume any saved RAM; `start <name> --discard-state` cold-boots instead.
+- Export artifacts of these guests use manifest version 5, which older servers refuse to import.
+
 ## Host-side API gateways
 
 srv can also expose host-side HTTP gateways on each VM's gateway IP:

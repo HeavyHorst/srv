@@ -66,10 +66,8 @@ func (p *Provisioner) waitForEnrollment(ctx context.Context, inst model.Instance
 	}
 }
 
-func enrollmentNode(path, nonce string) (string, error) {
-	if nonce == "" {
-		return "", errors.New("cold enrollment has no attempt nonce; recreate using an updated base image")
-	}
+// serialTail returns the last MiB of the guest's serial log.
+func serialTail(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -83,8 +81,52 @@ func enrollmentNode(path, nonce string) (string, error) {
 	if _, err := f.ReadAt(buf, info.Size()-int64(len(buf))); err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
+	return string(buf), nil
+}
+
+type guestBootReport struct {
+	Nonce      string `json:"nonce"`
+	SSHHostKey string `json:"ssh_host_key,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// errBootFailed means the guest reported that this attempt cannot succeed.
+var errBootFailed = errors.New("guest bootstrap failed")
+
+func bootReport(path, nonce string) (guestBootReport, error) {
+	if nonce == "" {
+		return guestBootReport{}, errors.New("boot readiness has no attempt nonce")
+	}
+	tail, err := serialTail(path)
+	if err != nil {
+		return guestBootReport{}, err
+	}
+	for _, line := range strings.Split(tail, "\n") {
+		_, payload, ok := strings.Cut(line, "srv-boot: ")
+		if !ok {
+			continue
+		}
+		var report guestBootReport
+		if json.Unmarshal([]byte(strings.TrimSpace(payload)), &report) == nil && report.Nonce == nonce {
+			if report.Error != "" {
+				return report, fmt.Errorf("%w: %s", errBootFailed, report.Error)
+			}
+			return report, nil
+		}
+	}
+	return guestBootReport{}, errors.New("waiting for nonce-bound guest boot report; image must support boot_nonce")
+}
+
+func enrollmentNode(path, nonce string) (string, error) {
+	if nonce == "" {
+		return "", errors.New("cold enrollment has no attempt nonce; recreate using an updated base image")
+	}
+	tail, err := serialTail(path)
+	if err != nil {
+		return "", err
+	}
 	var found string
-	for _, line := range strings.Split(string(buf), "\n") {
+	for _, line := range strings.Split(tail, "\n") {
 		_, payload, ok := strings.Cut(line, "srv-enrollment: ")
 		if !ok {
 			continue

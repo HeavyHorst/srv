@@ -53,6 +53,9 @@ func (s *Store) Checkpoint(ctx context.Context) error {
 }
 
 func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
+	if !model.ValidGuestNetwork(inst.GuestNetwork) {
+		return fmt.Errorf("invalid guest network %q", inst.GuestNetwork)
+	}
 	normalizeInstanceMemory(&inst)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -65,8 +68,8 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
-			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image, kind
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image, kind, guest_network
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		inst.ID,
 		inst.Name,
@@ -97,7 +100,7 @@ func (s *Store) CreateInstance(ctx context.Context, inst model.Instance) error {
 		inst.TailscaleIP,
 		inst.LastError,
 		nullableTime(inst.DeletedAt),
-		inst.StartRequestID, inst.StartBootID, inst.TailnetNodeID, inst.Image, inst.KindName(),
+		inst.StartRequestID, inst.StartBootID, inst.TailnetNodeID, inst.Image, inst.KindName(), inst.GuestNetwork,
 	)
 	if err != nil {
 		return fmt.Errorf("insert instance: %w", err)
@@ -185,7 +188,7 @@ func (s *Store) GetInstance(ctx context.Context, name string) (model.Instance, e
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
-			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image, kind
+			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image, kind, guest_network
 		FROM instances
 		WHERE name = ?
 	`, name)
@@ -243,7 +246,7 @@ func (s *Store) ListInstances(ctx context.Context, includeDeleted bool) ([]model
 			vcpu_count, memory_mib, memory_mode, memory_pool_id, rootfs_size_bytes,
 			rootfs_path, kernel_path, initrd_path, socket_path, log_path, serial_log_path,
 			tap_device, guest_mac, network_cidr, host_addr, guest_addr, gateway_addr,
-			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image, kind
+			firecracker_pid, tailscale_name, tailscale_ip, last_error, deleted_at, start_request_id, start_boot_id, tailnet_node_id, image, kind, guest_network
 		FROM instances
 	`
 	if !includeDeleted {
@@ -778,6 +781,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{name: "tailnet_node_id", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "image", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "kind", decl: "TEXT NOT NULL DEFAULT 'vm' CHECK (kind IN ('vm', 'orb'))"},
+		{name: "guest_network", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "stopped_since", decl: "TEXT"},
 	} {
 		if err := s.ensureColumn(ctx, "instances", column.name, column.decl); err != nil {
@@ -908,7 +912,7 @@ func scanInstance(scan func(dest ...any) error) (model.Instance, error) {
 		&inst.TailscaleIP,
 		&inst.LastError,
 		&deletedAt,
-		&inst.StartRequestID, &inst.StartBootID, &inst.TailnetNodeID, &inst.Image, &inst.Kind,
+		&inst.StartRequestID, &inst.StartBootID, &inst.TailnetNodeID, &inst.Image, &inst.Kind, &inst.GuestNetwork,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Instance{}, err

@@ -49,3 +49,31 @@ func TestInstanceKindPersistenceAndLegacyMigration(t *testing.T) {
 		t.Fatal("invalid kind accepted")
 	}
 }
+
+func TestGuestNetworkPersistsAndIsImmutable(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	guest := testInstance("guest", model.StateProvisioning, time.Now().UTC())
+	guest.GuestNetwork = model.GuestNetworkHost
+	if err := s.CreateInstance(ctx, guest); err != nil {
+		t.Fatal(err)
+	}
+	// Lifecycle updates cannot turn a guest without tailnet into a tailnet one.
+	guest.GuestNetwork, guest.State = model.GuestNetworkTailnet, model.StateReady
+	if err := s.UpdateInstance(ctx, guest); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetInstance(ctx, "guest")
+	if err != nil || got.GuestNetwork != model.GuestNetworkHost || got.State != model.StateReady {
+		t.Fatalf("guest network = %q, state = %s, err = %v", got.GuestNetwork, got.State, err)
+	}
+	listed, err := s.ListInstances(ctx, false)
+	if err != nil || len(listed) != 1 || listed[0].GuestNetwork != model.GuestNetworkHost {
+		t.Fatalf("listed = %#v, err = %v", listed, err)
+	}
+	bad := testInstance("bad", model.StateProvisioning, time.Now().UTC())
+	bad.GuestNetwork = "plain"
+	if err := s.CreateInstance(ctx, bad); err == nil {
+		t.Fatal("unknown guest network accepted")
+	}
+}

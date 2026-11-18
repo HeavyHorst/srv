@@ -118,6 +118,7 @@ type CreateOptions struct {
 	Image           string
 	Template        string
 	Kind            string
+	GuestNetwork    string
 	VCPUCount       int64
 	MemoryMiB       int64
 	MemoryPoolName  string
@@ -327,6 +328,9 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if opts.Kind != model.KindVM && opts.Kind != model.KindOrb {
 		return model.Instance{}, errors.New("invalid instance kind")
 	}
+	if !model.ValidGuestNetwork(opts.GuestNetwork) || (opts.GuestNetwork != model.GuestNetworkTailnet && opts.Kind != model.KindVM) {
+		return model.Instance{}, errors.New("guest network must be tailnet or host on an ordinary VM")
+	}
 	imageName := opts.Image
 	if imageName == "" {
 		imageName = "arch"
@@ -365,7 +369,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	if err != nil {
 		return model.Instance{}, err
 	}
-	if err := p.ensureCreatePrereqs(ctx, needsResize, image, opts.Kind); err != nil {
+	if err := p.ensureCreatePrereqs(ctx, needsResize, image, model.Instance{Kind: opts.Kind, GuestNetwork: opts.GuestNetwork}); err != nil {
 		return model.Instance{}, err
 	}
 	var pool model.MemoryPool
@@ -434,6 +438,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		inst = model.Instance{
 			ID:              uuid.NewString(),
 			Kind:            opts.Kind,
+			GuestNetwork:    opts.GuestNetwork,
 			Name:            name,
 			Image:           imageName,
 			State:           model.StateProvisioning,
@@ -518,7 +523,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 
 	guestAuthTags := p.guestAuthTagsForUser(actor.UserLogin)
 	var authKey string
-	if inst.KindName() != model.KindOrb {
+	if inst.GuestTailnet() {
 		var keyID string
 		authKey, keyID, err = p.mintGuestAuthKey(ctx, guestAuthTags)
 		if err != nil {
@@ -547,8 +552,12 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		TailscaleAuthKey:    authKey,
 		TailscaleControlURL: p.cfg.GuestTailscaleControlURL,
 		TailscaleTags:       guestAuthTags,
+		GuestNetwork:        inst.GuestNetwork,
 		ZenGatewayPort:      zenGatewayPort,
 		DeepSeekGatewayPort: deepseekGatewayPort,
+	}
+	if inst.GuestNetwork != model.GuestNetworkTailnet {
+		bootstrap.TailscaleControlURL = "" // Not even the coordination URL.
 	}
 	if err := p.writeMetadataFile(inst, bootstrap); err != nil {
 		inst.LastError = err.Error()
@@ -571,8 +580,8 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	}
 	p.recordEvent(inst.ID, "firecracker", "microVM started", map[string]any{"pid": pid})
 
-	if inst.KindName() == model.KindOrb {
-		return p.waitForOrb(ctx, inst)
+	if !inst.GuestTailnet() {
+		return p.waitForHostOnlyReadiness(ctx, inst)
 	}
 	observed := inst
 	device, tailscaleIP, err := p.waitForEnrollment(ctx, inst)
@@ -652,7 +661,7 @@ func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) 
 	if !shouldAutoStart {
 		return nil
 	}
-	if inst.KindName() != model.KindOrb && !hasTailnetIdentity(inst) {
+	if inst.GuestTailnet() && !hasTailnetIdentity(inst) {
 		p.recordEvent(inst.ID, "startup", "instance was left offline after control-plane startup because it never completed initial tailnet bootstrap", nil)
 		return nil
 	}
@@ -696,7 +705,7 @@ func (p *Provisioner) ReconcileInstance(ctx context.Context, name string) (model
 	case model.StateAwaitingTailnet:
 		_, err = p.reconcileLateTailnetJoin(ctx, &inst)
 	case model.StateAwaitingGuest:
-		return p.waitForOrb(ctx, inst)
+		return p.waitForHostOnlyReadiness(ctx, inst)
 	}
 	return inst, err
 }
@@ -779,6 +788,11 @@ func (p *Provisioner) StopWithOptions(ctx context.Context, name string, opts Sto
 	}
 	if inst.State == model.StateStopped && inst.FirecrackerPID == 0 {
 		return inst, fmt.Errorf("instance %q is already stopped", name)
+	}
+	if opts.SaveState && inst.GuestNetwork != model.GuestNetworkTailnet {
+		// A RAM resume skips the guest bootstrap, so it can never report this
+		// start attempt's boot nonce.
+		return inst, fmt.Errorf("instance %q uses guest network %s; stop --save-state is not supported", name, inst.GuestNetwork)
 	}
 
 	// Persist intent before calling the helper: a timed-out helper request may
@@ -985,8 +999,8 @@ func (p *Provisioner) StartWithOptions(ctx context.Context, name string, opts St
 		return model.Instance{}, err
 	}
 	p.applyConfiguredBootArtifacts(&inst)
-	if inst.KindName() == model.KindOrb && inst.State == model.StateAwaitingGuest && inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
-		return p.waitForOrb(ctx, inst)
+	if !inst.GuestTailnet() && inst.State == model.StateAwaitingGuest && inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
+		return p.waitForHostOnlyReadiness(ctx, inst)
 	}
 	if inst.State == model.StateAwaitingTailnet && inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) {
 		reconciled, err := p.reconcileLateTailnetJoin(ctx, &inst)
@@ -1083,9 +1097,15 @@ func (p *Provisioner) StartWithOptions(ctx context.Context, name string, opts St
 			_ = p.store.UpdateInstance(context.Background(), inst)
 		}
 	}()
+	if inst.GuestNetwork != model.GuestNetworkTailnet && !opts.DiscardState {
+		// Never resume saved RAM: readiness requires a fresh boot report.
+		if err := p.ramStateFence(inst.Name); err != nil {
+			return inst, fmt.Errorf("guests without a tailnet cannot resume saved RAM; start %s --discard-state cold-boots it: %w", inst.Name, err)
+		}
+	}
 	var previousDevice tailnetDeviceSnapshot
 	var hadPreviousDevice bool
-	if inst.KindName() != model.KindOrb {
+	if inst.GuestTailnet() {
 		previousDevice, hadPreviousDevice, err = p.currentDeviceSnapshot(ctx, inst.Name)
 		if err != nil {
 			return inst, err
@@ -1126,10 +1146,12 @@ func (p *Provisioner) StartWithOptions(ctx context.Context, name string, opts St
 	bootstrap := guestBootstrap{
 		Version:             1,
 		Hostname:            inst.Name,
-		TailscaleControlURL: p.cfg.GuestTailscaleControlURL,
-		TailscaleTags:       p.cfg.GuestAuthTags,
+		GuestNetwork:        inst.GuestNetwork,
 		ZenGatewayPort:      zenGatewayPort,
 		DeepSeekGatewayPort: deepseekGatewayPort,
+	}
+	if inst.GuestNetwork == model.GuestNetworkTailnet {
+		bootstrap.TailscaleControlURL, bootstrap.TailscaleTags = p.cfg.GuestTailscaleControlURL, p.cfg.GuestAuthTags
 	}
 	pid, err := p.startFirecracker(ctx, &inst, pool, bootstrap, opts.DiscardState)
 	if err != nil {
@@ -1151,8 +1173,8 @@ func (p *Provisioner) StartWithOptions(ctx context.Context, name string, opts St
 	}
 	p.recordEvent(inst.ID, "firecracker", "microVM started", map[string]any{"pid": pid})
 
-	if inst.KindName() == model.KindOrb {
-		return p.waitForOrb(ctx, inst)
+	if !inst.GuestTailnet() {
+		return p.waitForHostOnlyReadiness(ctx, inst)
 	}
 	observed := inst
 	runtimeIdentity, err := p.instanceRuntimeIdentity(ctx, inst)
@@ -1338,7 +1360,7 @@ func (p *Provisioner) checkInstanceDirReusable(ctx context.Context, name string)
 	return instanceDir, nil, nil
 }
 
-func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool, image config.Image, kind string) error {
+func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool, image config.Image, inst model.Instance) error {
 	for _, path := range []string{image.Kernel, image.RootFS} {
 		if path == "" {
 			return errors.New("create requires kernel and rootfs paths (SRV_BASE_KERNEL/SRV_BASE_ROOTFS or SRV_IMAGES_FILE)")
@@ -1364,10 +1386,10 @@ func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool,
 			return err
 		}
 	}
-	if kind != model.KindOrb && p.tsClient == nil {
+	if inst.GuestTailnet() && p.tsClient == nil {
 		return errors.New("create requires TS_TAILNET and TS_CLIENT_SECRET so the control plane can mint one-off guest auth keys")
 	}
-	if kind != model.KindOrb && len(p.cfg.GuestAuthTags) == 0 {
+	if inst.GuestTailnet() && len(p.cfg.GuestAuthTags) == 0 {
 		return errors.New("create requires SRV_GUEST_AUTH_TAGS so minted guest auth keys carry an allowed tag")
 	}
 	if err := p.ensureRootFSReflinkSupport(ctx, image.RootFS); err != nil {
@@ -1425,7 +1447,7 @@ func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
 	if inst.State == model.StateDeleting {
 		return fmt.Errorf("instance %q is being deleted", inst.Name)
 	}
-	if inst.KindName() != model.KindOrb && p.tsClient == nil {
+	if inst.GuestTailnet() && p.tsClient == nil {
 		return errors.New("start requires TS_TAILNET and TS_CLIENT_SECRET so the control plane can observe guest tailnet readiness")
 	}
 	for _, path := range []string{inst.KernelPath, inst.RootFSPath} {
@@ -1936,6 +1958,9 @@ func (p *Provisioner) startFirecracker(ctx context.Context, inst *model.Instance
 	}
 	if bootstrap.TailscaleAuthKey != "" {
 		bootstrap.EnrollmentNonce = inst.StartRequestID
+	}
+	if inst.KindName() == model.KindVM && !inst.GuestTailnet() {
+		bootstrap.BootNonce = inst.StartRequestID
 	}
 	resp, err := p.vmRunner.StartInstanceVM(ctx, vmrunner.StartRequest{
 		InstanceID: inst.ID, RequestID: inst.StartRequestID, HostBootID: inst.StartBootID,

@@ -1060,6 +1060,7 @@ func TestCmdInspectJSONReturnsStructuredInstanceAndEvents(t *testing.T) {
 	inst.RootFSSizeBytes = 8 << 30
 	inst.TailscaleName = "alpha.tailnet"
 	inst.TailscaleIP = "100.64.0.10"
+	inst.GuestNetwork = model.GuestNetworkHost
 	if err := st.CreateInstance(ctx, inst); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
@@ -1081,7 +1082,7 @@ func TestCmdInspectJSONReturnsStructuredInstanceAndEvents(t *testing.T) {
 	if err := json.Unmarshal([]byte(result.stdout), &payload); err != nil {
 		t.Fatalf("json.Unmarshal(cmdInspect): %v\noutput:\n%s", err, result.stdout)
 	}
-	if payload.Instance.Name != inst.Name || payload.Instance.State != model.StateReady || payload.Instance.VCPUCount != 4 || payload.Instance.MemoryMiB != 4096 || payload.Instance.RootFSSizeBytes != 8<<30 {
+	if payload.Instance.Name != inst.Name || payload.Instance.GuestNetwork != model.GuestNetworkHost || payload.Instance.State != model.StateReady || payload.Instance.VCPUCount != 4 || payload.Instance.MemoryMiB != 4096 || payload.Instance.RootFSSizeBytes != 8<<30 {
 		t.Fatalf("cmdInspect(json) instance = %#v", payload.Instance)
 	}
 	if payload.Instance.Logs.SerialCommand != "ssh srv logs alpha serial" || payload.Instance.Logs.FirecrackerCommand != "ssh srv logs alpha firecracker" {
@@ -2561,6 +2562,23 @@ func TestParseNewArgs(t *testing.T) {
 			args:     []string{"new", "demo", "--integration", "openai", "--integration=github-api"},
 			wantName: "demo",
 			wantInts: []string{"openai", "github-api"},
+		},
+		{
+			name:     "parses host guest network",
+			args:     []string{"new", "demo", "--guest-network", "host"},
+			wantName: "demo",
+			wantOpts: provision.CreateOptions{GuestNetwork: model.GuestNetworkHost},
+		},
+		{
+			name:     "parses explicit tailnet default",
+			args:     []string{"new", "demo", "--guest-network=tailnet"},
+			wantName: "demo",
+			wantOpts: provision.CreateOptions{},
+		},
+		{
+			name:    "rejects unknown guest network",
+			args:    []string{"new", "demo", "--guest-network", "plain"},
+			wantErr: "--guest-network must be tailnet or host",
 		},
 		{
 			name:    "rejects unknown options",

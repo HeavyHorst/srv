@@ -24,6 +24,7 @@ ssh srv -- --json status
 | `new <name> --image <name>` | Select a configured guest image, e.g. `debian-13` (default: `arch`) |
 | `new <name> --image <name> --template <id>` | Clone an owner-scoped prepared project template; requires explicit `--host` through srv-front |
 | `new <name> --integration <name>` | Create and enable one or more existing integrations (admin only) |
+| `new <name> --guest-network host` | Create a VM that does not join the tailnet and is reached by SSH from the host; see [Guests without Tailscale](../networking/overview.md#guests-without-tailscale) |
 | `new <name> --cpus <n>` | Create with custom vCPU count |
 | `new <name> --ram <size>` | Create with custom memory (`2G`, `512M`, or MiB integer) |
 | `new <name> --pool <name> --ram <size>` | Create a pooled-memory VM in an existing memory pool |
@@ -49,7 +50,7 @@ credentials are JSON on stdin, never command arguments; it does not accept `--js
 
 | Command | Description |
 |---------|-------------|
-| `start <name> [--discard-state]` | Resume saved RAM automatically; optionally discard it and cold boot. Also rechecks readiness in `awaiting-tailnet` / `awaiting-guest` |
+| `start <name> [--discard-state]` | Resume saved RAM automatically; optionally discard it and cold boot. Also rechecks readiness in `awaiting-tailnet` / `awaiting-guest`. Guests without Tailscale never resume saved RAM and refuse `stop --save-state` |
 | `stop <name> [--save-state]` | Graceful shutdown by default; optionally save RAM and device state for one resume |
 | `restart <name>` | Stop and start a VM |
 | `fsck <name>` | Force-check and repair the rootfs of a stopped VM |

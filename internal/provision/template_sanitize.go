@@ -198,12 +198,19 @@ func (d *templateDisk) resetMachineID() error {
 	return nil
 }
 
-func sanitizeTemplateDisk(ctx context.Context, path string) error {
+// sanitizeTemplateDisk removes per-guest identity. SSH host keys are removed
+// only for sources without Tailscale, whose bootstrap regenerates them; other
+// images keep their previous behaviour.
+func sanitizeTemplateDisk(ctx context.Context, path string, stripSSHHostKeys bool) error {
 	if err := runRootFSCheckContext(ctx, path, "check template filesystem before cleanup"); err != nil {
 		return err
 	}
 	d := templateDisk{ctx: ctx, path: path, remaining: 100000}
-	for _, target := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id", "/var/lib/tailscale", "/var/lib/srv/bootstrap.done", "/var/lib/systemd/random-seed"} {
+	targets := []string{"/etc/machine-id", "/var/lib/dbus/machine-id", "/var/lib/tailscale", "/var/lib/srv/bootstrap.done", "/var/lib/systemd/random-seed"}
+	if stripSSHHostKeys {
+		targets = append(targets, "/etc/ssh/ssh_host_rsa_key", "/etc/ssh/ssh_host_rsa_key.pub", "/etc/ssh/ssh_host_ecdsa_key", "/etc/ssh/ssh_host_ecdsa_key.pub", "/etc/ssh/ssh_host_ed25519_key", "/etc/ssh/ssh_host_ed25519_key.pub")
+	}
+	for _, target := range targets {
 		if err := d.clean(target); err != nil {
 			return err
 		}

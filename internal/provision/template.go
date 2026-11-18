@@ -148,7 +148,7 @@ func (p *Provisioner) createTemplate(ctx context.Context, name, templateID strin
 		return err
 	}
 	disk := filepath.Join(writable, "rootfs.img")
-	if err := sanitizeTemplateDisk(ctx, disk); err != nil {
+	if err := sanitizeTemplateDisk(ctx, disk, inst.GuestNetwork != model.GuestNetworkTailnet); err != nil {
 		return fmt.Errorf("sanitize template: %w", err)
 	}
 	if err := storage.SyncPath(disk); err != nil {

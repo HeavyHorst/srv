@@ -90,6 +90,7 @@ type portableManifest struct {
 
 type portableInstance struct {
 	Kind            string    `json:"kind,omitempty"`
+	GuestNetwork    string    `json:"guest_network,omitempty"`
 	MemoryMode      string    `json:"memory_mode,omitempty"`
 	ID              string    `json:"id,omitempty"`
 	Name            string    `json:"name"`
@@ -776,6 +777,7 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
 			MemoryPoolID:    poolID,
 			ID:              uuid.NewString(),
 			Kind:            manifest.Instance.Kind,
+			GuestNetwork:    manifest.Instance.GuestNetwork,
 			Name:            targetName,
 			Image:           manifest.Instance.Image,
 			State:           model.StateProvisioning,
@@ -989,11 +991,15 @@ func portableManifestFromInstance(exportedAt time.Time, inst model.Instance) por
 	if inst.KindName() == model.KindOrb {
 		version = 4 // Older servers must not silently import an orb as a Tailscale VM.
 	}
+	if inst.GuestNetwork != model.GuestNetworkTailnet {
+		version = 5 // Nor a guest without Tailscale.
+	}
 	return portableManifest{
 		Version:    version,
 		ExportedAt: exportedAt,
 		Instance: portableInstance{
 			Kind:            inst.Kind,
+			GuestNetwork:    inst.GuestNetwork,
 			MemoryMode:      inst.MemoryMode,
 			ID:              inst.ID,
 			Name:            inst.Name,
@@ -1061,7 +1067,7 @@ func readPortableManifest(tr *tar.Reader) (portableManifest, error) {
 }
 
 func (m portableManifest) validate() error {
-	if m.Version != 1 && m.Version != portableManifestVersion && m.Version != 3 && m.Version != 4 {
+	if m.Version != 1 && m.Version != portableManifestVersion && m.Version != 3 && m.Version != 4 && m.Version != 5 {
 		return fmt.Errorf("portable artifact uses unsupported manifest version %d", m.Version)
 	}
 	if m.Instance.Kind != "" && m.Instance.Kind != model.KindVM && m.Instance.Kind != model.KindOrb {
@@ -1069,6 +1075,9 @@ func (m portableManifest) validate() error {
 	}
 	if m.Instance.Kind == model.KindOrb && m.Version < 4 {
 		return errors.New("orb artifacts require portable manifest version 4")
+	}
+	if !model.ValidGuestNetwork(m.Instance.GuestNetwork) || (m.Instance.GuestNetwork != model.GuestNetworkTailnet && (m.Version < 5 || (model.Instance{Kind: m.Instance.Kind}).KindName() != model.KindVM)) {
+		return errors.New("guest network requires an ordinary VM and portable manifest version 5")
 	}
 	if m.Instance.MemoryMode != "" && m.Instance.MemoryMode != "fixed" && m.Instance.MemoryMode != "pool" {
 		return errors.New("invalid portable memory mode")

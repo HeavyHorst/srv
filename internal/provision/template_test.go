@@ -266,11 +266,30 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 	}
 }
 
+func TestTemplateSanitizerStripsSSHHostKeysOnlyWhenAsked(t *testing.T) {
+	templateTestTools(t)
+	for _, strip := range []bool{false, true} {
+		image := filepath.Join(t.TempDir(), "rootfs.img")
+		templateTestImage(t, image, map[string]string{"etc/machine-id": "identity", "etc/ssh/ssh_host_ed25519_key": "key", "etc/ssh/sshd_config": "keep"})
+		if err := sanitizeTemplateDisk(context.Background(), image, strip); err != nil {
+			t.Fatal(err)
+		}
+		key, err := exec.Command("debugfs", "-R", "cat /etc/ssh/ssh_host_ed25519_key", image).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		config, _ := exec.Command("debugfs", "-R", "cat /etc/ssh/sshd_config", image).Output()
+		if (string(key) == "key") == strip || string(config) != "keep" {
+			t.Fatalf("strip=%v: host key %q, config %q", strip, key, config)
+		}
+	}
+}
+
 func TestTemplateSanitizerFailsClosed(t *testing.T) {
 	templateTestTools(t)
 	image := filepath.Join(t.TempDir(), "rootfs.img")
 	templateTestImage(t, image, map[string]string{"etc/machine-id": "identity", "var/lib/tailscale/bad\"name": "secret"})
-	if err := sanitizeTemplateDisk(context.Background(), image); err == nil {
+	if err := sanitizeTemplateDisk(context.Background(), image, false); err == nil {
 		t.Fatal("unsafe directory entry accepted")
 	}
 	image = filepath.Join(t.TempDir(), "rootfs.img")
@@ -278,7 +297,7 @@ func TestTemplateSanitizerFailsClosed(t *testing.T) {
 	if out, err := exec.Command("debugfs", "-w", "-R", "symlink /root/.config /etc", image).CombinedOutput(); err != nil {
 		t.Fatalf("symlink: %s %v", out, err)
 	}
-	if err := sanitizeTemplateDisk(context.Background(), image); err == nil {
+	if err := sanitizeTemplateDisk(context.Background(), image, false); err == nil {
 		t.Fatal("symlink ancestor accepted")
 	}
 	bad := filepath.Join(t.TempDir(), "bad.img")

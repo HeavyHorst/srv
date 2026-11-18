@@ -146,7 +146,14 @@ func FuzzPortableManifestValidate(f *testing.F) {
 		{"wrong-serial", func(m *portableManifest) { m.Files.SerialLog = "other.log" }},
 		{"wrong-firecracker", func(m *portableManifest) { m.Files.FirecrackerLog = "other.log" }},
 		{"missing-exported", func(m *portableManifest) { m.ExportedAt = time.Time{} }},
-		{"unsupported", func(m *portableManifest) { m.Version = 5 }},
+		{"unsupported", func(m *portableManifest) { m.Version = 6 }},
+		{"host-guest-v4", func(m *portableManifest) { m.Version = 4; m.Instance.GuestNetwork = model.GuestNetworkHost }},
+		{"host-guest-v5", func(m *portableManifest) { m.Version = 5; m.Instance.GuestNetwork = model.GuestNetworkHost }},
+		{"host-guest-orb", func(m *portableManifest) {
+			m.Version = 5
+			m.Instance.Kind, m.Instance.GuestNetwork = model.KindOrb, model.GuestNetworkHost
+		}},
+		{"unknown-guest-network", func(m *portableManifest) { m.Version = 5; m.Instance.GuestNetwork = "plain" }},
 		{"pool-v2", func(m *portableManifest) { m.Instance.MemoryMode = model.MemoryModePool }},
 		{"orb-v3", func(m *portableManifest) { m.Version = 3; m.Instance.Kind = model.KindOrb }},
 	}
@@ -171,7 +178,7 @@ func FuzzPortableManifestValidate(f *testing.F) {
 		// Independent model of the accepted contract: weakening validate must
 		// not silently admit a manifest the importer cannot use.
 		switch manifest.Version {
-		case 1, portableManifestVersion, 3, 4:
+		case 1, portableManifestVersion, 3, 4, 5:
 		default:
 			t.Fatalf("accepted version %d", manifest.Version)
 		}
@@ -198,6 +205,10 @@ func FuzzPortableManifestValidate(f *testing.F) {
 		}
 		if manifest.Instance.Kind == model.KindOrb && manifest.Version < 4 {
 			t.Fatalf("accepted orb manifest version %d", manifest.Version)
+		}
+		if manifest.Instance.GuestNetwork != "" && (manifest.Instance.GuestNetwork != "host" ||
+			manifest.Version < 5 || manifest.Instance.Kind == model.KindOrb) {
+			t.Fatalf("accepted guest network %q in version %d for kind %q", manifest.Instance.GuestNetwork, manifest.Version, manifest.Instance.Kind)
 		}
 		if manifest.Instance.MemoryMode == model.MemoryModePool && manifest.Version < 3 {
 			t.Fatalf("accepted pooled manifest version %d", manifest.Version)

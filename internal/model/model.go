@@ -19,6 +19,12 @@ const (
 	StateDeleting        = "deleting"
 	StateDeleted         = "deleted"
 
+	// Guest network modes of ordinary VMs. The empty default is a Tailscale
+	// guest. Host guests do not join the tailnet and otherwise use ordinary VM
+	// networking.
+	GuestNetworkTailnet = ""
+	GuestNetworkHost    = "host"
+
 	MemoryModeFixed = "fixed"
 	MemoryModePool  = "pool"
 
@@ -77,6 +83,17 @@ type Instance struct {
 	LastError       string
 	DeletedAt       *time.Time
 	UpdatedAt       time.Time
+	GuestNetwork    string `json:",omitempty"`
+}
+
+// GuestTailnet reports whether the guest enrolls in the tailnet. Only
+// ordinary VMs in the default mode do; readiness then means tailnet presence.
+func (i Instance) GuestTailnet() bool {
+	return i.KindName() == KindVM && i.GuestNetwork == GuestNetworkTailnet
+}
+
+func ValidGuestNetwork(mode string) bool {
+	return mode == GuestNetworkTailnet || mode == GuestNetworkHost
 }
 
 // KindName treats records created before workload kinds existed as VMs.

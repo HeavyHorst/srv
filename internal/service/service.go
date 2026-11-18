@@ -594,6 +594,12 @@ func (a *App) Run(ctx context.Context) error {
 	g.Go(func() error {
 		a.restoreInstances(groupCtx)
 		startupLease.Release()
+		// Restore first brings running external-only guests' rules in line
+		// with the current configuration; checking earlier would stop them.
+		g.Go(func() error {
+			a.runExternalPolicyWatch(groupCtx)
+			return nil
+		})
 		if a.cfg.ColdStorageRetention > 0 {
 			g.Go(func() error {
 				a.runColdRetention(groupCtx)
@@ -657,6 +663,89 @@ func (a *App) restoreInstances(ctx context.Context) {
 	a.syncManagedGatewaysBestEffort()
 	if err != nil && ctx.Err() == nil {
 		a.log.Error("restore instances on startup", "err", err)
+	}
+}
+
+// externalPolicyInterval is how often running external-only guests' rules are
+// checked. It is not a bound on exposure after an external flush: helper
+// latency, sequential checks of several guests and waiting for the instance
+// lock add to it. On a failed check the helper takes the TAP down at once;
+// the guest is then stopped.
+const externalPolicyInterval = 5 * time.Second
+
+func (a *App) runExternalPolicyWatch(ctx context.Context) {
+	ticker := time.NewTicker(externalPolicyInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.checkExternalPolicies(ctx)
+		}
+	}
+}
+
+func externalPolicyActive(inst model.Instance) bool {
+	switch inst.State {
+	case model.StateProvisioning, model.StateAwaitingGuest, model.StateReady:
+		return inst.ExternalOnly() && inst.FirecrackerPID > 0
+	}
+	return false
+}
+
+// checkExternalPolicies verifies without instance locks: the helper serializes
+// verification with network setup and cleanup, and takes the TAP down itself
+// on failure. Any failure, including an unreachable helper, then stops that
+// exact guest incarnation like other background work. A quarantined TAP keeps
+// failing verification, so a deferred stop is retried on the next check.
+func (a *App) checkExternalPolicies(ctx context.Context) {
+	instances, err := a.store.ListInstances(ctx, false)
+	if err != nil {
+		a.log.Error("list instances for external-only policy check", "err", err)
+		return
+	}
+	for _, inst := range instances {
+		if !externalPolicyActive(inst) {
+			continue
+		}
+		attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := a.provisioner.VerifyExternalNetwork(attempt, inst)
+		cancel()
+		if err == nil || ctx.Err() != nil {
+			continue
+		}
+		a.log.Error("external-only policy check failed; stopping guest", "name", inst.Name, "err", err)
+		a.stopAfterPolicyLoss(ctx, inst)
+	}
+}
+
+// stopAfterPolicyLoss stops the checked incarnation only. Like reconciliation
+// it takes the snapshot barrier and never waits for a busy instance; a
+// deferred stop is retried on the next check while the TAP stays down.
+func (a *App) stopAfterPolicyLoss(ctx context.Context, checked model.Instance) {
+	lease, err := a.beginCommand()
+	if err != nil {
+		a.log.Warn("external-only guest quarantined; stop deferred", "name", checked.Name, "err", err)
+		return
+	}
+	defer lease.Release()
+	unlock := a.acquireInstance(checked.Name, false)
+	if unlock == nil {
+		a.log.Warn("external-only guest quarantined; stop deferred behind a running command", "name", checked.Name)
+		return
+	}
+	defer func() {
+		unlock()
+		a.syncManagedGatewaysBestEffort()
+	}()
+	current, err := a.store.GetInstance(ctx, checked.Name)
+	if err != nil || current.ID != checked.ID || current.StartRequestID != checked.StartRequestID ||
+		current.FirecrackerPID != checked.FirecrackerPID || !externalPolicyActive(current) {
+		return // Another incarnation or start attempt; the next check covers it.
+	}
+	if _, err := a.provisioner.Stop(ctx, checked.Name); err != nil {
+		a.log.Error("stop external-only guest after policy loss", "name", checked.Name, "err", err)
 	}
 }
 
@@ -1031,6 +1120,10 @@ func (a *App) cmdNew(ctx context.Context, actor model.Actor, args []string, outF
 	if len(integrations) > 0 && !a.isAdmin(actor) {
 		err := fmt.Errorf("new with --integration requires admin access")
 		return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
+	}
+	if len(integrations) > 0 && opts.GuestNetwork == model.GuestNetworkExternalOnly {
+		err := errors.New("external-only instances cannot use host integrations")
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
 	}
 	requestedIntegrations, err := a.lookupIntegrationsByName(ctx, integrations)
 	if err != nil {
@@ -2630,7 +2723,7 @@ func helpResult() commandResult {
 		{
 			header: "INSTANCE COMMANDS",
 			entries: []helpEntry{
-				{"new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME] [--guest-network tailnet|host]", "Create a new microvm instance (default image: arch)."},
+				{"new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME] [--guest-network tailnet|host|external-only]", "Create a new microvm instance (default image: arch)."},
 				{"list [--all]", "List VMs; --all includes Orb workloads."},
 				{"orb new <name> [options]", "Create an Orb workload using the new command options."},
 				{"orb list", "List Orb workloads."},
@@ -2718,10 +2811,13 @@ func helpResult() commandResult {
 	fmt.Fprintln(&b, "        Select a configured image during create (default: arch).")
 	fmt.Fprintln(&b, "    --template ID")
 	fmt.Fprintln(&b, "        Clone an owner-scoped project template during create.")
-	fmt.Fprintln(&b, "    --guest-network tailnet|host")
+	fmt.Fprintln(&b, "    --guest-network tailnet|host|external-only")
 	fmt.Fprintln(&b, "        Guest networking of a new VM (default: tailnet).")
 	fmt.Fprintln(&b, "        host guests do not join the tailnet and are reached by")
 	fmt.Fprintln(&b, "        SSH from the host, by guest IP.")
+	fmt.Fprintln(&b, "        external-only guests do not join the tailnet, may only")
+	fmt.Fprintln(&b, "        reach the internet through SRV_EXTERNAL_UPLINKS and are")
+	fmt.Fprintln(&b, "        reachable only by SSH from the host, by guest IP.")
 	fmt.Fprintln(&b, "    --cpus N")
 	fmt.Fprintln(&b, "        Number of vCPUs.")
 	fmt.Fprintln(&b, "    --ram SIZE")
@@ -3501,7 +3597,7 @@ func importUsage() string {
 }
 
 func newUsage() string {
-	return "usage: new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME] [--guest-network tailnet|host]"
+	return "usage: new <name> [--image NAME] [--template ID] [--cpus N] [--ram SIZE] [--pool NAME] [--rootfs-size SIZE] [--integration NAME] [--guest-network tailnet|host|external-only]"
 }
 
 func resizeUsage() string {

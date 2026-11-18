@@ -61,6 +61,8 @@ type Config struct {
 	VMRunnerSocketPath       string
 	FirecrackerBinary        string
 	OutboundInterface        string
+	ExternalUplinks          []string
+	ExternalDenyCIDRs        []string
 	VMNetworkCIDR            string
 	VMDNSServers             []string
 	VCPUCount                int64
@@ -138,6 +140,8 @@ func Load() (Config, error) {
 	flag.StringVar(&cfg.VMRunnerSocketPath, "vm-runner-socket", getenv("SRV_VM_RUNNER_SOCKET", defaultVMRunnerSocket), "unix socket used to reach the Firecracker runner helper")
 	flag.StringVar(&cfg.FirecrackerBinary, "firecracker-bin", getenv("SRV_FIRECRACKER_BIN", defaultFirecrackerBin), "firecracker binary path")
 	flag.StringVar(&cfg.OutboundInterface, "outbound-interface", getenv("SRV_OUTBOUND_IFACE", ""), "host network interface used for VM NAT")
+	externalUplinks := flag.String("external-uplinks", getenv("SRV_EXTERNAL_UPLINKS", ""), "comma separated host interfaces through which external-only guests may forward; empty disables external-only guests")
+	externalDeny := flag.String("external-deny-cidrs", getenv("SRV_EXTERNAL_DENY_CIDRS", ""), "comma separated IPv4 CIDRs external-only guests must not reach, in addition to private, special-purpose and VM ranges")
 	flag.StringVar(&cfg.VMNetworkCIDR, "vm-network-cidr", getenv("SRV_VM_NETWORK_CIDR", defaultVMNetworkCIDR), "IPv4 network reserved for VM /30 allocations")
 	vmDNS := flag.String("vm-dns", getenv("SRV_VM_DNS", "1.1.1.1,1.0.0.1"), "comma separated guest nameservers")
 	guestTags := flag.String("guest-auth-tags", getenv("SRV_GUEST_AUTH_TAGS", ""), "comma separated tags applied to one-off guest auth keys")
@@ -168,6 +172,8 @@ func Load() (Config, error) {
 	cfg.TrustedFrontends = splitCSV(*trustedFrontends)
 	cfg.TailscaleAdvertiseTags = splitCSV(*advertiseTags)
 	cfg.VMDNSServers = splitCSV(*vmDNS)
+	cfg.ExternalUplinks = splitCSV(*externalUplinks)
+	cfg.ExternalDenyCIDRs = splitCSV(*externalDeny)
 	cfg.GuestAuthTags = splitCSV(*guestTags)
 	cfg.GuestTailscaleAuthOnce = true
 

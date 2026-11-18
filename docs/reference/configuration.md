@@ -178,6 +178,8 @@ VMs created by `rene.michaelis@antares.net` receive only `tag:rene`; unmapped cr
 | `SRV_VM_NETWORK_CIDR` | `172.28.0.0/16` | IPv4 network reserved for VM `/30` allocations |
 | `SRV_VM_DNS` | `1.1.1.1,1.0.0.1` | Comma-separated guest nameservers |
 | `SRV_OUTBOUND_IFACE` | auto-detected | Optional override for the host interface used for NAT |
+| `SRV_EXTERNAL_UPLINKS` | empty | Comma-separated host interfaces through which external-only guests may forward; empty refuses external-only guests |
+| `SRV_EXTERNAL_DENY_CIDRS` | empty | Additional IPv4 CIDRs external-only guests must not reach, in addition to private and special-purpose ranges |
 
 ## Authorization
 

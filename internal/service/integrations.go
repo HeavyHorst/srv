@@ -233,6 +233,10 @@ func (a *App) cmdIntegration(ctx context.Context, actor model.Actor, args []stri
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
 		}
+		if inst.ExternalOnly() {
+			err := fmt.Errorf("instance %q is external-only and cannot use host integrations", vmName)
+			return commandResult{stderr: err.Error() + "\n", exitCode: 1}, err
+		}
 		integration, err := a.store.GetIntegrationByName(ctx, integrationName)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -554,10 +558,10 @@ func parseNewArgs(args []string) (string, provision.CreateOptions, []string, err
 			switch value {
 			case "tailnet":
 				opts.GuestNetwork = model.GuestNetworkTailnet
-			case model.GuestNetworkHost:
+			case model.GuestNetworkHost, model.GuestNetworkExternalOnly:
 				opts.GuestNetwork = value
 			default:
-				return "", provision.CreateOptions{}, nil, fmt.Errorf("--guest-network must be tailnet or host\n%s", newUsage())
+				return "", provision.CreateOptions{}, nil, fmt.Errorf("--guest-network must be tailnet, host or external-only\n%s", newUsage())
 			}
 		case "--template":
 			if opts.Template != "" || !validIntegrationName.MatchString(value) {

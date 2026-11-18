@@ -206,7 +206,7 @@ func FuzzPortableManifestValidate(f *testing.F) {
 		if manifest.Instance.Kind == model.KindOrb && manifest.Version < 4 {
 			t.Fatalf("accepted orb manifest version %d", manifest.Version)
 		}
-		if manifest.Instance.GuestNetwork != "" && (manifest.Instance.GuestNetwork != "host" ||
+		if manifest.Instance.GuestNetwork != "" && (manifest.Instance.GuestNetwork != "host" && manifest.Instance.GuestNetwork != "external-only" ||
 			manifest.Version < 5 || manifest.Instance.Kind == model.KindOrb) {
 			t.Fatalf("accepted guest network %q in version %d for kind %q", manifest.Instance.GuestNetwork, manifest.Version, manifest.Instance.Kind)
 		}

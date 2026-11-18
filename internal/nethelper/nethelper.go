@@ -38,6 +38,11 @@ type SetupRequest struct {
 	HostAddr          string `json:"host_addr"`
 	NetworkCIDR       string `json:"network_cidr"`
 	OutboundInterface string `json:"outbound_interface"`
+	// External-only confinement; set only on /network/setup-external-v1, so an
+	// older helper rejects the request instead of installing open forwarding.
+	GuestAddr       string   `json:"guest_addr,omitempty"`
+	ExternalUplinks []string `json:"external_uplinks,omitempty"`
+	DenyCIDRs       []string `json:"deny_cidrs,omitempty"`
 }
 
 type CleanupRequest struct {
@@ -77,6 +82,9 @@ func NewClient(socketPath string) *Client {
 func (c *Client) SetupInstanceNetwork(ctx context.Context, req SetupRequest) error {
 	if err := req.Validate(); err != nil {
 		return err
+	}
+	if req.external() {
+		return c.post(ctx, "/network/setup-external-v1", req)
 	}
 	if req.InstanceID != "" {
 		return c.post(ctx, "/network/setup-v2", req)
@@ -159,6 +167,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/network/setup", s.handleSetup)
 	mux.HandleFunc("/network/cleanup", s.handleCleanup)
 	mux.HandleFunc("/network/setup-v2", s.handleSetup)
+	mux.HandleFunc("/network/setup-external-v1", s.handleSetup)
+	mux.HandleFunc("/network/verify-external-v1", s.handleVerifyExternal)
+	mux.HandleFunc("/network/reapply-external-v1", s.handleReapplyExternal)
 	mux.HandleFunc("/network/cleanup-v2", s.handleCleanup)
 	mux.HandleFunc("/network/finalize-v1", s.handleFinalize)
 	mux.HandleFunc("/network/cleanup-proof-v1", s.handleCleanupProof)
@@ -208,17 +219,26 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
+	external := strings.HasSuffix(r.URL.Path, "/setup-external-v1")
+	if external != req.external() {
+		respondError(w, http.StatusBadRequest, errors.New("external-only setup requires its endpoint and approved uplinks"))
+		return
+	}
 	ctx, release, err := s.lockNetwork(r.Context())
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, err)
 		return
 	}
 	defer release()
-	if err := s.checkDeletion(req.InstanceID, strings.HasSuffix(r.URL.Path, "-v2")); err != nil {
+	if err := s.checkDeletion(req.InstanceID, external || strings.HasSuffix(r.URL.Path, "-v2")); err != nil {
 		respondError(w, http.StatusConflict, err)
 		return
 	}
-	if err := s.setupNetwork(ctx, req); err != nil {
+	setup := s.setupNetwork
+	if external {
+		setup = s.setupExternalNetwork
+	}
+	if err := setup(ctx, req); err != nil {
 		s.log.Error("setup instance network", "tap", req.TapDevice, "err", err)
 		respondError(w, http.StatusInternalServerError, err)
 		return
@@ -281,7 +301,7 @@ func (s *Server) setupNetwork(ctx context.Context, req SetupRequest) error {
 }
 
 func (s *Server) cleanupNetwork(ctx context.Context, req CleanupRequest) error {
-	var errs []string
+	errs := s.cleanupExternalNetwork(ctx, req)
 	if req.OutboundInterface != "" {
 		if err := deleteIPTablesRule(ctx, s.runner, "nat", "POSTROUTING", "-s", req.NetworkCIDR, "-o", req.OutboundInterface, "-j", "MASQUERADE"); err != nil {
 			errs = append(errs, err.Error())
@@ -317,6 +337,12 @@ func (r SetupRequest) Validate() error {
 	}
 	if err := validateInterfaceName("outbound interface", r.OutboundInterface); err != nil {
 		return err
+	}
+	if r.external() || r.GuestAddr != "" || len(r.DenyCIDRs) > 0 {
+		if !r.external() {
+			return errors.New("external-only networking requires at least one approved uplink")
+		}
+		return r.validateExternal()
 	}
 	return nil
 }

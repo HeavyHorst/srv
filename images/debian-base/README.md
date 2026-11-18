@@ -96,6 +96,10 @@ sudo env KERNEL_IMAGE="$PWD/images/arch-base/out/vmlinux" \
   ./images/debian-base/build.sh
 ```
 
+## External-only guest image
+
+`SRV_EXTERNAL_ONLY=1` builds an image for [external-only guests](../../docs/networking/overview.md#external-only-guests). It has no Tailscale. It has an OpenSSH server that allows only key-based root login, and it ships without host keys: each guest generates its own on first boot. Set `SRV_ROOT_AUTHORIZED_KEYS=/path/to/authorized_keys` to install root's authorized keys. Otherwise, provide keys some other way before you rely on SSH. The manifest gains `srv_guest_network=external-only`. This variant cannot be combined with `SRV_AMP_ORB=1`.
+
 ## Optional native Amp orb preparation
 
 Set `SRV_AMP_ORB=1` alongside the required kernel inputs:

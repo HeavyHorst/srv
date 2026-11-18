@@ -25,6 +25,7 @@ ssh srv -- --json status
 | `new <name> --image <name> --template <id>` | Clone an owner-scoped prepared project template; requires explicit `--host` through srv-front |
 | `new <name> --integration <name>` | Create and enable one or more existing integrations (admin only) |
 | `new <name> --guest-network host` | Create a VM that does not join the tailnet and is reached by SSH from the host; see [Guests without Tailscale](../networking/overview.md#guests-without-tailscale) |
+| `new <name> --guest-network external-only` | Create a VM that does not join the tailnet and may only reach the internet through `SRV_EXTERNAL_UPLINKS`; see [External-only guests](../networking/overview.md#external-only-guests) |
 | `new <name> --cpus <n>` | Create with custom vCPU count |
 | `new <name> --ram <size>` | Create with custom memory (`2G`, `512M`, or MiB integer) |
 | `new <name> --pool <name> --ram <size>` | Create a pooled-memory VM in an existing memory pool |

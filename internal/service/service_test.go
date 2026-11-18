@@ -12,10 +12,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +33,7 @@ import (
 
 	"srv/internal/config"
 	"srv/internal/model"
+	"srv/internal/nethelper"
 	"srv/internal/provision"
 	"srv/internal/store"
 	"srv/internal/vmrunner"
@@ -2564,6 +2567,12 @@ func TestParseNewArgs(t *testing.T) {
 			wantInts: []string{"openai", "github-api"},
 		},
 		{
+			name:     "parses external-only guest network",
+			args:     []string{"new", "demo", "--guest-network", "external-only"},
+			wantName: "demo",
+			wantOpts: provision.CreateOptions{GuestNetwork: model.GuestNetworkExternalOnly},
+		},
+		{
 			name:     "parses host guest network",
 			args:     []string{"new", "demo", "--guest-network", "host"},
 			wantName: "demo",
@@ -2578,7 +2587,7 @@ func TestParseNewArgs(t *testing.T) {
 		{
 			name:    "rejects unknown guest network",
 			args:    []string{"new", "demo", "--guest-network", "plain"},
-			wantErr: "--guest-network must be tailnet or host",
+			wantErr: "--guest-network must be tailnet, host or external-only",
 		},
 		{
 			name:    "rejects unknown options",
@@ -3408,4 +3417,197 @@ func writeSparseServiceTestFile(t *testing.T, path string, size int64) int64 {
 		t.Fatalf("Stat(%q) sys = %T, want *syscall.Stat_t", path, info.Sys())
 	}
 	return stat.Blocks * 512
+}
+
+func TestExternalPolicyLossStopsOnlyThatGuest(t *testing.T) {
+	ctx := context.Background()
+	st := newServiceTestStore(t)
+	exited := exec.Command("true")
+	if err := exited.Run(); err != nil {
+		t.Fatal(err)
+	}
+	guest := serviceTestInstance("ext", model.StateReady, time.Now().UTC())
+	guest.GuestNetwork, guest.FirecrackerPID = model.GuestNetworkExternalOnly, exited.Process.Pid
+	stopped := serviceTestInstance("ext-stopped", model.StateStopped, time.Now().UTC())
+	stopped.GuestNetwork, stopped.TapDevice = model.GuestNetworkExternalOnly, "tap-stopped"
+	normal := serviceTestInstance("normal", model.StateReady, time.Now().UTC())
+	normal.FirecrackerPID, normal.TapDevice = os.Getpid(), "tap-normal"
+	for _, inst := range []model.Instance{guest, stopped, normal} {
+		if err := st.CreateInstance(ctx, inst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir, err := os.MkdirTemp("", "srv-policy-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "helper.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var verified []string
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/network/verify-external-v1":
+			var req nethelper.SetupRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			mu.Lock()
+			verified = append(verified, req.TapDevice)
+			mu.Unlock()
+			if len(req.ExternalUplinks) == 0 || req.GuestAddr != guest.GuestAddr {
+				t.Errorf("verification without the instance policy: %+v", req)
+			}
+			http.Error(w, `{"error":"external-only jump is not the first FORWARD rule"}`, http.StatusConflict)
+			return
+		case "/vm/stop", "/network/cleanup-v2":
+		default:
+			t.Errorf("unexpected operation: %s", r.URL.Path)
+			http.Error(w, "unexpected operation", 400)
+			return
+		}
+		_, _ = io.WriteString(w, "{}")
+	})}
+	served := make(chan struct{})
+	go func() { defer close(served); _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close(); <-served })
+	cfg := loadServiceTestConfig(t, nil)
+	cfg.VMRunnerSocketPath, cfg.NetHelperSocketPath, cfg.OutboundInterface = socket, socket, "fixture0"
+	cfg.ExternalUplinks = []string{"wan0"}
+	app := &App{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if app.provisioner, err = provision.New(cfg, app.log, st); err != nil {
+		t.Fatal(err)
+	}
+	app.checkExternalPolicies(ctx)
+	if !slices.Equal(verified, []string{guest.TapDevice}) {
+		t.Fatalf("verified %q, want only the running external-only guest", verified)
+	}
+	got, err := st.GetInstance(ctx, guest.Name)
+	if err != nil || got.State != model.StateStopped || got.FirecrackerPID != 0 {
+		t.Fatalf("guest with lost policy was not stopped: %#v %v", got, err)
+	}
+	if got, err := st.GetInstance(ctx, normal.Name); err != nil || got.State != model.StateReady {
+		t.Fatalf("tailnet guest changed: %#v %v", got, err)
+	}
+	if shouldExposeGateway(guest) || !shouldExposeGateway(normal) {
+		t.Fatal("gateway exposure must exclude only external-only guests")
+	}
+}
+
+// The watchdog's persisting stop honours the snapshot barrier and is bound to
+// the checked incarnation; the helper's quarantine is independent of both.
+func TestExternalPolicyLossStopRespectsSnapshotAndIncarnation(t *testing.T) {
+	for _, tc := range []string{"snapshot", "recreated", "restarted"} {
+		t.Run(tc, func(t *testing.T) {
+			ctx := context.Background()
+			st := newServiceTestStore(t)
+			exited := exec.Command("true")
+			if err := exited.Run(); err != nil {
+				t.Fatal(err)
+			}
+			guest := serviceTestInstance("ext", model.StateReady, time.Now().UTC())
+			guest.GuestNetwork, guest.FirecrackerPID = model.GuestNetworkExternalOnly, exited.Process.Pid
+			if err := st.CreateInstance(ctx, guest); err != nil {
+				t.Fatal(err)
+			}
+			dir, err := os.MkdirTemp("", "srv-policy-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+			socket := filepath.Join(dir, "helper.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var verifies, stops atomic.Int32
+			// Runs after the failed check, before the watchdog takes the lock.
+			var race func()
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/network/verify-external-v1":
+					verifies.Add(1)
+					if race != nil {
+						race()
+						race = nil
+					}
+					http.Error(w, `{"error":"external-only TAP is quarantined"}`, http.StatusConflict)
+					return
+				case "/vm/stop":
+					stops.Add(1)
+				case "/network/cleanup-v2":
+				default:
+					t.Errorf("unexpected operation: %s", r.URL.Path)
+					http.Error(w, "unexpected operation", 400)
+					return
+				}
+				_, _ = io.WriteString(w, "{}")
+			})}
+			served := make(chan struct{})
+			go func() { defer close(served); _ = server.Serve(listener) }()
+			t.Cleanup(func() { _ = server.Close(); <-served })
+			cfg := loadServiceTestConfig(t, nil)
+			cfg.VMRunnerSocketPath, cfg.NetHelperSocketPath, cfg.OutboundInterface = socket, socket, "fixture0"
+			cfg.ExternalUplinks = []string{"wan0"}
+			app := &App{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			if app.provisioner, err = provision.New(cfg, app.log, st); err != nil {
+				t.Fatal(err)
+			}
+
+			var current model.Instance
+			switch tc {
+			case "snapshot":
+				lease, err := app.beginCommand()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := lease.PromoteToSnapshot(ctx); err != nil {
+					t.Fatal(err)
+				}
+				app.checkExternalPolicies(ctx)
+				got, err := st.GetInstance(ctx, guest.Name)
+				if verifies.Load() != 1 || stops.Load() != 0 || err != nil || !reflect.DeepEqual(got, guest) {
+					t.Fatalf("snapshot did not defer the stop: verifies=%d stops=%d %#v %v", verifies.Load(), stops.Load(), got, err)
+				}
+				lease.Release()
+				// The quarantined TAP keeps failing; the next check stops it.
+				app.checkExternalPolicies(ctx)
+				got, err = st.GetInstance(ctx, guest.Name)
+				if stops.Load() != 1 || err != nil || got.State != model.StateStopped {
+					t.Fatalf("deferred stop not retried: stops=%d %#v %v", stops.Load(), got, err)
+				}
+				return
+			case "recreated":
+				race = func() {
+					if err := st.DeleteInstance(ctx, guest.Name); err != nil {
+						t.Error(err)
+					}
+					current = serviceTestInstance("ext", model.StateReady, time.Now().UTC())
+					// Same PID (reuse) isolates the identity binding from the PID check.
+					current.ID, current.GuestNetwork, current.FirecrackerPID = "ext-new-id", model.GuestNetworkExternalOnly, guest.FirecrackerPID
+					if err := st.CreateInstance(ctx, current); err != nil {
+						t.Error(err)
+					}
+				}
+			case "restarted":
+				race = func() {
+					current = guest
+					current.StartRequestID = "new-attempt"
+					if err := st.UpdateInstance(ctx, current); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			app.checkExternalPolicies(ctx)
+			if verifies.Load() != 1 || stops.Load() != 0 {
+				t.Fatalf("stopped another incarnation: verifies=%d stops=%d", verifies.Load(), stops.Load())
+			}
+			got, err := st.GetInstance(ctx, guest.Name)
+			if err != nil || got.ID != current.ID || got.StartRequestID != current.StartRequestID || got.State != model.StateReady {
+				t.Fatalf("new incarnation changed: %#v %v", got, err)
+			}
+		})
+	}
 }

@@ -48,7 +48,8 @@ func (r *bootReportRunner) StartInstanceVM(ctx context.Context, req vmrunner.Sta
 
 type recordingNetworkHelper struct {
 	noopNetworkHelper
-	setups []nethelper.SetupRequest
+	setups   []nethelper.SetupRequest
+	reapplys []nethelper.SetupRequest
 }
 
 func (h *recordingNetworkHelper) SetupInstanceNetwork(_ context.Context, req nethelper.SetupRequest) error {
@@ -111,8 +112,9 @@ func TestHostGuestLifecycleWithoutGuestTailscale(t *testing.T) {
 	if err != nil || !slices.ContainsFunc(events, func(e model.InstanceEvent) bool { return strings.Contains(e.Message, "SHA256:fixture") }) {
 		t.Fatalf("ready event lacks the reported host key: %+v, %v", events, err)
 	}
-	if len(network.setups) != 1 {
-		t.Fatalf("network setups = %d", len(network.setups))
+	// Ordinary VM networking and host gateways, only without the tailnet.
+	if setup := network.setups[0]; setup.GuestAddr != "" || len(setup.ExternalUplinks) != 0 || len(setup.DenyCIDRs) != 0 {
+		t.Fatalf("host guest setup requested confinement: %+v", setup)
 	}
 	boot := runner.starts[0].Bootstrap
 	if boot.TailscaleAuthKey != "" || boot.TailscaleControlURL != "" || len(boot.TailscaleTags) != 0 || boot.EnrollmentNonce != "" ||

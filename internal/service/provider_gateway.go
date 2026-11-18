@@ -267,7 +267,12 @@ func desiredProviderGatewayInstances(instances []model.Instance) map[string]prov
 	return desired
 }
 
+// External-only guests never get host-side gateways: they would forward with
+// host credentials and host routing, outside the guest's confinement.
 func shouldExposeGateway(inst model.Instance) bool {
+	if inst.ExternalOnly() {
+		return false
+	}
 	switch inst.State {
 	case model.StateProvisioning, model.StateReady, model.StateAwaitingTailnet, model.StateAwaitingGuest:
 		return true

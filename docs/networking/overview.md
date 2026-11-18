@@ -71,6 +71,10 @@ For Amp runner VMs, this provides the network-connectivity role of an Orb Portal
 | `SRV_VM_NETWORK_CIDR` | `172.28.0.0/16` | IPv4 network reserved for VM `/30` allocations |
 | `SRV_VM_DNS` | `1.1.1.1,1.0.0.1` | Comma-separated guest nameservers |
 | `SRV_OUTBOUND_IFACE` | auto-detected | Optional override for the host interface used for NAT |
+| `SRV_EXTERNAL_UPLINKS` | empty | Host interfaces through which [external-only guests](#external-only-guests) may forward |
+| `SRV_EXTERNAL_DENY_CIDRS` | empty | Additional IPv4 destinations external-only guests must not reach |
+
+`SRV_OUTBOUND_IFACE` only selects which interface the MASQUERADE rule matches. It does not choose a route, gateway or source address: the host's routing table has already chosen the output interface.
 
 ## IPv4 forwarding
 
@@ -104,6 +108,26 @@ Manage the guest over SSH from the host, for example `ssh -J <host> root@<guest-
 
 - `stop --save-state` is refused for guests without Tailscale: a RAM resume skips the bootstrap and could not report a fresh boot nonce. `start` refuses to resume any saved RAM; `start <name> --discard-state` cold-boots instead.
 - Export artifacts of these guests use manifest version 5, which older servers refuse to import.
+
+### External-only guests
+
+`new <name> --guest-network external-only` creates a guest without Tailscale, as above, that is also confined to the internet. The network helper installs these rules before it brings the TAP up, and srv does not start the guest until they are in place:
+
+- `INPUT`, `FORWARD` and `OUTPUT` jump to srv-owned chains as their first rule. Rules that other tools later insert ahead of them are detected.
+- Forwarded guest traffic must come from the guest's single address, not just the guest's `/30`. It must not go to private, special-purpose, carrier-grade NAT or tailnet ranges, the VM network, or `SRV_EXTERNAL_DENY_CIDRS`. It may leave only through `SRV_EXTERNAL_UPLINKS`. Everything else is dropped, including traffic that a host route sends to another interface, so a lost uplink fails closed and never falls back to another route. All other internet destinations are allowed.
+- Nothing may open a connection to the guest: not other VMs, the LAN or the host. The one exception is TCP 22 from the host itself. The guest cannot open connections to any host address, and the host accepts replies from the TAP only from the guest's address.
+- IPv6 is disabled on the TAP and dropped in `ip6tables`.
+- No provider, integration or Amp CONNECT gateway is exposed, and `--integration` is refused.
+
+For an image with an OpenSSH server and no Tailscale, see the [Debian builder's external-only variant](../../images/debian-base/README.md#external-only-guest-image).
+
+The service starts a check of every running external-only guest's rules every 5 seconds. If rules are missing, reordered or behind another tool's rule, or the helper cannot check them, the helper takes the TAP down and srv stops the guest. This is detection, not continuous enforcement. After an external firewall flush or reload, the guest is unconfined until a check detects it. That time has no fixed upper bound: the check interval is only one part of it, alongside helper response time and checks of other guests that run first. Stop external-only guests before you reload the host firewall. A start reinstalls the rules. When srv restarts, it reapplies the current rules to running external-only guests before the first check, so changed `SRV_EXTERNAL_UPLINKS` and `SRV_EXTERNAL_DENY_CIDRS` take effect without stopping them. While the srv service is stopped, nothing checks the rules.
+
+Limits:
+
+- srv confines which host interface carries guest traffic. It cannot prove how routers beyond that uplink forward a public address. A public address of your own site, or an internet relay that reaches back into it, is reachable unless you list it in `SRV_EXTERNAL_DENY_CIDRS`.
+- The rules use `iptables`/`ip6tables` on the host. The host must have IPv6 enabled so that the helper can disable it on the TAP. They have been tested with `iptables` 1.8 using the nf_tables backend, not with `iptables-legacy`.
+- An imported external-only guest starts only where `SRV_EXTERNAL_UPLINKS` is configured.
 
 ## Host-side API gateways
 

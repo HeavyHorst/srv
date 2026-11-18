@@ -329,7 +329,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		return model.Instance{}, errors.New("invalid instance kind")
 	}
 	if !model.ValidGuestNetwork(opts.GuestNetwork) || (opts.GuestNetwork != model.GuestNetworkTailnet && opts.Kind != model.KindVM) {
-		return model.Instance{}, errors.New("guest network must be tailnet or host on an ordinary VM")
+		return model.Instance{}, errors.New("guest network must be tailnet, host or external-only on an ordinary VM")
 	}
 	imageName := opts.Image
 	if imageName == "" {
@@ -537,14 +537,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 	} else {
 		guestAuthTags = nil
 	}
-	zenGatewayPort := 0
-	if strings.TrimSpace(p.cfg.ZenAPIKey) != "" {
-		zenGatewayPort = p.cfg.ZenGatewayPort
-	}
-	deepseekGatewayPort := 0
-	if strings.TrimSpace(p.cfg.DeepSeekAPIKey) != "" {
-		deepseekGatewayPort = p.cfg.DeepSeekGatewayPort
-	}
+	zenGatewayPort, deepseekGatewayPort := p.providerGatewayPorts(inst)
 
 	bootstrap := guestBootstrap{
 		Version:             1,
@@ -649,6 +642,11 @@ func (p *Provisioner) restoreInstance(ctx context.Context, inst model.Instance) 
 		return nil // Reconciliation resumes shutdown intent without auto-starting.
 	}
 	if inst.FirecrackerPID > 0 && processExists(inst.FirecrackerPID) && !serialLogShowsGuestHalted(inst.SerialLogPath) {
+		if inst.ExternalOnly() {
+			// The running guest keeps its old rules across a service restart;
+			// bring them in line with the current configuration.
+			return p.reapplyExternalNetwork(ctx, inst)
+		}
 		return nil
 	}
 	if inst.FirecrackerPID != 0 {
@@ -1134,14 +1132,7 @@ func (p *Provisioner) StartWithOptions(ctx context.Context, name string, opts St
 		return inst, err
 	}
 	p.recordEvent(inst.ID, "network", "tap device and NAT configured", map[string]any{"tap": inst.TapDevice, "network": inst.NetworkCIDR})
-	zenGatewayPort := 0
-	if strings.TrimSpace(p.cfg.ZenAPIKey) != "" {
-		zenGatewayPort = p.cfg.ZenGatewayPort
-	}
-	deepseekGatewayPort := 0
-	if strings.TrimSpace(p.cfg.DeepSeekAPIKey) != "" {
-		deepseekGatewayPort = p.cfg.DeepSeekGatewayPort
-	}
+	zenGatewayPort, deepseekGatewayPort := p.providerGatewayPorts(inst)
 
 	bootstrap := guestBootstrap{
 		Version:             1,
@@ -1392,6 +1383,9 @@ func (p *Provisioner) ensureCreatePrereqs(ctx context.Context, needsResize bool,
 	if inst.GuestTailnet() && len(p.cfg.GuestAuthTags) == 0 {
 		return errors.New("create requires SRV_GUEST_AUTH_TAGS so minted guest auth keys carry an allowed tag")
 	}
+	if err := p.ensureExternalPolicy(inst); err != nil {
+		return err
+	}
 	if err := p.ensureRootFSReflinkSupport(ctx, image.RootFS); err != nil {
 		return err
 	}
@@ -1446,6 +1440,9 @@ func (p *Provisioner) ensureStartPrereqs(inst model.Instance) error {
 	}
 	if inst.State == model.StateDeleting {
 		return fmt.Errorf("instance %q is being deleted", inst.Name)
+	}
+	if err := p.ensureExternalPolicy(inst); err != nil {
+		return err
 	}
 	if inst.GuestTailnet() && p.tsClient == nil {
 		return errors.New("start requires TS_TAILNET and TS_CLIENT_SECRET so the control plane can observe guest tailnet readiness")
@@ -1857,13 +1854,82 @@ func (p *Provisioner) setupNetworking(ctx context.Context, inst model.Instance) 
 	if err != nil {
 		return err
 	}
-	return p.networkHelper.SetupInstanceNetwork(ctx, nethelper.SetupRequest{
+	return p.networkHelper.SetupInstanceNetwork(ctx, p.networkSetupRequest(inst, outbound))
+}
+
+func (p *Provisioner) networkSetupRequest(inst model.Instance, outbound string) nethelper.SetupRequest {
+	req := nethelper.SetupRequest{
 		InstanceID:        inst.ID,
 		TapDevice:         inst.TapDevice,
 		HostAddr:          inst.HostAddr,
 		NetworkCIDR:       inst.NetworkCIDR,
 		OutboundInterface: outbound,
+	}
+	if inst.ExternalOnly() {
+		req.GuestAddr = inst.GuestAddr
+		req.ExternalUplinks = append([]string(nil), p.cfg.ExternalUplinks...)
+		req.DenyCIDRs = append([]string{p.cfg.VMNetworkCIDR}, p.cfg.ExternalDenyCIDRs...)
+	}
+	return req
+}
+
+// ensureExternalPolicy refuses to activate an external-only guest without an
+// approved uplink; the helper would otherwise have nothing to confine it to.
+func (p *Provisioner) ensureExternalPolicy(inst model.Instance) error {
+	if inst.ExternalOnly() && len(p.cfg.ExternalUplinks) == 0 {
+		return errors.New("external-only guests require SRV_EXTERNAL_UPLINKS")
+	}
+	return nil
+}
+
+// VerifyExternalNetwork checks a running external-only guest's host policy.
+// On failure the helper has already taken the guest's TAP down.
+func (p *Provisioner) VerifyExternalNetwork(ctx context.Context, inst model.Instance) error {
+	helper, ok := p.networkHelper.(interface {
+		VerifyExternalNetwork(context.Context, nethelper.SetupRequest) error
 	})
+	if !ok {
+		return errors.New("network helper cannot verify external-only policy")
+	}
+	outbound, err := p.outboundInterface(ctx)
+	if err != nil {
+		return err
+	}
+	return helper.VerifyExternalNetwork(ctx, p.networkSetupRequest(inst, outbound))
+}
+
+func (p *Provisioner) reapplyExternalNetwork(ctx context.Context, inst model.Instance) error {
+	helper, ok := p.networkHelper.(interface {
+		ReapplyExternalNetwork(context.Context, nethelper.SetupRequest) error
+	})
+	if !ok {
+		return errors.New("network helper cannot reapply external-only policy")
+	}
+	if err := p.ensureExternalPolicy(inst); err != nil {
+		return err
+	}
+	outbound, err := p.outboundInterface(ctx)
+	if err != nil {
+		return err
+	}
+	if err := helper.ReapplyExternalNetwork(ctx, p.networkSetupRequest(inst, outbound)); err != nil {
+		return fmt.Errorf("reapply external-only policy: %w", err)
+	}
+	return nil
+}
+
+// External-only guests get no host-side credentialed gateways.
+func (p *Provisioner) providerGatewayPorts(inst model.Instance) (zen, deepseek int) {
+	if inst.ExternalOnly() {
+		return 0, 0
+	}
+	if strings.TrimSpace(p.cfg.ZenAPIKey) != "" {
+		zen = p.cfg.ZenGatewayPort
+	}
+	if strings.TrimSpace(p.cfg.DeepSeekAPIKey) != "" {
+		deepseek = p.cfg.DeepSeekGatewayPort
+	}
+	return zen, deepseek
 }
 
 func (p *Provisioner) cleanupNetworking(inst model.Instance) error {

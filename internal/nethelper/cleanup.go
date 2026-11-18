@@ -291,7 +291,8 @@ func verifyNetworkAbsent(ctx context.Context, q CleanupRequest, output func(cont
 		for _, token := range strings.FieldsFunc(string(data), func(r rune) bool {
 			return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._:/-", r))
 		}) {
-			if token == q.TapDevice {
+			// iptables-save declares chains as ":NAME".
+			if token == q.TapDevice || strings.TrimPrefix(token, ":") == externalInstanceChain(q.TapDevice) {
 				return fmt.Errorf("network residual for %s", q.TapDevice)
 			}
 		}

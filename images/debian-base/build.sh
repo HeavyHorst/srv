@@ -40,6 +40,16 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+EXTERNAL_ONLY="${SRV_EXTERNAL_ONLY:-0}"
+AUTHORIZED_KEYS="${SRV_ROOT_AUTHORIZED_KEYS:-}"
+if [[ "$EXTERNAL_ONLY" == 1 ]]; then
+  [[ "${SRV_AMP_ORB:-0}" != 1 ]] || die 'SRV_EXTERNAL_ONLY and SRV_AMP_ORB are mutually exclusive'
+  [[ -z "$AUTHORIZED_KEYS" || -f "$AUTHORIZED_KEYS" ]] || die 'SRV_ROOT_AUTHORIZED_KEYS must name a readable file'
+  PACKAGES+=(openssh-server)
+elif [[ -n "$AUTHORIZED_KEYS" ]]; then
+  die 'SRV_ROOT_AUTHORIZED_KEYS requires SRV_EXTERNAL_ONLY=1'
+fi
+
 [[ $(id -u) == 0 ]] || die 'run as root (debootstrap, chroot, device nodes and mounts require privileges)'
 [[ $(uname -m) == x86_64 ]] || die 'only native amd64 builds are supported'
 for cmd in debootstrap mkfs.ext4 chroot mount mountpoint umount systemctl \
@@ -78,7 +88,7 @@ curl -fsSL --retry 3 \
 printf '%s  %s\n' "$COMPOSE_SHA256" "$WORK/docker-compose" | sha256sum -c -
 install -D -m 0755 "$WORK/docker-compose" "$ROOT/usr/local/lib/docker/cli-plugins/docker-compose"
 [[ $(chroot "$ROOT" docker compose version --short) == "$COMPOSE_VERSION" ]] || die 'Docker Compose plugin validation failed'
-if [[ "${SRV_AMP_ORB:-0}" != 1 ]]; then
+if [[ "${SRV_AMP_ORB:-0}" != 1 && "$EXTERNAL_ONLY" != 1 ]]; then
 install -d "$ROOT/usr/share/keyrings" "$ROOT/etc/apt/sources.list.d"
 curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
   -o "$ROOT/usr/share/keyrings/tailscale-archive-keyring.gpg"
@@ -114,6 +124,20 @@ if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
   rm -f "$ROOT/etc/systemd/system/srv-bootstrap.service"
   systemctl --root="$ROOT" mask srv-bootstrap.service
   systemctl --root="$ROOT" enable srv-orb-guest.service srv-orb-trim.service
+elif [[ "$EXTERNAL_ONLY" == 1 ]]; then
+  # No Tailscale; bootstrap generates per-guest SSH host keys and starts sshd.
+  rm -f "$ROOT"/etc/ssh/ssh_host_*
+  install -D -m 0644 /dev/stdin "$ROOT/etc/ssh/sshd_config.d/10-srv.conf" <<'SSHD'
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+SSHD
+  if [[ -n "$AUTHORIZED_KEYS" ]]; then
+    install -D -o root -g root -m 0600 "$AUTHORIZED_KEYS" "$ROOT/root/.ssh/authorized_keys"
+    chmod 0700 "$ROOT/root/.ssh"
+  fi
+  systemctl --root="$ROOT" enable srv-bootstrap
+  systemctl --root="$ROOT" disable ssh.service ssh.socket 2>/dev/null || true
 else
   systemctl --root="$ROOT" enable tailscaled srv-bootstrap
 fi
@@ -148,6 +172,9 @@ cp "$KERNEL_IMAGE" "$WORK/vmlinux"
   echo "docker_compose_sha256=$COMPOSE_SHA256"
   if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
     echo 'srv_amp_orb=1'
+  fi
+  if [[ "$EXTERNAL_ONLY" == 1 ]]; then
+    echo 'srv_guest_network=external-only'
   fi
   (cd "$WORK" && sha256sum vmlinux rootfs-base.img)
   cat "$WORK/packages.txt"

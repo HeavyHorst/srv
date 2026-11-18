@@ -21,9 +21,11 @@ const (
 
 	// Guest network modes of ordinary VMs. The empty default is a Tailscale
 	// guest. Host guests do not join the tailnet and otherwise use ordinary VM
-	// networking.
-	GuestNetworkTailnet = ""
-	GuestNetworkHost    = "host"
+	// networking. External-only guests do not join the tailnet either and are
+	// confined to the configured external uplinks.
+	GuestNetworkTailnet      = ""
+	GuestNetworkHost         = "host"
+	GuestNetworkExternalOnly = "external-only"
 
 	MemoryModeFixed = "fixed"
 	MemoryModePool  = "pool"
@@ -92,8 +94,12 @@ func (i Instance) GuestTailnet() bool {
 	return i.KindName() == KindVM && i.GuestNetwork == GuestNetworkTailnet
 }
 
+func (i Instance) ExternalOnly() bool {
+	return i.GuestNetwork == GuestNetworkExternalOnly
+}
+
 func ValidGuestNetwork(mode string) bool {
-	return mode == GuestNetworkTailnet || mode == GuestNetworkHost
+	return mode == GuestNetworkTailnet || mode == GuestNetworkHost || mode == GuestNetworkExternalOnly
 }
 
 // KindName treats records created before workload kinds existed as VMs.

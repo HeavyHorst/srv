@@ -70,6 +70,7 @@ d /var/ossec/etc/shared 0770 root wazuh -
 z /var/ossec/etc/wpk_root.pem 0640 root wazuh -
 d /var/ossec/logs 0770 wazuh wazuh -
 f /var/ossec/logs/ossec.log 0660 wazuh wazuh -
+d /var/ossec/tmp 1770 root wazuh -
 `
 	root, calls, out, err := runOwners(t, conf, func(root string) {
 		os.WriteFile(filepath.Join(root, "var/ossec/etc/ossec.conf"), []byte("x"), 0o644)
@@ -87,6 +88,9 @@ f /var/ossec/logs/ossec.log 0660 wazuh wazuh -
 		if got := mode(t, filepath.Join(root, path)); got != want {
 			t.Errorf("%s mode %o, want %o", path, got, want)
 		}
+	}
+	if info, err := os.Lstat(filepath.Join(root, "var/ossec/tmp")); err != nil || info.Mode()&os.ModeSticky == 0 || info.Mode().Perm() != 0o770 {
+		t.Errorf("var/ossec/tmp is not sticky 1770: %v, %v", info, err)
 	}
 	// A z entry for a file the package did not ship is skipped, not created.
 	if _, err := os.Lstat(filepath.Join(root, "var/ossec/etc/wpk_root.pem")); err == nil {
@@ -117,6 +121,7 @@ func TestWazuhOwnersRefusals(t *testing.T) {
 		{name: "dot-dot", conf: "z /var/ossec/../etc/shadow 0644 root wazuh -\n", want: "refusing path"},
 		{name: "symlink type", conf: "L /var/ossec/etc/x 0644 root wazuh /etc/shadow\n", want: "unsupported entry type"},
 		{name: "setuid mode", conf: "z /var/ossec/etc/ossec.conf 4755 root wazuh -\n", want: "invalid mode"},
+		{name: "setgid mode", conf: "d /var/ossec/tmp 2770 root wazuh -\n", want: "invalid mode"},
 		{name: "argument", conf: "f /var/ossec/etc/x 0644 root wazuh content\n", want: "unsupported argument"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

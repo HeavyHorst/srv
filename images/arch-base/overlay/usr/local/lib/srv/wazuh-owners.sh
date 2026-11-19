@@ -12,7 +12,8 @@
 # never follows one.
 #
 # Only d (directory), f (empty file) and z (adjust existing) lines under
-# /var/ossec with octal modes are accepted; anything else fails.
+# /var/ossec with octal modes are accepted; the sticky bit is allowed (the
+# package's /var/ossec/tmp is 1770), setuid and setgid are not. Anything else fails.
 set -euo pipefail
 
 ROOT="${SRV_WAZUH_ENROLL_ROOT:-}"
@@ -42,7 +43,7 @@ while read -r type path mode user group rest; do
 	[[ -z "${type}" || "${type}" == \#* ]] && continue
 	[[ "${type}" =~ ^[dfz]$ ]] || fail "unsupported entry type ${type} for ${path}"
 	[[ "${path}" =~ ^/var/ossec(/[A-Za-z0-9._+@-]+)*$ && "${path}" != */../* && "${path}" != */.. ]] || fail "refusing path ${path}"
-	[[ "${mode}" =~ ^0[0-7]{3}$ ]] || fail "invalid mode ${mode} for ${path}"
+	[[ "${mode}" =~ ^[01][0-7]{3}$ ]] || fail "invalid mode ${mode} for ${path}"
 	[[ "${user}" =~ ${NAME_RE} && "${group}" =~ ${NAME_RE} ]] || fail "invalid owner ${user}:${group} for ${path}"
 	[[ "${rest}" == "-" ]] || fail "unsupported argument for ${path}"
 	check_path "${path}"

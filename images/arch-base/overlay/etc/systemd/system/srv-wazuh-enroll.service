@@ -1,0 +1,14 @@
+[Unit]
+Description=srv controller-mediated Wazuh agent enrollment
+Documentation=file:///usr/local/lib/srv/wazuh-enroll.sh
+# Started by the srv controller after it writes the identity; never at boot.
+ConditionPathExists=/run/srv-wazuh/enrollment.json
+After=local-fs.target srv-bootstrap.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/srv/wazuh-enroll.sh enroll /run/srv-wazuh/enrollment.json
+TimeoutStartSec=60s
+UMask=0077
+PrivateTmp=yes
+NoNewPrivileges=yes

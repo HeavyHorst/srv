@@ -41,6 +41,7 @@ import (
 	"srv/internal/provision"
 	"srv/internal/storage"
 	"srv/internal/store"
+	"srv/internal/wazuh"
 )
 
 type App struct {
@@ -561,6 +562,9 @@ func (a *App) Run(ctx context.Context) error {
 		return fmt.Errorf("open tailscale local api client: %w", err)
 	}
 	a.provisioner.SetLocalClient(a.localAPI)
+	if err := a.enableWazuhMonitoring(ctx); err != nil {
+		return fmt.Errorf("wazuh monitoring: %w", err)
+	}
 
 	listener, err := a.tailscale.Listen("tcp", a.cfg.ListenAddr)
 	if err != nil {
@@ -594,6 +598,9 @@ func (a *App) Run(ctx context.Context) error {
 	g.Go(func() error {
 		a.restoreInstances(groupCtx)
 		startupLease.Release()
+		if err := a.provisioner.ResumeMonitoring(groupCtx); err != nil {
+			a.log.Error("resume wazuh monitoring", "err", err)
+		}
 		// Restore first brings running external-only guests' rules in line
 		// with the current configuration; checking earlier would stop them.
 		g.Go(func() error {
@@ -3860,4 +3867,35 @@ func ensureHostSigner(path string) (ssh.Signer, error) {
 		return nil, fmt.Errorf("write host key: %w", err)
 	}
 	return ssh.ParsePrivateKey(pemBytes)
+}
+
+// enableWazuhMonitoring enrolls ready tailnet guests with the Wazuh manager
+// when SRV_WAZUH_API_URL is set (see wazuh.ConfigFromEnv). The controller
+// reaches each guest over the tailnet with Tailscale SSH, so the tailnet
+// policy must let this node's tags SSH as root to guests without check mode.
+func (a *App) enableWazuhMonitoring(ctx context.Context) error {
+	if !wazuh.Configured(os.Getenv) {
+		return nil
+	}
+	cfg, err := wazuh.ConfigFromEnv(os.Getenv)
+	if err != nil {
+		return err
+	}
+	coordinator, err := cfg.Coordinator()
+	if err != nil {
+		return err
+	}
+	a.provisioner.SetWazuhMonitoring(ctx, provision.WazuhMonitoring{
+		Coordinator: coordinator,
+		AssetPrefix: cfg.AssetPrefix,
+		OpenGuest: func(ctx context.Context, addr, hostKey string) (wazuh.Guest, io.Closer, error) {
+			client, err := wazuh.DialGuest(ctx, a.tailscale.Dial, addr, hostKey, nil)
+			if err != nil {
+				return nil, nil, err
+			}
+			return wazuh.CommandGuest{Run: wazuh.SSHRunner(client)}, client, nil
+		},
+	})
+	a.log.Info("wazuh monitoring enabled", "manager", cfg.ManagerAddress, "state", cfg.StatePath)
+	return nil
 }

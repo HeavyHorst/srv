@@ -79,6 +79,69 @@ To write directly into the service's expected runtime image directory:
 sudo OUTPUT_DIR=/var/lib/srv/images/arch-base ./images/arch-base/build.sh
 ```
 
+## Wazuh agent
+
+Native (non-Orb) images require Tailscale 1.104.4 or newer and ship the Wazuh agent 4.14.9, built from source by `packages/wazuh-agent/PKGBUILD`. The recipe is pinned to tag `v4.14.9`, commit `bed556db3f4f535cb3a585f3d9e7f35a6acf0f58`, and makepkg verifies the tag's upstream signature. Build the package in a clean Arch environment; rootless podman works:
+
+```bash
+podman run --rm --userns=keep-id:uid=0,gid=0 \
+	-v "$PWD/images/arch-base/packages/wazuh-agent:/recipe:ro" -v "$PWD/out:/out" \
+	docker.io/library/archlinux:base-devel sh -c '
+	pacman-key --init && pacman-key --populate archlinux
+	pacman -Syu --noconfirm --needed git cmake clang llvm python libtool autoconf automake pkgconf patchelf libelf
+	useradd -m builder && cp -a /recipe /build && chown -R builder /build /out
+	su builder -c "cd /build && gpg --batch --import keys/pgp/*.asc && PKGDEST=/out makepkg -f --noconfirm"'
+```
+
+The image build accepts only the package whose SHA-256 equals `WAZUH_PACKAGE_PINNED_SHA256` in `build.sh`.
+
+The package is stored, not rebuilt per image. Two builds of the same recipe differ (package build date, the OpenSSL build stamp inside `libwazuhext.so`), so a fresh build can never match the pin. The pin therefore names one reviewed artifact, and the image build reads that file from a stable path on the build host:
+
+```text
+/srv/artifacts/wazuh-agent/4.14.9-1/wazuh-agent-4.14.9-1-x86_64.pkg.tar.zst
+```
+
+Produce it once with the podman command above, check `sha256sum` against the pin, and copy it there (root-owned, not writable by the build user). Keep the build log with it. `WAZUH_PACKAGE=<file>` reads the package from elsewhere; the pin still applies. A rebuilt package means storing the new file under its own release directory and updating `WAZUH_PACKAGE_PINNED_SHA256` in a reviewed change.
+
+```bash
+sudo ./images/arch-base/build.sh                       # reads the stored artifact
+sudo WAZUH_PACKAGE=/path/wazuh-agent-4.14.9-1-x86_64.pkg.tar.zst ./images/arch-base/build.sh
+```
+
+The build also refuses a package of another version or built from another commit, and records `wazuh_agent_version`, `wazuh_package_sha256` and `wazuh_source_commit` in `manifest.txt`. The image has no manager address or agent key, automatic enrollment is off, and `wazuh-agent.service` is not enabled. `srv-wazuh-enroll` on the controller registers the agent through the manager API and writes its identity to `/run/srv-wazuh/enrollment.json` (format in `/usr/local/lib/srv/wazuh-enroll.sh`) over SSH, then starts `srv-wazuh-enroll.service`, which installs `client.keys` and starts the agent. The agent refuses to start without an identity installed that way, and templates are stripped of it. Orb images omit the agent.
+
+For development or emergency builds without the pinned package, `SRV_WAZUH_AGENT=0` builds a native image without the agent, its overlay files or its `libelf` dependency. Everything else, including the Tailscale floor, is unchanged, and the manifest records `wazuh_agent=disabled` so the gap stays visible. The default is `SRV_WAZUH_AGENT=1`; any value other than `0` or `1` is refused.
+
+```bash
+sudo SRV_WAZUH_AGENT=0 ./images/arch-base/build.sh
+```
+
+### Controller enrollment
+
+When `SRV_WAZUH_API_URL` is set, the srv service enrolls every tailnet guest automatically once it is ready (tailnet presence), and again for every ready guest after the service restarts. The asset is `SRV_WAZUH_ASSET_PREFIX` plus the guest name, which is also the agent name; the incarnation is the instance ID, sequenced by its creation time. The service pins the guest's ed25519 SSH host key as its tailnet node advertises it, connects over the tailnet with Tailscale SSH as root, and runs the same steps as the command below. Enrollment never delays readiness: while the manager is unreachable or refuses, the guest stays ready, its events show `monitoring pending`, and the service retries with backoff (30 s doubling to 15 min) until the agent reports. Deleting an instance leaves its agent registered; recreating the same name retires it, and `srv-wazuh-enroll retire` removes a decommissioned asset. An incorrect configuration stops the service at startup. Host-only and external-only guests are not enrolled automatically.
+
+`cmd/srv-wazuh-enroll` (package `internal/wazuh`) enrolls a booted guest by hand:
+
+```bash
+srv-wazuh-enroll enroll -asset <NRC asset> -incarnation <instance ID> -seq <N> -name <hostname> \
+	-guest <guest>:22 -host-key SHA256:<guest host key> [-ssh-key <file>]
+srv-wazuh-enroll retire -asset <NRC asset> -incarnation <instance ID> -seq <N>
+```
+
+It registers the agent with `POST /agents` (the manager's local authd), reads its key with `GET /agents/{id}/key`, writes `/run/srv-wazuh/enrollment.json` over SSH as root (pinned host key), starts `srv-wazuh-enroll.service`, and waits until the manager reports the agent `active`. Each asset maps to one incarnation and one agent: re-enrolling the same incarnation reuses its agent, a higher `-seq` (clean rebuild) deletes only the agent mapped to that asset before registering again, an older one is refused, and a disconnected agent is never deleted. It reads its configuration from the environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `SRV_WAZUH_API_URL` | Manager API, `https://<manager>:55000` |
+| `SRV_WAZUH_API_USER` | API user allowed to create, read and delete agents |
+| `SRV_WAZUH_API_PASSWORD_FILE` | File (mode 0600 or stricter) holding its password; or `SRV_WAZUH_API_PASSWORD` |
+| `SRV_WAZUH_API_CA_FILE` | PEM CA for the API certificate (system roots if unset) |
+| `SRV_WAZUH_MANAGER_ADDRESS`, `SRV_WAZUH_MANAGER_PORT` | Where agents connect (port defaults to 1514) |
+| `SRV_WAZUH_STATE` | Registration state file, shared by controllers on one host |
+| `SRV_WAZUH_ASSET_PREFIX` | Optional prefix for asset IDs and agent names in the srv service, such as `gpu-rig-` |
+
+The srv service also needs the tailnet policy to allow its tags to SSH as `root` to guest tags with action `accept` (not `check`).
+
 ## Optional native Amp orb preparation
 
 The default build is unchanged. Opt in at build time:

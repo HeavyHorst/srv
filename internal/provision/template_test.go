@@ -285,6 +285,75 @@ func TestTemplateSanitizerStripsSSHHostKeysOnlyWhenAsked(t *testing.T) {
 	}
 }
 
+func TestTemplateSanitizerStripsWazuhAgentIdentity(t *testing.T) {
+	templateTestTools(t)
+	image := filepath.Join(t.TempDir(), "rootfs.img")
+	templateTestImage(t, image, map[string]string{
+		"etc/machine-id":                                "identity",
+		"var/ossec/etc/client.keys":                     "012 vm-a any 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+		"var/ossec/etc/shared/merged.mg":                "manager group config",
+		"var/ossec/queue/rids/012":                      "counter",
+		"var/ossec/queue/diff/local/etc/x/diff":         "diff",
+		"var/ossec/queue/fim/db/fim.db":                 "fim",
+		"var/ossec/queue/syscollector/db/local.db":      "inventory",
+		"var/ossec/queue/sockets/queue":                 "socket",
+		"var/ossec/queue/alerts/ar":                     "alerts",
+		"var/ossec/queue/logcollector/file_status.json": "offsets",
+		"var/ossec/var/run/wazuh-agentd-1.pid":          "1",
+		"var/ossec/logs/ossec.log":                      "agent 012 vm-a connected",
+		"var/ossec/logs/ossec.json":                     "{}",
+		"var/ossec/logs/wazuh/2026/Nov/ossec-19.log.gz": "rotated",
+		"var/lib/srv/wazuh-enrolled":                    "hash",
+		// Image content the agent needs on every clone.
+		"var/ossec/etc/ossec.conf":                                "config",
+		"var/ossec/etc/client.keys.example":                       "keep",
+		"var/ossec/etc/shared/rootkit_files.txt":                  "keep",
+		"var/ossec/bin/wazuh-agentd":                              "binary",
+		"var/ossec/queue/fim/keep":                                "keep",
+		"var/ossec/logs/active-responses.log":                     "keep",
+		"var/lib/srv/other":                                       "keep",
+		"etc/systemd/system/multi-user.target.wants/sshd.service": "keep",
+	})
+	if out, err := exec.Command("debugfs", "-w", "-R", "symlink /etc/systemd/system/multi-user.target.wants/wazuh-agent.service /usr/lib/systemd/system/wazuh-agent.service", image).CombinedOutput(); err != nil {
+		t.Fatalf("symlink: %s %v", out, err)
+	}
+	if err := sanitizeTemplateDisk(context.Background(), image, false); err != nil {
+		t.Fatal(err)
+	}
+	exists := func(path string) bool {
+		out, _ := exec.Command("debugfs", "-R", "stat \""+path+"\"", image).CombinedOutput()
+		return !strings.Contains(string(out), "File not found")
+	}
+	for _, path := range []string{
+		"/var/ossec/etc/client.keys", "/var/ossec/etc/shared/merged.mg", "/var/ossec/queue/rids",
+		"/var/ossec/queue/diff", "/var/ossec/queue/fim/db", "/var/ossec/queue/syscollector/db",
+		"/var/ossec/queue/sockets", "/var/ossec/queue/alerts", "/var/ossec/queue/logcollector",
+		"/var/ossec/var/run", "/var/ossec/logs/ossec.log", "/var/ossec/logs/ossec.json",
+		"/var/ossec/logs/wazuh", "/var/lib/srv/wazuh-enrolled",
+		"/etc/systemd/system/multi-user.target.wants/wazuh-agent.service",
+	} {
+		if exists(path) {
+			t.Errorf("template still contains %s", path)
+		}
+	}
+	for _, path := range []string{
+		"/var/ossec/etc/ossec.conf", "/var/ossec/etc/client.keys.example", "/var/ossec/etc/shared/rootkit_files.txt",
+		"/var/ossec/bin/wazuh-agentd", "/var/ossec/queue/fim/keep", "/var/ossec/queue/syscollector",
+		"/var/ossec/logs/active-responses.log", "/var/ossec/var", "/var/lib/srv/other",
+		"/etc/systemd/system/multi-user.target.wants/sshd.service",
+	} {
+		if !exists(path) {
+			t.Errorf("template lost %s", path)
+		}
+	}
+	// Images without the agent are unaffected.
+	image = filepath.Join(t.TempDir(), "rootfs.img")
+	templateTestImage(t, image, map[string]string{"etc/machine-id": "identity", "var/lib/srv/other": "keep"})
+	if err := sanitizeTemplateDisk(context.Background(), image, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTemplateSanitizerFailsClosed(t *testing.T) {
 	templateTestTools(t)
 	image := filepath.Join(t.TempDir(), "rootfs.img")

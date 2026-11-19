@@ -198,6 +198,24 @@ func (d *templateDisk) resetMachineID() error {
 	return nil
 }
 
+var wazuhAgentState = []string{
+	"/var/ossec/etc/client.keys",
+	"/var/ossec/etc/shared/merged.mg",
+	"/var/ossec/queue/rids",
+	"/var/ossec/queue/diff",
+	"/var/ossec/queue/fim/db",
+	"/var/ossec/queue/syscollector/db",
+	"/var/ossec/queue/sockets",
+	"/var/ossec/queue/alerts",
+	"/var/ossec/queue/logcollector",
+	"/var/ossec/var/run",
+	"/var/ossec/logs/ossec.log",
+	"/var/ossec/logs/ossec.json",
+	"/var/ossec/logs/wazuh",
+	"/var/lib/srv/wazuh-enrolled",
+	"/etc/systemd/system/multi-user.target.wants/wazuh-agent.service",
+}
+
 // sanitizeTemplateDisk removes per-guest identity. SSH host keys are removed
 // only for sources without Tailscale, whose bootstrap regenerates them; other
 // images keep their previous behaviour.
@@ -207,6 +225,10 @@ func sanitizeTemplateDisk(ctx context.Context, path string, stripSSHHostKeys boo
 	}
 	d := templateDisk{ctx: ctx, path: path, remaining: 100000}
 	targets := []string{"/etc/machine-id", "/var/lib/dbus/machine-id", "/var/lib/tailscale", "/var/lib/srv/bootstrap.done", "/var/lib/systemd/random-seed"}
+	// Wazuh agent identity and the state bound to it: clones enroll afresh,
+	// and the agent unit refuses to start until they do. The package's
+	// tmpfiles.d entries recreate the removed directories at boot.
+	targets = append(targets, wazuhAgentState...)
 	if stripSSHHostKeys {
 		targets = append(targets, "/etc/ssh/ssh_host_rsa_key", "/etc/ssh/ssh_host_rsa_key.pub", "/etc/ssh/ssh_host_ecdsa_key", "/etc/ssh/ssh_host_ecdsa_key.pub", "/etc/ssh/ssh_host_ed25519_key", "/etc/ssh/ssh_host_ed25519_key.pub")
 	}

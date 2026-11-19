@@ -92,6 +92,7 @@ type Provisioner struct {
 	admissionMu         sync.Mutex
 	backendID           string
 	closeGateways       func(context.Context, model.Instance) error
+	monitoring          *monitoringWorker
 }
 
 type networkHelper interface {
@@ -596,6 +597,7 @@ func (p *Provisioner) Create(ctx context.Context, name string, actor model.Actor
 		return inst, err
 	}
 	p.recordEvent(inst.ID, "tailnet", "guest joined the tailnet", map[string]any{"tailscale_name": inst.TailscaleName, "tailscale_ip": tailscaleIP})
+	p.requestMonitoring(inst.Name)
 
 	cleanup = false
 	if mintedKeyID != "" {
@@ -1205,6 +1207,7 @@ func (p *Provisioner) StartWithOptions(ctx context.Context, name string, opts St
 		return inst, err
 	}
 	p.recordEvent(inst.ID, "tailnet", "guest rejoined the tailnet", map[string]any{"tailscale_name": tailscaleName, "tailscale_ip": tailscaleIP})
+	p.requestMonitoring(inst.Name)
 
 	cleanup = false
 	return inst, nil
@@ -1260,6 +1263,7 @@ func (p *Provisioner) reconcileLateTailnetJoin(ctx context.Context, inst *model.
 		return false, err
 	}
 	p.recordEvent(inst.ID, "tailnet", "guest joined the tailnet after readiness timeout; state reconciled on demand", map[string]any{"tailscale_name": inst.TailscaleName, "tailscale_ip": inst.TailscaleIP})
+	p.requestMonitoring(inst.Name)
 	return true, nil
 }
 

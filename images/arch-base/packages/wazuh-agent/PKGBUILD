@@ -1,0 +1,295 @@
+# Source-built Wazuh agent for the srv Arch guest image.
+#
+# This is not the AUR wazuh-agent recipe: nothing is repacked from upstream
+# RPMs, every source is pinned to an immutable commit or a SHA-256, and the
+# upstream tag signature is checked against a pinned key.
+#
+# Provenance of the Wazuh source (checked 2026-11-19):
+#   refs/tags/v4.14.9 is annotated tag object
+#     baad447a9fbed34f9dd3d23d5c916247da005ac6
+#   which peels to commit
+#     bed556db3f4f535cb3a585f3d9e7f35a6acf0f58
+#   It is signed by Jose Luis Carreras Marin <jose.carreras@wazuh.com>, RSA key
+#     19AFF1D3313289B5CA858E107EB06E5961B8E83E
+#   `git verify-tag v4.14.9` reports a good signature with that key, and the
+#   GitHub API reports both the tag and the commit as verified. The public key in
+#   keys/pgp/ was exported (export-minimal) from https://github.com/jotacarma90.gpg,
+#   the GitHub account that authors Wazuh commits as jose.carreras@wazuh.com.
+#   GitHub publishes the release "Wazuh v4.14.9" (not a prerelease, published
+#   2026-10-15). VERSION.json at the tag still says stage "rc2", as upstream ships it.
+#
+# Third-party sources follow upstream's Makefile at the pinned commit
+# (DEPS_VERSION = 55, RESOURCES_URL https://packages.wazuh.com/deps/55). Wazuh
+# does not sign those tarballs. Their SHA-256 sums below were recorded on
+# 2026-11-19 (trust on first use). Upstream's libbpf-bootstrap CMake project
+# would otherwise clone libbpf and bpftool by tag, clone vmlinux.h from a
+# floating branch, and download modern.bpf.c from wazuh v4.12.0 at configure
+# time. prepare() pins all of these and uses the modern.bpf.c in the pinned tree,
+# whose event layout matches the userspace code in this tree; the v4.12.0 file
+# does not (it lacks the euid and login_uid fields).
+#
+# Build this in a clean Arch environment (pkgctl build, or the rootless podman
+# recipe in images/arch-base/README.md). The resulting package is not signed:
+# images/arch-base/build.sh pins its SHA-256 instead.
+
+pkgname=wazuh-agent
+pkgver=4.14.9
+pkgrel=1
+pkgdesc='Wazuh host security agent (built from source for srv guests)'
+arch=(x86_64)
+url='https://github.com/wazuh/wazuh'
+license=(GPL-2.0-only)
+depends=(glibc libelf zlib systemd)
+makedepends=(git cmake make gcc clang llvm python libtool autoconf automake pkgconf patchelf)
+optdepends=('python: cloud and docker wodles')
+# Upstream's build manages its own optimisation flags; build() pins the
+# hardening flags instead of inheriting the builder's makepkg.conf.
+options=(!buildflags !lto !debug emptydirs)
+backup=(var/ossec/etc/local_internal_options.conf)
+
+_tag=v4.14.9
+_commit=bed556db3f4f535cb3a585f3d9e7f35a6acf0f58
+# Gitlink recorded at src/shared_modules/http-request in the pinned tree.
+_http_request_commit=cd50797cfe03c27f3759bdc243fecca6f7535d35
+# libbpf-bootstrap's CMakeLists.txt names libbpf v1.7.0 and bpftool v7.7.0.
+_libbpf_commit=f5dcbae736e5d7f83a35718e01be1a8e3010fa39   # v1.7.0 (lightweight tag)
+_bpftool_commit=4222ef1c8cdb0a1ea03c7a8c650ec334b782902d  # v7.7.0 (tag d245d44b...)
+_vmlinux_h_commit=c32912840154a82205530cd6d498b346ac73a6d1 # main on 2026-11-19
+_deps_version=55
+_deps=(
+	cJSON curl libdb libffi libyaml openssl procps sqlite zlib audit-userspace
+	msgpack bzip2 nlohmann googletest libpcre2 libplist pacman libarchive popt
+	lua rpm rocksdb lzma cpp-httplib benchmark libbpf-bootstrap dbus
+)
+
+source=(
+	"wazuh::git+https://github.com/wazuh/wazuh.git#tag=${_tag}?signed"
+	"wazuh-http-request::git+https://github.com/wazuh/wazuh-http-request.git#commit=${_http_request_commit}"
+	"libbpf::git+https://github.com/libbpf/libbpf.git#commit=${_libbpf_commit}"
+	"bpftool::git+https://github.com/libbpf/bpftool.git#commit=${_bpftool_commit}"
+	"vmlinux.h::git+https://github.com/libbpf/vmlinux.h.git#commit=${_vmlinux_h_commit}"
+	srv-install-shim.sh
+	wazuh-agent.sysusers
+)
+sha256sums=(SKIP SKIP SKIP SKIP SKIP
+	'a82538a9b184465d9cac7d297773275ed207decb79ad88feef88a81bc189e403'
+	'2892dfa168bba13057d911ca7a4049bac49e9369388a14018d43765bf7697083')
+noextract=()
+for _dep in "${_deps[@]}"; do
+	source+=("wazuh-deps-${_deps_version}-${_dep}.tar.gz::https://packages.wazuh.com/deps/${_deps_version}/libraries/sources/${_dep}.tar.gz")
+	noextract+=("wazuh-deps-${_deps_version}-${_dep}.tar.gz")
+done
+unset _dep
+# Same order as _deps.
+sha256sums+=(
+	'da809f70b7d03ac529ae6223d4390bfa26cd29f8c32c8e8b3b631efa1667892d' # cJSON
+	'30cf7142e4282718ceb237e17b5cbf75afcd7c9f3880a039c5efea62db094709' # curl
+	'7e9c44e8c7fdb186ff521a8d085b1bfa634d342dcc777ecea1fbf9a98ab5dc5e' # libdb
+	'0e971f64bacc22094e89f034bba075b40ecc2c2c2900eecd7ae85815fd6c9f69' # libffi
+	'35daad608b372d5ce099f738c0f21bfcc03d6920d92f448386c584e664f1376a' # libyaml
+	'0386fe3a0bf48bae2ca4d1742a53df9a8fcb1b73583ba22e8f8a7ddfa1375cd9' # openssl
+	'221f395e29d1bdbe4bacc9db39602eee0bae685a935437be0d7feb42e3192d07' # procps
+	'a81bff30bb4affd1b06a4983ff88ef827b4abaea3191b39aff7edb28d1ddd003' # sqlite
+	'b59d38149f0c29ec54d2766611ebc5a51a032bf9717e39a9af00fb6cb8532b8b' # zlib
+	'e82a32e5edf93b055160e14bc97f41dead39287925851dc80a7638e2d4d30434' # audit-userspace
+	'06d63bcf32896cd0af5480c401134b1ad1c166fd84ebe5b486e792101ee854e2' # msgpack
+	'27688ee0316a64b39e511b2c224070cad97c394a5f711f9d055fc1809d895bcd' # bzip2
+	'cefb07936d3d5bfdd3efc5e9bb8d3c807d681273bdac2e83b3d67aef2d1158c4' # nlohmann
+	'8c1e8a0a7f221c2125e99e6acb709da2ba472476b4d057c58de504bebf38d417' # googletest
+	'5a80d654d7d14b3db9fa3a49d7bf44a498683b46784a88cec514a8b194767b92' # libpcre2
+	'88278d4bdfc1bd6a3a1a55a4f3d933683d2732ba09cf7a749fe8ec8eec406e3c' # libplist
+	'631abe065ec982db56bfec05cf37c33a8f689fd7f4164c39277284bd7a0d0e31' # pacman
+	'540ff4a55defa75778a2c40567a830648ce5367b8aea123366874d96b734ef80' # libarchive
+	'd6880a06622ca32dc4aa39ad5dcf7bef2faa81bd931afbe64ba434ad8fee1daa' # popt
+	'233e87e871090bd30c4b692ac73bd714361c15051148e4eeec828a1df8436eca' # lua
+	'9c6c7b5f4460e8dd751936115fdc9f24ffae919e8dc2bc56a959de95a87cfbfe' # rpm
+	'eeed60a3d4e29f7305e79f9f5cebd4261174261227f1b5a7d05da55565675436' # rocksdb
+	'4ce0c192d41072b5679af89bb531efb685c8267a4b7e2005999149ac17028134' # lzma
+	'6517573263611686b9219ba796c35f54a306eb27dc3c72e1807f2a0a34cac1e8' # cpp-httplib
+	'94c57aa0cb2bd78dbe9e77d332cbc644daf0fecdc9a09632048be6e09f9ced6b' # benchmark
+	'6f76d05c5a4358204b9dfa0a372f257d138fff8402fdc52449135dab99adf336' # libbpf-bootstrap
+	'7c654ac9a4f68b50f32d674922c18ffe741d328a97d794457618fc3a07a48d3a' # dbus
+)
+validpgpkeys=(19AFF1D3313289B5CA858E107EB06E5961B8E83E) # Jose Luis Carreras Marin (Wazuh)
+
+_require_head() {
+	local dir="$1" want="$2" got
+	got="$(git -C "${dir}" rev-parse 'HEAD^{commit}')"
+	if [[ "${got}" != "${want}" ]]; then
+		echo "${dir} is at ${got}, expected pinned commit ${want}" >&2
+		return 1
+	fi
+}
+
+prepare() {
+	cd "${srcdir}/wazuh"
+	# The tag is mutable upstream; the commit is what was reviewed.
+	_require_head . "${_commit}"
+	[[ "$(git rev-parse "refs/tags/${_tag}^{commit}")" == "${_commit}" ]]
+
+	git submodule init src/shared_modules/http-request
+	git config submodule.src/shared_modules/http-request.url "${srcdir}/wazuh-http-request"
+	git -c protocol.file.allow=always submodule update src/shared_modules/http-request
+	_require_head src/shared_modules/http-request "${_http_request_commit}"
+
+	local dep
+	install -d src/external
+	for dep in "${_deps[@]}"; do
+		bsdtar -xf "${srcdir}/wazuh-deps-${_deps_version}-${dep}.tar.gz" -C src/external
+		[[ -d "src/external/${dep}" ]]
+	done
+
+	# Feed libbpf-bootstrap's ExternalProjects from the pinned checkouts rather
+	# than letting CMake clone or download anything at configure time.
+	local lbb=src/external/libbpf-bootstrap
+	cp -a "${srcdir}/libbpf" "${lbb}/libbpf"
+	cp -a "${srcdir}/vmlinux.h" "${lbb}/vmlinux.h"
+	cp -a "${srcdir}/bpftool" "${lbb}/bpftool"
+	git -C "${lbb}/bpftool" submodule init libbpf
+	git -C "${lbb}/bpftool" config submodule.libbpf.url "${srcdir}/libbpf"
+	git -C "${lbb}/bpftool" -c protocol.file.allow=always submodule update libbpf
+	_require_head "${lbb}/bpftool/libbpf" "${_libbpf_commit}"
+	install -d "${lbb}/src"
+	install -m 0644 src/syscheckd/src/ebpf/src/modern.bpf.c "${lbb}/src/modern.bpf.c"
+	sed -i \
+		-e 's|^  GIT_REPOSITORY .*|  DOWNLOAD_COMMAND ""|' \
+		-e '/^  GIT_TAG /d' \
+		-e '/^file(DOWNLOAD /d' \
+		"${lbb}/CMakeLists.txt"
+	if grep -Eq 'GIT_REPOSITORY|GIT_TAG|file\(DOWNLOAD' "${lbb}/CMakeLists.txt"; then
+		echo "libbpf-bootstrap still fetches sources at build time" >&2
+		return 1
+	fi
+	# The project also compiles modern.bpf.c with the host C compiler into an
+	# unused "modern" library, which only builds under pre-C23, pre-GCC-14
+	# defaults. The shipped modern.bpf.o comes from clang and is unaffected.
+	printf 'target_compile_options(modern PRIVATE -std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types)\n' \
+		>>"${lbb}/CMakeLists.txt"
+	# Keep build paths out of modern.bpf.o's BTF line information.
+	[[ "$(grep -c -- '-g -O2 -target bpf' "${lbb}/tools/cmake/FindBpfObject.cmake")" == 1 ]]
+	sed -i "s|-g -O2 -target bpf|-g -O2 -ffile-prefix-map=${srcdir}=/usr/src/debug/${pkgname} -target bpf|" \
+		"${lbb}/tools/cmake/FindBpfObject.cmake"
+
+	# Packaging must not touch the build host: accounts come from sysusers.d,
+	# the unit is installed by package(), and nothing is enabled or started.
+	printf '#!/bin/sh\nexit 0\n' >src/init/adduser.sh
+	[[ "$(grep -c '^    runInit \$INSTYPE \${update_only}$' install.sh)" == 1 ]]
+	sed -i 's|^    runInit \$INSTYPE \${update_only}$|    : # runInit disabled by srv PKGBUILD|' install.sh
+}
+
+build() {
+	cd "${srcdir}/wazuh/src"
+	# The pinned tree and its vendored libraries (libdb 18.1 and others) predate
+	# C23, which GCC 15+ uses by default; gnu17 keeps their prototypes valid.
+	local cflags="-O2 -pipe -fno-plt -fexceptions -fstack-protector-strong -fstack-clash-protection -fcf-protection -Wp,-D_FORTIFY_SOURCE=2 -ffile-prefix-map=${srcdir}=/usr/src/debug/${pkgname}"
+	export CFLAGS="${cflags} -std=gnu17"
+	export CXXFLAGS="${cflags} -Wp,-D_GLIBCXX_ASSERTIONS"
+	export LDFLAGS='-Wl,-O1 -Wl,--sort-common -Wl,--as-needed -Wl,-z,relro -Wl,-z,now'
+	# Vendored configure scripts probe for optional system libraries that the
+	# agent does not bundle; keep them off so the result does not depend on
+	# what the build host has installed.
+	export ac_cv_lib_rtmp_RTMP_Init=no ac_cv_header_librtmp_rtmp_h=no ac_cv_lib_md_MD5Init=no
+	local make_args=(TARGET=agent INSTALLDIR=/var/ossec EXTERNAL_SRC_ONLY=yes USE_SELINUX=no DEBUG=no)
+	# libbpf-bootstrap's CMake project races under make -j (its ExternalProject
+	# build steps run twice concurrently and the skeleton is generated before
+	# bpftool exists), so build it serially first.
+	make -j1 "${make_args[@]}" external/libbpf-bootstrap/build/modern.bpf.o
+	# data_provider needs libdb's generated db.h, but with locally built
+	# external sources no agent target depends on libdb.
+	make -j"$(nproc)" "${make_args[@]}" external/libdb/build_unix/.libs/libdb-18.1.a
+	make -j"$(nproc)" "${make_args[@]}" build
+}
+
+package() {
+	cd "${srcdir}/wazuh"
+	local shim="${srcdir}/srv-shim" log="${srcdir}/ownership.log" tool
+	# Upstream install.sh installs straight to INSTALLDIR as root with named
+	# owners. The shim keeps it inside ${pkgdir} and records the owners, which
+	# systemd-tmpfiles applies once sysusers has created the wazuh account.
+	rm -rf "${shim}"
+	install -d "${shim}"
+	for tool in install chown chgrp; do
+		ln -s "${srcdir}/srv-install-shim.sh" "${shim}/${tool}"
+	done
+	: >"${log}"
+
+	cat >etc/preloaded-vars.conf <<EOF
+USER_LANGUAGE="en"
+USER_NO_STOP="y"
+USER_INSTALL_TYPE="agent"
+USER_DIR="${pkgdir}/var/ossec"
+USER_DELETE_DIR="y"
+USER_ENABLE_ACTIVE_RESPONSE="n"
+USER_ENABLE_SYSCHECK="y"
+USER_ENABLE_ROOTCHECK="y"
+USER_ENABLE_OPENSCAP="n"
+USER_ENABLE_SYSCOLLECTOR="y"
+USER_ENABLE_CISCAT="n"
+USER_UPDATE="n"
+USER_AGENT_SERVER_IP="MANAGER_IP"
+USER_CA_STORE="/path/to/my_cert.pem"
+USER_AUTO_START="n"
+EOF
+	PATH="${shim}:${PATH}" SRV_PKGDIR="${pkgdir}" SRV_OWNERSHIP_LOG="${log}" \
+		./install.sh binary-install
+
+	local root="${pkgdir}/var/ossec"
+	# Per-agent identity is never packaged: srv-wazuh-enroll creates it from
+	# a controller-delivered key, and pacman upgrades must not replace it.
+	rm -f "${root}/etc/client.keys"
+	# install.sh copies the build host's /etc/localtime; guests run in UTC.
+	install -m 0640 /usr/share/zoneinfo/UTC "${root}/etc/localtime"
+	# CMake leaves build-tree RUNPATHs in the shared modules. On a guest those
+	# directories do not exist and must never be searched: point every RUNPATH
+	# at the package's own lib directory instead.
+	local elf
+	while IFS= read -r -d '' elf; do
+		[[ -n "$(patchelf --print-rpath "${elf}" 2>/dev/null)" ]] || continue
+		case "${elf#"${root}/"}" in
+		lib/*) patchelf --set-rpath '$ORIGIN' "${elf}" ;;
+		bin/*) patchelf --set-rpath '$ORIGIN/../lib' "${elf}" ;;
+		active-response/bin/*) patchelf --set-rpath '$ORIGIN/../../lib' "${elf}" ;;
+		*)
+			echo "unexpected RUNPATH in ${elf}" >&2
+			return 1
+			;;
+		esac
+	done < <(find "${root}" -type f -print0)
+	# install.sh writes INSTALLDIR into generated configs; it is ${pkgdir} here.
+	grep -rlIF -- "${pkgdir}" "${pkgdir}" | xargs -r sed -i "s|${pkgdir}||g"
+	# Binaries still name build directories in strings (vendored D-Bus's
+	# configured prefix, OpenSSL's compiler line); none is a search path.
+	if grep -rlIF -- "${srcdir}" "${pkgdir}" || grep -rlIF -- "${pkgdir}" "${pkgdir}"; then
+		echo "package text files contain build paths" >&2
+		return 1
+	fi
+	# Only distro-independent SCA policy applies to Arch.
+	[[ "$(ls "${root}/ruleset/sca")" == sca_distro_independent_linux.yml ]]
+
+	install -Dm0644 "${srcdir}/wazuh-agent.sysusers" "${pkgdir}/usr/lib/sysusers.d/wazuh-agent.conf"
+	install -d "${pkgdir}/usr/lib/tmpfiles.d"
+	# Recreate directories and empty log files with their owners on every boot,
+	# so template sanitising may delete runtime state wholesale.
+	awk '
+		$1 == "own" {
+			if (!($4 in type)) { type[$4] = "z"; mode[$4] = "-"; user[$4] = "root"; group[$4] = "root" }
+			if ($2 != "-") user[$4] = $2
+			if ($3 != "-") group[$4] = $3
+			next
+		}
+		{ type[$5] = $1; mode[$5] = $2; user[$5] = $3; group[$5] = $4 }
+		END {
+			for (p in type) {
+				if (p == "/var/ossec/etc/client.keys") continue
+				if (type[p] == "d" || type[p] == "f" || user[p] != "root" || group[p] != "root")
+					printf "%s %s %s %s %s -\n", type[p], p, mode[p], user[p], group[p]
+			}
+		}' "${log}" | LC_ALL=C sort -k2,2 >"${pkgdir}/usr/lib/tmpfiles.d/wazuh-agent.conf"
+	[[ -s "${pkgdir}/usr/lib/tmpfiles.d/wazuh-agent.conf" ]]
+
+	sed 's|WAZUH_HOME_TMP|/var/ossec|g' src/init/templates/wazuh-agent.service \
+		| install -Dm0644 /dev/stdin "${pkgdir}/usr/lib/systemd/system/wazuh-agent.service"
+	install -d "${pkgdir}/usr/share/wazuh-agent"
+	printf '%s\n' "${_commit}" >"${pkgdir}/usr/share/wazuh-agent/source-commit"
+	install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

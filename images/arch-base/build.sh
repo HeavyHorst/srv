@@ -28,6 +28,29 @@ MANIFEST_OUTPUT="${OUTPUT_DIR}/manifest.txt"
 PACMAN_CONFIG_PATH="${WORK_DIR}/pacman.conf"
 PACMAN_HOOKS_DIR="${WORK_DIR}/pacman-hooks"
 KERNEL_RELEASE=""
+TAILSCALE_VERSION=""
+# Native guests ship the Wazuh agent built from images/arch-base/packages/wazuh-agent,
+# whose PKGBUILD verifies the signed upstream tag. The package file is pinned
+# by SHA-256: rebuilding it means updating WAZUH_PACKAGE_PINNED_SHA256 here.
+# Orb images omit the agent; SRV_WAZUH_AGENT=0 omits it from a native image
+# too, for development and emergency builds, and the manifest records that.
+SRV_WAZUH_AGENT="${SRV_WAZUH_AGENT:-1}"
+WAZUH_AGENT_ENABLED=1
+if [[ "${SRV_AMP_ORB:-0}" == 1 || "${SRV_WAZUH_AGENT}" == 0 ]]; then
+	WAZUH_AGENT_ENABLED=0
+fi
+WAZUH_AGENT_VERSION="4.14.9"
+WAZUH_SOURCE_COMMIT="bed556db3f4f535cb3a585f3d9e7f35a6acf0f58"
+# Rootless clean build in archlinux:base-devel@sha256:97119fd9e21219b02b3c14ba256c9d3c0d031d07fc26c836c41ed793beeb5b74.
+# Builds are not byte-reproducible (build date, OpenSSL build stamp), so this
+# names one stored artifact rather than any build of the recipe.
+WAZUH_PACKAGE_PINNED_SHA256="19a2b75facf36849572dc14391125d2ac9cf0b1cb767b9d9378e17d781cead0f"
+WAZUH_PACKAGE_RELEASE="${WAZUH_AGENT_VERSION}-1"
+# The stored artifact lives at a stable path on the build host (README: Wazuh
+# agent); WAZUH_PACKAGE overrides it, and the pin above still applies.
+WAZUH_PACKAGE="${WAZUH_PACKAGE:-/srv/artifacts/wazuh-agent/${WAZUH_PACKAGE_RELEASE}/wazuh-agent-${WAZUH_PACKAGE_RELEASE}-x86_64.pkg.tar.zst}"
+WAZUH_INSTALLED_VERSION=""
+WAZUH_PACKAGE_SHA256=""
 
 ROOTFS_PACKAGES=(
 	base
@@ -60,6 +83,11 @@ ROOTFS_PACKAGES=(
 )
 if [[ "${SRV_AMP_ORB:-0}" != 1 ]]; then
 	ROOTFS_PACKAGES+=(tailscale)
+fi
+if [[ "${WAZUH_AGENT_ENABLED}" == 1 ]]; then
+	# libelf is the one wazuh-agent dependency outside base; it is installed here
+	# so the local package installs without consulting repositories.
+	ROOTFS_PACKAGES+=(libelf)
 fi
 
 LOOP_DEVICE=""
@@ -378,6 +406,61 @@ install_agent_browser() {
 	ln -sfn /opt/agent-browser/bin/agent-browser "${ROOTFS_MOUNT_DIR}/usr/local/bin/agent-browser"
 }
 
+# Check before the kernel build so a missing or unpinned package fails fast.
+require_wazuh_package() {
+	local sum
+	if [[ ! -f "${WAZUH_PACKAGE}" ]]; then
+		echo "native guest images need WAZUH_PACKAGE: ${WAZUH_PACKAGE} does not exist (store the pinned package there, set WAZUH_PACKAGE, or SRV_WAZUH_AGENT=0)" >&2
+		exit 1
+	fi
+	read -r sum _ < <(sha256sum "${WAZUH_PACKAGE}")
+	if [[ "${sum}" != "${WAZUH_PACKAGE_PINNED_SHA256}" ]]; then
+		echo "WAZUH_PACKAGE has SHA-256 ${sum}, not the pinned ${WAZUH_PACKAGE_PINNED_SHA256}" >&2
+		exit 1
+	fi
+}
+
+install_wazuh_agent() {
+	local stage="/root/srv-wazuh" package
+	local stage_dir="${ROOTFS_MOUNT_DIR}${stage}"
+	package="$(basename -- "${WAZUH_PACKAGE}")"
+
+	rm -rf "${stage_dir}"
+	install -d -m 0700 "${stage_dir}"
+	install -m 0600 "${WAZUH_PACKAGE}" "${stage_dir}/${package}"
+	# Hash the staged copy: that is the file pacman installs.
+	read -r WAZUH_PACKAGE_SHA256 _ < <(sha256sum "${stage_dir}/${package}")
+	if [[ "${WAZUH_PACKAGE_SHA256}" != "${WAZUH_PACKAGE_PINNED_SHA256}" ]]; then
+		echo "staged wazuh-agent package does not match the pinned SHA-256" >&2
+		exit 1
+	fi
+	# No repositories: dependencies must already be in the rootfs.
+	cat >"${stage_dir}/pacman.conf" <<EOF
+[options]
+Architecture = auto
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+EOF
+	arch-chroot "${ROOTFS_MOUNT_DIR}" pacman --config "${stage}/pacman.conf" --noconfirm -U "${stage}/${package}"
+	rm -rf "${stage_dir}"
+
+	WAZUH_INSTALLED_VERSION="$(arch-chroot "${ROOTFS_MOUNT_DIR}" pacman -Q wazuh-agent)"
+	WAZUH_INSTALLED_VERSION="${WAZUH_INSTALLED_VERSION#wazuh-agent }"
+	if [[ "${WAZUH_INSTALLED_VERSION%-*}" != "${WAZUH_AGENT_VERSION}" ]]; then
+		echo "installed wazuh-agent ${WAZUH_INSTALLED_VERSION} is not ${WAZUH_AGENT_VERSION}" >&2
+		exit 1
+	fi
+	if [[ "$(cat "${ROOTFS_MOUNT_DIR}/usr/share/wazuh-agent/source-commit" 2>/dev/null)" != "${WAZUH_SOURCE_COMMIT}" ]]; then
+		echo "wazuh-agent package was not built from ${WAZUH_SOURCE_COMMIT}" >&2
+		exit 1
+	fi
+	# The agent starts only after controller-mediated enrollment enables it.
+	if [[ -e "${ROOTFS_MOUNT_DIR}/etc/systemd/system/multi-user.target.wants/wazuh-agent.service" ]]; then
+		echo "wazuh-agent.service must not be enabled in the image" >&2
+		exit 1
+	fi
+}
+
 configure_rootfs() {
 	install -d "${ROOTFS_MOUNT_DIR}/var/lib/srv"
 	chmod 0755 "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/bootstrap.sh"
@@ -399,6 +482,9 @@ configure_rootfs() {
 		systemctl --root="${ROOTFS_MOUNT_DIR}" mask srv-bootstrap.service >/dev/null
 		systemctl --root="${ROOTFS_MOUNT_DIR}" enable srv-orb-guest.service srv-orb-trim.service >/dev/null
 	else
+		if [[ "${WAZUH_AGENT_ENABLED}" == 1 ]]; then
+			chmod 0755 "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/wazuh-enroll.sh"
+		fi
 		systemctl --root="${ROOTFS_MOUNT_DIR}" enable tailscaled.service srv-bootstrap.service >/dev/null
 	fi
 	systemctl --root="${ROOTFS_MOUNT_DIR}" disable \
@@ -439,10 +525,39 @@ build_rootfs() {
 
 	write_pacman_config
 	pacstrap -C "${PACMAN_CONFIG_PATH}" -K -c "${ROOTFS_MOUNT_DIR}" "${ROOTFS_PACKAGES[@]}"
+	if [[ "${SRV_AMP_ORB:-0}" != 1 ]]; then
+		local tailscale_min_version="1.104.4" comparison
+		# Check the installed Arch package, not the mirror candidate or host binary.
+		TAILSCALE_VERSION="$(arch-chroot "${ROOTFS_MOUNT_DIR}" pacman -Q tailscale)"
+		TAILSCALE_VERSION="${TAILSCALE_VERSION#tailscale }"
+		comparison="$(arch-chroot "${ROOTFS_MOUNT_DIR}" vercmp "${TAILSCALE_VERSION}" "${tailscale_min_version}")"
+		if [[ ! "${comparison}" =~ ^[0-9]+$ ]]; then
+			echo "Tailscale ${TAILSCALE_VERSION} does not meet required minimum ${tailscale_min_version}; refusing to build guest image" >&2
+			exit 1
+		fi
+	fi
+	if [[ "${WAZUH_AGENT_ENABLED}" == 1 ]]; then
+		install_wazuh_agent
+	fi
 	install_kernel_modules
 
+	local overlay_excludes=()
+	if [[ "${WAZUH_AGENT_ENABLED}" != 1 ]]; then
+		# Images without the Wazuh agent get none of its configuration.
+		overlay_excludes=(
+			--exclude=/var/ossec/
+			--exclude=/usr/local/lib/srv/wazuh-enroll.sh
+			--exclude=/etc/systemd/system/srv-wazuh-enroll.service
+			--exclude=/etc/systemd/system/wazuh-agent.service.d/
+			--exclude=/etc/tmpfiles.d/srv-wazuh.conf
+		)
+	fi
 	# Overlay paths belong to root in the guest, regardless of checkout ownership.
-	rsync -a --chown=0:0 "${SCRIPT_DIR}/overlay/" "${ROOTFS_MOUNT_DIR}/"
+	rsync -a --chown=0:0 "${overlay_excludes[@]}" "${SCRIPT_DIR}/overlay/" "${ROOTFS_MOUNT_DIR}/"
+	if [[ "${WAZUH_AGENT_ENABLED}" == 1 ]]; then
+		# The overlay resets /var/ossec modes and owners; restore the package's.
+		arch-chroot "${ROOTFS_MOUNT_DIR}" systemd-tmpfiles --create wazuh-agent.conf
+	fi
 	install_pi
 	install_agent_browser
 	bootstrap_lazyvim
@@ -473,6 +588,18 @@ artifacts=$(basename -- "${VMLINUX_OUTPUT}"),$(basename -- "${ROOTFS_OUTPUT}")
 EOF
 	if [[ "${SRV_AMP_ORB:-0}" == 1 ]]; then
 		echo 'srv_amp_orb=1' >>"${MANIFEST_OUTPUT}"
+	else
+		echo "tailscale_version=${TAILSCALE_VERSION}" >>"${MANIFEST_OUTPUT}"
+		if [[ "${WAZUH_AGENT_ENABLED}" == 1 ]]; then
+			cat >>"${MANIFEST_OUTPUT}" <<EOF
+wazuh_agent_version=${WAZUH_INSTALLED_VERSION}
+wazuh_package_sha256=${WAZUH_PACKAGE_SHA256}
+wazuh_source_commit=${WAZUH_SOURCE_COMMIT}
+EOF
+		else
+			# Make an image without coverage visible to whoever deploys it.
+			echo 'wazuh_agent=disabled' >>"${MANIFEST_OUTPUT}"
+		fi
 	fi
 	(cd "${OUTPUT_DIR}" && sha256sum vmlinux rootfs-base.img) >>"${MANIFEST_OUTPUT}"
 }
@@ -481,6 +608,13 @@ main() {
 	trap cleanup EXIT
 	require_root
 	require_commands
+	if [[ "${SRV_WAZUH_AGENT}" != 0 && "${SRV_WAZUH_AGENT}" != 1 ]]; then
+		echo "SRV_WAZUH_AGENT must be 0 or 1, not ${SRV_WAZUH_AGENT}" >&2
+		exit 1
+	fi
+	if [[ "${WAZUH_AGENT_ENABLED}" == 1 ]]; then
+		require_wazuh_package
+	fi
 	install -d "${OUTPUT_DIR}" "${WORK_DIR}" "${ROOTFS_MOUNT_DIR}"
 	build_kernel
 	build_rootfs

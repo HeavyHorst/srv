@@ -86,8 +86,9 @@ if [[ "${SRV_AMP_ORB:-0}" != 1 ]]; then
 fi
 if [[ "${WAZUH_AGENT_ENABLED}" == 1 ]]; then
 	# libelf is the one wazuh-agent dependency outside base; it is installed here
-	# so the local package installs without consulting repositories.
-	ROOTFS_PACKAGES+=(libelf)
+	# so the local package installs without consulting repositories. net-tools
+	# provides the netstat rootcheck uses for its port check.
+	ROOTFS_PACKAGES+=(libelf net-tools)
 fi
 
 LOOP_DEVICE=""

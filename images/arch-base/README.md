@@ -95,6 +95,8 @@ podman run --rm --userns=keep-id:uid=0,gid=0 \
 
 The image build accepts only the package whose SHA-256 equals `WAZUH_PACKAGE_PINNED_SHA256` in `build.sh`.
 
+Images with the agent also install `libelf` (its one dependency outside `base`) and `net-tools`, whose `netstat` the agent's rootcheck uses for its port check; without it rootcheck logs `netstat not available. Skipping port check.` Syscollector's port inventory does not need it. Existing guests can add it with `pacman -S net-tools`.
+
 The package is stored, not rebuilt per image. Two builds of the same recipe differ (package build date, the OpenSSL build stamp inside `libwazuhext.so`), so a fresh build can never match the pin. The pin therefore names one reviewed artifact, and the image build reads that file from a stable path on the build host:
 
 ```text
@@ -110,7 +112,7 @@ sudo WAZUH_PACKAGE=/path/wazuh-agent-4.14.9-1-x86_64.pkg.tar.zst ./images/arch-b
 
 The build also refuses a package of another version or built from another commit, and records `wazuh_agent_version`, `wazuh_package_sha256` and `wazuh_source_commit` in `manifest.txt`. The image has no manager address or agent key, automatic enrollment is off, and `wazuh-agent.service` is not enabled. `srv-wazuh-enroll` on the controller registers the agent through the manager API and writes its identity to `/run/srv-wazuh/enrollment.json` (format in `/usr/local/lib/srv/wazuh-enroll.sh`) over SSH, then starts `srv-wazuh-enroll.service`, which installs `client.keys` and starts the agent. The agent refuses to start without an identity installed that way, and templates are stripped of it. Orb images omit the agent.
 
-For development or emergency builds without the pinned package, `SRV_WAZUH_AGENT=0` builds a native image without the agent, its overlay files or its `libelf` dependency. Everything else, including the Tailscale floor, is unchanged, and the manifest records `wazuh_agent=disabled` so the gap stays visible. The default is `SRV_WAZUH_AGENT=1`; any value other than `0` or `1` is refused.
+For development or emergency builds without the pinned package, `SRV_WAZUH_AGENT=0` builds a native image without the agent, its overlay files or its `libelf` and `net-tools` packages. Everything else, including the Tailscale floor, is unchanged, and the manifest records `wazuh_agent=disabled` so the gap stays visible. The default is `SRV_WAZUH_AGENT=1`; any value other than `0` or `1` is refused.
 
 ```bash
 sudo SRV_WAZUH_AGENT=0 ./images/arch-base/build.sh

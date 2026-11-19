@@ -318,8 +318,10 @@ func TestWazuhAgentInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(args), "\nlibelf\n") {
-		t.Errorf("pacstrap must provide wazuh-agent's libelf dependency: %s", args)
+	for _, pkg := range []string{"libelf", "net-tools"} {
+		if !strings.Contains(string(args), "\n"+pkg+"\n") {
+			t.Errorf("pacstrap must provide %s for the Wazuh agent: %s", pkg, args)
+		}
 	}
 }
 
@@ -416,7 +418,7 @@ func TestImagesWithoutWazuh(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if strings.Contains(string(args), "\nlibelf\n") {
+			if strings.Contains(string(args), "\nlibelf\n") || strings.Contains(string(args), "\nnet-tools\n") {
 				t.Errorf("pacstrap installs Wazuh dependencies: %s", args)
 			}
 			// The opt-out drops only the agent: native images keep the Tailscale floor.

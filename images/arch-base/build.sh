@@ -138,7 +138,7 @@ require_commands() {
 
 cleanup() {
 	set +e
-	detach_rootfs
+	detach_rootfs lazy
 }
 
 detach_loop_device() {
@@ -160,9 +160,24 @@ detach_loop_device() {
 	LOOP_DEVICE=""
 }
 
+# detach_rootfs unmounts the image before write_manifest hashes it. A lazy
+# unmount would leave the filesystem live while it is hashed, so only the
+# error-path cleanup (argument "lazy") may fall back to one.
 detach_rootfs() {
+	local gnupg="${ROOTFS_MOUNT_DIR}/etc/pacman.d/gnupg"
 	if mountpoint -q "${ROOTFS_MOUNT_DIR}"; then
-		umount -R "${ROOTFS_MOUNT_DIR}" || umount -Rl "${ROOTFS_MOUNT_DIR}"
+		# pacstrap -K leaves gpg-agent and keyboxd running on the guest keyring,
+		# holding the mount busy.
+		if [[ -d "${gnupg}" ]] && command -v gpgconf >/dev/null 2>&1; then
+			gpgconf --homedir "${gnupg}" --kill all || true
+		fi
+		if ! umount -R "${ROOTFS_MOUNT_DIR}"; then
+			if [[ "${1:-}" != lazy ]]; then
+				echo "cannot unmount ${ROOTFS_MOUNT_DIR}; refusing to hash a live rootfs" >&2
+				exit 1
+			fi
+			umount -Rl "${ROOTFS_MOUNT_DIR}"
+		fi
 	fi
 	detach_loop_device
 }

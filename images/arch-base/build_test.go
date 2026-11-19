@@ -461,3 +461,66 @@ func TestWazuhAgentSwitch(t *testing.T) {
 		t.Fatalf("explicit SRV_WAZUH_AGENT=1: %v\n%s\n%s", run.err, run.manifest, run.output)
 	}
 }
+
+// The image must be fully unmounted before the manifest hashes it: a busy
+// mount fails the build instead of being unmounted lazily, and the guest
+// keyring's gpg agents are stopped first.
+func TestDetachRootfsRefusesLazyUnmount(t *testing.T) {
+	source, err := os.ReadFile("build.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions := strings.TrimSuffix(string(source), "\nmain \"$@\"\n")
+	for _, tc := range []struct {
+		name, busy, mode, want string
+		ok                     bool
+	}{
+		{name: "unmounts", ok: true, want: "gpgconf --homedir MNT/etc/pacman.d/gnupg --kill all\numount -R MNT\nlosetup -d /dev/fake-loop\n"},
+		{name: "busy fails", busy: "1", want: "gpgconf --homedir MNT/etc/pacman.d/gnupg --kill all\numount -R MNT\n"},
+		{name: "busy cleanup is lazy", busy: "1", mode: "lazy", ok: true, want: "gpgconf --homedir MNT/etc/pacman.d/gnupg --kill all\numount -R MNT\numount -Rl MNT\nlosetup -d /dev/fake-loop\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mnt := filepath.Join(dir, "mnt")
+			if err := os.MkdirAll(filepath.Join(mnt, "etc/pacman.d/gnupg"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			log := filepath.Join(dir, "calls")
+			harness := definitions + `
+ROOTFS_MOUNT_DIR=` + mnt + `
+LOOP_DEVICE=/dev/fake-loop
+c() { printf '%s\n' "$*" >>` + log + `; }
+mountpoint() { return 0; }
+gpgconf() { c gpgconf "$@"; }
+umount() { c umount "$@"; [[ "$1" == -Rl || -z "` + tc.busy + `" ]]; }
+losetup() { c losetup "$@"; }
+detach_rootfs ` + tc.mode + `
+`
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			dirname, err := exec.LookPath("dirname")
+			if err != nil {
+				t.Skip(err)
+			}
+			if err := os.Symlink(dirname, filepath.Join(bin, "dirname")); err != nil {
+				t.Fatal(err)
+			}
+			script := filepath.Join(dir, "detach-test.sh")
+			if err := os.WriteFile(script, []byte(harness), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", script)
+			cmd.Env = []string{"PATH=" + bin}
+			out, err := cmd.CombinedOutput()
+			if (err == nil) != tc.ok {
+				t.Fatalf("err %v: %s", err, out)
+			}
+			calls, _ := os.ReadFile(log)
+			if got := strings.ReplaceAll(string(calls), mnt, "MNT"); got != tc.want {
+				t.Fatalf("calls:\n%s\nwant:\n%s", got, tc.want)
+			}
+		})
+	}
+}

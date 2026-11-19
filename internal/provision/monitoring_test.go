@@ -169,6 +169,14 @@ func (g *monitorGuest) WriteEnrollment(_ context.Context, identity []byte) error
 }
 
 func (g *monitorGuest) StartEnrollment(context.Context) error {
+	// Like wazuh-enroll.sh, the guest accepts only an agent named for its
+	// hostname, which srv sets to the instance name.
+	var file struct {
+		AgentName string `json:"agent_name"`
+	}
+	if err := json.Unmarshal(g.identity, &file); err != nil || file.AgentName != "demo" {
+		return fmt.Errorf("agent_name %q is not this guest", file.AgentName)
+	}
 	g.h.mu.Lock()
 	g.h.delivered = append(g.h.delivered, string(g.identity))
 	g.h.mu.Unlock()
@@ -332,7 +340,7 @@ func TestProvisioningEnrollsMonitoring(t *testing.T) {
 	for _, a := range agents {
 		agent = a
 	}
-	if agent.Name != "gpu-rig-demo" || agent.Status != "active" {
+	if agent.Name != "demo" || agent.Status != "active" {
 		t.Fatalf("agent %+v", agent)
 	}
 	if want := "100.64.0.10:22 " + h.hostKey; len(h.opened) != 1 || h.opened[0] != want {
@@ -359,7 +367,7 @@ func TestProvisioningEnrollsMonitoring(t *testing.T) {
 	// Clean rebuild: a new incarnation of the asset retires only the mapped
 	// agent, then registers its own.
 	h.manager.mu.Lock()
-	other := h.manager.addLocked("gpu-rig-other", "disconnected")
+	other := h.manager.addLocked("other", "disconnected")
 	h.manager.mu.Unlock()
 	if err := h.st.DeleteInstance(context.Background(), "demo"); err != nil {
 		t.Fatal(err)
@@ -371,7 +379,7 @@ func TestProvisioningEnrollsMonitoring(t *testing.T) {
 		t.Fatalf("rebuild: agents %v, registers %d, deletes %v", agents, registers, deletes)
 	}
 	for id, a := range agents {
-		if id != other && (a.Name != "gpu-rig-demo" || a.Status != "active" || id == agent.ID) {
+		if id != other && (a.Name != "demo" || a.Status != "active" || id == agent.ID) {
 			t.Fatalf("rebuilt agent %+v", a)
 		}
 	}
@@ -426,7 +434,7 @@ func TestProvisioningMonitoringDuplicatePrevention(t *testing.T) {
 	h := newMonitorHarness(t)
 	// Another srv host (or a hand-made registration) already owns the name.
 	h.manager.mu.Lock()
-	foreign := h.manager.addLocked("gpu-rig-demo", "active")
+	foreign := h.manager.addLocked("demo", "active")
 	h.manager.mu.Unlock()
 	inst := h.boot("demo-id-1", time.Now().UTC(), "attempt-1")
 	waitFor(t, "a pending event", func() bool {

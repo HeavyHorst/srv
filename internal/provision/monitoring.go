@@ -21,7 +21,7 @@ import (
 
 // WazuhMonitoring enrolls every ready tailnet guest with the Wazuh manager.
 // The asset is the guest name under AssetPrefix, which stays the same across
-// clean rebuilds; the incarnation is the instance ID, sequenced by creation
+// clean rebuilds, and the agent is named for the guest's hostname; the incarnation is the instance ID, sequenced by creation
 // time, so an ordinary boot reuses the agent and a rebuild replaces it.
 type WazuhMonitoring struct {
 	Coordinator *wazuh.Coordinator
@@ -171,13 +171,15 @@ func (p *Provisioner) enrollGuest(w *monitoringWorker, name string) (model.Insta
 		return inst, true, fmt.Errorf("connecting to guest: %w", err)
 	}
 	defer conn.Close()
+	// The guest accepts only an agent named for its hostname, the instance
+	// name. The prefix scopes the asset in the registration store.
 	asset := w.AssetPrefix + inst.Name
-	id, err := w.Coordinator.Enroll(ctx, asset, wazuh.Incarnation{ID: inst.ID, Seq: inst.CreatedAt.UnixNano()}, asset, guest)
+	id, err := w.Coordinator.Enroll(ctx, asset, wazuh.Incarnation{ID: inst.ID, Seq: inst.CreatedAt.UnixNano()}, inst.Name, guest)
 	if err != nil {
 		// A newer incarnation owns the asset; this one must never take it back.
 		return inst, !errors.Is(err, wazuh.ErrStaleIncarnation), err
 	}
-	p.recordEvent(inst.ID, "wazuh", "wazuh agent "+id+" is reporting", map[string]any{"agent_id": id, "agent_name": asset, "ssh_host_key": hostKey})
+	p.recordEvent(inst.ID, "wazuh", "wazuh agent "+id+" is reporting", map[string]any{"agent_id": id, "agent_name": inst.Name, "asset": asset, "ssh_host_key": hostKey})
 	return inst, false, nil
 }
 

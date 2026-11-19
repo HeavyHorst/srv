@@ -168,6 +168,16 @@ func (g *monitorGuest) WriteEnrollment(_ context.Context, identity []byte) error
 	return nil
 }
 
+func (g *monitorGuest) ProbeAgent(context.Context) error {
+	g.h.mu.Lock()
+	defer g.h.mu.Unlock()
+	g.h.probes++
+	if g.h.agentMissing {
+		return errors.New("Process exited with status 1")
+	}
+	return nil
+}
+
 func (g *monitorGuest) StartEnrollment(context.Context) error {
 	// Like wazuh-enroll.sh, the guest accepts only an agent named for its
 	// hostname, which srv sets to the instance name.
@@ -191,9 +201,11 @@ type monitorHarness struct {
 	hostKey string // the fingerprint the guest's tailnet node advertises
 	cancel  context.CancelFunc
 
-	mu        sync.Mutex
-	opened    []string
-	delivered []string
+	mu           sync.Mutex
+	opened       []string
+	delivered    []string
+	probes       int
+	agentMissing bool // the guest lacks the in-place agent
 }
 
 func newMonitorHarness(t *testing.T) *monitorHarness {
@@ -487,5 +499,121 @@ func TestProvisioningMonitoringSkipsImagesWithoutAgent(t *testing.T) {
 		if len(agents) != 0 || registers != 0 || len(h.opened) != 0 || len(h.events(inst.ID)) != 0 {
 			t.Fatalf("manifest %q: agents %v, registers %d, guest connections %v, events %v", manifest, agents, registers, h.opened, h.events(inst.ID))
 		}
+	}
+}
+
+// removeManifest makes the harness image one without the agent, like the
+// images existing guests booted before the agent shipped.
+func (h *monitorHarness) removeManifest() {
+	h.t.Helper()
+	if err := os.Remove(filepath.Join(h.p.cfg.ImagesDir(), "manifest.txt")); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// An admin's in-place mark is the only way past the manifest gate: unmarked
+// guests are never contacted, marked ones enroll once the agent is confirmed.
+func TestProvisioningMonitoringInPlaceMark(t *testing.T) {
+	h := newMonitorHarness(t)
+	h.removeManifest()
+	inst := h.boot("demo-id-1", time.Now().UTC(), "attempt-1")
+	h.settle()
+	if agents, registers, _ := h.manager.snapshot(); len(agents) != 0 || registers != 0 || len(h.opened) != 0 {
+		t.Fatalf("unmarked guest enrolled: agents %v, registers %d, opened %v", agents, registers, h.opened)
+	}
+
+	if _, err := h.p.SetWazuhInPlace(context.Background(), "demo", true); err != nil {
+		t.Fatal(err)
+	}
+	h.settle()
+	agents, registers, _ := h.manager.snapshot()
+	if len(agents) != 1 || registers != 1 || h.probes != 1 {
+		t.Fatalf("marked guest: agents %v, registers %d, probes %d", agents, registers, h.probes)
+	}
+	for _, a := range agents {
+		if a.Name != "demo" || a.Status != "active" {
+			t.Fatalf("agent %+v", a)
+		}
+	}
+	if ev := h.events(inst.ID); !slices.ContainsFunc(ev, func(e string) bool { return strings.HasSuffix(e, "is reporting") }) {
+		t.Fatalf("events %v", ev)
+	}
+
+	// Clearing the mark stops enrollment on the next readiness.
+	if _, err := h.p.SetWazuhInPlace(context.Background(), "demo", false); err != nil {
+		t.Fatal(err)
+	}
+	opened := len(h.opened)
+	h.boot("demo-id-1", inst.CreatedAt, "attempt-2")
+	h.settle()
+	if len(h.opened) != opened {
+		t.Fatalf("cleared mark still contacted the guest: %v", h.opened)
+	}
+
+	// A clean rebuild is a new incarnation and starts unmarked.
+	if err := h.st.DeleteInstance(context.Background(), "demo"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.p.SetWazuhInPlace(context.Background(), "demo", true); err == nil {
+		t.Fatal("mark set on a deleted instance")
+	}
+	rebuilt := h.boot("demo-id-2", inst.CreatedAt.Add(time.Minute), "attempt-3")
+	if on, err := h.st.WazuhInPlace(context.Background(), rebuilt.ID); err != nil || on {
+		t.Fatalf("rebuilt incarnation mark %t, %v", on, err)
+	}
+}
+
+// A marked guest whose rootfs lacks the agent is never registered.
+func TestProvisioningMonitoringInPlaceMissingAgent(t *testing.T) {
+	h := newMonitorHarness(t)
+	h.removeManifest()
+	h.agentMissing = true
+	inst := h.boot("demo-id-1", time.Now().UTC(), "attempt-1")
+	h.settle()
+	if _, err := h.p.SetWazuhInPlace(context.Background(), "demo", true); err != nil {
+		t.Fatal(err)
+	}
+	h.settle()
+	agents, registers, _ := h.manager.snapshot()
+	if len(agents) != 0 || registers != 0 || h.probes != 1 || len(h.delivered) != 0 {
+		t.Fatalf("agents %v, registers %d, probes %d, delivered %d", agents, registers, h.probes, len(h.delivered))
+	}
+	if ev := h.events(inst.ID); len(ev) == 0 || ev[0] != "monitoring not enrolled" {
+		t.Fatalf("events %v", ev)
+	}
+}
+
+// Manifest images enroll without a mark and without the in-place probe.
+func TestProvisioningMonitoringManifestNeedsNoMark(t *testing.T) {
+	h := newMonitorHarness(t)
+	h.agentMissing = true // the probe must not run
+	h.boot("demo-id-1", time.Now().UTC(), "attempt-1")
+	h.settle()
+	if agents, registers, _ := h.manager.snapshot(); len(agents) != 1 || registers != 1 || h.probes != 0 {
+		t.Fatalf("agents %v, registers %d, probes %d", agents, registers, h.probes)
+	}
+}
+
+// Orbs can be neither marked nor enrolled.
+func TestProvisioningMonitoringExcludesOrbs(t *testing.T) {
+	h := newMonitorHarness(t)
+	orb := provisionTestInstance(h.p.cfg, "orb-1", model.StateReady, time.Now().UTC())
+	orb.Kind = model.KindOrb
+	orb.TailscaleIP, orb.TailnetNodeID = "100.64.0.20", "node-orb"
+	if err := h.st.CreateInstance(context.Background(), orb); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.p.SetWazuhInPlace(context.Background(), "orb-1", true); err == nil {
+		t.Fatal("orb accepted the in-place mark")
+	}
+	if err := h.st.SetWazuhInPlace(context.Background(), orb.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.p.ResumeMonitoring(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h.settle()
+	if agents, registers, _ := h.manager.snapshot(); len(agents) != 0 || registers != 0 || len(h.opened) != 0 {
+		t.Fatalf("orb enrolled: agents %v, registers %d, opened %v", agents, registers, h.opened)
 	}
 }

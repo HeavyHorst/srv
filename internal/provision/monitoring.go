@@ -70,14 +70,57 @@ func (p *Provisioner) ResumeMonitoring(ctx context.Context) error {
 	}
 	for _, inst := range instances {
 		if monitorable(inst) {
+			// The attempt itself checks the image manifest or in-place mark.
 			p.requestMonitoring(inst.Name)
 		}
 	}
 	return nil
 }
 
+// monitorable reports whether a guest could be enrolled at all: a ready
+// tailnet VM (never an Orb) with a known tailnet node.
 func monitorable(inst model.Instance) bool {
-	return inst.DeletedAt == nil && inst.State == model.StateReady && inst.GuestTailnet() && inst.TailnetNodeID != "" && inst.TailscaleIP != "" && imageShipsWazuh(inst)
+	return inst.DeletedAt == nil && inst.State == model.StateReady && inst.GuestTailnet() && inst.TailnetNodeID != "" && inst.TailscaleIP != ""
+}
+
+// shipsWazuh reports whether the guest carries the agent: either its image
+// manifest records it, or an admin marked this incarnation as having the
+// agent installed in place (inPlace). Only the mark bypasses the manifest.
+func (p *Provisioner) shipsWazuh(ctx context.Context, inst model.Instance) (inPlace bool, ok bool, err error) {
+	if imageShipsWazuh(inst) {
+		return false, true, nil
+	}
+	inPlace, err = p.store.WazuhInPlace(ctx, inst.ID)
+	if err != nil {
+		return false, false, err
+	}
+	return inPlace, inPlace, nil
+}
+
+// AgentProber is implemented by guests that can confirm the in-place agent
+// and its srv enrollment units are installed before anything is registered.
+type AgentProber interface {
+	ProbeAgent(ctx context.Context) error
+}
+
+// SetWazuhInPlace sets or clears an admin's mark that a VM's rootfs carries
+// an in-place installed agent, and requests enrollment when it is set.
+func (p *Provisioner) SetWazuhInPlace(ctx context.Context, name string, on bool) (model.Instance, error) {
+	inst, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return inst, err
+	}
+	if inst.KindName() != model.KindVM || !inst.GuestTailnet() {
+		return inst, errors.New("wazuh in-place applies only to tailnet VMs, not Orbs")
+	}
+	if err := p.store.SetWazuhInPlace(ctx, inst.ID, on); err != nil {
+		return inst, err
+	}
+	p.recordEvent(inst.ID, "wazuh", fmt.Sprintf("wazuh in-place agent mark set to %t", on), nil)
+	if on && monitorable(inst) {
+		p.requestMonitoring(inst.Name)
+	}
+	return inst, nil
 }
 
 // imageShipsWazuh reports whether the guest booted an image whose build
@@ -162,6 +205,14 @@ func (p *Provisioner) enrollGuest(w *monitoringWorker, name string) (model.Insta
 		// The next readiness requests enrollment again.
 		return inst, false, nil
 	}
+	inPlace, ships, err := p.shipsWazuh(ctx, inst)
+	if err != nil {
+		return inst, true, err
+	}
+	if !ships {
+		// Guests from images without the agent are never contacted.
+		return inst, false, nil
+	}
 	hostKey, err := p.guestSSHHostKey(ctx, inst)
 	if err != nil {
 		return inst, true, err
@@ -171,6 +222,17 @@ func (p *Provisioner) enrollGuest(w *monitoringWorker, name string) (model.Insta
 		return inst, true, fmt.Errorf("connecting to guest: %w", err)
 	}
 	defer conn.Close()
+	if inPlace {
+		// The mark is an admin's claim; confirm it before registering, so a
+		// guest without the agent never gets a manager registration.
+		prober, ok := guest.(AgentProber)
+		if !ok {
+			return inst, false, errors.New("guest cannot confirm the in-place agent")
+		}
+		if err := prober.ProbeAgent(ctx); err != nil {
+			return inst, false, fmt.Errorf("in-place wazuh agent is not installed: %w", err)
+		}
+	}
 	// The guest accepts only an agent named for its hostname, the instance
 	// name. The prefix scopes the asset in the registration store.
 	asset := w.AssetPrefix + inst.Name

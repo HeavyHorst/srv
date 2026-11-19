@@ -286,6 +286,7 @@ cold migration, host-qualified names, and `node list` across servers, see the
 | `pool delete <name>` | Admin-only delete an empty memory pool |
 | `status` | Admin-only host capacity and allocation summary |
 | `snapshot create` | Admin-only host-local [readonly root-and-disk snapshot bundle](../tasks/host-snapshots.md) with a manifest |
+| `wazuh in-place <name> on\|off` | Admin-only mark that a tailnet VM's rootfs has the Wazuh agent installed in place, so srv enrolls it ([Wazuh agent](../../images/arch-base/README.md#wazuh-agent)) |
 
 `pool resize` sets the total reservation, not a size delta. The size must be
 positive and at least as large as each member's configured guest RAM, not the

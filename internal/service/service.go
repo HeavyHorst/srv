@@ -1074,6 +1074,8 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 		return a.cmdUpgrade(ctx, actor, req.args, req.format)
 	case "fsck":
 		return a.cmdFSCK(ctx, actor, req.args, req.format)
+	case "wazuh":
+		return a.cmdWazuh(ctx, actor, req.args, req.format)
 	case "backup":
 		return a.cmdBackup(ctx, actor, req.args, req.format)
 	case "disk":
@@ -1252,6 +1254,29 @@ func (a *App) cmdFSCK(ctx context.Context, actor model.Actor, args []string, out
 		return jsonResult(commandActionJSON{Action: "checked", Instance: instanceSummaryPayload(a.cfg, inst, false)})
 	}
 	return commandResult{stdout: fmt.Sprintf("checked: %s\nstate: %s\n", inst.Name, inst.State), exitCode: 0}, nil
+}
+
+// cmdWazuh sets the admin-only in-place Wazuh agent mark. Guests booting an
+// image whose manifest records the agent need no mark.
+func (a *App) cmdWazuh(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
+	if len(args) != 4 || args[1] != "in-place" || (args[3] != "on" && args[3] != "off") {
+		err := errors.New("usage: wazuh in-place <name> on|off")
+		return commandResult{stderr: err.Error() + "\n", exitCode: 2}, err
+	}
+	name, on := args[2], args[3] == "on"
+	unlock := a.lockInstance(name)
+	defer unlock()
+	if _, err := a.lookupVisibleInstance(ctx, actor, name); err != nil {
+		return missingInstanceResult("wazuh", name, err)
+	}
+	inst, err := a.provisioner.SetWazuhInPlace(ctx, name, on)
+	if err != nil {
+		return missingInstanceResult("wazuh", name, err)
+	}
+	if outFormat == outputFormatJSON {
+		return jsonResult(commandActionJSON{Action: "wazuh-in-place-" + args[3], Instance: instanceSummaryPayload(a.cfg, inst, false)})
+	}
+	return commandResult{stdout: fmt.Sprintf("wazuh-in-place: %s %s\n", inst.Name, args[3]), exitCode: 0}, nil
 }
 
 func (a *App) cmdBackup(ctx context.Context, actor model.Actor, args []string, outFormat outputFormat) (commandResult, error) {
@@ -2790,6 +2815,7 @@ func helpResult() commandResult {
 				{"pool delete <name>", "Delete an empty memory pool."},
 				{"status", "Show host capacity and allocation summary."},
 				{"snapshot create", "Create a read-only btrfs data snapshot."},
+				{"wazuh in-place <name> on|off", "Mark a VM whose rootfs has the Wazuh agent installed in place, so srv enrolls it."},
 			},
 		},
 	}
@@ -3373,7 +3399,7 @@ func lifecycleReadyResult(action string, inst model.Instance) commandResult {
 }
 
 func (a *App) authorize(actor model.Actor, command string) (bool, string) {
-	if command == "snapshot" || command == "status" || command == "integration" || command == "pool" {
+	if command == "snapshot" || command == "status" || command == "integration" || command == "pool" || command == "wazuh" {
 		if !a.isAdmin(actor) {
 			return false, fmt.Sprintf("%s is not in SRV_ADMIN_USERS", actor.UserLogin)
 		}

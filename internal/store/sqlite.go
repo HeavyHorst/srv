@@ -210,6 +210,29 @@ func (s *Store) FindInstance(ctx context.Context, name string) (model.Instance, 
 	return model.Instance{}, false, err
 }
 
+// WazuhInPlace reports whether an admin marked the instance's rootfs as
+// carrying an in-place installed Wazuh agent. The mark belongs to one
+// incarnation: a clean rebuild is a new instance ID and starts unmarked.
+func (s *Store) WazuhInPlace(ctx context.Context, instanceID string) (bool, error) {
+	var on bool
+	err := s.db.QueryRowContext(ctx, `SELECT wazuh_in_place FROM instances WHERE id = ? AND deleted_at IS NULL`, instanceID).Scan(&on)
+	return on, err
+}
+
+// SetWazuhInPlace sets or clears the in-place Wazuh agent mark.
+func (s *Store) SetWazuhInPlace(ctx context.Context, instanceID string, on bool) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE instances SET wazuh_in_place = ? WHERE id = ? AND deleted_at IS NULL`, on, instanceID)
+	if err != nil {
+		return fmt.Errorf("set wazuh_in_place: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) DeleteInstance(ctx context.Context, name string) error {
 	inst, found, err := s.FindInstance(ctx, name)
 	if err != nil {
@@ -782,6 +805,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{name: "image", decl: "TEXT NOT NULL DEFAULT ''"},
 		{name: "kind", decl: "TEXT NOT NULL DEFAULT 'vm' CHECK (kind IN ('vm', 'orb'))"},
 		{name: "guest_network", decl: "TEXT NOT NULL DEFAULT ''"},
+		{name: "wazuh_in_place", decl: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "stopped_since", decl: "TEXT"},
 	} {
 		if err := s.ensureColumn(ctx, "instances", column.name, column.decl); err != nil {

@@ -18,6 +18,10 @@ const (
 		"cat >/run/srv-wazuh/.enrollment.json.tmp && " +
 		"mv -f /run/srv-wazuh/.enrollment.json.tmp /run/srv-wazuh/enrollment.json"
 	startEnrollmentCommand = "systemctl start srv-wazuh-enroll.service"
+	// probeAgentCommand succeeds only when the agent package and srv's
+	// enrollment units are installed (as by the image or an in-place install).
+	probeAgentCommand = "test -x /var/ossec/bin/wazuh-agentd && test -x /usr/local/lib/srv/wazuh-enroll.sh && " +
+		"systemctl cat srv-wazuh-enroll.service wazuh-agent.service >/dev/null"
 )
 
 // Runner runs one command as root on the guest with stdin.
@@ -34,6 +38,10 @@ func (g CommandGuest) WriteEnrollment(ctx context.Context, identity []byte) erro
 
 func (g CommandGuest) StartEnrollment(ctx context.Context) error {
 	return g.Run(ctx, startEnrollmentCommand, nil)
+}
+
+func (g CommandGuest) ProbeAgent(ctx context.Context) error {
+	return g.Run(ctx, probeAgentCommand, nil)
 }
 
 // SSHRunner runs commands over an SSH client the caller has authenticated

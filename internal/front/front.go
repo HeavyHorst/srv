@@ -327,7 +327,7 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 		} else if hostName == "" {
 			h, err = r.choose(ctx, a, args[1:])
 		}
-	case "inspect", "start", "stop", "restart", "delete", "resize", "upgrade", "fsck", "restore", "backup", "disk", "logs", "export", "bootstrap":
+	case "inspect", "start", "stop", "restart", "delete", "resize", "upgrade", "fsck", "restore", "backup", "disk", "logs", "export", "bootstrap", "wazuh":
 		if cmd == "delete" && len(args) > 2 && args[2] == "--expect" && hostName == "" {
 			return fmt.Errorf("delete --expect requires --host")
 		}
@@ -335,7 +335,7 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
 			return fmt.Errorf("use orb bootstrap NAME")
 		}
 		nameIndex := 1
-		if cmd == "backup" || cmd == "disk" {
+		if cmd == "backup" || cmd == "disk" || cmd == "wazuh" {
 			nameIndex = 2
 		}
 		if cmd == "logs" {

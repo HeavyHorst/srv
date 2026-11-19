@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply wazuh-agent file owners and modes
+Documentation=file:///usr/local/lib/srv/wazuh-owners.sh
+# Pulled in by wazuh-agent.service and srv-wazuh-enroll.service, before any
+# wazuh process runs. Replaces the masked wazuh-agent tmpfiles.d entry.
+DefaultDependencies=no
+After=local-fs.target systemd-sysusers.service
+Before=wazuh-agent.service srv-wazuh-enroll.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/srv/wazuh-owners.sh

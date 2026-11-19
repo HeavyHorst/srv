@@ -434,6 +434,10 @@ install_wazuh_agent() {
 		echo "staged wazuh-agent package does not match the pinned SHA-256" >&2
 		exit 1
 	fi
+	# Mask the package's tmpfiles.d entry before pacman's tmpfiles hook sees
+	# it; wazuh-owners.sh applies it instead (see that script).
+	install -d "${ROOTFS_MOUNT_DIR}/etc/tmpfiles.d"
+	ln -sfn /dev/null "${ROOTFS_MOUNT_DIR}/etc/tmpfiles.d/wazuh-agent.conf"
 	# No repositories: dependencies must already be in the rootfs.
 	cat >"${stage_dir}/pacman.conf" <<EOF
 [options]
@@ -550,13 +554,16 @@ build_rootfs() {
 			--exclude=/etc/systemd/system/srv-wazuh-enroll.service
 			--exclude=/etc/systemd/system/wazuh-agent.service.d/
 			--exclude=/etc/tmpfiles.d/srv-wazuh.conf
+			--exclude=/etc/tmpfiles.d/wazuh-agent.conf
+			--exclude=/usr/local/lib/srv/wazuh-owners.sh
+			--exclude=/etc/systemd/system/srv-wazuh-owners.service
 		)
 	fi
 	# Overlay paths belong to root in the guest, regardless of checkout ownership.
 	rsync -a --chown=0:0 "${overlay_excludes[@]}" "${SCRIPT_DIR}/overlay/" "${ROOTFS_MOUNT_DIR}/"
 	if [[ "${WAZUH_AGENT_ENABLED}" == 1 ]]; then
 		# The overlay resets /var/ossec modes and owners; restore the package's.
-		arch-chroot "${ROOTFS_MOUNT_DIR}" systemd-tmpfiles --create wazuh-agent.conf
+		arch-chroot "${ROOTFS_MOUNT_DIR}" /usr/local/lib/srv/wazuh-owners.sh
 	fi
 	install_pi
 	install_agent_browser

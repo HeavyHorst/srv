@@ -142,6 +142,8 @@ arch-chroot() {
       local command="$*"
       local staged="${ROOTFS_MOUNT_DIR}${command##* }"
       [[ "$(cat "${staged}")" == "$(cat "${WAZUH_PACKAGE}")" ]] || return 95
+      # pacman's tmpfiles hook must see the package's entry masked.
+      [[ -L "${ROOTFS_MOUNT_DIR}/etc/tmpfiles.d/wazuh-agent.conf" && "${ROOTFS_MOUNT_DIR}/etc/tmpfiles.d/wazuh-agent.conf" -ef /dev/null ]] || return 97
       cat "${stage}/pacman.conf" >"${OUTPUT_DIR}/wazuh-pacman.conf"
       if [[ "${TEST_INSTALL}" == reject ]]; then echo "error: failed to commit transaction (conflicting files)" >&2; return 96; fi
       install -d "${ROOTFS_MOUNT_DIR}/usr/share/wazuh-agent"
@@ -152,7 +154,7 @@ arch-chroot() {
       fi
       ;;
     'pacman -Q wazuh-agent') printf 'wazuh-agent %s\n' "${TEST_WAZUH_VERSION}" ;;
-    'systemd-tmpfiles --create wazuh-agent.conf') ;;
+    '/usr/local/lib/srv/wazuh-owners.sh') ;;
     '/bin/bash /root/prepare-amp.'*) return 0 ;;
     *) echo "unexpected chroot command: $*" >&2; return 93 ;;
   esac
@@ -274,7 +276,7 @@ func TestWazuhAgentInstall(t *testing.T) {
 		"chroot pacman --config /root/srv-wazuh/pacman.conf --noconfirm -U /root/srv-wazuh/" + testPackageName,
 		"chroot pacman -Q wazuh-agent",
 		"rsync ",
-		"chroot systemd-tmpfiles --create wazuh-agent.conf",
+		"chroot /usr/local/lib/srv/wazuh-owners.sh",
 	}
 	last := -1
 	for _, step := range order {
@@ -304,6 +306,9 @@ func TestWazuhAgentInstall(t *testing.T) {
 		"etc/systemd/system/srv-wazuh-enroll.service",
 		"etc/systemd/system/wazuh-agent.service.d/10-srv-require-enrollment.conf",
 		"etc/tmpfiles.d/srv-wazuh.conf",
+		"etc/tmpfiles.d/wazuh-agent.conf",
+		"usr/local/lib/srv/wazuh-owners.sh",
+		"etc/systemd/system/srv-wazuh-owners.service",
 	} {
 		if !run.exists(path) {
 			t.Errorf("native rootfs lacks %s", path)
@@ -396,6 +401,9 @@ func TestImagesWithoutWazuh(t *testing.T) {
 				"etc/systemd/system/srv-wazuh-enroll.service",
 				"etc/systemd/system/wazuh-agent.service.d",
 				"etc/tmpfiles.d/srv-wazuh.conf",
+				"etc/tmpfiles.d/wazuh-agent.conf",
+				"usr/local/lib/srv/wazuh-owners.sh",
+				"etc/systemd/system/srv-wazuh-owners.service",
 			} {
 				if run.exists(path) {
 					t.Errorf("rootfs contains %s", path)

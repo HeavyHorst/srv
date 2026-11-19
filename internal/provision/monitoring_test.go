@@ -196,6 +196,13 @@ func newMonitorHarness(t *testing.T) *monitorHarness {
 		return []tailscale.Device{{NodeID: "node-demo", Hostname: "demo", Addresses: []string{"100.64.0.10"}}}, nil
 	}
 	cfg := loadProvisionTestConfig(t, map[string]string{"SRV_GUEST_READY_TIMEOUT": "2s"})
+	// Guests boot an image whose manifest records the agent.
+	if err := os.MkdirAll(cfg.ImagesDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.ImagesDir(), "manifest.txt"), []byte("arch=x86_64\nwazuh_agent_version=4.14.9-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	h := &monitorHarness{t: t, st: newProvisionTestStore(t, cfg), manager: &monitorManager{agents: map[string]wazuh.Agent{}}}
 
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
@@ -449,5 +456,28 @@ func TestProvisioningMonitoringCoalescesRequests(t *testing.T) {
 	agents, registers, deletes := h.manager.snapshot()
 	if len(agents) != 1 || registers != 1 || len(deletes) != 0 {
 		t.Fatalf("agents %v, registers %d, deletes %v", agents, registers, deletes)
+	}
+}
+
+// Guests from images without the agent, such as every guest created before
+// the agent shipped, are neither registered nor contacted.
+func TestProvisioningMonitoringSkipsImagesWithoutAgent(t *testing.T) {
+	for _, manifest := range []string{"arch=x86_64\nwazuh_agent=disabled\n", ""} {
+		h := newMonitorHarness(t)
+		path := filepath.Join(h.p.cfg.ImagesDir(), "manifest.txt")
+		if manifest == "" {
+			os.Remove(path)
+		} else if err := os.WriteFile(path, []byte(manifest), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		inst := h.boot("demo-id-1", time.Now().UTC(), "attempt-1")
+		if err := h.p.ResumeMonitoring(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		h.settle()
+		agents, registers, _ := h.manager.snapshot()
+		if len(agents) != 0 || registers != 0 || len(h.opened) != 0 || len(h.events(inst.ID)) != 0 {
+			t.Fatalf("manifest %q: agents %v, registers %d, guest connections %v, events %v", manifest, agents, registers, h.opened, h.events(inst.ID))
+		}
 	}
 }

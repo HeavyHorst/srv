@@ -8,7 +8,10 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,7 +77,20 @@ func (p *Provisioner) ResumeMonitoring(ctx context.Context) error {
 }
 
 func monitorable(inst model.Instance) bool {
-	return inst.DeletedAt == nil && inst.State == model.StateReady && inst.GuestTailnet() && inst.TailnetNodeID != "" && inst.TailscaleIP != ""
+	return inst.DeletedAt == nil && inst.State == model.StateReady && inst.GuestTailnet() && inst.TailnetNodeID != "" && inst.TailscaleIP != "" && imageShipsWazuh(inst)
+}
+
+// imageShipsWazuh reports whether the guest booted an image whose build
+// manifest, beside its kernel, records the Wazuh agent. Guests from older
+// images, images built with SRV_WAZUH_AGENT=0 and Orbs are never contacted
+// or registered. A guest whose kernel moved out of its image directory (a
+// kernel upgrade) is no longer enrolled, which fails safe.
+func imageShipsWazuh(inst model.Instance) bool {
+	if inst.KernelPath == "" {
+		return false
+	}
+	manifest, err := os.ReadFile(filepath.Join(filepath.Dir(inst.KernelPath), "manifest.txt"))
+	return err == nil && strings.Contains("\n"+string(manifest), "\nwazuh_agent_version=")
 }
 
 // requestMonitoring starts enrolling a guest that just became ready. It

@@ -12,7 +12,7 @@ but image boot and the Amp connection still need validation on a real srv host.
 | --- | --- |
 | First `spawn` | Create an Orb, wait for its host-only vsock agent, start `amp orb bootstrap` as `user`. |
 | Later `spawn` | Start the same stopped Orb, or reuse the running Orb; restart bootstrap with the fresh token. |
-| `pause` | Stop the VM and retain its disk; with `ORB_SNAPSHOT_ID`, save an immutable prepared disk template. |
+| `pause` | Stop the VM and retain its disk; optionally save RAM with `SRV_ORB_SAVE_STATE=1`. With `ORB_SNAPSHOT_ID`, save an immutable prepared disk template. |
 | `delete` | Remove the native Orb; retain any legacy backups, shared snapshots, project templates and the exact cleanup receipt. |
 
 Orbs use the same Firecracker, capacity accounting and placement infrastructure
@@ -38,23 +38,34 @@ snapshots are unchanged.
 Common `inspect`, `start`, `stop`, `delete` and capacity commands still
 operate on both kinds. The same list separation applies through srv-front.
 
-Amp pause does not request RAM suspend, and there is no automatic migration.
-Manual `stop --save-state` and `start` use the same
-[single-use RAM state](../tasks/instance-lifecycle.md#save-ram-before-stopping)
-as ordinary VMs, including exact Firecracker snapshot-format matching and a cold
-boot with the existing disk when the format changes or is missing from the manifest.
-New orbs reuse a known
-`ORB_SNAPSHOT_ID` on its recorded backend; unknown IDs fall back to the base
-image. Existing orbs always retain their own disk and use Amp's resume workflow. Processes, Terminal
-sessions and in-memory state do not survive a pause. Let Amp manage development
-services so they can be restarted after wake-up.
+By default, Amp pause retains the disk and stops processes. Set
+`SRV_ORB_SAVE_STATE=1` in the provider environment to request `stop --save-state`
+on ordinary pauses. Wake uses the existing `start` command, which automatically
+restores srv's [single-use RAM state](../tasks/instance-lifecycle.md#save-ram-before-stopping).
+RAM resume requires an exact Firecracker snapshot-format match. A changed or
+missing format in the manifest causes a cold boot with the existing disk.
+A failed RAM save is reported and remains fenced by the lifecycle receipt.
+The dispatcher does not retry it as a disk-only stop. There is no automatic migration.
+
+Every wake refreshes Amp bootstrap with the fresh token. The guest stops the
+previous bootstrap and its descendants, including terminal processes, before
+starting the replacement. Independent guest services can survive RAM resume.
+This setting does not preserve a full Amp session or guarantee Terminal or
+Desktop continuity. Let Amp manage development services that need to restart.
+
+New orbs reuse a known `ORB_SNAPSHOT_ID` on its recorded backend; unknown IDs
+fall back to the base image. Existing orbs retain their own disk and use Amp's
+resume workflow.
 
 ## Project snapshots
 
 Amp requests a snapshot by sending `pause` with `ORB_SNAPSHOT_ID`, then wakes the
 same orb again. srv stops the source, reflink-clones its disk, sanitizes the copy,
 and publishes it atomically in an owner-scoped template namespace. The source
-disk remains unchanged. A later new orb gets a clone of this prepared template
+disk remains unchanged. Snapshot pauses use disk-only stop even with
+`SRV_ORB_SAVE_STATE=1`. If the source is already stopped with saved RAM, the
+snapshot request leaves that RAM state on the source. Templates never copy RAM.
+A later new orb gets a clone of this prepared template
 and fresh srv allocation, rather than a migration of the source VM. Templates
 retain their workload kind: an Orb cannot clone a normal VM template or vice versa.
 
@@ -217,8 +228,9 @@ For the Amp provider, set both `ORB_IMAGE=amp-orb-desktop` and
 `SRV_ORB_IMAGE=amp-orb-desktop`. srv-front already considers image availability
 when placing new VMs. This is provider configuration, not a new per-thread Amp
 image selector. Existing VMs keep their original rootfs; rebuild and create a
-new orb to pick up Desktop support. Desktop processes restart after pause rather
-than resuming their old in-memory session.
+new orb to pick up Desktop support. Desktop processes restart after the default
+disk-only pause. RAM resume does not guarantee Desktop session continuity because
+wake refreshes bootstrap and stops its descendants.
 
 ## Provider machine and identity
 
@@ -397,9 +409,12 @@ amp -ox "Inspect this repository" --orb-provider YOUR_PROVIDER_NAME
 | `SRV_ORB_RAM` | `4G`; new VM memory. |
 | `SRV_ORB_POOL` | Optional existing memory pool for new VMs (`new --pool`); `SRV_ORB_RAM` stays the guest-visible RAM. Unset creates fixed-memory VMs. |
 | `SRV_ORB_DISK` | `20G`; new VM rootfs size. |
+| `SRV_ORB_SAVE_STATE` | Unset or `0`: disk-only pause. `1`: save RAM on ordinary pauses. Project snapshots remain disk-only. Other values, including empty, reject pause before mutation; delete remains available. |
 
 Sizes are operator configuration, not dispatch fields supplied by Amp. Changing
-these settings affects new VMs only. Existing VMs keep their disks and placement.
+these size settings affects new VMs only. Existing VMs keep their disks and placement.
+`SRV_ORB_SAVE_STATE` applies to pauses of existing orbs too. The dispatcher
+validates its value before every pause, including project snapshot requests.
 `AMP_URL`, when provided by Amp on spawn, is passed to bootstrap.
 
 Only one provider installation may own an Orb ID. Do not run independent
@@ -746,8 +761,12 @@ Before relying on this provider, create a disposable Amp thread and verify:
    setup runs successfully. Verify separate VM/Orb lists and common capacity accounting.
 2. Write a file and install a dependency; pause and wake the thread. Both survive,
    while terminal processes do not. Verify `.agents/resume` behavior.
-3. Open an Amp Terminal, Portal and Desktop; launch a graphical application and
-   verify reconnect/service startup after wake (the old desktop session is lost).
+3. With `SRV_ORB_SAVE_STATE=1`, start an independent guest service and pause/wake.
+   Verify its in-memory state survives, bootstrap receives a fresh token, and old
+   bootstrap descendants stop. Open an Amp Terminal, Portal and Desktop and verify
+   reconnect/service startup. Do not assume the old sessions survive.
+   Repeat a project snapshot pause with this setting and verify the new thread
+   gets prepared disk contents without the source's in-memory state.
 4. With srv-front, take an unrelated backend out of service and wake the orb on
    its recorded healthy host.
 5. Let Amp save a project snapshot; create a second thread from it. Verify prepared

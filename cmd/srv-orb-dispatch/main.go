@@ -135,6 +135,17 @@ func envDefault(key, fallback string) string {
 	return fallback
 }
 
+func pauseSaveState() (bool, error) {
+	value, configured := os.LookupEnv("SRV_ORB_SAVE_STATE")
+	if !configured || value == "0" {
+		return false, nil
+	}
+	if value == "1" {
+		return true, nil
+	}
+	return false, errors.New("SRV_ORB_SAVE_STATE must be 0 or 1; unset it to keep disk-only pauses")
+}
+
 // SRV_ORB_PROXY_BYPASS names the provider-owned destinations appended to the
 // guest's built-in NO_PROXY list. It is read and validated before spawn can
 // change compute, and travels only in the bootstrap payload: never in
@@ -226,6 +237,14 @@ func dispatch(ctx context.Context, c config, j job) error {
 	}
 	if strings.ContainsAny(j.token+j.ampURL, "\x00\r\n") {
 		return errors.New("invalid bootstrap environment")
+	}
+	var saveState bool
+	if j.operation == "pause" {
+		var err error
+		saveState, err = pauseSaveState()
+		if err != nil {
+			return err
+		}
 	}
 	var bypass string
 	if j.operation == "spawn" {
@@ -528,7 +547,11 @@ func dispatch(ctx context.Context, c config, j job) error {
 	switch j.operation {
 	case "pause":
 		if v.State != "stopped" {
-			if err = operate(ctx, c, path, &r, "stop"); err != nil {
+			var options []string
+			if saveState && j.snapshot == "" {
+				options = append(options, "--save-state")
+			}
+			if err = operate(ctx, c, path, &r, "stop", options...); err != nil {
 				return err
 			}
 		}
@@ -655,7 +678,7 @@ func ssh(ctx context.Context, c config, destination, command string, input *stri
 	// Do not expose provider credentials to ssh (including SendEnv configurations).
 	for _, value := range os.Environ() {
 		key, _, _ := strings.Cut(value, "=")
-		if key != "AMP_ORB_PROVIDER_TOKEN" && key != "ORB_TOKEN" && key != "SRV_ORB_PROXY_BYPASS" {
+		if key != "AMP_ORB_PROVIDER_TOKEN" && key != "ORB_TOKEN" && key != "SRV_ORB_PROXY_BYPASS" && key != "SRV_ORB_SAVE_STATE" {
 			cmd.Env = append(cmd.Env, value)
 		}
 	}

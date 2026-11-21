@@ -78,12 +78,14 @@ func matches(r record, v *instance) error {
 	return nil
 }
 
-func operate(ctx context.Context, c config, path string, r *record, operation string) error {
+func operate(ctx context.Context, c config, path string, r *record, operation string, options ...string) error {
 	r.Pending, r.RequestID = operation, uuid.NewString()
 	if err := save(path, r); err != nil {
 		return err
 	}
-	args := append([]string{operation, r.Name, "--expect", r.RequestID}, identity(*r)...)
+	args := append([]string{operation, r.Name}, options...)
+	args = append(args, "--expect", r.RequestID)
+	args = append(args, identity(*r)...)
 	if _, err := control(ctx, c, *r, args...); err != nil {
 		return err
 	}

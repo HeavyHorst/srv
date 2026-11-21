@@ -89,6 +89,11 @@ type testServer struct {
 	RefuseCreate         bool
 	RejectStart          bool
 	LoseStop             bool
+	RejectSaveState      bool
+	Stops                int
+	SaveStops            int
+	SavedState           bool
+	Restores             int
 	LoseDelete           bool
 	RejectDelete         bool
 	DeleteRequestID      string
@@ -100,8 +105,10 @@ func fakeSSH() error {
 	if os.Getenv("ORB_TOKEN") != "" || os.Getenv("AMP_ORB_PROVIDER_TOKEN") != "" {
 		return fmt.Errorf("credential leaked into SSH environment")
 	}
-	if _, ok := os.LookupEnv("SRV_ORB_PROXY_BYPASS"); ok {
-		return fmt.Errorf("bypass configuration leaked into SSH environment")
+	for _, key := range []string{"SRV_ORB_PROXY_BYPASS", "SRV_ORB_SAVE_STATE"} {
+		if _, ok := os.LookupEnv(key); ok {
+			return fmt.Errorf("provider configuration leaked into SSH environment")
+		}
 	}
 	path := os.Getenv("SRV_ORB_TEST_SERVER")
 	b, err := os.ReadFile(path)
@@ -332,12 +339,26 @@ func fakeSSH() error {
 	case "inspect":
 		return emit(map[string]any{"instance": s.VM})
 	case "stop":
+		saveState := len(args) > 3 && args[3] == "--save-state"
+		if saveState {
+			args = append(args[:3:3], args[4:]...)
+			s.SaveStops++
+		}
+		s.Stops++
 		if err := finish("stop", 0); err != nil {
 			return err
+		}
+		if saveState && s.RejectSaveState {
+			s.Results[args[4]]["phase"], s.Results[args[4]]["exit_code"] = "failed", 1
+			if err := write(); err != nil {
+				return err
+			}
+			return fmt.Errorf("RAM snapshot failed")
 		}
 		if s.VM.State == "stopped" {
 			return fmt.Errorf("already stopped")
 		}
+		s.SavedState = saveState
 		s.VM.State = "stopped"
 		if s.LateStop {
 			s.Results[args[4]]["phase"] = "executing"
@@ -361,6 +382,10 @@ func fakeSSH() error {
 		}
 		if s.VM.State != "stopped" {
 			return fmt.Errorf("already running")
+		}
+		if s.SavedState {
+			s.Restores++
+			s.SavedState = false
 		}
 		s.VM.State = "ready"
 	case "delete":
@@ -458,7 +483,12 @@ func (h harness) runArgs(args []string, operation, token string, extra ...string
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, h.program, args...)
-	cmd.Env = append(os.Environ(),
+	for _, value := range os.Environ() {
+		if !strings.HasPrefix(value, "SRV_ORB_SAVE_STATE=") {
+			cmd.Env = append(cmd.Env, value)
+		}
+	}
+	cmd.Env = append(cmd.Env,
 		"PATH="+h.dir+":"+os.Getenv("PATH"), "SRV_ORB_TEST_MODE=dispatch",
 		"SRV_ORB_TEST_SERVER="+filepath.Join(h.dir, "server.json"),
 		"SRV_ORB_STATE_DIR="+filepath.Join(h.dir, "state"), "SRV_ORB_ENDPOINT=srv", "SRV_ORB_HOST=",
@@ -691,6 +721,136 @@ func TestDispatchLifecycle(t *testing.T) {
 				t.Fatalf("SRV_ORB_POOL not passed to orb new: %q", s.Pool)
 			}
 		})
+	}
+}
+
+func TestDispatchPauseSaveState(t *testing.T) {
+	for _, host := range []string{"", "b"} {
+		for _, policy := range []string{"unset", "0", "1", "snapshot"} {
+			t.Run(host+"/"+policy, func(t *testing.T) {
+				h := newHarness(t, host)
+				h.must("spawn", "first-token", "SRV_ORB_HOST="+host)
+				name := h.read().VM.Name
+				s := h.read()
+				s.Disk = "retained workspace"
+				s.OtherDown = host != ""
+				h.write(s)
+				options := []string{"SRV_ORB_HOST=a"}
+				if policy != "unset" {
+					value := policy
+					if policy == "snapshot" {
+						value = "1"
+						options = append(options, "ORB_SNAPSHOT_ID=prepared-project")
+					}
+					options = append(options, "SRV_ORB_SAVE_STATE="+value)
+				}
+				h.must("pause", "", options...)
+				h.must("pause", "", options...)
+				s = h.read()
+				wantSave := policy == "1"
+				if s.Stops != 1 || s.SavedState != wantSave || (s.SaveStops == 1) != wantSave || s.VM.State != "stopped" {
+					t.Fatalf("wrong pause behavior: stops=%d saved=%t save-stops=%d state=%s", s.Stops, s.SavedState, s.SaveStops, s.VM.State)
+				}
+				if policy == "snapshot" && len(s.Templates) != 1 {
+					t.Fatal("snapshot pause did not publish a disk template")
+				}
+				h.must("spawn", "fresh-token", "SRV_ORB_SAVE_STATE=0", "SRV_ORB_HOST=a")
+				s = h.read()
+				wantRestores := 0
+				if wantSave {
+					wantRestores = 1
+				}
+				if s.Restores != wantRestores || s.VM.Name != name || s.VM.Generation != 2 || s.Disk != "retained workspace" || !strings.Contains(s.Environment, `ORB_TOKEN="fresh-token"`) {
+					t.Fatalf("wake did not retain the orb and refresh bootstrap: %+v", s)
+				}
+			})
+		}
+	}
+}
+
+func TestDispatchSaveStateLostReply(t *testing.T) {
+	h := newHarness(t, "b")
+	h.must("spawn", "first-token", "SRV_ORB_HOST=b")
+	s := h.read()
+	s.LoseStop = true
+	h.write(s)
+	if _, err := h.run("pause", "", "SRV_ORB_SAVE_STATE=1"); err == nil {
+		t.Fatal("lost save-state stop reply was not reported")
+	}
+	h.must("pause", "", "SRV_ORB_SAVE_STATE=0")
+	s = h.read()
+	if s.Stops != 1 || s.SaveStops != 1 || !s.SavedState {
+		t.Fatal("retry changed or repeated the committed save-state stop")
+	}
+	h.must("spawn", "fresh-token")
+	if s := h.read(); s.Restores != 1 || s.VM.Generation != 2 {
+		t.Fatal("lost-reply reconciliation did not permit normal wake")
+	}
+}
+
+func TestDispatchFailedSaveStateStaysFenced(t *testing.T) {
+	h := newHarness(t, "")
+	h.must("spawn", "first-token")
+	s := h.read()
+	s.RejectSaveState = true
+	h.write(s)
+	for _, policy := range []string{"1", "0"} {
+		if _, err := h.run("pause", "", "SRV_ORB_SAVE_STATE="+policy); err == nil {
+			t.Fatal("failed save-state stop was accepted")
+		}
+	}
+	if _, err := h.run("spawn", "fresh-token"); err == nil {
+		t.Fatal("failed save-state stop allowed a fresh bootstrap")
+	}
+	s = h.read()
+	if s.Stops != 1 || s.SaveStops != 1 || s.SavedState || s.VM.State != "ready" || s.VM.Generation != 1 {
+		t.Fatal("save failure fell back to plain stop or lost its fence")
+	}
+}
+
+func TestDispatchInvalidSaveStateBeforePause(t *testing.T) {
+	for _, value := range []string{"", "true", "2", " 1"} {
+		for _, snapshot := range []string{"", "prepared-project"} {
+			t.Run(value+"/"+snapshot, func(t *testing.T) {
+				h := newHarness(t, "")
+				h.must("spawn", "first-token")
+				before, err := os.ReadFile(filepath.Join(h.dir, "state", orbName("amp-thread/with spaces and 'quotes'", "")+".json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if out, err := h.run("pause", "", "SRV_ORB_SAVE_STATE="+value, "ORB_SNAPSHOT_ID="+snapshot); err == nil || !strings.Contains(out, "SRV_ORB_SAVE_STATE") {
+					t.Fatalf("invalid pause policy accepted: %v %s", err, out)
+				}
+				after, err := os.ReadFile(filepath.Join(h.dir, "state", orbName("amp-thread/with spaces and 'quotes'", "")+".json"))
+				if err != nil || !bytes.Equal(before, after) || h.read().Stops != 0 || len(h.read().Templates) != 0 {
+					t.Fatal("invalid pause policy changed the dispatch record or compute")
+				}
+				h.must("delete", "", "SRV_ORB_SAVE_STATE="+value)
+			})
+		}
+	}
+}
+
+func TestDispatchSnapshotAfterSaveStatePause(t *testing.T) {
+	h := newHarness(t, "")
+	h.must("spawn", "first-token")
+	s := h.read()
+	s.Disk = "prepared disk"
+	h.write(s)
+	h.must("pause", "", "SRV_ORB_SAVE_STATE=1")
+	h.must("pause", "", "SRV_ORB_SAVE_STATE=1", "ORB_SNAPSHOT_ID=prepared-project")
+	s = h.read()
+	if s.Stops != 1 || !s.SavedState || s.Disk != "prepared disk" || len(s.Templates) != 1 {
+		t.Fatal("snapshot pause changed the stopped source or issued another stop")
+	}
+	for _, disk := range s.Templates {
+		if disk != "prepared disk" {
+			t.Fatal("template did not retain prepared disk contents")
+		}
+	}
+	h.must("spawn", "fresh-token")
+	if h.read().Restores != 1 {
+		t.Fatal("snapshot pause discarded the source's saved RAM")
 	}
 }
 

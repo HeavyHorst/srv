@@ -80,6 +80,8 @@ class GuestTests(unittest.TestCase):
                 self.assertNotIn("fresh-secret", unit.read_text())
                 self.assertIn("User=user", unit.read_text())
                 self.assertIn("KillMode=control-group", unit.read_text())
+                self.assertIn("Slice=amp-control.slice", unit.read_text())
+                self.assertIn("Environment=AMP_ORB_WORKLOAD_SLICE=amp-workload.slice", unit.read_text())
                 self.assertIn("EnvironmentFile=-/etc/amp-orb.env", unit.read_text())
                 self.assertTrue(calls)
 

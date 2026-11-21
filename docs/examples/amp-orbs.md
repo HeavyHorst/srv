@@ -48,10 +48,18 @@ A failed RAM save is reported and remains fenced by the lifecycle receipt.
 The dispatcher does not retry it as a disk-only stop. There is no automatic migration.
 
 Every wake refreshes Amp bootstrap with the fresh token. The guest stops the
-previous bootstrap and its descendants, including terminal processes, before
-starting the replacement. Independent guest services can survive RAM resume.
-This setting does not preserve a full Amp session or guarantee Terminal or
-Desktop continuity. Let Amp manage development services that need to restart.
+previous bootstrap and its descendants before starting the replacement. Prepared
+images put bootstrap in `amp-control.slice` and set
+`AMP_ORB_WORKLOAD_SLICE=amp-workload.slice`. The pinned official Amp runtime
+provides an independent `amp-headless.service` and `amp-run-workload` launcher.
+Workloads launched by that executor can remain in sibling scopes when srv
+replaces bootstrap. Processes still owned by bootstrap are stopped.
+
+This separation permits workload survival; it does not guarantee Amp session,
+Terminal, or Desktop continuity. Killing a workload launcher forwards signals to
+its scope. An executor restart or Amp's own cancellation can therefore stop its
+workloads. Authenticated Amp behavior across fresh-token RAM resume still needs
+the live validation below.
 
 New orbs reuse a known `ORB_SNAPSHOT_ID` on its recorded backend; unknown IDs
 fall back to the base image. Existing orbs retain their own disk and use Amp's
@@ -229,8 +237,35 @@ For the Amp provider, set both `ORB_IMAGE=amp-orb-desktop` and
 when placing new VMs. This is provider configuration, not a new per-thread Amp
 image selector. Existing VMs keep their original rootfs; rebuild and create a
 new orb to pick up Desktop support. Desktop processes restart after the default
-disk-only pause. RAM resume does not guarantee Desktop session continuity because
-wake refreshes bootstrap and stops its descendants.
+disk-only pause. RAM resume retains processes only if their owning service and
+workload launcher survive the fresh-token bootstrap cycle. Desktop continuity
+still needs authenticated Amp validation.
+
+### Executor and workload runtime
+
+Both guest builders run [`install-runtime.py`](../../contrib/amp/orbs/install-runtime.py)
+inside the prepared root. It downloads the official amd64 Amp runtime layer
+`sha256:9571fe6d7a57c153f0dafa679edd453a60171d6f049d4b2c85764ea65f7aedd0`
+and verifies the digest before writing files. The allowlist contains `amp.slice`,
+`amp-control.slice`, `amp-workload.slice`, the headless executor and environment
+watcher units, `amp-headless-update-binary`, `amp-headless-apply-env`,
+`amp-run-workload`, and its sudoers setting. Preparation makes the launcher
+executable and enables only `amp-headless-env.path`. The watcher enables the
+executor after Amp creates `/home/user/.config/amp/headless.env`.
+
+The installer excludes the vendor bootstrap service, accounts, home contents,
+Docker settings, and unrelated services. srv's vsock agent remains the sole
+bootstrap owner. `/usr/local/share/srv/amp-runtime-layer.sha256` records the pin.
+Project-template cleanup removes the source thread's executor environment and
+enabled executor link while retaining the runtime and environment watcher.
+The older Desktop layer pin remains unchanged. Rebuild the image and create a
+new Orb to install this runtime in an existing deployment.
+
+The vendor environment helper supports `--stage-only` and avoids a restart when
+the applied environment hash is unchanged. Its path watcher can still apply a
+changed environment and restart the executor. srv does not change this behavior
+or provide a token-refresh API. Live Amp validation must establish whether a
+fresh bootstrap leaves the executor and its workload launchers running.
 
 ## Provider machine and identity
 
@@ -761,10 +796,15 @@ Before relying on this provider, create a disposable Amp thread and verify:
    setup runs successfully. Verify separate VM/Orb lists and common capacity accounting.
 2. Write a file and install a dependency; pause and wake the thread. Both survive,
    while terminal processes do not. Verify `.agents/resume` behavior.
-3. With `SRV_ORB_SAVE_STATE=1`, start an independent guest service and pause/wake.
-   Verify its in-memory state survives, bootstrap receives a fresh token, and old
-   bootstrap descendants stop. Open an Amp Terminal, Portal and Desktop and verify
-   reconnect/service startup. Do not assume the old sessions survive.
+3. Rebuild the prepared image with the runtime above. With
+   `SRV_ORB_SAVE_STATE=1`, start a long-running workload through Amp's executor,
+   then pause and wake. Record its PID, `/proc/PID/cgroup`, and an in-memory
+   counter before and after. Verify the workload scope is in `amp-workload.slice`,
+   the counter continues, bootstrap receives a fresh token, and old bootstrap
+   descendants stop. Inspect executor restarts and environment-watcher events
+   with `journalctl -u amp-headless.service -u amp-headless-env.service` without
+   printing environment contents or tokens. Open an Amp Terminal, Portal, and
+   Desktop and verify reconnect/service startup. Do not assume old sessions survive.
    Repeat a project snapshot pause with this setting and verify the new thread
    gets prepared disk contents without the source's in-memory state.
 4. With srv-front, take an unrelated backend out of service and wake the orb on
@@ -790,15 +830,33 @@ Local automated checks:
 
 ```bash
 go test ./cmd/srv-orb-dispatch ./internal/store ./internal/service ./internal/provision ./internal/front ./internal/vmrunner ./internal/nethelper ./internal/orbguest
-python3 -m unittest discover -s contrib/amp/orbs -p 'test_*.py'
-# Disposable root/systemd environment only; unique temporary unit, synthetic token:
-sudo python3 contrib/amp/orbs/probe_guest_systemd.py
+# Download only the pinned small runtime layer; the installer also checks its digest.
+curl -fsSL --retry 3 https://us-central1-docker.pkg.dev/v2/amp-prod-0/amp-orb/amp-orb/blobs/sha256:9571fe6d7a57c153f0dafa679edd453a60171d6f049d4b2c85764ea65f7aedd0 -o /tmp/amp-runtime.tar.gz
+AMP_RUNTIME_LAYER=/tmp/amp-runtime.tar.gz python3 -m unittest discover -s contrib/amp/orbs -p 'test_*.py'
+# Disposable root/systemd Linux environment with Bash and sudo only:
+sudo python3 contrib/amp/orbs/probe_guest_systemd.py --runtime-layer /tmp/amp-runtime.tar.gz
 ```
 
 The Go dispatch tests use a subprocess SSH stand-in, not Firecracker or Amp.
+The runtime tests install the real pinned layer into a temporary root, check the
+allowlist and executable modes, reject a bad checksum before target writes, and
+run the vendor environment helper with a systemctl stand-in. Set
+`AMP_RUNTIME_LAYER` to include those integration checks; otherwise they are skipped.
+
 The root probe exercises the real guest handler, systemd jobs, token-holding
-descendants and environment lifecycle over a socketpair, not real vsock. Neither
-proves Amp/Tunnel interoperability or the guest-reset runtime boundary.
+descendants, and environment lifecycle over a socketpair. It runs the pinned
+vendor workload launcher from an independent synthetic executor service. Only
+the slice names are mapped to unique disposable units. It checks workload PID,
+in-memory identity/counter, scope placement, and executor PID across bootstrap
+replacement, lost replies, stale requests, and a killed handler's queued start.
+It also checks old synthetic-token holders are gone. Cleanup stops the executor
+and workload scopes and removes the probe's units.
+
+These checks do not run authenticated Amp, actual vsock, Firecracker RAM
+save/restore, Terminal, Portal, or Desktop. They do not establish that real Amp
+leaves an executor running across a token change, or prove the guest-reset
+runtime boundary. Run the disposable live cycle above before relying on session
+continuity.
 Provision tests additionally check real temporary
 ext4 images, identity cleanup, retained settings/skills, immutable templates and
 cancellation. Actual Amp setup-skipping still requires the live cycle above;

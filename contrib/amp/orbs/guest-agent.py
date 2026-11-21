@@ -26,8 +26,10 @@ Description=Amp orb bootstrap
 Type=exec
 User=user
 Group=user
+Slice=amp-control.slice
 WorkingDirectory=/home/user
 Environment=HOME=/home/user USER=user
+Environment=AMP_ORB_WORKLOAD_SLICE=amp-workload.slice
 EnvironmentFile=-/etc/amp-orb.env
 EnvironmentFile=/run/srv-orb/bootstrap.env
 ExecStart=/usr/local/bin/amp orb bootstrap

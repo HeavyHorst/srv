@@ -146,8 +146,17 @@ under any srv catalog name (for example `amp-orb-desktop`) and set the provider'
 `ORB_IMAGE` and `SRV_ORB_IMAGE` to that name, or use
 `orb new NAME --image amp-orb-desktop` directly (not plain `new`).
 
-Real srv/KVM boot, registration, CLI self-updates, Desktop/Tunnel operation and
-wake-up still need host validation. Stop/start does not preserve desktop sessions.
+Preparation also installs the SHA-256-pinned official Amp executor/workload
+runtime and enables its environment watcher. srv owns bootstrap in
+`amp-control.slice`; the independent executor launches workloads into
+`amp-workload.slice`. The runtime pin is recorded in
+`/usr/local/share/srv/amp-runtime-layer.sha256`. See the
+[asset allowlist and validation limits](../../docs/examples/amp-orbs.md#executor-and-workload-runtime).
+
+Real srv/KVM registration, CLI updates, Desktop/Tunnel operation, and wake-up
+still require host validation. Default disk-only pause stops all processes.
+Optional RAM save can preserve independent workloads, but authenticated Amp
+fresh-token behavior and Desktop continuity remain unverified.
 
 ## Install and configure
 

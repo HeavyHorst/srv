@@ -588,6 +588,7 @@ build_rootfs() {
 		(
 			guest_script="$(mktemp "${ROOTFS_MOUNT_DIR}/root/prepare-amp.XXXXXX")"
 			trap 'rm -f "${guest_script}"' EXIT
+			install -D -m 0755 "${SCRIPT_DIR}/../../contrib/amp/orbs/install-runtime.py" "${ROOTFS_MOUNT_DIR}/usr/local/lib/srv/install-amp-runtime.py"
 			install -o root -g root -m 0700 "${SCRIPT_DIR}/../../contrib/amp/orbs/prepare-guest.sh" "${guest_script}"
 			arch-chroot "${ROOTFS_MOUNT_DIR}" /bin/bash "${guest_script#"${ROOTFS_MOUNT_DIR}"}"
 		)

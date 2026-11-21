@@ -229,6 +229,9 @@ func sanitizeTemplateDisk(ctx context.Context, path string, stripSSHHostKeys boo
 	// and the agent unit refuses to start until they do. The package's
 	// tmpfiles.d entries recreate the removed directories at boot.
 	targets = append(targets, wazuhAgentState...)
+	// Amp's environment watcher enables the executor after bootstrap. Clones
+	// must wait for their own environment instead of starting the source thread.
+	targets = append(targets, "/etc/systemd/system/multi-user.target.wants/amp-headless.service")
 	if stripSSHHostKeys {
 		targets = append(targets, "/etc/ssh/ssh_host_rsa_key", "/etc/ssh/ssh_host_rsa_key.pub", "/etc/ssh/ssh_host_ecdsa_key", "/etc/ssh/ssh_host_ecdsa_key.pub", "/etc/ssh/ssh_host_ed25519_key", "/etc/ssh/ssh_host_ed25519_key.pub")
 	}
@@ -238,10 +241,10 @@ func sanitizeTemplateDisk(ctx context.Context, path string, stripSSHHostKeys boo
 		}
 	}
 	// Preserve prepared settings, skills, installed tools and setup state. Only
-	// remove named authentication/session files, never whole Amp directories.
+	// remove named authentication/session/runtime identity files, never whole Amp directories.
 	// Bootstrap receives fresh ORB_TOKEN in /run; these disks remain confidential.
 	for _, home := range []string{"/root", "/home/user"} {
-		for _, suffix := range []string{"/.config/amp/secrets.json", "/.local/share/amp/secrets.json", "/.local/share/amp/session.json", "/.local/share/amp/device-id.json"} {
+		for _, suffix := range []string{"/.config/amp/secrets.json", "/.config/amp/headless.env", "/.config/amp/headless-bootstrap.env", "/.local/share/amp/secrets.json", "/.local/share/amp/session.json", "/.local/share/amp/device-id.json"} {
 			if err := d.clean(home + suffix); err != nil {
 				return err
 			}

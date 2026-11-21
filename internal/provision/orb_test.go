@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,17 +25,33 @@ import (
 type orbLifecycleRunner struct {
 	noopVMRunner
 	templateTestBootResolver
-	running bool
-	starts  []vmrunner.StartRequest
+	running      bool
+	starts       []vmrunner.StartRequest
+	stops        []vmrunner.StopRequest
+	instancesDir string
+	resumes      int
 }
 
 func (r *orbLifecycleRunner) StartInstanceVM(_ context.Context, req vmrunner.StartRequest) (vmrunner.StartResponse, error) {
+	ramState := filepath.Join(r.instancesDir, req.Name, "ram-state")
+	if _, err := os.Stat(ramState); r.instancesDir != "" && err == nil && !req.DiscardState {
+		r.resumes++
+		if err := os.RemoveAll(ramState); err != nil {
+			return vmrunner.StartResponse{}, err
+		}
+	}
 	r.running = true
 	r.starts = append(r.starts, req)
 	return vmrunner.StartResponse{Outcome: vmrunner.StartRunning, PID: os.Getpid()}, nil
 }
 
-func (r *orbLifecycleRunner) StopInstanceVM(context.Context, vmrunner.StopRequest) error {
+func (r *orbLifecycleRunner) StopInstanceVM(_ context.Context, req vmrunner.StopRequest) error {
+	r.stops = append(r.stops, req)
+	if req.SaveState {
+		if err := os.Mkdir(filepath.Join(r.instancesDir, req.Name, "ram-state"), 0700); err != nil {
+			return err
+		}
+	}
 	r.running = false
 	return nil
 }
@@ -46,7 +63,7 @@ func (r *orbLifecycleRunner) ResolveInstanceStart(context.Context, vmrunner.Star
 	return vmrunner.StartResponse{Outcome: vmrunner.StartAbsent}, nil
 }
 
-func TestOrbLifecycleWithoutGuestTailscale(t *testing.T) {
+func TestOrbLifecycleSaveStateWithoutGuestTailscale(t *testing.T) {
 	templateTestTools(t)
 	ctx := context.Background()
 	// Keep the Unix socket below Linux's pathname limit.
@@ -64,7 +81,7 @@ func TestOrbLifecycleWithoutGuestTailscale(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := newProvisionTestStore(t, cfg)
-	runner := &orbLifecycleRunner{}
+	runner := &orbLifecycleRunner{instancesDir: cfg.InstancesDir()}
 	p := &Provisioner{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		vmRunner: runner, networkHelper: noopNetworkHelper{}}
 	if err := os.MkdirAll(cfg.InstancesDir(), 0700); err != nil {
@@ -72,6 +89,7 @@ func TestOrbLifecycleWithoutGuestTailscale(t *testing.T) {
 	}
 	// Create starts synchronously; provide its endpoint after the directory exists.
 	ready := make(chan error, 1)
+	var pings atomic.Int32
 	serverCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
@@ -107,6 +125,7 @@ func TestOrbLifecycleWithoutGuestTailscale(t *testing.T) {
 				fmt.Fprintln(conn, "OK 4050")
 				var request map[string]string
 				if json.NewDecoder(reader).Decode(&request) == nil && request["action"] == "ping" {
+					pings.Add(1)
 					fmt.Fprintln(conn, `{"ok":true}`)
 				}
 			}
@@ -128,11 +147,26 @@ func TestOrbLifecycleWithoutGuestTailscale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Stop(ctx, inst.Name); err != nil {
-		t.Fatal(err)
+	if inst, err = p.StopWithOptions(ctx, inst.Name, StopOptions{SaveState: true}); err != nil || inst.State != model.StateStopped || inst.FirecrackerPID != 0 {
+		t.Fatalf("save Orb RAM: %+v, %v", inst, err)
+	}
+	if len(runner.stops) != 1 || !runner.stops[0].SaveState {
+		t.Fatal("save-state stop was not forwarded to the runner")
+	}
+	if _, err := os.Stat(filepath.Join(cfg.InstancesDir(), inst.Name, "ram-state")); err != nil {
+		t.Fatalf("runner did not save RAM: %v", err)
 	}
 	if inst, err = p.Start(ctx, inst.Name); err != nil || inst.State != model.StateReady {
 		t.Fatalf("resume: %+v %v", inst, err)
+	}
+	if runner.resumes != 1 || runner.starts[len(runner.starts)-1].DiscardState {
+		t.Fatal("start did not resume saved Orb RAM")
+	}
+	if pings.Load() != 2 {
+		t.Fatalf("create and RAM resume must each probe the Orb channel; got %d pings", pings.Load())
+	}
+	if _, err := bootReport(inst.SerialLogPath, inst.StartRequestID); err == nil {
+		t.Fatal("fixture unexpectedly provided a boot report for RAM resume")
 	}
 	after, err := os.ReadFile(inst.RootFSPath)
 	if err != nil || !bytes.Equal(before, after) {

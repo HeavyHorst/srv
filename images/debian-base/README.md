@@ -154,9 +154,10 @@ runtime and enables its environment watcher. srv owns bootstrap in
 [asset allowlist and validation limits](../../docs/examples/amp-orbs.md#executor-and-workload-runtime).
 
 Real srv/KVM registration, CLI updates, Desktop/Tunnel operation, and wake-up
-still require host validation. Default disk-only pause stops all processes.
-Optional RAM save can preserve independent workloads, but authenticated Amp
-fresh-token behavior and Desktop continuity remain unverified.
+still require host validation. Ordinary Amp pauses save RAM. Project snapshot
+pauses stop a running source and retain only its disk in the template.
+RAM resume can preserve independent workloads. Validate authenticated Amp
+fresh-token behavior and Desktop continuity on your host.
 
 ## Install and configure
 

@@ -242,29 +242,27 @@ still needs authenticated Amp validation.
 
 ### Executor and workload runtime
 
-Both guest builders run [`install-runtime.py`](../../contrib/amp/orbs/install-runtime.py)
-inside the prepared root. It downloads the official amd64 Amp runtime layer
-`sha256:9571fe6d7a57c153f0dafa679edd453a60171d6f049d4b2c85764ea65f7aedd0`
-and verifies the digest before writing files. The allowlist contains `amp.slice`,
-`amp-control.slice`, `amp-workload.slice`, the headless executor and environment
-watcher units, `amp-headless-update-binary`, `amp-headless-apply-env`,
-`amp-run-workload`, and its sudoers setting. Preparation makes the launcher
-executable and enables only `amp-headless-env.path`. The watcher enables the
-executor after Amp creates `/home/user/.config/amp/headless.env`.
+Both guest builders install selected executor and workload assets from Amp's
+official runtime layer. The
+[runtime installer](../../contrib/amp/orbs/install-runtime.py) defines the
+checksum pin and asset allowlist, and verifies the layer before writing files.
+It installs the executor, workload launcher, environment watcher, and their
+systemd and sudo configuration. srv's vsock agent remains the sole bootstrap
+owner. The installer excludes vendor bootstrap and unrelated image configuration.
 
-The installer excludes the vendor bootstrap service, accounts, home contents,
-Docker settings, and unrelated services. srv's vsock agent remains the sole
-bootstrap owner. `/usr/local/share/srv/amp-runtime-layer.sha256` records the pin.
-Project-template cleanup removes the source thread's executor environment and
-enabled executor link while retaining the runtime and environment watcher.
-The older Desktop layer pin remains unchanged. Rebuild the image and create a
-new Orb to install this runtime in an existing deployment.
+Preparation enables the environment watcher. When Amp creates the executor
+environment, the watcher starts the independent executor. Bootstrap runs in
+`amp-control.slice`, while the executor launches workloads in
+`amp-workload.slice`. Project templates clear the source thread's executor
+environment and enabled executor link but retain the runtime and watcher.
+Rebuild the image and create a new Orb to add this runtime to an existing
+deployment.
 
-The vendor environment helper supports `--stage-only` and avoids a restart when
-the applied environment hash is unchanged. Its path watcher can still apply a
-changed environment and restart the executor. srv does not change this behavior
-or provide a token-refresh API. Live Amp validation must establish whether a
-fresh bootstrap leaves the executor and its workload launchers running.
+The environment helper avoids restarting the executor when its environment is
+unchanged, but the watcher can restart it when the environment changes. srv does
+not alter this behavior or provide a token-refresh API. Live Amp validation must
+establish whether a fresh bootstrap leaves the executor and its workload
+launchers running.
 
 ## Provider machine and identity
 
@@ -826,8 +824,17 @@ Local automated checks:
 
 ```bash
 go test ./cmd/srv-orb-dispatch ./internal/store ./internal/service ./internal/provision ./internal/front ./internal/vmrunner ./internal/nethelper ./internal/orbguest
-# Download only the pinned small runtime layer; the installer also checks its digest.
-curl -fsSL --retry 3 https://us-central1-docker.pkg.dev/v2/amp-prod-0/amp-orb/amp-orb/blobs/sha256:9571fe6d7a57c153f0dafa679edd453a60171d6f049d4b2c85764ea65f7aedd0 -o /tmp/amp-runtime.tar.gz
+# From the repository root, download the layer selected by the installer.
+# The integration checks verify its checksum before installing it.
+python3 - <<'PYTHON'
+import runpy
+import urllib.request
+
+runtime = runpy.run_path("contrib/amp/orbs/install-runtime.py")
+with urllib.request.urlopen(runtime["LAYER_URL"], timeout=60) as response:
+	with open("/tmp/amp-runtime.tar.gz", "wb") as layer:
+		layer.write(response.read())
+PYTHON
 AMP_RUNTIME_LAYER=/tmp/amp-runtime.tar.gz python3 -m unittest discover -s contrib/amp/orbs -p 'test_*.py'
 # Disposable root/systemd Linux environment with Bash and sudo only:
 sudo python3 contrib/amp/orbs/probe_guest_systemd.py --runtime-layer /tmp/amp-runtime.tar.gz

@@ -87,16 +87,35 @@ template still exists.
 The command reads local dispatcher state only and does not lock, modify, or
 delete mappings or templates. It never contacts the backend or Coldstorage.
 
-Amp documents no snapshot-delete dispatch operation. Retire a snapshot in Amp
-first, stop the provider and wait for outstanding jobs, then delete the backend
-template and its `project-*.json` dispatcher mapping. The mapping contains the
-backend and template name. Keep lock files. Backend commands, executed as the
-same srv owner, are:
+Amp documents no snapshot-delete dispatch operation. To retire one ID, use the
+same dispatcher binary, state directory, endpoint and SSH identity as the
+provider. Update the dispatcher and backend before using these commands. Older
+dispatchers do not recognize retired mappings; do not downgrade while such
+mappings remain.
+
+```bash
+srv-orb-dispatch snapshot-gc --quarantine SNAPSHOT_ID
+# Verify a fresh orb can run setup without the template before proceeding.
+# To undo quarantine instead: srv-orb-dispatch snapshot-gc --restore SNAPSHOT_ID
+srv-orb-dispatch snapshot-gc --delete SNAPSHOT_ID
+```
+
+Quarantine keeps the template but makes new orbs fall back to the base image.
+After at least 24 hours, `--delete` first matches the template manifest on the
+recorded backend to the source instance ID in the mapping. The original VM need
+not exist. If the mapping has no source instance ID or the template cannot be
+identified, it stays quarantined and can still be restored. Once deletion starts,
+every attempt checks the authenticated owner, source instance and backend ID.
+Restore is no longer allowed at that point. If a delete reply is lost, repeat
+`--delete` for the same ID. Keep the retired mapping and lock: they prevent late
+snapshot publication jobs from recreating the ID.
+Existing orb disks, image bases and Coldstorage objects are not deletion targets.
+
+Backend commands, executed as the same srv owner, are:
 
 ```bash
 ssh srv-front -- --json project-template create ORB_VM_NAME TEMPLATE_ID --host a
 ssh srv-front -- --json orb new NEW_ORB_NAME --image amp-orb --template TEMPLATE_ID --host a
-ssh srv-front -- --json project-template delete TEMPLATE_ID --host a
 ```
 
 Use no `--host` when connecting directly to srv. Template creation requires a

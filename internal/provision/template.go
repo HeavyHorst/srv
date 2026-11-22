@@ -55,6 +55,19 @@ func (p *Provisioner) readTemplate(id string, actor model.Actor) (string, templa
 	return dir, m, nil
 }
 
+// CheckTemplateSource confirms a published template belongs to this owner and
+// source incarnation without opening its disk or looking up the original VM.
+func (p *Provisioner) CheckTemplateSource(id, sourceID string, actor model.Actor) error {
+	_, m, err := p.readTemplate(id, actor)
+	if err != nil {
+		return err
+	}
+	if m.SourceID != sourceID {
+		return errors.New("template belongs to a different source incarnation")
+	}
+	return nil
+}
+
 // CreateTemplate snapshots a stopped disk, not RAM. The caller must hold the
 // instance lifecycle lock and serialize template creation/deletion with Create.
 // Existing IDs are immutable: a retry only succeeds for the same instance ID
@@ -217,6 +230,11 @@ func (p *Provisioner) createTemplate(ctx context.Context, name, templateID strin
 
 // DeleteTemplate is owner-scoped and idempotent. It never removes a source VM.
 func (p *Provisioner) DeleteTemplate(ctx context.Context, templateID string, actor model.Actor) error {
+	return p.DeleteTemplateFromSource(ctx, templateID, "", actor)
+}
+
+// DeleteTemplateFromSource also checks the source incarnation if one was supplied.
+func (p *Provisioner) DeleteTemplateFromSource(ctx context.Context, templateID, sourceID string, actor model.Actor) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -230,7 +248,10 @@ func (p *Provisioner) DeleteTemplate(ctx context.Context, templateID string, act
 	if err := storage.ValidatePath(parent); err != nil {
 		return err
 	}
-	if _, _, err := p.readTemplate(templateID, actor); err == nil {
+	if _, m, err := p.readTemplate(templateID, actor); err == nil {
+		if sourceID != "" && m.SourceID != sourceID {
+			return errors.New("template belongs to a different source incarnation")
+		}
 		// Unpublish before reclaiming files so a partial removal cannot leave
 		// a visible template with a missing manifest or disk.
 		trash := filepath.Join(parent, ".deleted-"+uuid.NewString())

@@ -24,8 +24,17 @@ type snapshotRecord struct {
 	Source           string     `json:"source_orb"`
 	SourceInstanceID string     `json:"source_instance_id,omitempty"`
 	Phase            string     `json:"phase"`
+	QuarantinedAt    *time.Time `json:"quarantined_at,omitempty"`
 	PublishedAt      *time.Time `json:"published_at,omitempty"`
 	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
+	DeleteOwner      string     `json:"delete_owner,omitempty"`
+	DeleteBackendID  string     `json:"delete_backend_id,omitempty"`
+}
+
+const snapshotQuarantine = 24 * time.Hour
+
+func (s snapshotRecord) retired() bool {
+	return s.Phase == "quarantined" || s.Phase == "deleting" || s.Phase == "deleted"
 }
 
 func snapshotName(id string) string {
@@ -73,7 +82,7 @@ func parseSnapshot(c config, path, id string, b []byte) (*snapshotRecord, error)
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, err
 	}
-	if s.ID == "" || (id != "" && s.ID != id) || path != snapshotPath(c, s.ID) || s.Name != snapshotName(s.ID) || s.Endpoint != c.endpoint || s.Source == "" || s.Image == "" || (s.Phase != "creating" && s.Phase != "ready") {
+	if s.ID == "" || (id != "" && s.ID != id) || path != snapshotPath(c, s.ID) || s.Name != snapshotName(s.ID) || s.Endpoint != c.endpoint || s.Source == "" || s.Image == "" || (s.Phase != "creating" && s.Phase != "ready" && !s.retired()) || (s.retired() != (s.QuarantinedAt != nil && !s.QuarantinedAt.IsZero())) {
 		return nil, errors.New("invalid snapshot mapping or endpoint mismatch")
 	}
 	return &s, nil
@@ -88,6 +97,97 @@ func checkSnapshotGCState(c config) error {
 		return errors.New("provider state missing or endpoint changed")
 	}
 	return nil
+}
+
+func snapshotGCChange(ctx context.Context, c config, action, id string) (string, error) {
+	if strings.TrimSpace(id) == "" {
+		return "", errors.New("snapshot ID is required")
+	}
+	if err := checkSnapshotGCState(c); err != nil {
+		return "", err
+	}
+	path := snapshotPath(c, id)
+	unlock, err := lockSnapshot(ctx, c, id)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	s, err := loadSnapshot(c, id)
+	if err != nil {
+		return "", err
+	}
+	if s == nil {
+		return "", errors.New("snapshot mapping not found")
+	}
+	return changeSnapshotLocked(ctx, c, path, action, s)
+}
+
+func changeSnapshotLocked(ctx context.Context, c config, path, action string, s *snapshotRecord) (string, error) {
+	switch action {
+	case "--quarantine":
+		if s.Phase == "quarantined" {
+			return s.Phase, nil
+		}
+		if s.Phase != "ready" {
+			return "", fmt.Errorf("cannot quarantine snapshot in phase %q", s.Phase)
+		}
+		now := time.Now().UTC()
+		s.Phase, s.QuarantinedAt = "quarantined", &now
+	case "--restore":
+		if s.Phase != "quarantined" {
+			return "", fmt.Errorf("cannot restore snapshot in phase %q", s.Phase)
+		}
+		s.Phase, s.QuarantinedAt = "ready", nil
+	case "--delete":
+		backend := record{Host: s.Host}
+		type templateReply struct {
+			Action, Template, Owner string
+			BackendID               string `json:"backend_id"`
+		}
+		switch s.Phase {
+		case "deleted":
+			return s.Phase, nil
+		case "quarantined":
+			if until := s.QuarantinedAt.Add(snapshotQuarantine); time.Now().Before(until) {
+				return "", fmt.Errorf("snapshot is quarantined until %s", until.Format(time.RFC3339))
+			}
+			if s.SourceInstanceID == "" {
+				return "", errors.New("cannot identify template without a recorded source instance ID")
+			}
+			data, err := control(ctx, c, backend, "project-template", "identify", s.Name, s.SourceInstanceID)
+			if err != nil {
+				return "", fmt.Errorf("cannot identify template: %w", err)
+			}
+			var reply templateReply
+			if err := json.Unmarshal(data, &reply); err != nil || reply.Action != "identify" || reply.Template != s.Name || strings.TrimSpace(reply.Owner) == "" || strings.HasPrefix(reply.Owner, "-") || reply.BackendID == "" {
+				return "", errors.New("unexpected template identification reply")
+			}
+			s.Phase, s.DeleteOwner, s.DeleteBackendID = "deleting", reply.Owner, reply.BackendID
+		case "deleting":
+			if strings.TrimSpace(s.DeleteOwner) == "" || strings.HasPrefix(s.DeleteOwner, "-") || s.SourceInstanceID == "" || s.DeleteBackendID == "" {
+				return "", errors.New("cannot retry template deletion without a recorded owner, source and backend ID")
+			}
+		default:
+			return "", fmt.Errorf("cannot delete snapshot in phase %q; quarantine it first", s.Phase)
+		}
+		// Persist the restore fence before every attempt, including after a lost
+		// backend reply. The backend delete is idempotent for the same template.
+		if err := save(path, s); err != nil {
+			return "", err
+		}
+		data, err := control(ctx, c, backend, "project-template", "delete", s.Name, "--expect-owner", s.DeleteOwner, "--expect-source", s.SourceInstanceID, "--expect-backend", s.DeleteBackendID)
+		if err != nil {
+			return "", fmt.Errorf("template deletion not confirmed; repeat --delete: %w", err)
+		}
+		var reply templateReply
+		if err := json.Unmarshal(data, &reply); err != nil || reply.Action != "delete" || reply.Template != s.Name || !strings.EqualFold(reply.Owner, s.DeleteOwner) || reply.BackendID != s.DeleteBackendID {
+			return "", errors.New("unexpected template deletion reply; repeat --delete")
+		}
+		s.Phase = "deleted"
+	default:
+		return "", errors.New("invalid snapshot GC action")
+	}
+	return s.Phase, save(path, s)
 }
 
 func snapshotGCDryRun(c config, cutoff time.Time, out io.Writer) error {
@@ -171,6 +271,9 @@ func scanSnapshotMappings(c config) ([]snapshotMapping, error) {
 func captureSnapshot(ctx context.Context, c config, j job, r record, image string, s *snapshotRecord) error {
 	if image == "" {
 		return errors.New("snapshot requires srv inventory with an image name")
+	}
+	if s != nil && s.retired() {
+		return errors.New("snapshot is retired; refusing to publish it again")
 	}
 	if s == nil {
 		s = &snapshotRecord{ID: j.snapshot, Name: snapshotName(j.snapshot), Endpoint: c.endpoint, Host: r.Host, Image: image, Source: j.id, SourceInstanceID: r.InstanceID, Phase: "creating"}

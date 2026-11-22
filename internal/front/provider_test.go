@@ -14,6 +14,8 @@ func TestHostLocalTemplatesRequireExplicitHost(t *testing.T) {
 		{"new", "vm", "--template=id"},
 		{"project-template", "create", "vm", "id"},
 		{"project-template", "delete", "id"},
+		{"project-template", "identify", "id", "source-id"},
+		{"project-template", "delete", "id", "--expect-owner", "service:amp-orbs", "--expect-source", "source-id", "--expect-backend", "backend-one"},
 	} {
 		calls := 0
 		r := router(func(h front.Host, got []string, _ io.Reader, _ io.Writer) error {

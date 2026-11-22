@@ -253,7 +253,16 @@ func TestProjectTemplateLifecycleAndIdentityCleanup(t *testing.T) {
 			if _, _, err := p.readTemplate("prepared", actor); err != nil {
 				t.Fatal("source deletion lost template", err)
 			}
-			if err := p.DeleteTemplate(ctx, "prepared", actor); err != nil {
+			if err := p.CheckTemplateSource("prepared", inst.ID, actor); err != nil {
+				t.Fatal("could not identify template without source VM", err)
+			}
+			if err := p.DeleteTemplateFromSource(ctx, "prepared", "wrong-source", actor); err == nil {
+				t.Fatal("conditional delete accepted the wrong source")
+			}
+			if _, err := os.Stat(disk); err != nil {
+				t.Fatal("conditional delete removed the wrong source's disk", err)
+			}
+			if err := p.DeleteTemplateFromSource(ctx, "prepared", inst.ID, actor); err != nil {
 				t.Fatal(err)
 			}
 			if err := p.DeleteTemplate(ctx, "prepared", actor); err != nil {

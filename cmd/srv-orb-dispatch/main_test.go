@@ -64,33 +64,36 @@ type testVM struct {
 }
 
 type testServer struct {
-	Results         map[string]map[string]any
-	Proof           map[string]any
-	ProofVersion    int
-	ProxyBypass     *string
-	Creates         int
-	CreateAttempts  int
-	LateStop        bool
-	LoseBootstrap   bool
-	VM              *testVM
-	Disk            string
-	Pool            string
-	Templates       map[string]string
-	LoseTemplate    bool
-	Environment     string
-	Host            string
-	Unreachable     bool
-	OtherDown       bool
-	LoseCreate      bool
-	RejectCreate    bool
-	RefuseCreate    bool
-	RejectStart     bool
-	LoseStop        bool
-	LoseDelete      bool
-	RejectDelete    bool
-	DeleteRequestID string
-	BadInventory    bool
-	FailGuest       bool
+	Results              map[string]map[string]any
+	Proof                map[string]any
+	ProofVersion         int
+	ProxyBypass          *string
+	Creates              int
+	CreateAttempts       int
+	LateStop             bool
+	LoseBootstrap        bool
+	VM                   *testVM
+	Disk                 string
+	Pool                 string
+	Templates            map[string]string
+	LoseTemplate         bool
+	LoseTemplateDelete   bool
+	WrongTemplateOwner   bool
+	WrongTemplateBackend bool
+	Environment          string
+	Host                 string
+	Unreachable          bool
+	OtherDown            bool
+	LoseCreate           bool
+	RejectCreate         bool
+	RefuseCreate         bool
+	RejectStart          bool
+	LoseStop             bool
+	LoseDelete           bool
+	RejectDelete         bool
+	DeleteRequestID      string
+	BadInventory         bool
+	FailGuest            bool
 }
 
 func fakeSSH() error {
@@ -279,6 +282,35 @@ func fakeSSH() error {
 			return fmt.Errorf("connection lost after creation")
 		}
 	case "project-template":
+		const owner = "service:amp-orbs"
+		if args[2] == "identify" {
+			if len(args) != 5 || host != s.Host || args[4] != "12345678-1234-4234-8234-000000000001" {
+				return fmt.Errorf("unexpected template identification target")
+			}
+			if _, ok := s.Templates[args[3]]; !ok || s.WrongTemplateOwner {
+				return fmt.Errorf("template not found for authenticated owner")
+			}
+			return emit(map[string]string{"action": "identify", "template": args[3], "owner": owner, "backend_id": "backend-one"})
+		}
+		if args[2] == "delete" {
+			if len(args) != 10 || host != s.Host || args[4] != "--expect-owner" || args[5] != owner || args[6] != "--expect-source" || args[7] != "12345678-1234-4234-8234-000000000001" || args[8] != "--expect-backend" || args[9] != "backend-one" {
+				return fmt.Errorf("unexpected template deletion target")
+			}
+			if s.WrongTemplateOwner {
+				return fmt.Errorf("authenticated template owner does not match --expect-owner")
+			}
+			if s.WrongTemplateBackend {
+				return fmt.Errorf("backend ID does not match --expect-backend")
+			}
+			delete(s.Templates, args[3])
+			if err := write(); err != nil {
+				return err
+			}
+			if s.LoseTemplateDelete {
+				return fmt.Errorf("lost template deletion reply")
+			}
+			return emit(map[string]string{"action": "delete", "template": args[3], "owner": owner, "backend_id": "backend-one"})
+		}
 		if (args[2] != "create" && args[2] != "verify") || s.VM == nil || s.VM.State != "stopped" || s.VM.Name != args[3] {
 			return fmt.Errorf("template needs a stopped source")
 		}
@@ -1693,6 +1725,105 @@ func TestSnapshotGCDryRun(t *testing.T) {
 	}
 	if out, err := h.runArgs(args, "", "", "SRV_ORB_ENDPOINT=other"); err == nil || !strings.Contains(out, "endpoint changed") {
 		t.Fatalf("expected wrong provider to fail: %v\n%s", err, out)
+	}
+}
+
+func TestSnapshotGC(t *testing.T) {
+	h := newHarness(t, "b")
+	c := config{directory: filepath.Join(h.dir, "state"), endpoint: "srv"}
+	id := "test-snapshot"
+	opt := "ORB_SNAPSHOT_ID=" + id
+	gc := func(action, want string, success bool) {
+		t.Helper()
+		out, err := h.runArgs([]string{"snapshot-gc", action, id}, "", "")
+		if (err == nil) != success || !strings.Contains(out, want) {
+			t.Fatalf("%s: %v\n%s", action, err, out)
+		}
+	}
+	read := func() *snapshotRecord {
+		t.Helper()
+		s, err := loadSnapshot(c, id)
+		if err != nil || s == nil {
+			t.Fatalf("read snapshot: %v", err)
+		}
+		return s
+	}
+	h.must("spawn", "initial")
+	s := h.read()
+	s.Disk = "prepared disk"
+	h.write(s)
+	h.must("pause", "", opt)
+	first := read()
+	if first.PublishedAt == nil || first.LastUsedAt != nil {
+		t.Fatal("publication must record its time, but is not a clone")
+	}
+	h.must("spawn", "resume", opt)
+	if read().LastUsedAt != nil {
+		t.Fatal("resuming an existing orb counted as template use")
+	}
+	h.must("delete", "")
+	h.must("spawn", "clone", opt)
+	cloned := read()
+	if h.read().Disk != "prepared disk" || cloned.LastUsedAt == nil || !cloned.PublishedAt.Equal(*first.PublishedAt) {
+		t.Fatal("clone did not retain publication time and record use")
+	}
+	gc("--delete", "quarantine it first", false)
+	gc("--quarantine", "quarantined", true)
+	gc("--delete", "quarantined until", false)
+	gc("--restore", "ready", true)
+	gc("--quarantine", "quarantined", true)
+	if out, err := h.run("pause", "", opt); err == nil || !strings.Contains(out, "snapshot is retired") {
+		t.Fatalf("retired snapshot capture was not rejected: %v %s", err, out)
+	}
+	h.must("spawn", "resume-quarantined", opt)
+	if h.read().Disk != "prepared disk" {
+		t.Fatal("quarantine changed an existing orb's disk")
+	}
+	h.must("delete", "")
+	h.must("spawn", "fallback", opt)
+	if h.read().Disk != "fresh disk" || !read().LastUsedAt.Equal(*cloned.LastUsedAt) {
+		t.Fatal("quarantine did not fall back without recording a clone")
+	}
+	record := read()
+	old := time.Now().UTC().Add(-25 * time.Hour)
+	record.QuarantinedAt = &old
+	if err := save(snapshotPath(c, id), record); err != nil {
+		t.Fatal(err)
+	}
+	s = h.read()
+	s.Templates["unrelated-template"] = "unrelated disk"
+	s.WrongTemplateOwner = true
+	h.write(s)
+	gc("--delete", "cannot identify template", false)
+	if read().Phase != "quarantined" || h.read().Templates[first.Name] != "prepared disk" {
+		t.Fatal("identification failure did not preserve quarantine and template")
+	}
+	s.WrongTemplateOwner = false
+	s.LoseTemplateDelete = true
+	h.write(s)
+	gc("--delete", "not confirmed", false)
+	gc("--restore", "deleting", false)
+	s = h.read()
+	s.LoseTemplateDelete = false
+	s.WrongTemplateOwner = true
+	h.write(s)
+	gc("--delete", "owner does not match", false)
+	if read().Phase != "deleting" {
+		t.Fatal("wrong owner confirmed a deletion")
+	}
+	s.WrongTemplateOwner = false
+	s.WrongTemplateBackend = true
+	h.write(s)
+	gc("--delete", "backend ID does not match", false)
+	if read().Phase != "deleting" {
+		t.Fatal("wrong backend confirmed a deletion")
+	}
+	s.WrongTemplateBackend = false
+	h.write(s)
+	gc("--delete", "deleted", true)
+	gc("--delete", "deleted", true)
+	if s = h.read(); len(s.Templates) != 1 || s.Templates["unrelated-template"] != "unrelated disk" || s.Disk != "fresh disk" {
+		t.Fatal("delete removed the wrong template or changed the orb disk")
 	}
 }
 

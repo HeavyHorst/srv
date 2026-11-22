@@ -75,11 +75,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(ctx, 270*time.Second)
 	defer cancel()
 	dryRun := len(os.Args) == 5 && os.Args[1] == "snapshot-gc" && os.Args[2] == "--dry-run" && os.Args[3] == "--older-than"
+	autoGC := len(os.Args) == 3 && os.Args[1] == "snapshot-gc" && os.Args[2] == "--auto"
 	gcChange := len(os.Args) == 4 && os.Args[1] == "snapshot-gc" && (os.Args[2] == "--quarantine" || os.Args[2] == "--restore" || os.Args[2] == "--delete")
 	if len(os.Args) == 4 && (os.Args[1] == "bind" || os.Args[1] == "cancel") {
 		j = job{operation: os.Args[1], id: os.Args[2], expected: os.Args[3]}
-	} else if len(os.Args) > 1 && !dryRun && !gcChange && !(len(os.Args) == 2 && os.Args[1] == "init") {
-		fmt.Fprintln(os.Stderr, "usage: srv-orb-dispatch [init | bind ORB_ID UUID | cancel ORB_ID REQUEST | snapshot-gc --dry-run --older-than DURATION | snapshot-gc {--quarantine|--restore|--delete} SNAPSHOT_ID]")
+	} else if len(os.Args) > 1 && !dryRun && !autoGC && !gcChange && !(len(os.Args) == 2 && os.Args[1] == "init") {
+		fmt.Fprintln(os.Stderr, "usage: srv-orb-dispatch [init | bind ORB_ID UUID | cancel ORB_ID REQUEST | snapshot-gc --auto | snapshot-gc --dry-run --older-than DURATION | snapshot-gc {--quarantine|--restore|--delete} SNAPSHOT_ID]")
 		os.Exit(2)
 	}
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
@@ -93,6 +94,13 @@ func main() {
 			os.Exit(2)
 		}
 		if err := snapshotGCDryRun(c, time.Now().UTC().Add(-age), os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "srv-orb snapshot-gc:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if autoGC {
+		if err := snapshotGCAuto(ctx, c, os.Getenv("SRV_ORB_SNAPSHOT_GC_OLDER_THAN"), os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "srv-orb snapshot-gc:", err)
 			os.Exit(1)
 		}

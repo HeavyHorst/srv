@@ -29,6 +29,7 @@ type snapshotRecord struct {
 	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
 	DeleteOwner      string     `json:"delete_owner,omitempty"`
 	DeleteBackendID  string     `json:"delete_backend_id,omitempty"`
+	AutoRetired      bool       `json:"auto_retired,omitempty"`
 }
 
 const snapshotQuarantine = 24 * time.Hour
@@ -138,6 +139,7 @@ func changeSnapshotLocked(ctx context.Context, c config, path, action string, s 
 			return "", fmt.Errorf("cannot restore snapshot in phase %q", s.Phase)
 		}
 		s.Phase, s.QuarantinedAt = "ready", nil
+		s.AutoRetired = false
 	case "--delete":
 		backend := record{Host: s.Host}
 		type templateReply struct {
@@ -266,6 +268,81 @@ func scanSnapshotMappings(c config) ([]snapshotMapping, error) {
 		mappings = append(mappings, mapping)
 	}
 	return mappings, nil
+}
+
+func (m snapshotMapping) autoAction(now time.Time, age time.Duration) string {
+	s := m.snapshot
+	cutoff := now.Add(-age)
+	switch s.Phase {
+	case "ready":
+		if s.SourceInstanceID != "" && s.PublishedAt != nil && !s.PublishedAt.IsZero() && s.PublishedAt.Before(cutoff) && m.modified.Before(cutoff) &&
+			(s.LastUsedAt == nil || !s.LastUsedAt.IsZero() && s.LastUsedAt.Before(cutoff)) {
+			return "--quarantine"
+		}
+	case "quarantined", "deleting":
+		if s.AutoRetired && !now.Before(s.QuarantinedAt.Add(snapshotQuarantine)) {
+			return "--delete"
+		}
+	}
+	return ""
+}
+
+func snapshotGCAuto(ctx context.Context, c config, retention string, out io.Writer) error {
+	if retention == "" {
+		return nil
+	}
+	age, err := time.ParseDuration(retention)
+	if err != nil || age <= 0 {
+		return errors.New("SRV_ORB_SNAPSHOT_GC_OLDER_THAN requires a positive Go duration (for example 2160h)")
+	}
+	mappings, err := scanSnapshotMappings(c)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	var failures error
+	for _, mapping := range mappings {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(failures, err)
+		}
+		if mapping.autoAction(now, age) == "" {
+			continue
+		}
+		id := mapping.snapshot.ID
+		err := func() error {
+			// A busy Orb job must not hold up the rest of this sweep.
+			lockCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			unlock, err := lockSnapshot(lockCtx, c, id)
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			defer unlock()
+			path := snapshotPath(c, id)
+			// A clone or manual restore may have changed eligibility after the scan.
+			current, err := readSnapshotMapping(c, path)
+			if err != nil {
+				return err
+			}
+			action := current.autoAction(now, age)
+			if action == "" {
+				return nil
+			}
+			current.snapshot.AutoRetired = true
+			phase, err := changeSnapshotLocked(ctx, c, path, action, current.snapshot)
+			if err == nil {
+				fmt.Fprintf(out, "snapshot %q: %s\n", id, phase)
+			}
+			return err
+		}()
+		if err != nil {
+			failures = errors.Join(failures, fmt.Errorf("snapshot %q: %w", id, err))
+		}
+	}
+	return failures
 }
 
 func captureSnapshot(ctx context.Context, c config, j job, r record, image string, s *snapshotRecord) error {

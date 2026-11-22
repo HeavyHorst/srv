@@ -111,6 +111,35 @@ Restore is no longer allowed at that point. If a delete reply is lost, repeat
 snapshot publication jobs from recreating the ID.
 Existing orb disks, image bases and Coldstorage objects are not deletion targets.
 
+### Automatic retirement (opt-in)
+
+After updating the dispatcher and backend, set `SRV_ORB_SNAPSHOT_GC_OLDER_THAN=2160h`
+(90 days, for example) in `/etc/srv-orbs.env`. Install the two units on the
+provider machine and enable the daily timer:
+
+```bash
+sudo install -m 0644 contrib/amp/orbs/srv-orb-snapshot-gc.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now srv-orb-snapshot-gc.timer
+```
+
+The timer uses the provider's account and state. A run does nothing if the
+retention setting is empty or unset. Auto GC only quarantines `ready` templates
+with a recorded source and publication time. Publication, the mapping's last
+modification, and any recorded clone attempt must all be older than retention.
+Legacy mappings without publication time and manual quarantines are left alone.
+On a later run, after at least 24 hours in automatic quarantine, the same
+owner/source/backend checks as manual deletion apply. Failed attempts can be
+retried by subsequent runs. This is an age policy, not proof that Amp will stop
+requesting the snapshot ID; new orbs may need to run setup again.
+
+Use `journalctl -u srv-orb-snapshot-gc.service` to see transitions and failures.
+Disable the timer or clear the setting to prevent future sweeps. To cancel a
+running sweep, stop the service as well; a deletion that already started may
+have completed. Use `--restore` as the provider user to recover quarantines that
+have not entered deletion. Restored mappings become eligible again after the
+retention period.
+
 Backend commands, executed as the same srv owner, are:
 
 ```bash

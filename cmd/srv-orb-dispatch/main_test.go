@@ -1728,6 +1728,86 @@ func TestSnapshotGCDryRun(t *testing.T) {
 	}
 }
 
+func TestSnapshotGCAuto(t *testing.T) {
+	h := newHarness(t, "b")
+	c := config{directory: filepath.Join(h.dir, "state"), endpoint: "srv"}
+	const id = "automatic"
+	h.must("spawn", "initial")
+	h.must("pause", "", "ORB_SNAPSHOT_ID="+id)
+	s, err := loadSnapshot(c, id)
+	if err != nil || s == nil || s.PublishedAt == nil {
+		t.Fatalf("missing publication: %v", err)
+	}
+	now := time.Now().UTC()
+	old := now.Add(-72 * time.Hour)
+	put := func(record snapshotRecord) {
+		t.Helper()
+		path := snapshotPath(c, record.ID)
+		if err := save(path, record); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.PublishedAt = &old
+	put(*s)
+	for _, other := range []string{"legacy", "recent-use", "recent-publication", "manual"} {
+		record := *s
+		record.ID, record.Name = other, snapshotName(other)
+		switch other {
+		case "legacy":
+			record.PublishedAt = nil
+		case "recent-use":
+			record.LastUsedAt = &now
+		case "recent-publication":
+			record.PublishedAt = &now
+		case "manual":
+			record.Phase, record.QuarantinedAt = "quarantined", &old
+		}
+		put(record)
+	}
+	run := func(age, output string, success bool) {
+		t.Helper()
+		out, err := h.runArgs([]string{"snapshot-gc", "--auto"}, "", "", "SRV_ORB_SNAPSHOT_GC_OLDER_THAN="+age)
+		if (err == nil) != success || (output == "" && out != "") || !strings.Contains(out, output) {
+			t.Fatalf("retention %q: %v\n%s", age, err, out)
+		}
+	}
+	run("", "", true)
+	run("0s", "positive Go duration", false)
+	run("48h", `snapshot "automatic": quarantined`, true)
+	run("48h", "", true)
+	if len(h.read().Templates) != 1 {
+		t.Fatal("quarantine reclaimed the template too soon")
+	}
+	q, err := loadSnapshot(c, id)
+	if err != nil || q == nil || q.Phase != "quarantined" {
+		t.Fatalf("snapshot not quarantined: %+v %v", q, err)
+	}
+	q.QuarantinedAt = &old
+	put(*q)
+	state := h.read()
+	state.LoseTemplateDelete = true
+	h.write(state)
+	run("48h", "deletion not confirmed", false)
+	state = h.read()
+	state.LoseTemplateDelete = false
+	h.write(state)
+	run("", "", true)
+	run("48h", `snapshot "automatic": deleted`, true)
+	run("48h", "", true)
+	for name, want := range map[string]string{id: "deleted", "legacy": "ready", "recent-use": "ready", "recent-publication": "ready", "manual": "quarantined"} {
+		s, err := loadSnapshot(c, name)
+		if err != nil || s == nil || s.Phase != want {
+			t.Fatalf("%s: want %s, got %+v (%v)", name, want, s, err)
+		}
+	}
+	if len(h.read().Templates) != 0 {
+		t.Fatal("template still exists after automatic deletion")
+	}
+}
+
 func TestSnapshotGC(t *testing.T) {
 	h := newHarness(t, "b")
 	c := config{directory: filepath.Join(h.dir, "state"), endpoint: "srv"}

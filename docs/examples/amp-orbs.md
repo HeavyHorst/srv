@@ -69,6 +69,24 @@ copy; another source cannot replace it. Templates survive source-orb deletion.
 Back up both dispatcher mappings and backend templates. Restoring only one side
 does not restore usable snapshots.
 
+To preview old `ready` mappings, run the dispatcher as the provider user with
+its existing `SRV_ORB_STATE_DIR` and `SRV_ORB_ENDPOINT`:
+
+```bash
+srv-orb-dispatch snapshot-gc --dry-run --older-than 720h
+```
+
+The JSON report includes the snapshot ID, template name, backend host (empty for
+a direct endpoint), mapping modification time, and recorded times. `published_at`
+is when publication was confirmed. `last_used_at` records an attempt to create a
+new orb from the template, even if the create reply is lost. Waking an existing
+orb does not count. Unknown times in legacy mappings remain `null`. Both the
+mapping modification time and any recorded use must precede the cutoff. This is
+a review list, not proof that Amp no longer requests the ID or that the backend
+template still exists.
+The command reads local dispatcher state only and does not lock, modify, or
+delete mappings or templates. It never contacts the backend or Coldstorage.
+
 Amp documents no snapshot-delete dispatch operation. Retire a snapshot in Amp
 first, stop the provider and wait for outstanding jobs, then delete the backend
 template and its `project-*.json` dispatcher mapping. The mapping contains the

@@ -1640,6 +1640,62 @@ func TestFreshComputeDoesNotClaimOldSnapshots(t *testing.T) {
 	}
 }
 
+func TestSnapshotGCDryRun(t *testing.T) {
+	h := newHarness(t, "")
+	c := config{directory: filepath.Join(h.dir, "state"), endpoint: "srv"}
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-48 * time.Hour)
+	for _, fixture := range []struct {
+		id, phase string
+		updated   time.Time
+	}{
+		{"old-ready", "ready", old},
+		{"recent-ready", "ready", now.Add(-time.Hour)},
+		{"old-creating", "creating", old},
+	} {
+		path := snapshotPath(c, fixture.id)
+		if err := save(path, snapshotRecord{ID: fixture.id, Name: snapshotName(fixture.id), Endpoint: c.endpoint, Host: "a", Image: "amp-orb", Source: "source", Phase: fixture.phase}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, fixture.updated, fixture.updated); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{"snapshot-gc", "--dry-run", "--older-than", "24h"}
+	// No backend may be needed for an offline preview.
+	out, err := h.runArgs(args, "", "", "PATH="+filepath.Join(h.dir, "no-tools"))
+	if err != nil {
+		t.Fatal(err, out)
+	}
+	var report struct {
+		DryRun     bool                         `json:"dry_run"`
+		Candidates []map[string]json.RawMessage `json:"candidates"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil || !report.DryRun || len(report.Candidates) != 1 {
+		t.Fatalf("expected one old ready candidate: %v\n%s", err, out)
+	}
+	for key, want := range map[string]string{
+		"snapshot_id": `"old-ready"`, "template": strconv.Quote(snapshotName("old-ready")),
+		"host": `"a"`, "mapping_updated_at": strconv.Quote(old.Format(time.RFC3339)), "last_used_at": "null",
+	} {
+		if got := string(report.Candidates[0][key]); got != want {
+			t.Errorf("%s = %s, want %s", key, got, want)
+		}
+	}
+	entries, err := os.ReadDir(c.directory)
+	if err != nil || len(entries) != 4 {
+		t.Fatalf("dry run changed state directory: %v %v", entries, err)
+	}
+	for _, id := range []string{"old-ready", "recent-ready", "old-creating"} {
+		if record, err := loadSnapshot(c, id); err != nil || record == nil {
+			t.Fatalf("mapping %s missing or invalid after dry run: %v", id, err)
+		}
+	}
+	if out, err := h.runArgs(args, "", "", "SRV_ORB_ENDPOINT=other"); err == nil || !strings.Contains(out, "endpoint changed") {
+		t.Fatalf("expected wrong provider to fail: %v\n%s", err, out)
+	}
+}
+
 func TestProjectSnapshotLifecycle(t *testing.T) {
 	for _, host := range []string{"", "b"} {
 		t.Run("host="+host, func(t *testing.T) {

@@ -74,15 +74,28 @@ func main() {
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, 270*time.Second)
 	defer cancel()
+	dryRun := len(os.Args) == 5 && os.Args[1] == "snapshot-gc" && os.Args[2] == "--dry-run" && os.Args[3] == "--older-than"
 	if len(os.Args) == 4 && (os.Args[1] == "bind" || os.Args[1] == "cancel") {
 		j = job{operation: os.Args[1], id: os.Args[2], expected: os.Args[3]}
-	} else if len(os.Args) > 1 && !(len(os.Args) == 2 && os.Args[1] == "init") {
-		fmt.Fprintln(os.Stderr, "usage: srv-orb-dispatch [init | bind ORB_ID UUID | cancel ORB_ID REQUEST]")
+	} else if len(os.Args) > 1 && !dryRun && !(len(os.Args) == 2 && os.Args[1] == "init") {
+		fmt.Fprintln(os.Stderr, "usage: srv-orb-dispatch [init | bind ORB_ID UUID | cancel ORB_ID REQUEST | snapshot-gc --dry-run --older-than DURATION]")
 		os.Exit(2)
 	}
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 		fmt.Fprintln(os.Stderr, "srv-orb: disable core dumps:", err)
 		os.Exit(1)
+	}
+	if dryRun {
+		age, err := time.ParseDuration(os.Args[4])
+		if err != nil || age <= 0 {
+			fmt.Fprintln(os.Stderr, "--older-than requires a positive Go duration (for example 720h)")
+			os.Exit(2)
+		}
+		if err := snapshotGCDryRun(c, time.Now().UTC().Add(-age), os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "srv-orb snapshot-gc:", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if len(os.Args) == 2 && os.Args[1] == "init" {
 		if err := initialize(c); err != nil {
@@ -411,6 +424,13 @@ func dispatch(ctx context.Context, c config, j job) error {
 			args = append(args, "--pool", c.pool)
 		}
 		if snapshot != nil {
+			// Record the attempt before sending it: the backend can clone the
+			// template even if we never receive its reply.
+			now := time.Now().UTC()
+			snapshot.LastUsedAt = &now
+			if err := save(snapshotPath(c, snapshot.ID), snapshot); err != nil {
+				return err
+			}
 			args = append(args, "--template", snapshot.Name)
 		}
 		r.Phase = "creating"

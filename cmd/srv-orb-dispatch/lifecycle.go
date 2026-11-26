@@ -113,6 +113,14 @@ func resolveOperation(ctx context.Context, c config, path string, r *record) err
 	// A proven start rejection releases only this attempt, never replays its
 	// ID. Generic failures and interrupted execution remain uncertain.
 	terminal = terminal || r.Pending == "start" && result.Phase == "rejected" && result.ExitCode != 0
+	if r.Pending == "stop" && result.Phase == "recovered" && result.ExitCode == 0 {
+		proof := result.Recovery
+		if proof != nil && proof.Phase == "done" && proof.MatchesRequest(result) && proof.InstanceID == r.InstanceID && proof.CreatedAt == r.CreatedAt && proof.BackendID == r.BackendID && proof.Image == r.Image && r.BootstrapGeneration != nil && proof.BootstrapGeneration == *r.BootstrapGeneration {
+			_, idErr := uuid.Parse(proof.ID)
+			_, attemptErr := uuid.Parse(proof.StartRequestID)
+			terminal = idErr == nil && attemptErr == nil
+		}
+	}
 	if result.ID != r.RequestID || result.Name != r.Name || result.Command != r.Pending || result.Arguments != string(expected) || !terminal {
 		return errors.New("no bound terminal operation receipt; observation alone cannot clear pending execution")
 	}

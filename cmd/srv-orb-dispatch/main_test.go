@@ -797,6 +797,68 @@ func TestDispatchFailedSaveStateStaysFenced(t *testing.T) {
 	}
 }
 
+func TestDispatchBoundStopRecoveryProof(t *testing.T) {
+	for _, mode := range []string{"valid", "missing", "pending", "request", "arguments", "actor", "incarnation", "generation", "attempt", "mode"} {
+		t.Run(mode, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.must("spawn", "first-token")
+			s := h.read()
+			s.RejectSaveState = true
+			h.write(s)
+			if _, err := h.run("pause", ""); err == nil {
+				t.Fatal("fixture stop did not fail")
+			}
+			s = h.read()
+			var id string
+			var result map[string]any
+			for key, value := range s.Results {
+				if value["command"] == "stop" {
+					id, result = key, value
+				}
+			}
+			if result == nil {
+				t.Fatal("missing failed stop receipt")
+			}
+			result["phase"], result["exit_code"], result["actor"] = "recovered", 0, "owner"
+			proof := map[string]any{"id": "bbbbbbbb-1234-4234-8234-123456789abc", "original_request_id": id, "actor": "owner", "original_arguments": result["arguments"], "name": s.VM.Name, "instance_id": s.VM.ID, "created_at": s.VM.CreatedAt, "backend_id": s.VM.BackendID, "image": s.VM.Image, "start_request_id": "cccccccc-1234-4234-8234-123456789abc", "host_boot_id": "boot", "bootstrap_generation": s.VM.Generation, "save_state": true, "phase": "done"}
+			switch mode {
+			case "pending":
+				proof["phase"] = "pending"
+			case "request":
+				proof["original_request_id"] = "other"
+			case "arguments":
+				proof["original_arguments"] = "[]"
+			case "actor":
+				proof["actor"] = "other"
+			case "incarnation":
+				proof["instance_id"] = "other"
+			case "generation":
+				proof["bootstrap_generation"] = s.VM.Generation + 1
+			case "attempt":
+				proof["start_request_id"] = ""
+			case "mode":
+				proof["save_state"] = false
+			}
+			if mode != "missing" {
+				result["recovery"] = proof
+			}
+			s.VM.State, s.SavedState, s.RejectSaveState = "stopped", true, false
+			h.write(s)
+			_, err := h.run("spawn", "fresh-token")
+			if mode == "valid" {
+				if err != nil {
+					t.Fatal("valid proof did not release fence:", err)
+				}
+				if current := h.read(); current.Restores != 1 || current.Stops != 1 || current.VM.Generation != 2 {
+					t.Fatal("recovery replayed stop or lost RAM resume")
+				}
+			} else if err == nil {
+				t.Fatal("invalid proof released fence")
+			}
+		})
+	}
+}
+
 func TestDispatchSnapshotAfterSaveStatePause(t *testing.T) {
 	h := newHarness(t, "")
 	h.must("spawn", "first-token")

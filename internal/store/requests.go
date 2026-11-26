@@ -9,18 +9,22 @@ import (
 // LifecycleRequest is an ingress receipt, not proof that a runtime is absent.
 // IDs are retained indefinitely, including requests cancelled before execution.
 type LifecycleRequest struct {
-	ID        string `json:"id"`
-	Actor     string `json:"actor"`
-	Command   string `json:"command"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-	Phase     string `json:"phase"`
-	ExitCode  int    `json:"exit_code"`
+	ID        string        `json:"id"`
+	Actor     string        `json:"actor"`
+	Command   string        `json:"command"`
+	Name      string        `json:"name"`
+	Arguments string        `json:"arguments"`
+	Phase     string        `json:"phase"`
+	ExitCode  int           `json:"exit_code"`
+	Recovery  *StopRecovery `json:"recovery,omitempty"`
 }
 
 func (s *Store) GetLifecycleRequest(ctx context.Context, id, actor string) (LifecycleRequest, error) {
 	var r LifecycleRequest
 	err := s.db.QueryRowContext(ctx, `SELECT id, actor, command, name, arguments, phase, exit_code FROM lifecycle_requests WHERE id=? AND actor=?`, id, actor).Scan(&r.ID, &r.Actor, &r.Command, &r.Name, &r.Arguments, &r.Phase, &r.ExitCode)
+	if err == nil && r.Phase == "recovered" {
+		r.Recovery, err = s.stopRecoveryForRequest(ctx, r)
+	}
 	return r, err
 }
 

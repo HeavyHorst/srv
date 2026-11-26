@@ -88,6 +88,48 @@ func (s *Server) readRAMState(name string) (*ramState, error) {
 	return &state, nil
 }
 
+// Non-destructive proof for stop recovery. Unlike checkRAMState this never
+// discards incompatible RAM. Caller holds the runner name lock.
+func (s *Server) verifySavedRAMLocked(r *startReceipt, expectedMemoryBytes int64) error {
+	if r == nil || r.State != "closed" || !r.SaveState || r.ResumeConfig == "" {
+		return errors.New("saved RAM source is not a closed save-state attempt")
+	}
+	state, err := s.readRAMState(r.Name)
+	if err != nil {
+		return err
+	}
+	if state == nil || state.Attempt != r.StartResultRequest || state.Config != r.ResumeConfig || state.Binary == "" || !snapshotVersionOutput.MatchString(state.SnapshotVersion) {
+		return errors.New("saved RAM proof is missing or mismatched")
+	}
+	disk, err := stampFile(filepath.Join(s.config.InstancesDir, r.Name, "disk", "rootfs.img"))
+	if err != nil {
+		return err
+	}
+	if disk != state.Disk {
+		return errors.New("disk changed since suspend")
+	}
+	for _, name := range []string{"memory", "vmstate"} {
+		f, err := storage.OpenNoSymlinks(filepath.Join(s.ramStateDir(r.Name), name), unix.O_RDONLY|unix.O_NONBLOCK)
+		if err != nil {
+			return err
+		}
+		info, statErr := f.Stat()
+		var probe [1]byte
+		_, readErr := f.Read(probe[:])
+		closeErr := f.Close()
+		if statErr != nil || readErr != nil || closeErr != nil {
+			return errors.Join(statErr, readErr, closeErr)
+		}
+		if !info.Mode().IsRegular() || info.Size() <= 0 {
+			return fmt.Errorf("invalid saved RAM payload %s", name)
+		}
+		if name == "memory" && info.Size() != expectedMemoryBytes {
+			return errors.New("saved RAM memory length differs from guest memory")
+		}
+	}
+	return nil
+}
+
 func (s *Server) discardRAMState(name string) error {
 	dir := s.ramStateDir(name)
 	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {

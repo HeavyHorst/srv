@@ -131,5 +131,18 @@ func (a *App) cmdOperationResult(ctx context.Context, actor model.Actor, args []
 	if r.Command != "start" && r.Command != "stop" && r.Command != "bootstrap" {
 		return cleanupError(fmt.Errorf("not an orb operation"))
 	}
+	if r.Phase == "recovered" {
+		if args[0] == "operation-result" {
+			unlock := a.lockInstance(r.Name)
+			defer unlock()
+			r, err = a.store.GetLifecycleRequest(ctx, args[1], actor.UserLogin)
+			if err != nil {
+				return cleanupError(err)
+			}
+		}
+		if err := a.validateStopRecovery(ctx, actor, r); err != nil {
+			return cleanupError(err)
+		}
+	}
 	return jsonResult(r)
 }

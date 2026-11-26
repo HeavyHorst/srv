@@ -630,6 +630,53 @@ failures are not classified as rejections. Existing `executing`/`interrupted`
 records from older versions cannot be retrospectively classified from VM state.
 Upgrade srv and the dispatcher together to use this result.
 
+#### Recover an interrupted RAM-save stop
+
+Upgrade srv, srv-vm-runner, and the dispatcher together before recovery. A runner
+upgrade can drain running VMs. Save their RAM through the existing stop protocol
+before restarting that service.
+
+For an `executing` or `interrupted` stop, its owner can explicitly authorize recovery
+of the current start attempt. Read the original `operation-result REQUEST_ID` and
+the persisted instance record first. Confirm the exact incarnation, backend,
+image, start request ID, host boot ID, and bootstrap generation. Fix the storage
+capacity problem before submitting recovery. Use a fresh recovery UUID and retain
+all arguments for retries:
+
+```sh
+ssh srv operation-reconcile-stop RECOVERY_ID REQUEST_ID NAME \
+	--save-state --expect UUID CREATED_AT BACKEND_ID IMAGE \
+	--attempt START_REQUEST_ID HOST_BOOT_ID --generation N
+```
+
+The authenticated actor must own the original receipt and have access to the Orb. All
+arguments are non-secret identifiers. Recovery supports only stopping or stopped
+native Orbs whose exact start attempt already has durable RAM-save intent. The
+runner completes that same attempt, including after a lost reply or background
+completion. Before publishing proof, the runner checks the closed receipt, saved
+configuration, unchanged disk stamp, snapshot format and binary metadata, and
+readable regular snapshot files. The memory file must match the configured guest
+RAM size. These checks establish the saved files' presence and identity. They do
+not checksum every payload byte or replace verification by an actual resume.
+
+srv stores a new immutable recovery intent before requesting runner effects.
+Pending recovery blocks new starts and bootstrap. Retry the identical command
+after interruption. Changed arguments or another recovery ID for the same
+original request fail closed.
+
+Legacy ingress receipts do not record their downstream start attempt. Recovery
+does not invent that history or mark the original receipt `done`. It explicitly
+authorizes the named current attempt and atomically publishes a linked recovery
+receipt with phase `done` and original phase `recovered`. `operation-result`
+returns that proof only while its incarnation, attempt, and bootstrap generation
+remain current. The dispatcher validates the link before clearing its own pending
+stop through normal resolution. Ordinary duplicate stop admission stays forbidden.
+No receipt or provider JSON edits are required.
+
+Missing saved RAM, consumed snapshots, changed disks, successor attempts, and
+generation mismatches leave the stop fenced. This command cannot recover starts,
+bootstrap, deletion, or an ordinary stop that lacks durable RAM-save intent.
+
 `srv-orb-dispatch cancel ORB_ID REQUEST` attempts cancellation of a pending
 **start or stop**. srv takes the same instance lock and installs an exactly bound
 cancel tombstone only if the request was never admitted. If the worker won the

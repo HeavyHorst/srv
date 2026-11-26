@@ -810,6 +810,10 @@ func (p *Provisioner) StopWithOptions(ctx context.Context, name string, opts Sto
 	if err := p.stopFirecrackerWithState(ctx, inst, opts.SaveState); err != nil {
 		return inst, err
 	}
+	return p.finishStop(inst)
+}
+
+func (p *Provisioner) finishStop(inst model.Instance) (model.Instance, error) {
 	if err := p.cleanupNetworking(inst); err != nil {
 		return inst, err
 	}
@@ -991,6 +995,13 @@ func (p *Provisioner) Start(ctx context.Context, name string) (inst model.Instan
 type StartOptions struct{ DiscardState bool }
 
 func (p *Provisioner) StartWithOptions(ctx context.Context, name string, opts StartOptions) (inst model.Instance, err error) {
+	current, err := p.store.GetInstance(ctx, name)
+	if err != nil {
+		return inst, err
+	}
+	if err := p.store.CheckStopRecoveryFence(ctx, current.ID); err != nil {
+		return current, err
+	}
 	if err := p.migrationFence(ctx, name); err != nil {
 		return inst, err
 	}

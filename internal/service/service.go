@@ -1008,7 +1008,7 @@ func startCommandKeepAlive(sess gssh.Session, args []string, interval time.Durat
 		return func() {}
 	}
 	switch args[0] {
-	case "start", "stop", "restart", "disk", "delete", "resize", "upgrade", "fsck", "backup", "restore", "export", "migration", "project-template":
+	case "start", "stop", "operation-reconcile-stop", "restart", "disk", "delete", "resize", "upgrade", "fsck", "backup", "restore", "export", "migration", "project-template":
 	case "orb":
 		if len(args) < 2 || args[1] != "bootstrap" {
 			return func() {}
@@ -1045,6 +1045,8 @@ func (a *App) dispatch(ctx context.Context, actor model.Actor, req commandReques
 		return a.cmdCleanupReceipt(ctx, actor, req.args)
 	case "operation-result", "operation-cancel":
 		return a.cmdOperationResult(ctx, actor, req.args)
+	case "operation-reconcile-stop":
+		return a.cmdReconcileStop(ctx, actor, req.args)
 	case "project-template":
 		return a.cmdProjectTemplate(ctx, actor, req.args)
 	case "placement", "import-placement":

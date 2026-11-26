@@ -136,12 +136,14 @@ type StartResponse struct {
 }
 
 type StopRequest struct {
-	SaveState  bool   `json:"save_state,omitempty"`
-	InstanceID string `json:"instance_id"`
-	RequestID  string `json:"request_id"`
-	HostBootID string `json:"host_boot_id"`
-	Name       string `json:"name"`
-	PID        int    `json:"pid"`
+	SaveState           bool   `json:"save_state,omitempty"`
+	RequireSavedState   bool   `json:"require_saved_state,omitempty"`
+	ExpectedMemoryBytes int64  `json:"expected_memory_bytes,omitempty"`
+	InstanceID          string `json:"instance_id"`
+	RequestID           string `json:"request_id"`
+	HostBootID          string `json:"host_boot_id"`
+	Name                string `json:"name"`
+	PID                 int    `json:"pid"`
 }
 
 type MetricsRequest struct {
@@ -225,6 +227,9 @@ func (c *Client) StartInstanceVM(ctx context.Context, req StartRequest) (StartRe
 func (c *Client) StopInstanceVM(ctx context.Context, req StopRequest) error {
 	if err := req.Validate(); err != nil {
 		return err
+	}
+	if req.RequireSavedState {
+		return c.post(ctx, "/vm/stop-recovery-v1", req, nil)
 	}
 	if req.SaveState {
 		return c.post(ctx, "/vm/stop-state-v1", req, nil)
@@ -408,6 +413,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vm/start-result", s.handleStartResult)
 	mux.HandleFunc("/vm/stop", s.handleStop)
 	mux.HandleFunc("/vm/stop-state-v1", s.handleStop)
+	mux.HandleFunc("/vm/stop-recovery-v1", s.handleStop)
 	mux.HandleFunc("/vm/cleanup-proof-v1", s.handleCleanupProof)
 	mux.HandleFunc("/vm/cleanup-proof-v2", s.handleCleanupProof)
 	mux.HandleFunc("/vm/storage-idle-v1", s.handleStorageIdle)

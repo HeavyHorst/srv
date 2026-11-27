@@ -192,9 +192,19 @@ For a different catalog name such as `amp-orb-desktop`, set both `ORB_IMAGE` and
 `SRV_ORB_IMAGE` to that name in the provider configuration. Normal srv clients
 can select it with `orb new NAME --image amp-orb-desktop` (not plain `new`).
 
-Real srv/KVM registration, CLI updates, Desktop/Tunnel operation and wake-up
-still require host validation. A pause stops desktop processes; they are not
-saved in RAM.
+Preparation also verifies and installs selected assets from the official Amp
+runtime, then enables its environment watcher. The watcher starts an independent
+executor when Amp supplies its environment. srv owns bootstrap in
+`amp-control.slice`; the executor launches workloads into `amp-workload.slice`.
+See [runtime ownership and validation limits](../../docs/examples/amp-orbs.md#executor-and-workload-runtime).
+The [runtime installer](../../contrib/amp/orbs/install-runtime.py) defines the
+checksum pin and asset allowlist.
+
+Real srv/KVM registration, CLI updates, Desktop/Tunnel operation, and wake-up
+still require host validation. Ordinary Amp pauses save RAM. Project snapshot
+pauses stop a running source and retain only its disk in the template.
+RAM resume can preserve independent workloads. Validate authenticated Amp
+fresh-token behavior and Desktop continuity on your host.
 
 ## Podman Build On Non-Arch Linux Hosts
 

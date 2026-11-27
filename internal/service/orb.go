@@ -51,6 +51,9 @@ func (a *App) handleOrbBootstrapSession(sess gssh.Session, actor model.Actor, ar
 	if err := a.checkOrbIdentity(sess.Context(), inst, args[5:]); err != nil {
 		return fail(err)
 	}
+	if err := a.store.CheckStopRecoveryFence(sess.Context(), inst.ID); err != nil {
+		return fail(err)
+	}
 	r := orbOperationRequest(actor, "bootstrap", inst.Name, args[4], append(args[5:], strconv.FormatInt(request.Generation, 10)))
 	if err := a.store.AdmitBootstrap(sess.Context(), r, inst.ID, inst.CreatedAt, request.Generation); err != nil {
 		return fail(err)

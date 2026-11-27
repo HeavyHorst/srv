@@ -68,6 +68,9 @@ type testServer struct {
 	Proof                map[string]any
 	ProofVersion         int
 	ProxyBypass          *string
+	CPUs                 string
+	RAM                  string
+	RootFS               string
 	Creates              int
 	CreateAttempts       int
 	LateStop             bool
@@ -89,6 +92,11 @@ type testServer struct {
 	RefuseCreate         bool
 	RejectStart          bool
 	LoseStop             bool
+	RejectSaveState      bool
+	Stops                int
+	SaveStops            int
+	SavedState           bool
+	Restores             int
 	LoseDelete           bool
 	RejectDelete         bool
 	DeleteRequestID      string
@@ -101,7 +109,7 @@ func fakeSSH() error {
 		return fmt.Errorf("credential leaked into SSH environment")
 	}
 	if _, ok := os.LookupEnv("SRV_ORB_PROXY_BYPASS"); ok {
-		return fmt.Errorf("bypass configuration leaked into SSH environment")
+		return fmt.Errorf("provider configuration leaked into SSH environment")
 	}
 	path := os.Getenv("SRV_ORB_TEST_SERVER")
 	b, err := os.ReadFile(path)
@@ -264,6 +272,15 @@ func fakeSSH() error {
 		s.Disk = "fresh disk"
 		s.Pool = ""
 		for i, arg := range args {
+			if arg == "--cpus" {
+				s.CPUs = args[i+1]
+			}
+			if arg == "--ram" {
+				s.RAM = args[i+1]
+			}
+			if arg == "--rootfs-size" {
+				s.RootFS = args[i+1]
+			}
 			if arg == "--pool" {
 				s.Pool = args[i+1]
 			}
@@ -332,12 +349,26 @@ func fakeSSH() error {
 	case "inspect":
 		return emit(map[string]any{"instance": s.VM})
 	case "stop":
+		saveState := len(args) > 3 && args[3] == "--save-state"
+		if saveState {
+			args = append(args[:3:3], args[4:]...)
+			s.SaveStops++
+		}
+		s.Stops++
 		if err := finish("stop", 0); err != nil {
 			return err
+		}
+		if saveState && s.RejectSaveState {
+			s.Results[args[4]]["phase"], s.Results[args[4]]["exit_code"] = "failed", 1
+			if err := write(); err != nil {
+				return err
+			}
+			return fmt.Errorf("RAM snapshot failed")
 		}
 		if s.VM.State == "stopped" {
 			return fmt.Errorf("already stopped")
 		}
+		s.SavedState = saveState
 		s.VM.State = "stopped"
 		if s.LateStop {
 			s.Results[args[4]]["phase"] = "executing"
@@ -361,6 +392,10 @@ func fakeSSH() error {
 		}
 		if s.VM.State != "stopped" {
 			return fmt.Errorf("already running")
+		}
+		if s.SavedState {
+			s.Restores++
+			s.SavedState = false
 		}
 		s.VM.State = "ready"
 	case "delete":
@@ -458,12 +493,13 @@ func (h harness) runArgs(args []string, operation, token string, extra ...string
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, h.program, args...)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env,
 		"PATH="+h.dir+":"+os.Getenv("PATH"), "SRV_ORB_TEST_MODE=dispatch",
 		"SRV_ORB_TEST_SERVER="+filepath.Join(h.dir, "server.json"),
 		"SRV_ORB_STATE_DIR="+filepath.Join(h.dir, "state"), "SRV_ORB_ENDPOINT=srv", "SRV_ORB_HOST=",
 		"SRV_ORB_IMAGE=amp-orb", "ORB_IMAGE=amp-orb", "ORB_OPERATION="+operation,
-		"ORB_SNAPSHOT_ID=",
+		"ORB_SNAPSHOT_ID=", "ORB_TYPE=", "SRV_ORB_TYPES_FILE=",
 		"ORB_ID=amp-thread/with spaces and 'quotes'", "ORB_TOKEN="+token,
 		"AMP_ORB_PROVIDER_TOKEN=provider-secret", "AMP_URL=https://amp.example.test",
 	)
@@ -691,6 +727,170 @@ func TestDispatchLifecycle(t *testing.T) {
 				t.Fatalf("SRV_ORB_POOL not passed to orb new: %q", s.Pool)
 			}
 		})
+	}
+}
+
+func TestDispatchPauseSaveState(t *testing.T) {
+	for _, host := range []string{"", "b"} {
+		for _, policy := range []string{"ordinary", "snapshot"} {
+			t.Run(host+"/"+policy, func(t *testing.T) {
+				h := newHarness(t, host)
+				h.must("spawn", "first-token", "SRV_ORB_HOST="+host)
+				name := h.read().VM.Name
+				s := h.read()
+				s.Disk = "retained workspace"
+				s.OtherDown = host != ""
+				h.write(s)
+				options := []string{"SRV_ORB_HOST=a"}
+				if policy == "snapshot" {
+					options = append(options, "ORB_SNAPSHOT_ID=prepared-project")
+				}
+				h.must("pause", "", options...)
+				h.must("pause", "", options...)
+				s = h.read()
+				wantSave := policy == "ordinary"
+				if s.Stops != 1 || s.SavedState != wantSave || (s.SaveStops == 1) != wantSave || s.VM.State != "stopped" {
+					t.Fatalf("wrong pause behavior: stops=%d saved=%t save-stops=%d state=%s", s.Stops, s.SavedState, s.SaveStops, s.VM.State)
+				}
+				if policy == "snapshot" && len(s.Templates) != 1 {
+					t.Fatal("snapshot pause did not publish a disk template")
+				}
+				h.must("spawn", "fresh-token", "SRV_ORB_HOST=a")
+				s = h.read()
+				wantRestores := 0
+				if wantSave {
+					wantRestores = 1
+				}
+				if s.Restores != wantRestores || s.VM.Name != name || s.VM.Generation != 2 || s.Disk != "retained workspace" || !strings.Contains(s.Environment, `ORB_TOKEN="fresh-token"`) {
+					t.Fatalf("wake did not retain the orb and refresh bootstrap: %+v", s)
+				}
+			})
+		}
+	}
+}
+
+func TestDispatchSaveStateLostReply(t *testing.T) {
+	h := newHarness(t, "b")
+	h.must("spawn", "first-token", "SRV_ORB_HOST=b")
+	s := h.read()
+	s.LoseStop = true
+	h.write(s)
+	if _, err := h.run("pause", ""); err == nil {
+		t.Fatal("lost save-state stop reply was not reported")
+	}
+	h.must("pause", "")
+	s = h.read()
+	if s.Stops != 1 || s.SaveStops != 1 || !s.SavedState {
+		t.Fatal("retry changed or repeated the committed save-state stop")
+	}
+	h.must("spawn", "fresh-token")
+	if s := h.read(); s.Restores != 1 || s.VM.Generation != 2 {
+		t.Fatal("lost-reply reconciliation did not permit normal wake")
+	}
+}
+
+func TestDispatchFailedSaveStateStaysFenced(t *testing.T) {
+	h := newHarness(t, "")
+	h.must("spawn", "first-token")
+	s := h.read()
+	s.RejectSaveState = true
+	h.write(s)
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := h.run("pause", ""); err == nil {
+			t.Fatal("failed save-state stop was accepted")
+		}
+	}
+	if _, err := h.run("spawn", "fresh-token"); err == nil {
+		t.Fatal("failed save-state stop allowed a fresh bootstrap")
+	}
+	s = h.read()
+	if s.Stops != 1 || s.SaveStops != 1 || s.SavedState || s.VM.State != "ready" || s.VM.Generation != 1 {
+		t.Fatal("save failure fell back to plain stop or lost its fence")
+	}
+}
+
+func TestDispatchBoundStopRecoveryProof(t *testing.T) {
+	for _, mode := range []string{"valid", "missing", "pending", "request", "arguments", "actor", "incarnation", "generation", "attempt", "mode"} {
+		t.Run(mode, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.must("spawn", "first-token")
+			s := h.read()
+			s.RejectSaveState = true
+			h.write(s)
+			if _, err := h.run("pause", ""); err == nil {
+				t.Fatal("fixture stop did not fail")
+			}
+			s = h.read()
+			var id string
+			var result map[string]any
+			for key, value := range s.Results {
+				if value["command"] == "stop" {
+					id, result = key, value
+				}
+			}
+			if result == nil {
+				t.Fatal("missing failed stop receipt")
+			}
+			result["phase"], result["exit_code"], result["actor"] = "recovered", 0, "owner"
+			proof := map[string]any{"id": "bbbbbbbb-1234-4234-8234-123456789abc", "original_request_id": id, "actor": "owner", "original_arguments": result["arguments"], "name": s.VM.Name, "instance_id": s.VM.ID, "created_at": s.VM.CreatedAt, "backend_id": s.VM.BackendID, "image": s.VM.Image, "start_request_id": "cccccccc-1234-4234-8234-123456789abc", "host_boot_id": "boot", "bootstrap_generation": s.VM.Generation, "save_state": true, "phase": "done"}
+			switch mode {
+			case "pending":
+				proof["phase"] = "pending"
+			case "request":
+				proof["original_request_id"] = "other"
+			case "arguments":
+				proof["original_arguments"] = "[]"
+			case "actor":
+				proof["actor"] = "other"
+			case "incarnation":
+				proof["instance_id"] = "other"
+			case "generation":
+				proof["bootstrap_generation"] = s.VM.Generation + 1
+			case "attempt":
+				proof["start_request_id"] = ""
+			case "mode":
+				proof["save_state"] = false
+			}
+			if mode != "missing" {
+				result["recovery"] = proof
+			}
+			s.VM.State, s.SavedState, s.RejectSaveState = "stopped", true, false
+			h.write(s)
+			_, err := h.run("spawn", "fresh-token")
+			if mode == "valid" {
+				if err != nil {
+					t.Fatal("valid proof did not release fence:", err)
+				}
+				if current := h.read(); current.Restores != 1 || current.Stops != 1 || current.VM.Generation != 2 {
+					t.Fatal("recovery replayed stop or lost RAM resume")
+				}
+			} else if err == nil {
+				t.Fatal("invalid proof released fence")
+			}
+		})
+	}
+}
+
+func TestDispatchSnapshotAfterSaveStatePause(t *testing.T) {
+	h := newHarness(t, "")
+	h.must("spawn", "first-token")
+	s := h.read()
+	s.Disk = "prepared disk"
+	h.write(s)
+	h.must("pause", "")
+	h.must("pause", "", "ORB_SNAPSHOT_ID=prepared-project")
+	s = h.read()
+	if s.Stops != 1 || !s.SavedState || s.Disk != "prepared disk" || len(s.Templates) != 1 {
+		t.Fatal("snapshot pause changed the stopped source or issued another stop")
+	}
+	for _, disk := range s.Templates {
+		if disk != "prepared disk" {
+			t.Fatal("template did not retain prepared disk contents")
+		}
+	}
+	h.must("spawn", "fresh-token")
+	if h.read().Restores != 1 {
+		t.Fatal("snapshot pause discarded the source's saved RAM")
 	}
 }
 

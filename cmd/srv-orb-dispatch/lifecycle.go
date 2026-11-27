@@ -78,12 +78,14 @@ func matches(r record, v *instance) error {
 	return nil
 }
 
-func operate(ctx context.Context, c config, path string, r *record, operation string) error {
+func operate(ctx context.Context, c config, path string, r *record, operation string, options ...string) error {
 	r.Pending, r.RequestID = operation, uuid.NewString()
 	if err := save(path, r); err != nil {
 		return err
 	}
-	args := append([]string{operation, r.Name, "--expect", r.RequestID}, identity(*r)...)
+	args := append([]string{operation, r.Name}, options...)
+	args = append(args, "--expect", r.RequestID)
+	args = append(args, identity(*r)...)
 	if _, err := control(ctx, c, *r, args...); err != nil {
 		return err
 	}
@@ -111,6 +113,14 @@ func resolveOperation(ctx context.Context, c config, path string, r *record) err
 	// A proven start rejection releases only this attempt, never replays its
 	// ID. Generic failures and interrupted execution remain uncertain.
 	terminal = terminal || r.Pending == "start" && result.Phase == "rejected" && result.ExitCode != 0
+	if r.Pending == "stop" && result.Phase == "recovered" && result.ExitCode == 0 {
+		proof := result.Recovery
+		if proof != nil && proof.Phase == "done" && proof.MatchesRequest(result) && proof.InstanceID == r.InstanceID && proof.CreatedAt == r.CreatedAt && proof.BackendID == r.BackendID && proof.Image == r.Image && r.BootstrapGeneration != nil && proof.BootstrapGeneration == *r.BootstrapGeneration {
+			_, idErr := uuid.Parse(proof.ID)
+			_, attemptErr := uuid.Parse(proof.StartRequestID)
+			terminal = idErr == nil && attemptErr == nil
+		}
+	}
 	if result.ID != r.RequestID || result.Name != r.Name || result.Command != r.Pending || result.Arguments != string(expected) || !terminal {
 		return errors.New("no bound terminal operation receipt; observation alone cannot clear pending execution")
 	}

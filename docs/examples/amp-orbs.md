@@ -12,7 +12,7 @@ but image boot and the Amp connection still need validation on a real srv host.
 | --- | --- |
 | First `spawn` | Create an Orb, wait for its host-only vsock agent, start `amp orb bootstrap` as `user`. |
 | Later `spawn` | Start the same stopped Orb, or reuse the running Orb; restart bootstrap with the fresh token. |
-| `pause` | Stop the VM and retain its disk; with `ORB_SNAPSHOT_ID`, save an immutable prepared disk template. |
+| `pause` | Save RAM and stop the VM, retaining its disk. With `ORB_SNAPSHOT_ID`, stop without saving RAM and publish an immutable prepared disk template. |
 | `delete` | Remove the native Orb; retain any legacy backups, shared snapshots, project templates and the exact cleanup receipt. |
 
 Orbs use the same Firecracker, capacity accounting and placement infrastructure
@@ -38,23 +38,41 @@ snapshots are unchanged.
 Common `inspect`, `start`, `stop`, `delete` and capacity commands still
 operate on both kinds. The same list separation applies through srv-front.
 
-Amp pause does not request RAM suspend, and there is no automatic migration.
-Manual `stop --save-state` and `start` use the same
-[single-use RAM state](../tasks/instance-lifecycle.md#save-ram-before-stopping)
-as ordinary VMs, including exact Firecracker snapshot-format matching and a cold
-boot with the existing disk when the format changes or is missing from the manifest.
-New orbs reuse a known
-`ORB_SNAPSHOT_ID` on its recorded backend; unknown IDs fall back to the base
-image. Existing orbs always retain their own disk and use Amp's resume workflow. Processes, Terminal
-sessions and in-memory state do not survive a pause. Let Amp manage development
-services so they can be restarted after wake-up.
+Ordinary Amp pauses retain the disk and save RAM with `stop --save-state`.
+Wake uses the existing `start` command, which automatically
+restores srv's [single-use RAM state](../tasks/instance-lifecycle.md#save-ram-before-stopping).
+RAM resume requires an exact Firecracker snapshot-format match. A changed or
+missing format in the manifest causes a cold boot with the existing disk.
+A failed RAM save is reported and remains fenced by the lifecycle receipt.
+The dispatcher does not retry it as a disk-only stop. There is no automatic migration.
+
+Every wake refreshes Amp bootstrap with the fresh token. The guest stops the
+previous bootstrap and its descendants before starting the replacement. Prepared
+images put bootstrap in `amp-control.slice` and set
+`AMP_ORB_WORKLOAD_SLICE=amp-workload.slice`. The pinned official Amp runtime
+provides an independent `amp-headless.service` and `amp-run-workload` launcher.
+Workloads launched by that executor can remain in sibling scopes when srv
+replaces bootstrap. Processes still owned by bootstrap are stopped.
+
+This separation permits workload survival; it does not guarantee Amp session,
+Terminal, or Desktop continuity. Killing a workload launcher forwards signals to
+its scope. An executor restart or Amp's own cancellation can therefore stop its
+workloads. Authenticated Amp behavior across fresh-token RAM resume still needs
+the live validation below.
+
+New orbs reuse a known `ORB_SNAPSHOT_ID` on its recorded backend; unknown IDs
+fall back to the base image. Existing orbs retain their own disk and use Amp's
+resume workflow.
 
 ## Project snapshots
 
 Amp requests a snapshot by sending `pause` with `ORB_SNAPSHOT_ID`, then wakes the
 same orb again. srv stops the source, reflink-clones its disk, sanitizes the copy,
 and publishes it atomically in an owner-scoped template namespace. The source
-disk remains unchanged. A later new orb gets a clone of this prepared template
+disk remains unchanged. Snapshot pauses use disk-only stop. If the source is
+already stopped with saved RAM, the
+snapshot request leaves that RAM state on the source. Templates never copy RAM.
+A later new orb gets a clone of this prepared template
 and fresh srv allocation, rather than a migration of the source VM. Templates
 retain their workload kind: an Orb cannot clone a normal VM template or vice versa.
 
@@ -217,8 +235,34 @@ For the Amp provider, set both `ORB_IMAGE=amp-orb-desktop` and
 `SRV_ORB_IMAGE=amp-orb-desktop`. srv-front already considers image availability
 when placing new VMs. This is provider configuration, not a new per-thread Amp
 image selector. Existing VMs keep their original rootfs; rebuild and create a
-new orb to pick up Desktop support. Desktop processes restart after pause rather
-than resuming their old in-memory session.
+new orb to pick up Desktop support. Ordinary pauses save RAM. RAM resume retains
+Desktop processes only if their owning service and workload launcher survive the
+fresh-token bootstrap cycle. Desktop continuity
+still needs authenticated Amp validation.
+
+### Executor and workload runtime
+
+Both guest builders install selected executor and workload assets from Amp's
+official runtime layer. The
+[runtime installer](../../contrib/amp/orbs/install-runtime.py) defines the
+checksum pin and asset allowlist, and verifies the layer before writing files.
+It installs the executor, workload launcher, environment watcher, and their
+systemd and sudo configuration. srv's vsock agent remains the sole bootstrap
+owner. The installer excludes vendor bootstrap and unrelated image configuration.
+
+Preparation enables the environment watcher. When Amp creates the executor
+environment, the watcher starts the independent executor. Bootstrap runs in
+`amp-control.slice`, while the executor launches workloads in
+`amp-workload.slice`. Project templates clear the source thread's executor
+environment and enabled executor link but retain the runtime and watcher.
+Rebuild the image and create a new Orb to add this runtime to an existing
+deployment.
+
+The environment helper avoids restarting the executor when its environment is
+unchanged, but the watcher can restart it when the environment changes. srv does
+not alter this behavior or provide a token-refresh API. Live Amp validation must
+establish whether a fresh bootstrap leaves the executor and its workload
+launchers running.
 
 ## Provider machine and identity
 
@@ -393,13 +437,34 @@ amp -ox "Inspect this repository" --orb-provider YOUR_PROVIDER_NAME
 | `SRV_ORB_IMAGE` | `amp-orb`; prepared srv image for new VMs. |
 | `ORB_IMAGE` | Set to the same prepared image name in the provider environment. |
 | `SRV_ORB_HOST` | Optional srv-front host name; omit for automatic placement. Do not set for direct backend access. |
-| `SRV_ORB_CPUS` | `2`; new VM vCPUs. |
-| `SRV_ORB_RAM` | `4G`; new VM memory. |
+| `SRV_ORB_CPUS` | `2`; new VM vCPUs for jobs without `ORB_TYPE`. |
+| `SRV_ORB_RAM` | `4G`; new VM memory for jobs without `ORB_TYPE`. |
+| `SRV_ORB_TYPES_FILE` | Optional absolute path to the orb type resource map described below. |
 | `SRV_ORB_POOL` | Optional existing memory pool for new VMs (`new --pool`); `SRV_ORB_RAM` stays the guest-visible RAM. Unset creates fixed-memory VMs. |
 | `SRV_ORB_DISK` | `20G`; new VM rootfs size. |
 
-Sizes are operator configuration, not dispatch fields supplied by Amp. Changing
-these settings affects new VMs only. Existing VMs keep their disks and placement.
+Sizes are operator configuration. To support Amp orb types, set
+`SRV_ORB_TYPES_FILE=/etc/srv-orbs/types.json` and create a JSON object whose keys
+match the type names advertised by your Amp provider, for example:
+
+```json
+{
+  "small": {"cpus": 2, "memory_mib": 4096},
+  "large": {"cpus": 8, "memory_mib": 16384}
+}
+```
+
+Amp supplies the selected name as `ORB_TYPE` on spawn. Before allocating a new
+VM, the dispatcher validates every configured shape using srv's machine limits
+and selects its CPU and memory values. A typed allocation fails if the file is
+missing, malformed, or has an unknown type; it never falls back to the untyped
+sizes. Jobs without `ORB_TYPE` use `SRV_ORB_CPUS` and `SRV_ORB_RAM`, without
+reading the map. `SRV_ORB_DISK` and `SRV_ORB_POOL` apply to all types.
+
+Changing these settings affects new allocations only. Existing VMs keep their
+CPU, memory, disks, and placement; resume, pause, and delete do not read the type
+map. Type selection does not resize an existing VM. The map need not retain old
+type names to resume existing threads.
 `AMP_URL`, when provided by Amp on spawn, is passed to bootstrap.
 
 Only one provider installation may own an Orb ID. Do not run independent
@@ -586,6 +651,53 @@ failures are not classified as rejections. Existing `executing`/`interrupted`
 records from older versions cannot be retrospectively classified from VM state.
 Upgrade srv and the dispatcher together to use this result.
 
+#### Recover an interrupted RAM-save stop
+
+Upgrade srv, srv-vm-runner, and the dispatcher together before recovery. A runner
+upgrade can drain running VMs. Save their RAM through the existing stop protocol
+before restarting that service.
+
+For an `executing` or `interrupted` stop, its owner can explicitly authorize recovery
+of the current start attempt. Read the original `operation-result REQUEST_ID` and
+the persisted instance record first. Confirm the exact incarnation, backend,
+image, start request ID, host boot ID, and bootstrap generation. Fix the storage
+capacity problem before submitting recovery. Use a fresh recovery UUID and retain
+all arguments for retries:
+
+```sh
+ssh srv operation-reconcile-stop RECOVERY_ID REQUEST_ID NAME \
+	--save-state --expect UUID CREATED_AT BACKEND_ID IMAGE \
+	--attempt START_REQUEST_ID HOST_BOOT_ID --generation N
+```
+
+The authenticated actor must own the original receipt and have access to the Orb. All
+arguments are non-secret identifiers. Recovery supports only stopping or stopped
+native Orbs whose exact start attempt already has durable RAM-save intent. The
+runner completes that same attempt, including after a lost reply or background
+completion. Before publishing proof, the runner checks the closed receipt, saved
+configuration, unchanged disk stamp, snapshot format and binary metadata, and
+readable regular snapshot files. The memory file must match the configured guest
+RAM size. These checks establish the saved files' presence and identity. They do
+not checksum every payload byte or replace verification by an actual resume.
+
+srv stores a new immutable recovery intent before requesting runner effects.
+Pending recovery blocks new starts and bootstrap. Retry the identical command
+after interruption. Changed arguments or another recovery ID for the same
+original request fail closed.
+
+Legacy ingress receipts do not record their downstream start attempt. Recovery
+does not invent that history or mark the original receipt `done`. It explicitly
+authorizes the named current attempt and atomically publishes a linked recovery
+receipt with phase `done` and original phase `recovered`. `operation-result`
+returns that proof only while its incarnation, attempt, and bootstrap generation
+remain current. The dispatcher validates the link before clearing its own pending
+stop through normal resolution. Ordinary duplicate stop admission stays forbidden.
+No receipt or provider JSON edits are required.
+
+Missing saved RAM, consumed snapshots, changed disks, successor attempts, and
+generation mismatches leave the stop fenced. This command cannot recover starts,
+bootstrap, deletion, or an ordinary stop that lacks durable RAM-save intent.
+
 `srv-orb-dispatch cancel ORB_ID REQUEST` attempts cancellation of a pending
 **start or stop**. srv takes the same instance lock and installs an exactly bound
 cancel tombstone only if the request was never admitted. If the worker won the
@@ -744,10 +856,19 @@ Before relying on this provider, create a disposable Amp thread and verify:
 
 1. The guest boots and registers with Amp without Tailscale or guest SSH;
    setup runs successfully. Verify separate VM/Orb lists and common capacity accounting.
-2. Write a file and install a dependency; pause and wake the thread. Both survive,
-   while terminal processes do not. Verify `.agents/resume` behavior.
-3. Open an Amp Terminal, Portal and Desktop; launch a graphical application and
-   verify reconnect/service startup after wake (the old desktop session is lost).
+2. Write a file and install a dependency; pause and wake the thread. Both survive.
+   Verify `.agents/resume` behavior and fresh-token bootstrap.
+3. Rebuild the prepared image with the runtime above. Start a long-running
+   workload through Amp's executor,
+   then pause and wake. Record its PID, `/proc/PID/cgroup`, and an in-memory
+   counter before and after. Verify the workload scope is in `amp-workload.slice`,
+   the counter continues, bootstrap receives a fresh token, and old bootstrap
+   descendants stop. Inspect executor restarts and environment-watcher events
+   with `journalctl -u amp-headless.service -u amp-headless-env.service` without
+   printing environment contents or tokens. Open an Amp Terminal, Portal, and
+   Desktop and verify reconnect/service startup. Do not assume old sessions survive.
+   Repeat a project snapshot pause and verify the new thread
+   gets prepared disk contents without the source's in-memory state.
 4. With srv-front, take an unrelated backend out of service and wake the orb on
    its recorded healthy host.
 5. Let Amp save a project snapshot; create a second thread from it. Verify prepared
@@ -771,15 +892,42 @@ Local automated checks:
 
 ```bash
 go test ./cmd/srv-orb-dispatch ./internal/store ./internal/service ./internal/provision ./internal/front ./internal/vmrunner ./internal/nethelper ./internal/orbguest
-python3 -m unittest discover -s contrib/amp/orbs -p 'test_*.py'
-# Disposable root/systemd environment only; unique temporary unit, synthetic token:
-sudo python3 contrib/amp/orbs/probe_guest_systemd.py
+# From the repository root, download the layer selected by the installer.
+# The integration checks verify its checksum before installing it.
+python3 - <<'PYTHON'
+import runpy
+import urllib.request
+
+runtime = runpy.run_path("contrib/amp/orbs/install-runtime.py")
+with urllib.request.urlopen(runtime["LAYER_URL"], timeout=60) as response:
+	with open("/tmp/amp-runtime.tar.gz", "wb") as layer:
+		layer.write(response.read())
+PYTHON
+AMP_RUNTIME_LAYER=/tmp/amp-runtime.tar.gz python3 -m unittest discover -s contrib/amp/orbs -p 'test_*.py'
+# Disposable root/systemd Linux environment with Bash and sudo only:
+sudo python3 contrib/amp/orbs/probe_guest_systemd.py --runtime-layer /tmp/amp-runtime.tar.gz
 ```
 
 The Go dispatch tests use a subprocess SSH stand-in, not Firecracker or Amp.
+The runtime tests install the real pinned layer into a temporary root, check the
+allowlist and executable modes, reject a bad checksum before target writes, and
+run the vendor environment helper with a systemctl stand-in. Set
+`AMP_RUNTIME_LAYER` to include those integration checks; otherwise they are skipped.
+
 The root probe exercises the real guest handler, systemd jobs, token-holding
-descendants and environment lifecycle over a socketpair, not real vsock. Neither
-proves Amp/Tunnel interoperability or the guest-reset runtime boundary.
+descendants, and environment lifecycle over a socketpair. It runs the pinned
+vendor workload launcher from an independent synthetic executor service. Only
+the slice names are mapped to unique disposable units. It checks workload PID,
+in-memory identity/counter, scope placement, and executor PID across bootstrap
+replacement, lost replies, stale requests, and a killed handler's queued start.
+It also checks old synthetic-token holders are gone. Cleanup stops the executor
+and workload scopes and removes the probe's units.
+
+These checks do not run authenticated Amp, actual vsock, Firecracker RAM
+save/restore, Terminal, Portal, or Desktop. They do not establish that real Amp
+leaves an executor running across a token change, or prove the guest-reset
+runtime boundary. Run the disposable live cycle above before relying on session
+continuity.
 Provision tests additionally check real temporary
 ext4 images, identity cleanup, retained settings/skills, immutable templates and
 cancellation. Actual Amp setup-skipping still requires the live cycle above;

@@ -562,6 +562,9 @@ func (s *Server) resolveStartContext(ctx context.Context, q StartResultRequest) 
 }
 
 func (s *Server) receiptStop(ctx context.Context, req StopRequest) error {
+	if req.RequireSavedState && (!req.SaveState || req.RequestID == "" || req.ExpectedMemoryBytes <= 0) {
+		return errors.New("stop recovery requires an exact saved-state attempt")
+	}
 	if req.SaveState && req.RequestID == "" {
 		return errors.New("saving RAM requires a managed start attempt")
 	}
@@ -607,6 +610,18 @@ func (s *Server) receiptStop(ctx context.Context, req StopRequest) error {
 	if r == nil {
 		return errors.New("start receipt not found")
 	}
+	if req.RequireSavedState {
+		if !r.SaveState {
+			return errors.New("stop recovery requires pre-existing save-state intent")
+		}
+		active, err := s.activeReceipt(r.Name)
+		if err != nil {
+			return err
+		}
+		if active != nil && active.StartResultRequest != r.StartResultRequest {
+			return errors.New("successor attempt occupies name; stop recovery refused")
+		}
+	}
 	if req.SaveState && !r.SaveState {
 		if r.State != "started" || r.ResumeConfig == "" {
 			return errors.New("saving RAM requires a running VM started with RAM-state support")
@@ -623,6 +638,13 @@ func (s *Server) receiptStop(ctx context.Context, req StopRequest) error {
 		return err
 	}
 	if req.SaveState {
+		if req.RequireSavedState {
+			closed, err := s.readReceipt(q)
+			if err != nil {
+				return err
+			}
+			return s.verifySavedRAMLocked(closed, req.ExpectedMemoryBytes)
+		}
 		state, err := s.readRAMState(r.Name)
 		if err != nil {
 			return err

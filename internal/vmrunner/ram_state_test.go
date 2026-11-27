@@ -36,6 +36,7 @@ func TestRAMStateLifecycle(t *testing.T) {
 		"compatible-update", "incompatible-format", "legacy-format", "legacy-changed-disk",
 		"unfinished-source", "query-failure", "query-exit", "query-exec", "query-timeout",
 		"save-query-failure", "restore-failure", "other-incarnation", "plain-stop", "dead-source", "cross-filesystem",
+		"recovery", "recovery-missing-memory", "recovery-zero-memory", "recovery-short-memory", "recovery-symlink", "recovery-disk", "recovery-config", "recovery-successor",
 	} {
 		t.Run(mode, func(t *testing.T) {
 			s, _, _ := newRunnerShutdownTestServer(t)
@@ -162,6 +163,49 @@ func TestRAMStateLifecycle(t *testing.T) {
 			state, err := s.readRAMState(q.Name)
 			if err != nil || state == nil || state.SnapshotVersion != "v1.0.0" {
 				t.Fatalf("producer format: %+v %v", state, err)
+			}
+			if strings.HasPrefix(mode, "recovery") {
+				stop.RequireSavedState, stop.ExpectedMemoryBytes = true, int64(len("saved guest memory"))
+				switch mode {
+				case "recovery-missing-memory":
+					if err := os.Remove(filepath.Join(stateDir, "memory")); err != nil {
+						t.Fatal(err)
+					}
+				case "recovery-zero-memory", "recovery-short-memory":
+					size := int64(0)
+					if mode == "recovery-short-memory" {
+						size = 1
+					}
+					if err := os.Truncate(filepath.Join(stateDir, "memory"), size); err != nil {
+						t.Fatal(err)
+					}
+				case "recovery-symlink":
+					if err := os.Remove(filepath.Join(stateDir, "memory")); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(disk, filepath.Join(stateDir, "memory")); err != nil {
+						t.Fatal(err)
+					}
+				case "recovery-disk":
+					if err := os.WriteFile(disk, []byte("changed"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				case "recovery-config":
+					state.Config = "wrong"
+					if err := atomicColdJSON(filepath.Join(stateDir, "state.json"), state, 0600); err != nil {
+						t.Fatal(err)
+					}
+				case "recovery-successor":
+					q.RequestID = "new-attempt"
+					if err := s.writeReceipt(startReceipt{StartResultRequest: StartResultRequest{q.Name, q.InstanceID, q.RequestID, q.HostBootID}, State: "started", PID: os.Getpid()}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				err := c.StopInstanceVM(ctx, stop)
+				if (mode == "recovery") != (err == nil) {
+					t.Fatalf("recovery proof mode %s: %v", mode, err)
+				}
+				return
 			}
 			f, err := os.Open(binary)
 			if err != nil {

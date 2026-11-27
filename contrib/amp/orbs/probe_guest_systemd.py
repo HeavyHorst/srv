@@ -1,10 +1,12 @@
 #!/usr/bin/python3
-"""Disposable root-only systemd probe. No srv, Amp, network or real credentials.
+"""Disposable root-only systemd probe with synthetic credentials.
 
 Run: sudo python3 contrib/amp/orbs/probe_guest_systemd.py
 Exercises the real handler and systemd with a unique temporary unit. The Unix
 socketpair replaces only transport; this is not a Firecracker or Amp test.
+Downloads the pinned runtime layer unless --runtime-layer supplies an offline copy.
 """
+import argparse
 import importlib.util
 import json
 import multiprocessing
@@ -36,13 +38,51 @@ def request(generation):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runtime-layer", type=Path, help="offline copy of the pinned runtime layer")
+    args = parser.parse_args()
     assert os.geteuid() == 0, "requires root in a disposable systemd environment"
     assert Path("/proc/1/comm").read_text().strip() == "systemd"
-    name = "srv-orb-probe-" + uuid.uuid4().hex + ".service"
+    identity = "srvprobe" + uuid.uuid4().hex
+    name = identity + ".service"
+    control_slice = identity + "-control.slice"
+    workload_slice = identity + "-workload.slice"
+    headless_name = identity + "-headless.service"
+    scope_name = "amp-" + identity + ".scope"
+    extra_units = [Path("/run/systemd/system") / item for item in
+                   [identity + ".slice", control_slice, workload_slice, headless_name]]
     unit = Path("/run/systemd/system") / name
     with tempfile.TemporaryDirectory(prefix="srv-orb-probe-", dir="/run") as tmp:
         root = Path(tmp)
         guest.RUNTIME, guest.UNIT, guest.UNIT_NAME = root, unit, name
+        subprocess.run(["python3", str(Path(__file__).with_name("install-runtime.py")), str(root / "vendor")]
+                       + (["--layer", str(args.runtime_layer.resolve())] if args.runtime_layer else []), check=True)
+        wrapper = root / "amp-run-workload"
+        wrapper.write_text((root / "vendor/usr/local/bin/amp-run-workload").read_text()
+                           .replace("slice=amp-workload.slice", "slice=" + workload_slice))
+        wrapper.chmod(0o755)
+        workload = root / "workload.py"
+        workload.write_text('''import json, os, socket, uuid
+from pathlib import Path
+identity, counter = uuid.uuid4().hex, 0
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(str(Path(__file__).parent / "workload.sock"))
+    server.listen()
+    while True:
+        conn, _ = server.accept()
+        with conn:
+            counter += 1
+            conn.sendall(json.dumps({"pid": os.getpid(), "identity": identity, "counter": counter}).encode())
+''')
+        headless_unit = f"""[Unit]
+Description=Disposable independent Amp executor stand-in
+[Service]
+Type=exec
+Slice={control_slice}
+Environment=HOME={root} PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash {wrapper} --retain --unit={scope_name} -- /usr/bin/python3 {workload}
+KillMode=control-group
+"""
         script = root / "standin.py"
         script.write_text('''import json, os, signal, time
 from pathlib import Path
@@ -56,7 +96,9 @@ while True: time.sleep(1)
 ''')
         gate = root / "gate"
         guest.BOOTSTRAP_UNIT = (guest.BOOTSTRAP_UNIT.replace("User=user", "User=root")
-            .replace("Group=user", "Group=root").replace("WorkingDirectory=/home/user", f"WorkingDirectory={root}")
+            .replace("Group=user", "Group=root")
+            .replace("amp-control.slice", control_slice).replace("amp-workload.slice", workload_slice)
+            .replace("WorkingDirectory=/home/user", f"WorkingDirectory={root}")
             .replace("EnvironmentFile=-/etc/amp-orb.env\n", "")
             .replace("/run/srv-orb/bootstrap.env", str(root / "bootstrap.env"))
             .replace("ExecStart=/usr/local/bin/amp orb bootstrap", f"ExecStartPre=/bin/sh -c 'while test -e {gate}; do sleep 0.1; done'\nExecStart=/usr/bin/python3 {script}")
@@ -83,7 +125,9 @@ while True: time.sleep(1)
             wait_for(applied)
             value = json.loads(path.read_text())
             for pid in value["pids"]:
-                assert f"ORB_TOKEN=synthetic-{generation}".encode() in Path(f"/proc/{pid}/environ").read_bytes()
+                environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+                assert f"ORB_TOKEN=synthetic-{generation}".encode() in environment
+                assert f"AMP_ORB_WORKLOAD_SLICE={workload_slice}".encode() in environment, "bootstrap does not select the workload slice"
             assert not (root / "bootstrap.env").exists()
             return value["pids"]
 
@@ -92,14 +136,42 @@ while True: time.sleep(1)
                 path = Path(f"/proc/{pid}/stat")
                 assert not path.exists() or path.read_text().split()[2] == "Z", "old credential-holding process survived"
 
+        def workload_state():
+            with socket.socket(socket.AF_UNIX) as conn:
+                conn.connect(str(root / "workload.sock"))
+                return json.loads(conn.recv(1024))
+
+        def assert_workload_survives():
+            current = workload_state()
+            assert current["pid"] == memory["pid"]
+            assert current["identity"] == memory["identity"]
+            assert current["counter"] > memory["counter"]
+            memory.update(current)
+            cgroup = Path(f"/proc/{current['pid']}/cgroup").read_text()
+            assert workload_slice + "/" + scope_name in cgroup, cgroup
+            assert control_slice not in cgroup, cgroup
+            assert b"ORB_TOKEN=" not in Path(f"/proc/{current['pid']}/environ").read_bytes()
+            assert subprocess.check_output(["systemctl", "show", "-p", "MainPID", "--value", headless_name], text=True).strip() == executor_pid
+
         child = None
         try:
+            for path in extra_units[:3]:
+                path.write_text("[Unit]\nDescription=Disposable srv Amp runtime probe\n[Slice]\n")
+            extra_units[-1].write_text(headless_unit)
             guest.initialize_generation()
             assert exchange(1) == {"ok": True, "generation": 1}
             old = processes(1)
+            assert control_slice in Path(f"/proc/{old[0]}/cgroup").read_text()
+            subprocess.run(["systemctl", "start", headless_name], check=True)
+            wait_for(lambda: (root / "workload.sock").exists())
+            memory = workload_state()
+            executor_pid = subprocess.check_output(["systemctl", "show", "-p", "MainPID", "--value", headless_name], text=True).strip()
+            assert executor_pid != "0"
+            assert_workload_survives()
             assert exchange(2) == {"ok": True, "generation": 2}
             processes(2)
             assert_gone(old)
+            assert_workload_survives()
             print("PASS old-before-new: cgroup-wide stop kills token-holding descendants")
 
             # Bytes from the old connection exist before the newer request but
@@ -114,6 +186,7 @@ while True: time.sleep(1)
             with late_client:
                 assert json.loads(late_client.recv(1024)) == {"ok": False}
             assert processes(3) == newest
+            assert_workload_survives()
             assert guest.read_generation() == {"generation": 3, "phase": "done"}
             print("PASS lost acknowledgment, agent restart and newer-before-buffered-old: no replay")
 
@@ -143,17 +216,25 @@ while True: time.sleep(1)
             processes(5)
             assert_gone(newest)
             assert exchange(4) == {"ok": False}
+            assert_workload_survives()
+            print("PASS independent executor and vendor workload scope retain PIDs and in-memory state across fresh bootstrap generations")
             print("PASS killed handler with orphan systemd job: newer stop cancels job before replacing credentials")
         finally:
             if child is not None and child.is_alive():
                 child.kill()
                 child.join(5)
+            for target in [headless_name, scope_name]:
+                subprocess.run(["systemctl", "stop", target], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["systemctl", "kill", "--kill-whom=all", "--signal=KILL", name],
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["systemctl", "stop", name], check=False, stdout=subprocess.DEVNULL)
+            for path in extra_units:
+                subprocess.run(["systemctl", "stop", path.name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                path.unlink(missing_ok=True)
             unit.unlink(missing_ok=True)
             subprocess.run(["systemctl", "daemon-reload"], check=True)
-            subprocess.run(["systemctl", "reset-failed", name], check=False, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "reset-failed", name, headless_name, scope_name],
+                           check=False, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

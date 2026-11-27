@@ -81,7 +81,7 @@ fi
 	echo 'user must have home /home/user and primary group user' >&2
 	exit 1
 }
-install -d -m 0755 -o user -g user /home/user /home/user/.amp
+install -d -m 0755 -o user -g user /home/user /home/user/.amp /home/user/.config /home/user/.config/amp
 install -d -m 0755 /etc/sudoers.d /usr/local/bin
 printf 'user ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/amp-user
 chmod 0440 /etc/sudoers.d/amp-user
@@ -97,3 +97,8 @@ runuser -u user -- env -i HOME=/home/user USER=user LOGNAME=user \
 	bash < "$installer"
 test -x /home/user/.amp/bin/amp
 ln -sfn /home/user/.amp/bin/amp /usr/local/bin/amp
+
+# Keep bootstrap under srv's vsock owner. Only the environment watcher is enabled;
+# Amp writes headless.env before the independent executor can be started.
+python3 /usr/local/lib/srv/install-amp-runtime.py /
+visudo -cf /etc/sudoers.d/amp-systemd-run

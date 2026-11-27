@@ -669,6 +669,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`PRAGMA journal_mode = WAL;`,
 		`PRAGMA synchronous = FULL;`,
 		`CREATE TABLE IF NOT EXISTS lifecycle_requests (id TEXT PRIMARY KEY, actor TEXT NOT NULL, command TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL, phase TEXT NOT NULL, exit_code INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);`,
+		`CREATE TABLE IF NOT EXISTS stop_recoveries (id TEXT PRIMARY KEY, original_request_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_requests(id), actor TEXT NOT NULL, instance_id TEXT NOT NULL, binding TEXT NOT NULL, phase TEXT NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS enrollment_keys (instance_id TEXT PRIMARY KEY, key_id TEXT NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS cleanup_receipts (request_id TEXT PRIMARY KEY REFERENCES lifecycle_requests(id), actor TEXT NOT NULL, receipt TEXT NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS cleanup_fences (instance_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_requests(id));`,

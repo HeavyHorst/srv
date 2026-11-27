@@ -68,6 +68,9 @@ type testServer struct {
 	Proof                map[string]any
 	ProofVersion         int
 	ProxyBypass          *string
+	CPUs                 string
+	RAM                  string
+	RootFS               string
 	Creates              int
 	CreateAttempts       int
 	LateStop             bool
@@ -269,6 +272,15 @@ func fakeSSH() error {
 		s.Disk = "fresh disk"
 		s.Pool = ""
 		for i, arg := range args {
+			if arg == "--cpus" {
+				s.CPUs = args[i+1]
+			}
+			if arg == "--ram" {
+				s.RAM = args[i+1]
+			}
+			if arg == "--rootfs-size" {
+				s.RootFS = args[i+1]
+			}
 			if arg == "--pool" {
 				s.Pool = args[i+1]
 			}
@@ -487,7 +499,7 @@ func (h harness) runArgs(args []string, operation, token string, extra ...string
 		"SRV_ORB_TEST_SERVER="+filepath.Join(h.dir, "server.json"),
 		"SRV_ORB_STATE_DIR="+filepath.Join(h.dir, "state"), "SRV_ORB_ENDPOINT=srv", "SRV_ORB_HOST=",
 		"SRV_ORB_IMAGE=amp-orb", "ORB_IMAGE=amp-orb", "ORB_OPERATION="+operation,
-		"ORB_SNAPSHOT_ID=",
+		"ORB_SNAPSHOT_ID=", "ORB_TYPE=", "SRV_ORB_TYPES_FILE=",
 		"ORB_ID=amp-thread/with spaces and 'quotes'", "ORB_TOKEN="+token,
 		"AMP_ORB_PROVIDER_TOKEN=provider-secret", "AMP_URL=https://amp.example.test",
 	)

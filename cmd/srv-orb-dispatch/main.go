@@ -22,11 +22,13 @@ import (
 
 type config struct {
 	endpoint, directory, image, host, cpus, ram, pool, disk, ssh string
+	typesFile                                                    string
 }
 
 type job struct {
 	operation, id, image, token, ampURL, snapshot string
 	expected                                      string
+	orbType                                       string
 }
 
 // A creating record is written BEFORE sending new. An uncertain create is never
@@ -67,9 +69,9 @@ func main() {
 		endpoint: envDefault("SRV_ORB_ENDPOINT", "srv"), directory: os.Getenv("SRV_ORB_STATE_DIR"),
 		image: envDefault("SRV_ORB_IMAGE", "amp-orb"), host: os.Getenv("SRV_ORB_HOST"),
 		cpus: envDefault("SRV_ORB_CPUS", "2"), ram: envDefault("SRV_ORB_RAM", "4G"), pool: os.Getenv("SRV_ORB_POOL"),
-		disk: envDefault("SRV_ORB_DISK", "20G"), ssh: "ssh",
+		disk: envDefault("SRV_ORB_DISK", "20G"), ssh: "ssh", typesFile: os.Getenv("SRV_ORB_TYPES_FILE"),
 	}
-	j := job{operation: os.Getenv("ORB_OPERATION"), id: os.Getenv("ORB_ID"), image: os.Getenv("ORB_IMAGE"), token: os.Getenv("ORB_TOKEN"), ampURL: os.Getenv("AMP_URL"), snapshot: os.Getenv("ORB_SNAPSHOT_ID")}
+	j := job{operation: os.Getenv("ORB_OPERATION"), id: os.Getenv("ORB_ID"), image: os.Getenv("ORB_IMAGE"), token: os.Getenv("ORB_TOKEN"), ampURL: os.Getenv("AMP_URL"), snapshot: os.Getenv("ORB_SNAPSHOT_ID"), orbType: os.Getenv("ORB_TYPE")}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, 270*time.Second)
@@ -440,7 +442,11 @@ func dispatch(ctx context.Context, c config, j job) error {
 			}
 			return nil
 		}
-		args := []string{"orb", "new", r.Name, "--image", c.image, "--cpus", c.cpus, "--ram", c.ram, "--rootfs-size", c.disk}
+		cpus, ram, err := allocationResources(c, j.orbType)
+		if err != nil {
+			return err
+		}
+		args := []string{"orb", "new", r.Name, "--image", c.image, "--cpus", cpus, "--ram", ram, "--rootfs-size", c.disk}
 		if c.pool != "" {
 			args = append(args, "--pool", c.pool)
 		}
@@ -458,7 +464,7 @@ func dispatch(ctx context.Context, c config, j job) error {
 		if err := save(path, r); err != nil {
 			return err
 		}
-		_, err := control(ctx, c, r, args...)
+		_, err = control(ctx, c, r, args...)
 		if err != nil {
 			// Only srv's explicit admission refusal proves nothing was
 			// allocated; every other failure, including a lost reply, stays fenced.

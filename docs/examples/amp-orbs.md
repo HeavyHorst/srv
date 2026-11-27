@@ -437,13 +437,34 @@ amp -ox "Inspect this repository" --orb-provider YOUR_PROVIDER_NAME
 | `SRV_ORB_IMAGE` | `amp-orb`; prepared srv image for new VMs. |
 | `ORB_IMAGE` | Set to the same prepared image name in the provider environment. |
 | `SRV_ORB_HOST` | Optional srv-front host name; omit for automatic placement. Do not set for direct backend access. |
-| `SRV_ORB_CPUS` | `2`; new VM vCPUs. |
-| `SRV_ORB_RAM` | `4G`; new VM memory. |
+| `SRV_ORB_CPUS` | `2`; new VM vCPUs for jobs without `ORB_TYPE`. |
+| `SRV_ORB_RAM` | `4G`; new VM memory for jobs without `ORB_TYPE`. |
+| `SRV_ORB_TYPES_FILE` | Optional absolute path to the orb type resource map described below. |
 | `SRV_ORB_POOL` | Optional existing memory pool for new VMs (`new --pool`); `SRV_ORB_RAM` stays the guest-visible RAM. Unset creates fixed-memory VMs. |
 | `SRV_ORB_DISK` | `20G`; new VM rootfs size. |
 
-Sizes are operator configuration, not dispatch fields supplied by Amp. Changing
-these size settings affects new VMs only. Existing VMs keep their disks and placement.
+Sizes are operator configuration. To support Amp orb types, set
+`SRV_ORB_TYPES_FILE=/etc/srv-orbs/types.json` and create a JSON object whose keys
+match the type names advertised by your Amp provider, for example:
+
+```json
+{
+  "small": {"cpus": 2, "memory_mib": 4096},
+  "large": {"cpus": 8, "memory_mib": 16384}
+}
+```
+
+Amp supplies the selected name as `ORB_TYPE` on spawn. Before allocating a new
+VM, the dispatcher validates every configured shape using srv's machine limits
+and selects its CPU and memory values. A typed allocation fails if the file is
+missing, malformed, or has an unknown type; it never falls back to the untyped
+sizes. Jobs without `ORB_TYPE` use `SRV_ORB_CPUS` and `SRV_ORB_RAM`, without
+reading the map. `SRV_ORB_DISK` and `SRV_ORB_POOL` apply to all types.
+
+Changing these settings affects new allocations only. Existing VMs keep their
+CPU, memory, disks, and placement; resume, pause, and delete do not read the type
+map. Type selection does not resize an existing VM. The map need not retain old
+type names to resume existing threads.
 `AMP_URL`, when provided by Amp on spawn, is passed to bootstrap.
 
 Only one provider installation may own an Orb ID. Do not run independent
